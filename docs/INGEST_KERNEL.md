@@ -375,7 +375,9 @@ ScanReport {
 - **pip（PyO3）何时才上**：仅当**实测**出现高频细粒度（逐事件）调用、大正文序列化成热点、或需给第三方干净 `import` API 时，用 `maturin` 把同一份 crate 包成预编译 wheel 传 PyPI——是锦上添花，不替代 CLI。
 - **预编译**：各平台 CLI 走 GitHub Release（Windows / macOS / Linux）；TumeFlow 打包对应二进制随 sidecar 一起发。
 - **semver**：来源目录、`RawEvent`、`ScanReport`、游标都是公开 API；黄金语料是一致性套件，消费者升级前必须跑。
-- **早期减负**：两个消费者用 git submodule pin 到某个 commit（QuotaBar 已用 submodule，顺手）；契约稳定后再走正式 registry（crates.io / PyPI）发版。
+- **两个消费者的钉版方式不同**（"submodule" 是源码钉版手段，不是调用方式）：
+  - **QuotaBar（Rust，进程内 lib）**——钉**源码**。抽取期（P1–P2，co-development）用 **git submodule + cargo `path` 依赖**，submodule 的 commit SHA 即版本，方便在 QuotaBar 构建里直接迭代 crate；契约稳定后转 **cargo git `rev` 锁** 或 **crates.io**。QuotaBar 已用 submodule，顺手。
+  - **TumeFlow（Python，子进程 CLI）**——**不** submodule Rust 源码，而是钉 **GitHub Release 的预编译 `svault` 二进制版本**，随 sidecar 打包、运行时子进程调用。仅当将来上 PyO3/pip（ADR-024 后置项）才可能 submodule 源码本地构建 wheel。
 
 ## 13. 集成形态：上游 RawEvent 总库 + 下游物化分库
 
