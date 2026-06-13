@@ -345,6 +345,15 @@ fn parse_codex(
         match entry_type {
             Some("session_meta") => {
                 if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                    // 同一文件可含多个 session_meta（黄金语料用例）。切到**新** session 时
+                    // 必须重置 session 绑定状态——否则新 session 从 0 起算的 total_token_usage
+                    // 会被减去上一 session 的累计值，delta 变 0 或错值；model/effort/cwd 同理。
+                    if state.current_session_id.as_deref() != Some(id) {
+                        state.previous_total = CodexUsage::default();
+                        state.current_model = None;
+                        state.current_effort = None;
+                        state.current_cwd = None;
+                    }
                     state.current_session_id = Some(id.to_string());
                 }
                 if let Some(c) = payload.get("cwd").and_then(Value::as_str) {
@@ -416,7 +425,12 @@ fn parse_codex(
             }
         }
 
-        // event_msg + token_count：usage（累计 delta）。
+        // event_msg：**只取 token_count 出 usage**。正文（user_message / agent_message /
+        // agent_reasoning 等 event_msg 类型）是上面 response_item（message / reasoning）的
+        // UI 镜像——Codex rollout 同时写两套，正文权威源是 response_item（QuotaBar 实证：
+        // 正文仅从 response_item 提取、event_msg 仅取 token_count）。若也从 event_msg 取正文
+        // 会与 response_item **重复计数**。如将来出现 event_msg-only 的格式（无 response_item），
+        // 应作两层契约的「已验证实现」补充并配去重，而非在此盲目展开。
         if entry_type == Some("event_msg")
             && payload.get("type").and_then(Value::as_str) == Some("token_count")
         {
@@ -784,6 +798,40 @@ mod tests {
         // 第二条：delta = {50,10,30} → cached=min(10,50)=10, input=40, read=10
         let u1 = usages[1].usage.unwrap();
         assert_eq!((u1.input, u1.output, u1.cache_read), (40, 30, 10));
+    }
+
+    #[test]
+    fn codex_multi_session_resets_cumulative_state() {
+        // 同一文件两个 session_meta：第二 session 的 total 从 0 起算，
+        // 不应减去第一 session 的累计值（否则 delta 归零、usage 事件丢失）。
+        let s1 = serde_json::json!({"type": "session_meta", "payload": {"id": "s1"}}).to_string();
+        let t1 = serde_json::json!({
+            "type": "event_msg", "timestamp": "2026-06-01T10:00:00Z",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 50}
+            }}
+        })
+        .to_string();
+        let s2 = serde_json::json!({"type": "session_meta", "payload": {"id": "s2"}}).to_string();
+        let t2 = serde_json::json!({
+            "type": "event_msg", "timestamp": "2026-06-01T11:00:00Z",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 30, "cached_input_tokens": 5, "output_tokens": 10}
+            }}
+        })
+        .to_string();
+        let lines = [s1.as_str(), t1.as_str(), s2.as_str(), t2.as_str()];
+        let out = parse_lines(&ctx(SourceType::Codex, Profile::Full), &lines, 0, None);
+        let usages: Vec<_> = out
+            .events
+            .iter()
+            .filter(|e| e.event_type == EventType::Usage)
+            .collect();
+        assert_eq!(usages.len(), 2, "两个 session 各出一条 usage（无重置则第二条会被减成 0 而丢失）");
+        assert_eq!(usages[1].source_session_id, "s2");
+        // s2 从 0 起算：delta={30,5,10} → cached=min(5,30)=5, input=25, read=5
+        let u = usages[1].usage.unwrap();
+        assert_eq!((u.input, u.output, u.cache_read), (25, 10, 5));
     }
 
     #[test]
