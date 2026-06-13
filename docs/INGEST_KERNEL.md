@@ -328,6 +328,8 @@ ScanReport {
 
 建议宿主界面至少展示：本轮扫描的 provider 与生效根、每个文件读取的新字节/事件数、跳过/出错原因、未授权与格式漂移告警，以及"前端填路径/启停 provider"的设置入口（写回 §5 的用户配置）。
 
+> **`ScanReport`（机器结果）≠ 日志（诊断流水账）**：前者确定性、`return`/序列化给宿主渲染、可进黄金语料断言；后者走 stderr、含 `run_id`/时间等易变量、给人排错。日志规范见 `LOGGING.md`（对齐 QuotaBar `docs/LOGGING.md`：lib 用 `log` 复用宿主 sink、stdout=NDJSON/stderr=日志、正文不进日志；决策见 TumeFlow ADR-026）。
+
 ## 11. 黄金 fixture 语料（一致性套件，必须覆盖）
 
 这是整套架构最值钱的资产：所有 tricky case 做成样例输入 + 期望 `RawEvent` / `ScanReport` 输出，消费者升级内核前必须全绿。
