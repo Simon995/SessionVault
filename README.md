@@ -67,6 +67,7 @@ SessionVault **不从零写**，而是**抽取 QuotaBar 已实机验证的扫描
 ## 文档
 
 - [docs/INGEST_KERNEL.md](docs/INGEST_KERNEL.md) —— 完整设计契约（来源目录、provider 扩展、`RawEvent`、游标、扫描报告、总库/分库、黄金语料、落地计划）。
+- [docs/deep-research-report.md](docs/deep-research-report.md) —— Claude Code / Codex 数据源完备性审计与缺口分析（基于官方文档/源码），结论已并入 §3–§8 / 落定为 TumeFlow ADR-025。
 - 跨仓库决策记录见 [TumeFlow `DECISIONS.md`](https://github.com/Simon995/TumeFlow/blob/main/docs/DECISIONS.md)（ADR-018～ADR-023）。
 
 ## 分发与版本
