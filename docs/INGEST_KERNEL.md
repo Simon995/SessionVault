@@ -7,7 +7,7 @@
 > - `DECISIONS.md` / `SYSTEM_DESIGN.md` / `INTEGRATION.md` → [TumeFlow `docs/`](https://github.com/Simon995/TumeFlow/tree/main/docs)（ADR-024/025/026 与本内核直接相关；其摘要见本仓 [README](../README.md) 与 [LOGGING.md](LOGGING.md)）。
 > - `SESSION_MEMORY_ARCHITECTURE.md` / `AGENT_MEMORY_POSITION.md` / `LOGGING.md`（QuotaBar 侧）→ [QuotaBar `docs/`](https://github.com/Simon995/QuotaBar/tree/main/docs)。
 >
-> 本仓内的文档为：本文 + [rawevent-reconciliation.md](rawevent-reconciliation.md) + [LOGGING.md](LOGGING.md) + [deep-research-report.md](deep-research-report.md)。内核独立建仓后，关键 ADR 摘要将固化进本仓，外部仅留链接。
+> 本仓内的文档为：本文 + [rawevent-reconciliation.md](rawevent-reconciliation.md) + [LOGGING.md](LOGGING.md)。内核独立建仓后，关键 ADR 摘要将固化进本仓，外部仅留链接。
 
 ## 1. 定位
 
@@ -44,7 +44,7 @@
 
 #### 来源的两个正交属性（架构保险，见 ADR-025）
 
-数据源审计（`deep-research-report.md`）揭示一个关键点：**不能把所有来源都默认当成"追加写的 JSONL、按字节增量读"**——一旦后面接 rules / hooks / agents / 任务状态 / SQLite，就会被迫改核心层。为此来源目录给每个 artifact 标两个正交属性：
+数据源审计（结论已并入本文，原始报告已移除）揭示一个关键点：**不能把所有来源都默认当成"追加写的 JSONL、按字节增量读"**——一旦后面接 rules / hooks / agents / 任务状态 / SQLite，就会被迫改核心层。为此来源目录给每个 artifact 标两个正交属性：
 
 - **`source_mode`（形态）**：决定怎么读、用什么游标——
   - `append_log`：只增长的 JSONL（会话、history 的常态），按字节 `safe_offset` 增量读。
@@ -495,4 +495,4 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
 
-> 数据源完备性审计见 `deep-research-report.md`（基于 Claude Code / Codex 官方文档与源码），缺口与架构风险已并入 §3–§8 并定型为 ADR-025。**核验 caveat**：该审计的路径/环境变量/语义为 **2026-06 快照**，会随上游版本漂移；当前未逐条附可复核 URL + 核验日期，故作**设计依据**可用、但**不作长期稳定契约**——所有候选路径仍走"先探测、后按 schema 解析、`planned`→`stable` 升级"（§3.4 / §4），把"官方确认"的稳定性约束交给探测与黄金语料，而非审计快照。
+> 数据源完备性审计（基于 Claude Code / Codex 官方文档与源码）的缺口与架构风险已并入 §3–§8 并定型为 ADR-025；原始调研报告已移除，结论以本文与 ADR-025 为准。**核验 caveat**：该审计的路径/环境变量/语义为 **2026-06 快照**，会随上游版本漂移；未逐条附可复核 URL + 核验日期，故作**设计依据**可用、但**不作长期稳定契约**——所有候选路径仍走"先探测、后按 schema 解析、`planned`→`stable` 升级"（§3.4 / §4），把"官方确认"的稳定性约束交给探测与黄金语料，而非审计快照。
