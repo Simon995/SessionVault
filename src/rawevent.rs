@@ -96,12 +96,17 @@ pub enum TimeConfidence {
     Low,
 }
 
-/// token 计量（与 QuotaBar `usage_facts` 对齐：input/cached/output 三段）。
+/// token 计量（与 QuotaBar `UsageFactRow` 无损对齐：四段）。
+///
+/// Claude 直接取 `message.usage` 四字段；Codex 由累计 delta 拆分：
+/// `cached = min(delta.cached, delta.input)`、`input = delta.input − cached`、
+/// `cache_read = cached`、`cache_creation = 0`（Codex 无 creation 概念）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input: u64,
-    pub cached: u64,
     pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
 }
 
 /// 归一化事件。去重唯一键见 `dedup_key()`。
@@ -122,19 +127,27 @@ pub struct RawEvent {
     pub source_mode: SourceMode,
 
     // --- 工程定位 ---
-    /// 工程物理位置（解析自 cwd / git / marker，可与 source_path 不同盘不同机）。
-    pub workspace_location: Option<String>,
+    /// 对话记录里的原始 cwd（provenance）。
+    pub cwd: Option<String>,
+    /// 解析出的工程根路径（`resolve_project_root`）。
+    pub project_root: Option<String>,
     /// 工程根判定依据：git / marker:<file> / cwd / wsl_cwd / missing_cwd。
     pub project_root_source: Option<String>,
+    /// 工程物理位置（local | wsl:<distro>）与 transcript 存储位置的二分——
+    /// QuotaBar 有此分，但 WSL 项目记在 local transcript 下的检测是 greenfield，v0 恒 None。
+    pub workspace_location: Option<String>,
 
     // --- 事件语义 ---
     pub event_type: EventType,
     pub actor: Option<Actor>,
-    /// 对话内时间，latest-wins 唯一权威；非入库顺序 / offset。
+    /// 对话内时间（原始时间戳字符串，多为 ISO8601）；latest-wins 唯一权威，非入库顺序 / offset。
+    /// v0 存原始串，归一到 UTC unix 秒是后续细化。
     pub occurred_at: Option<String>,
     pub time_confidence: TimeConfidence,
 
     pub model: Option<String>,
+    /// Codex 推理 effort（low/medium/high/…）；Claude 当前无，恒 None。
+    pub effort: Option<String>,
     pub usage: Option<TokenUsage>,
 
     // --- greenfield（QuotaBar 暂未持久化）---

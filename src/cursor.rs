@@ -60,6 +60,9 @@ pub struct Cursor {
 
     // --- provider 私有 ---
     pub codex_state: Option<CodexState>,
+
+    /// 下一条事件的 `seq` 起点（文件内单调，增量批次间延续）。回退重读时归零。
+    pub next_seq: u64,
 }
 
 impl Cursor {
@@ -74,6 +77,7 @@ impl Cursor {
             last_rowid: None,
             schema_fingerprint: None,
             codex_state: None,
+            next_seq: 0,
         }
     }
 }

@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
 use crate::discover::SourceRef;
 use crate::logging::tag;
-use crate::parser::parse_lines;
+use crate::parser::{parse_lines, ParseCtx};
 use crate::rawevent::SourceMode;
 use crate::report::SourceReport;
 use crate::Profile;
@@ -43,7 +43,7 @@ pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
 }
 
 /// 追加型日志增量扫描。
-fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, _profile: Profile) -> ScanResult {
+fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
     let path = &source.path;
     let mut report = SourceReport {
         source_path: path.display().to_string(),
@@ -120,9 +120,15 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, _profile: Prof
     report.pending_tail_bytes = pending as u64;
 
     let lines: Vec<&str> = complete.lines().collect();
-    let base_seq = 0; // TODO(P1): 真实文件内行号需累计；骨架占位。
+    let ctx = ParseCtx {
+        source_type: source.source_type,
+        source_location: source.source_location.clone(),
+        source_path: report.source_path.clone(),
+        profile,
+    };
+    let base_seq = cursor.next_seq;
     let codex_state_before = cursor.codex_state.clone();
-    let parsed = parse_lines(source.source_type, &lines, base_seq, cursor.codex_state.take());
+    let parsed = parse_lines(&ctx, &lines, base_seq, cursor.codex_state.take());
 
     cursor.kind = CursorKind::ByteOffset;
     cursor.size = size;
@@ -155,6 +161,7 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, _profile: Prof
 
     // 全部好行：推进 safe_offset 到「完整行」边界（size - pending），半行留下轮。
     cursor.safe_offset = size - pending as u64;
+    cursor.next_seq = base_seq + parsed.events.len() as u64;
     cursor.codex_state = parsed.codex_state;
     report.events_emitted = parsed.events.len() as u64;
 
