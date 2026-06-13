@@ -280,11 +280,20 @@ ScanReport {
 
 ## 12. 分发与版本
 
-- **独立仓库 SessionVault**（crate `session-vault`，CLI `svault`）。
-- 形态：Rust **lib**（QuotaBar 原生 cargo 依赖）+ **CLI**（NDJSON 出 stdout，TumeFlow 子进程消费）+ 可选 **PyO3** wheel（进程内提速时再上）。
-- 各平台预编译 CLI（GitHub Release：Windows / macOS / Linux），TumeFlow 打包对应二进制随 sidecar 一起发。
+**独立仓库 SessionVault**（crate `session-vault`，CLI `svault`）。交付分三层，**按优先级**排，决策见 `DECISIONS.md` ADR-024：
+
+| 形态 | 服务谁 | 调用方式 | 优先级 |
+|---|---|---|---|
+| **CLI `svault`（NDJSON）** | 任何语言（Python / Node / Go / …） | 子进程 + stdout 流 | **P0 主交付** |
+| **Rust lib `session-vault`** | QuotaBar（原生） | cargo 依赖，进程内 | **P0**（同一份代码） |
+| **PyO3 wheel（pip）** | 仅 Python | `import`，进程内 | 后置，实测需要再上 |
+
+- **CLI 是跨语言主交付，不是 pip**：内核中立，交付也中立。一个 `svault` 二进制服务所有语言；pip 只解决 Python 一种消费者，却要背 `manylinux × macOS × Windows × 多 Python 版本` 的 wheel 构建矩阵。
+- **CLI 优先的四个理由**：(1) 一个产物服务所有消费者；(2) 给定二进制 = 给定确定内核版本，和"总库 offset + schema 版本"复现戳天然对齐，钉版最干净；(3) 扫描器 panic 只挂子进程，不波及宿主（PyO3 同进程一崩全崩）；(4) 扫描是 I/O 密集批量摄取、非高频小调用热循环，子进程开销被大块读摊薄，且 NDJSON 流贴合 `scan_all`。
+- **pip（PyO3）何时才上**：仅当**实测**出现高频细粒度（逐事件）调用、大正文序列化成热点、或需给第三方干净 `import` API 时，用 `maturin` 把同一份 crate 包成预编译 wheel 传 PyPI——是锦上添花，不替代 CLI。
+- **预编译**：各平台 CLI 走 GitHub Release（Windows / macOS / Linux）；TumeFlow 打包对应二进制随 sidecar 一起发。
 - **semver**：来源目录、`RawEvent`、`ScanReport`、游标都是公开 API；黄金语料是一致性套件，消费者升级前必须跑。
-- **早期减负**：两个消费者用 git submodule pin 到某个 commit（QuotaBar 已用 submodule，顺手）；契约稳定后再走正式 registry 发版。
+- **早期减负**：两个消费者用 git submodule pin 到某个 commit（QuotaBar 已用 submodule，顺手）；契约稳定后再走正式 registry（crates.io / PyPI）发版。
 
 ## 13. 集成形态：上游 RawEvent 总库 + 下游物化分库
 
