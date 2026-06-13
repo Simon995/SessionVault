@@ -217,12 +217,13 @@ mod tests {
     use super::{scan_source, split_complete_jsonl};
     use crate::cursor::ScanStatus;
     use crate::discover::SourceRef;
-    use crate::rawevent::{SourceLocation, SourceMode, SourceType};
+    use crate::rawevent::{EventType, SourceLocation, SourceMode, SourceType};
     use crate::Profile;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
 
     /// 写一个唯一的临时 jsonl 文件，返回其 SourceRef（用完即弃，测试后删）。
-    fn temp_source(name: &str, body: &str) -> (std::path::PathBuf, SourceRef) {
+    fn temp_source(name: &str, body: &str) -> (PathBuf, SourceRef) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -236,6 +237,46 @@ mod tests {
             source_mode: SourceMode::AppendLog,
             path: path.clone(),
         };
+        (path, src)
+    }
+
+    /// 追加写入已存在文件（模拟会话继续写）。
+    fn append(path: &Path, data: &str) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(data.as_bytes()).unwrap();
+    }
+
+    /// 一条 Claude user 行（产 1 个 message 事件，正文=text）。
+    fn claude_line(session: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": session,
+            "message": {"role": "user", "content": text}
+        })
+        .to_string()
+    }
+
+    fn codex_meta(id: &str) -> String {
+        serde_json::json!({"type": "session_meta", "payload": {"id": id}}).to_string()
+    }
+
+    /// 一条 Codex 累计 token 行（total_token_usage 三段）。
+    fn codex_token(input: u64, cached: u64, output: u64) -> String {
+        serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2026-06-01T10:00:00Z",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": {
+                    "input_tokens": input, "cached_input_tokens": cached, "output_tokens": output
+                }
+            }}
+        })
+        .to_string()
+    }
+
+    fn temp_source_codex(name: &str, body: &str) -> (PathBuf, SourceRef) {
+        let (path, mut src) = temp_source(name, body);
+        src.source_type = SourceType::Codex;
         (path, src)
     }
 
@@ -264,6 +305,119 @@ mod tests {
         assert_eq!(res.cursor_out.safe_offset, body.len() as u64);
         assert_eq!(res.report.items_skipped, 0);
         assert_eq!(res.report.items_examined, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incremental_append_no_dup_no_miss() {
+        // 两行 → 扫；追加一行 → 带游标续扫：只出新行、seq 续接、不重不漏。
+        let (path, src) = temp_source(
+            "incr",
+            &format!("{}\n{}\n", claude_line("s", "alpha"), claude_line("s", "beta")),
+        );
+        let r1 = scan_source(&src, None, Profile::Full);
+        assert_eq!(r1.status, ScanStatus::Ok);
+        let n1 = r1.events.len();
+        assert_eq!(n1, 2, "两条 user 行 → 两个 message 事件");
+        let off1 = r1.cursor_out.safe_offset;
+
+        append(&path, &format!("{}\n", claude_line("s", "gamma")));
+        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
+        assert_eq!(r2.status, ScanStatus::Ok);
+        assert_eq!(r2.events.len(), 1, "只出新增那一行");
+        assert_eq!(r2.events[0].seq, n1 as u64, "seq 跨批续接（不重不漏）");
+        assert_eq!(r2.events[0].content.as_deref(), Some("gamma"));
+        assert!(
+            r2.events.iter().all(|e| e.content.as_deref() != Some("alpha")),
+            "旧行不被重发"
+        );
+        assert!(r2.cursor_out.safe_offset > off1, "offset 前进");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pending_half_line_completed_next_scan() {
+        // 文件 = 完整行 + 下一行前半（无换行）→ 半行 pending、不解析；
+        // 追加后半 + 换行 → 续扫补全该行。
+        let l1 = claude_line("s", "first");
+        let l2 = claude_line("s", "second");
+        let cut = l2.len() / 2;
+        let (path, src) = temp_source("pending", &format!("{l1}\n{}", &l2[..cut]));
+        let r1 = scan_source(&src, None, Profile::Full);
+        assert_eq!(r1.status, ScanStatus::Partial);
+        assert!(r1.report.pending_tail_bytes > 0, "半行应 pending");
+        assert_eq!(r1.events.len(), 1);
+        assert_eq!(r1.events[0].content.as_deref(), Some("first"));
+
+        append(&path, &format!("{}\n", &l2[cut..]));
+        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
+        assert_eq!(r2.report.pending_tail_bytes, 0);
+        assert_eq!(r2.events.len(), 1);
+        assert_eq!(r2.events[0].content.as_deref(), Some("second"));
+        assert_eq!(r2.events[0].seq, 1, "seq 续接首批");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rescan_unchanged_emits_nothing() {
+        let (path, src) = temp_source("nochange", &format!("{}\n", claude_line("s", "x")));
+        let r1 = scan_source(&src, None, Profile::Full);
+        let off = r1.cursor_out.safe_offset;
+        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
+        assert_eq!(r2.status, ScanStatus::Ok);
+        assert!(r2.events.is_empty(), "未变文件不重发事件");
+        assert_eq!(r2.cursor_out.safe_offset, off);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn truncation_triggers_rollback_and_reread() {
+        let (path, src) = temp_source(
+            "trunc",
+            &format!("{}\n{}\n", claude_line("s", "one"), claude_line("s", "two")),
+        );
+        let r1 = scan_source(&src, None, Profile::Full);
+        assert!(r1.cursor_out.safe_offset > 0);
+        assert!(r1.cursor_out.next_seq > 0);
+
+        // 重写为更短内容（截断/重写）→ size 回退。
+        std::fs::write(&path, format!("{}\n", claude_line("s", "fresh"))).unwrap();
+        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
+        assert!(r2.report.rollback_detected, "size 变小应触发回退");
+        assert_eq!(r2.events.len(), 1);
+        assert_eq!(r2.events[0].seq, 0, "回退后 seq 归零重读");
+        assert_eq!(r2.events[0].content.as_deref(), Some("fresh"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn codex_cumulative_token_persists_across_scans() {
+        // 命门：Codex 累计 token 的 previous_total 必须跨增量批次延续。
+        let (path, src) =
+            temp_source_codex("codexincr", &format!("{}\n{}\n", codex_meta("cdx"), codex_token(100, 20, 50)));
+        let r1 = scan_source(&src, None, Profile::Full);
+        let u1: Vec<_> = r1
+            .events
+            .iter()
+            .filter(|e| e.event_type == EventType::Usage)
+            .collect();
+        assert_eq!(u1.len(), 1);
+        assert_eq!(u1[0].usage.unwrap().input, 80); // 100 - cached(20)
+        assert!(r1.cursor_out.codex_state.is_some(), "游标应携带 Codex 状态");
+
+        // 追加第二条累计 token（仅这一行进第二批，session_meta 不重复）。
+        append(&path, &format!("{}\n", codex_token(150, 30, 80)));
+        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
+        let u2: Vec<_> = r2
+            .events
+            .iter()
+            .filter(|e| e.event_type == EventType::Usage)
+            .collect();
+        assert_eq!(u2.len(), 1);
+        // 用持久化 previous_total={100,20,50}：delta={50,10,30}→input=40,read=10
+        let u = u2[0].usage.unwrap();
+        assert_eq!((u.input, u.output, u.cache_read), (40, 30, 10), "跨批次 delta 正确");
+        assert_eq!(u2[0].source_session_id, "cdx", "session_id 跨批次保留");
         let _ = std::fs::remove_file(path);
     }
 
