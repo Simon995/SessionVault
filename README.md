@@ -15,7 +15,7 @@
 中立、无头，不属于任何单一消费者。两个产品平等依赖它：
 
 - **[QuotaBar](https://github.com/Simon995/QuotaBar)** —— 配额/用量监控桌面应用，是总库的默认常驻写者。
-- **[TumeFlow](https://github.com/Simon995/TumeFlow)** —— 时间一致的个人 Agent 记忆系统，从总库物化自己的固化分库。
+- **[TumeFlow](https://github.com/Simon995/TumeFlow)**（Time-Uniform Memory Flow，时间一致记忆流）—— 让 Agent 记忆新旧一视同仁的本地优先记忆系统，从总库物化自己的固化分库。
 
 这样避免两处各写一遍扫描器、各踩一遍 Codex 累计 token / `safe_offset` / WSL 桥 / 路径发现等坑。
 
