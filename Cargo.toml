@@ -1,0 +1,30 @@
+[package]
+name = "session-vault"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Shared ingestion kernel + immutable RawEvent contract for agent session data (QuotaBar / TumeFlow)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Simon995/SessionVault"
+readme = "README.md"
+
+[lib]
+name = "session_vault"
+path = "src/lib.rs"
+
+[[bin]]
+name = "svault"
+path = "src/bin/svault.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+thiserror = "1"
+dirs-next = "2"
+
+# CLI-only (used by the `svault` bin; kept minimal)
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+
+[dev-dependencies]
