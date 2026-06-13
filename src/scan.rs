@@ -22,6 +22,8 @@ pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
         SourceMode::SnapshotFile | SourceMode::SqliteStore | SourceMode::OpaqueFamily => {
             let mut report = SourceReport {
                 source_path: source.path.display().to_string(),
+                source_mode: Some(source.source_mode),
+                cursor_kind: Some(CursorKind::NoCursor),
                 ..Default::default()
             };
             report
@@ -45,6 +47,8 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, _profile: Prof
     let path = &source.path;
     let mut report = SourceReport {
         source_path: path.display().to_string(),
+        source_mode: Some(SourceMode::AppendLog),
+        cursor_kind: Some(CursorKind::ByteOffset),
         ..Default::default()
     };
 
@@ -117,18 +121,42 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, _profile: Prof
 
     let lines: Vec<&str> = complete.lines().collect();
     let base_seq = 0; // TODO(P1): 真实文件内行号需累计；骨架占位。
-    let codex_state = cursor.codex_state.take();
-    let parsed = parse_lines(source.source_type, &lines, base_seq, codex_state);
+    let codex_state_before = cursor.codex_state.clone();
+    let parsed = parse_lines(source.source_type, &lines, base_seq, cursor.codex_state.take());
 
-    report.events_emitted = parsed.events.len() as u64;
-    report.warnings.extend(parsed.warnings);
-
-    // 推进游标：safe_offset 只推进到「完整行」边界（size - pending）。
     cursor.kind = CursorKind::ByteOffset;
-    cursor.safe_offset = size - pending as u64;
     cursor.size = size;
     cursor.mtime = mtime;
+    report.items_examined = lines.len() as u64;
+    report.items_skipped = parsed.skipped;
+    report.warnings.extend(parsed.warnings);
+
+    // P1：坏 JSON 行 → **冻结整批尾**（对齐 QuotaBar 实证，见 rawevent-reconciliation §2 / §8 规则 2）。
+    // append-only 的完整行不可变，坏了就永远坏；保守契约选「保持起点 offset + status=error +
+    // 本轮不发事件 + 下轮重读整段尾」，宁可重读也不静默跳过/错解。
+    // （已知取舍：永久损坏的完整行会让该来源停在原地——这是从 QuotaBar 继承的行为，
+    //   将来可在游标加 retry 计数做「毒行」跳过，属后续阶段。）
+    if parsed.skipped > 0 {
+        cursor.safe_offset = start; // 不前进
+        cursor.codex_state = codex_state_before; // 不吃进坏批的状态推进
+        report.events_emitted = 0;
+        log::warn!(
+            target: tag::SCAN,
+            "append_log batch frozen (bad json): path={} skipped={} kept_offset={}",
+            report.source_path, parsed.skipped, start
+        );
+        return ScanResult {
+            status: ScanStatus::Error,
+            events: Vec::new(),
+            cursor_out: cursor,
+            report,
+        };
+    }
+
+    // 全部好行：推进 safe_offset 到「完整行」边界（size - pending），半行留下轮。
+    cursor.safe_offset = size - pending as u64;
     cursor.codex_state = parsed.codex_state;
+    report.events_emitted = parsed.events.len() as u64;
 
     let status = if pending > 0 {
         ScanStatus::Partial
@@ -138,8 +166,8 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, _profile: Prof
 
     log::info!(
         target: tag::SCAN,
-        "append_log done: path={} events={} bytes={} pending={} rollback={}",
-        report.source_path, report.events_emitted, report.bytes_read, pending, report.rollback_detected
+        "append_log done: path={} events={} examined={} bytes={} pending={} rollback={}",
+        report.source_path, report.events_emitted, report.items_examined, report.bytes_read, pending, report.rollback_detected
     );
 
     ScanResult {
@@ -179,7 +207,58 @@ pub fn split_complete_jsonl(text: &str) -> (&str, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_complete_jsonl;
+    use super::{scan_source, split_complete_jsonl};
+    use crate::cursor::ScanStatus;
+    use crate::discover::SourceRef;
+    use crate::rawevent::{SourceLocation, SourceMode, SourceType};
+    use crate::Profile;
+    use std::io::Write;
+
+    /// 写一个唯一的临时 jsonl 文件，返回其 SourceRef（用完即弃，测试后删）。
+    fn temp_source(name: &str, body: &str) -> (std::path::PathBuf, SourceRef) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("svault-test-{name}-{nanos}.jsonl"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        let src = SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::AppendLog,
+            path: path.clone(),
+        };
+        (path, src)
+    }
+
+    #[test]
+    fn bad_json_freezes_batch_and_keeps_offset() {
+        // 两条好行 + 一条坏 JSON（均完整行）→ 整批冻结：offset 不前进、status=error、无事件。
+        let (path, src) = temp_source(
+            "bad",
+            "{\"a\":1}\n{\"b\":2}\nnot-json-here\n",
+        );
+        let res = scan_source(&src, None, Profile::Metadata);
+        assert_eq!(res.status, ScanStatus::Error);
+        assert_eq!(res.cursor_out.safe_offset, 0, "坏行应保持起点 offset");
+        assert!(res.events.is_empty());
+        assert_eq!(res.report.items_skipped, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn all_good_lines_advance_offset() {
+        // 全好行 → status=ok、offset 推进到完整行边界、无跳过。
+        let body = "{\"a\":1}\n{\"b\":2}\n";
+        let (path, src) = temp_source("good", body);
+        let res = scan_source(&src, None, Profile::Metadata);
+        assert_eq!(res.status, ScanStatus::Ok);
+        assert_eq!(res.cursor_out.safe_offset, body.len() as u64);
+        assert_eq!(res.report.items_skipped, 0);
+        assert_eq!(res.report.items_examined, 2);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn no_newline_is_all_pending() {

@@ -3,6 +3,12 @@
 状态：初始设计
 最后更新：2026-06-13
 
+> **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
+> - `DECISIONS.md` / `SYSTEM_DESIGN.md` / `INTEGRATION.md` → [TumeFlow `docs/`](https://github.com/Simon995/TumeFlow/tree/main/docs)（ADR-024/025/026 与本内核直接相关；其摘要见本仓 [README](../README.md) 与 [LOGGING.md](LOGGING.md)）。
+> - `SESSION_MEMORY_ARCHITECTURE.md` / `AGENT_MEMORY_POSITION.md` / `LOGGING.md`（QuotaBar 侧）→ [QuotaBar `docs/`](https://github.com/Simon995/QuotaBar/tree/main/docs)。
+>
+> 本仓内的文档为：本文 + [rawevent-reconciliation.md](rawevent-reconciliation.md) + [LOGGING.md](LOGGING.md) + [deep-research-report.md](deep-research-report.md)。内核独立建仓后，关键 ADR 摘要将固化进本仓，外部仅留链接。
+
 ## 1. 定位
 
 **SessionVault** 是一个**独立仓库的 Rust crate**（共享摄取内核 + 不可变 RawEvent 总库），把"发现各 Agent 的本地数据 → 增量扫描 → 归一化为 `RawEvent` → 落入永不删的总库"这件最容易踩坑的事**只实现一次**。QuotaBar 与 TumeFlow 都消费它，避免两处实现悄悄分叉、各踩一遍 Codex 累计 token / `safe_offset` / WSL / 路径发现等坑。
@@ -42,7 +48,7 @@
 
 - **`source_mode`（形态）**：决定怎么读、用什么游标——
   - `append_log`：只增长的 JSONL（会话、history 的常态），按字节 `safe_offset` 增量读。
-  - `snapshot_file`：会被整体重写/覆盖的文本（CLAUDE.md / AGENTS.md / rules / settings / hooks / 自定义 commands、agents、skills），按内容指纹（`hash` / `mtime+size`）判变，变了产"快照变更事件"。
+  - `snapshot_file`：会被整体重写/覆盖的文本（CLAUDE.md / AGENTS.md / rules / settings / hooks / 自定义 commands、agents、skills），按内容指纹（`hash` / `mtime+size`）判变，变了产"快照变更事件"。**内容存哪里需定型**：`config_snapshot` 事件仅带新旧 `hash` 不足以回溯"改成了什么"——要做行为归因，须把（脱敏后的）配置正文存进 `RawEvent.content`（`full` 档）或单独的 `artifact_store`/`snapshot_blob`（按 `content_hash` 寻址、去重）。骨架暂只发 hash 变更事件，正文存储留作 snapshot 解析器实装时的设计点。
   - `sqlite_store`：SQLite 状态库（Codex `CODEX_SQLITE_HOME`、Cursor `state.vscdb`），用表游标（`rowid` / `wal_lsn` / `content_hash`），**不可按字节读**。
   - `opaque_family`：官方未公开稳定结构的状态族（Claude background/supervisor state、Codex plugin bundle），只登记为"保留来源族"先不写死 glob。
 - **两层契约**：§3 区分**来源族**（稳定层：session log / snapshot 指令 / rules / hooks / skill root / plugin root / sqlite state root / derived 任务根）与**已验证实现**（易变层：具体子目录 glob，如 Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`）。子目录漂移只动易变层，**不拖公开契约升 major**。
@@ -207,14 +213,14 @@ schema_version            # 内核归一化 schema 版本
 source_type               # claude_code | codex | cursor | gemini | jsonl
 source_location           # transcript 文件存储位置：local | wsl:<distro>
 workspace_location        # 项目物理所在：local | wsl:<distro> | wsl（WSL 项目可记在 local transcript 下，与 source_location 不同；QuotaBar 实证有此二分）
-source_mode               # append_log | snapshot_file | sqlite_store（事件来自哪类形态，见 §3）
+source_mode               # append_log | snapshot_file | sqlite_store（事件来自哪类形态，见 §3）。注：opaque_family 只登记、不产 RawEvent，故此处不含它
 source_path               # 源文件
 source_session_id
 seq                       # 文件内单调序号，用于排序 + 去重
 occurred_at               # 事件在对话内发生的时间，UTC unix 秒；冲突裁决(latest-wins)的权威时间
 time_confidence           # occurred_at 可信度：high | low（缺失/不可靠时 low，交下游处理）；【QuotaBar 无此概念，本契约新增——QuotaBar 对无时间戳事件直接丢弃】
-actor                     # user | assistant | tool | system
-event_type                # message | tool_use | tool_result | usage | meta | config_snapshot（snapshot_file 变更时产出）
+actor                     # user | assistant | tool | system（thinking 不单列 actor，归 assistant，见下 event_type 说明）
+event_type                # message | tool_use | tool_result | usage | meta | config_snapshot（snapshot_file 变更时产出）| thinking（思考/推理块）
 cwd
 project_root              # 解析结果
 project_root_source       # git | marker:<file> | cwd | wsl_cwd | missing_cwd（QuotaBar 实证取值；marker 文件∈{Cargo.toml,package.json,pyproject.toml,go.mod,AGENTS.md,CLAUDE.md}）
@@ -240,6 +246,8 @@ parser_version            # 解析器版本，绑定字段语义
 去重唯一键 = `(source_type, source_location, source_path, source_session_id, seq)`。`content_hash` 仅用于相似重复检测，不作全局唯一约束（见 `SYSTEM_DESIGN.md` §9.4）。`ingested_at`（入总库时间）与总库 `offset` 由**总库层在 append 时附加**，不由解析内核产出（解析内核无状态，见 §13.1）。
 
 > **粒度对账（见 `rawevent-reconciliation.md`）**：QuotaBar 只在 **usage 事件**（Claude `type=assistant` 带 usage；Codex `token_count`）产 fact，**用户提问 / 工具结果 / 纯文本助手消息不成事件**，且正文只在即时 transcript 路径上、不落库。本契约的"逐事件 RawEvent（每条消息一事件、含正文、带 `actor`/`event_type`）"是在 QuotaBar 正文抽取函数（`message_from_*_value` / `extract_text`）之上的**升级**：把即时、含正文的 transcript 解析改成持久事件源。`seq` 语义 = 文件内行位序（增量时接已存最大 `seq`+1）。
+
+> **thinking / reasoning 建模（闭合 `rawevent-reconciliation.md` §3.3 的取舍）**：思考块（Claude `thinking`、Codex `reasoning.summary[].text`）统一记为 `actor=assistant` + `event_type=thinking`——**不另设 thinking actor**（QuotaBar 的 role=thinking 气泡归一到 actor/event_type 二维）。**opaque（明文不可得）**：Codex `encrypted_content` 等无明文场景，仍产 `thinking` 事件但 `content=None`，表示"推理发生过、无正文"，下游据此区分明文思考与加密思考。黄金语料 §11 已含该用例。
 
 ## 8. 无状态游标 API
 
@@ -279,7 +287,7 @@ Cursor {
 推进规则（与 QuotaBar 实机验证一致）：
 
 1. **append_log** — 只解析**完整 JSONL 行**；末行半截写入本轮不解析、不推进 `safe_offset`。
-2. **append_log** — 单行坏 JSON 跳过该行、保留同文件其余好行、`status=error`，但**不推进** `safe_offset`，等待下轮重试。
+2. **append_log 坏 JSON** — 本轮所读尾批中**任一完整行**解析失败 → **冻结整批**：`safe_offset` 保持本轮起点、`status=error`、**本轮不发事件**，下轮重读整段尾（与 QuotaBar 实证一致，见 `rawevent-reconciliation.md` §2："一坏行冻结整批尾"）。append-only 完整行不可变、retry 对永久损坏无效，这是"宁可重读、不静默跳过/错解"的保守取舍；**已知代价**：永久损坏的完整行会让该来源停在原地，将来可在游标加 retry 计数做"毒行"跳过（后续阶段）。（半截尾行属规则 1 的 pending，不在此列。）
 3. `(mtime, size)` 未变且游标已到尾（byte_offset 满足 `safe_offset >= size`；fingerprint 满足 `content_hash` 未变）时跳过该文件。
 4. **append_log 截断 / 重写 / 压缩检测**（关键）：判据以 **`(mtime, size)` 回退**为准（QuotaBar 实证：缓存 `mtime > 当前` 或 `size <` 缓存即触发 `safe_offset` 归零、全量重建；WSL 侧 `size < known` → Full 重读）。压缩场景如 Codex `history.jsonl` 超 `max_bytes` 丢最旧。重建后用 `(occurred_at, message_id, request_id)` 去重，**不把旧尾当新事件**。（`content_hash` 不用于 append_log 截断判定，仅用于 snapshot_file，见规则 5。）
 5. **snapshot_file** — 比 `content_hash`；变了产一条 `config_snapshot` 事件（带新旧哈希），未变跳过。整体重写是常态，不用字节游标。
@@ -312,9 +320,15 @@ ScanReport {
       roots_probed [ { path, location, exists, source: builtin|user|env } ],
       sources [
         { source_path, location, kind, provider_id,
-          bytes_total, bytes_new, events_emitted,
-          cursor_advanced, status: ok|partial|skipped|error, error?,
-          last_event_at } ],
+          # —— 模式无关（任何 source_mode 都有意义）——
+          source_mode, cursor_kind,
+          items_examined, events_emitted, items_skipped,
+          fingerprint_changed,    # snapshot_file：指纹是否变
+          schema_changed,         # sqlite_store：schema 指纹是否漂移
+          rollback_detected,
+          status: ok|partial|skipped|error, error?, last_event_at,
+          # —— append_log 专属（字节口径）——
+          bytes_new, pending_tail_bytes } ],
       totals { sources, events, bytes_new } } ]
   warnings [ ... ]   # 路径不存在 / 权限拒绝 / 未授权 / 格式漂移
 }
@@ -339,7 +353,7 @@ ScanReport {
 - 一文件多 session：Claude `--resume`/fork 把父 `sessionId` 行重放进子文件、Codex 多个 `session_meta` → 按**行级** `session_id` 归属，不串话。
 - thinking/reasoning：Claude `thinking` 块、Codex `reasoning.summary[].text` → 按取舍策略产 `thinking` 事件或排除；Codex `encrypted_content` 无明文 → 不产正文（opaque）。
 - 末行半截写入 → 本轮不解析、`safe_offset` 不前进。
-- 单行坏 JSON → 跳过该行、保留同文件好行、`status=error`、不推进。
+- 单行坏 JSON（完整行）→ **冻结整批**：`status=error`、`safe_offset` 不前进、本轮不发事件、下轮重读整段尾（见 §8 规则 2）。
 - `(mtime, size)` 回退 / 文件被截断 → 归零重建。
 - 同 `session_id` 在 `local` 与 `wsl:<distro>` 各一份 → 靠 `source_location` 区分，不互相覆盖。
 - Claude `parentUuid` 分支 / 重试 / 编辑 → 父子树，区分采纳与废弃分支。
@@ -392,7 +406,7 @@ ScanReport {
 - **写者**：谁跑扫描谁写，同一时刻单写者；QuotaBar 常驻，天然当默认写者。开 WAL，读者不挡写。
 - **版本**：一直跟随最新内核往前走，方便 QuotaBar 直接读用。
 - **正文**：以 `full` 物化（含正文）。QuotaBar 已放开"不读正文"限制（ADR-021），故总库可承载正文供两边使用。
-- **保留**：**永不删、不压缩、不过期**——总库是证据最终归宿（与 ADR-016 一致）；正因永不删，下游落后可随时全量重建。
+- **保留**：**永不删、不压缩、不过期**——总库是证据最终归宿（与 ADR-016 一致）；正因永不删，下游落后可随时全量重建。**注意此默认与本地隐私控制存在张力，必须配套 §13.6 的隐私/删除机制**，否则"证据归宿"会与"用户对本机数据的掌控权"冲突。
 - **时间**：每条记录 `occurred_at`（对话内时间，冲突裁决权威）与 `ingested_at`（入库时间，溯源）；`offset` 仅作同步游标，**不代表**时间先后（迟到入库的旧事件 offset 大但 `occurred_at` 旧）。
 
 ### 13.2 TumeFlow 分库（物化、固化、可复现）
@@ -427,6 +441,18 @@ TumeFlow 运行时不依赖 QuotaBar 是否存在：
 - **状态行**——显示"已固化至 offset / 时间、落后总库 N 条、上次固化时间"（数据取自同步游标 + `ScanReport`）。
 - **"锁定版本"开关**——评测 / 开发期暂停自动同步、冻住分库，满足"钉固定版本"诉求。
 
+### 13.6 隐私 / 删除 / 加密（设计要求，待定型为 ADR）
+
+总库默认 `full`、含正文、永不删——架构上强，但隐私风险也最大。"证据最终归宿"与"用户对本机数据的掌控"必须靠下列机制调和，**否则二者打架**。这些是总库组件的硬要求（解析内核仍无状态、不涉隐私存储）：
+
+- **显式授权**：`discover()` 首次只发现不读；每个来源（尤其 `full` 含正文、forensic log、含凭据目录）须经用户显式授权才纳入摄取。
+- **敏感源默认排除**：`auth.json` / `.env` / 私钥 / 凭据面**永不进 RawEvent**（§3.3 已列、§11 有用例）；未授权目录默认不扫。
+- **at-rest 加密**：总库正文落盘应支持加密（密钥归用户/OS keychain，内核不持密钥）。
+- **导出 / 销毁**：提供"导出整库"与"销毁整库 / 按来源删除"两类操作。**永不删是默认保留策略、不是不可删**——用户主动销毁是一等公民操作（与"逻辑 append-only"不矛盾：销毁是用户对物理存储的控制权）。
+- **正文存储档位可配**：除全局 `metadata` / `full`（§6）外，允许**按来源**关正文（只留元数据），满足"想留用量、不想留正文"的折中。
+
+> 落点：这些应固化为一条 ADR（暂记 **ADR-027 隐私与删除**，TumeFlow `DECISIONS.md`），并在 QuotaBar/TumeFlow 的"记忆"页给出对应 GUI（授权清单、排除规则、导出/销毁、加密开关）。**在该 ADR 落定前，总库默认实现应保守：`full` 正文加密 + 敏感源排除 + 可销毁。**
+
 ## 14. 非目标
 
 - ❌ 不脱敏（TumeFlow 在物化分库时做）。
@@ -460,6 +486,13 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 **风险点**（切换前必须有 fixture）：Codex 累计 token parser state、WSL 桥、增量 `safe_offset`——对应 QuotaBar `SESSION_MEMORY_ARCHITECTURE.md` §13 回归风险。
 
-**优先级**：P0 黄金语料 + `RawEvent` 定稿（含 §11 新增的 snapshot/sqlite/压缩/派生路径用例，及 ADR-025 的 source_mode / 多形态游标定型）→ P1 crate 抽取过语料 → P2 QuotaBar 影子切换 → P3 总库落地 + TumeFlow 消费。
+**优先级与 P0 硬边界**（防止 P0 被总库/snapshot/sqlite/插件/隐私一起拖大）：
 
-> 数据源完备性审计见 `deep-research-report.md`（基于 Claude Code / Codex 官方文档与源码），缺口与架构风险已并入 §3–§8 并定型为 ADR-025。
+- **P0（窄而硬）**：只冻 **`append_log` JSONL + WSL + Codex 累计 token** 的黄金语料 + `RawEvent` 字段定稿。`source_mode` / 多形态游标 / 派生路径 / 两层目录的**公开 API 预留**（ADR-025），但 `snapshot_file` / `sqlite_store` / `opaque_family` / derived-path 的**实现先返回 `planned` / `skipped`**，不进 P0 语料门槛。理由：抽取 QuotaBar 已验证的部分恰好就是 append_log 那套，先把它抽干净、契约预留扩展点，再逐步打开高风险来源。
+- **P1**：crate 抽取过 P0 语料（claude/codex append_log 解析器实装）。
+- **P2**：QuotaBar 影子并跑 → diff `cache.db` 一致才切（feature flag）。
+- **P3**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
+
+> snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
+
+> 数据源完备性审计见 `deep-research-report.md`（基于 Claude Code / Codex 官方文档与源码），缺口与架构风险已并入 §3–§8 并定型为 ADR-025。**核验 caveat**：该审计的路径/环境变量/语义为 **2026-06 快照**，会随上游版本漂移；当前未逐条附可复核 URL + 核验日期，故作**设计依据**可用、但**不作长期稳定契约**——所有候选路径仍走"先探测、后按 schema 解析、`planned`→`stable` 升级"（§3.4 / §4），把"官方确认"的稳定性约束交给探测与黄金语料，而非审计快照。

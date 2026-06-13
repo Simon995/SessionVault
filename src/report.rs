@@ -5,18 +5,38 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 单来源报告。
+use crate::cursor::CursorKind;
+use crate::rawevent::SourceMode;
+
+/// 单来源报告。字段分两类：**模式无关**（任何 source_mode 都有意义）+ **append_log 专属**（字节口径）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceReport {
     pub source_path: String,
-    /// 本轮新增事件数。
+
+    // --- 模式无关（snapshot_file / sqlite_store 同样自然）---
+    /// 本来源形态。
+    pub source_mode: Option<SourceMode>,
+    /// 本轮用的游标形态。
+    pub cursor_kind: Option<CursorKind>,
+    /// 本轮检视的记录数（append_log=行数 / snapshot=1 / sqlite=取回行数）。
+    pub items_examined: u64,
+    /// 本轮新增事件数（= items_new，对所有形态成立）。
     pub events_emitted: u64,
-    /// 本轮读取字节数。
-    pub bytes_read: u64,
+    /// 本轮跳过的坏记录数（坏 JSON / schema 不符）。
+    pub items_skipped: u64,
+    /// snapshot_file：内容指纹是否变化（变化才产 config_snapshot）。
+    pub fingerprint_changed: bool,
+    /// sqlite_store：schema 指纹是否漂移（漂移即显式失败）。
+    pub schema_changed: bool,
     /// 是否检测到截断/回退并触发全量重读。
     pub rollback_detected: bool,
+
+    // --- append_log 专属（字节口径）---
+    /// 本轮读取字节数。
+    pub bytes_read: u64,
     /// 尾部留待下轮的半行字节数。
     pub pending_tail_bytes: u64,
+
     /// 跳过/告警信息（非致命）。
     pub warnings: Vec<String>,
 }

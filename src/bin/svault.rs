@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use session_vault::catalog::Profile;
 use session_vault::logging::tag;
+use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
 
 #[derive(Parser)]
 #[command(name = "svault", version, about = "SessionVault ingestion CLI")]
@@ -45,14 +46,21 @@ impl From<ProfileArg> for Profile {
     }
 }
 
-/// 一行 NDJSON 输出包络。
+/// 一行 NDJSON 输出包络。`kind` 区分记录类型，下游按 `kind` 分流。
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Out<'a> {
+    /// discover 产物。枚举直接 serde 序列化为稳定 snake_case（`claude_code` 等），
+    /// 与 `RawEvent` 的序列化一致——不再用 `{:?}` Debug 输出 Rust 变体名。
     Source {
-        source_type: String,
-        source_location: String,
+        source_type: SourceType,
+        source_location: SourceLocation,
+        source_mode: SourceMode,
         path: String,
+    },
+    /// scan 产出的一条归一化事件（TumeFlow 依赖的事件流契约）。
+    Event {
+        event: &'a RawEvent,
     },
     SourceReport {
         report: &'a session_vault::report::SourceReport,
@@ -99,8 +107,9 @@ fn run_discover() -> i32 {
         Ok(sources) => {
             for s in &sources {
                 emit(&Out::Source {
-                    source_type: format!("{:?}", s.source_type),
-                    source_location: s.source_location.as_key(),
+                    source_type: s.source_type,
+                    source_location: s.source_location.clone(),
+                    source_mode: s.source_mode,
                     path: s.path.display().to_string(),
                 });
             }
@@ -129,6 +138,10 @@ fn run_scan_all(profile: Profile) -> i32 {
     for s in &sources {
         let res = session_vault::scan(s, None, profile);
         total_events += res.report.events_emitted;
+        // 先逐条吐事件（NDJSON 事件流，TumeFlow 据此消费），再吐该来源的报告。
+        for ev in &res.events {
+            emit(&Out::Event { event: ev });
+        }
         emit(&Out::SourceReport { report: &res.report });
     }
     emit(&Out::Summary {

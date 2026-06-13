@@ -41,6 +41,10 @@ impl SourceLocation {
 }
 
 /// 来源物理形态（ADR-025 保险①）。决定游标形态与增量读取策略。
+///
+/// 注意：`OpaqueFamily` 只用于 catalog/discover 层登记「保留来源族」，
+/// **不产生 `RawEvent`**——因此挂在 `RawEvent.source_mode` 上的取值只会是
+/// `{AppendLog, SnapshotFile, SqliteStore}` 三者之一（见 §7 与 `scan::scan_source`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceMode {
@@ -50,7 +54,7 @@ pub enum SourceMode {
     SnapshotFile,
     /// SQLite 库——rowid 游标。
     SqliteStore,
-    /// 已知来源族但实现未验证——不可增量，仅元数据。
+    /// 已知来源族但实现未验证——仅登记、不增量、**不进 RawEvent**。
     OpaqueFamily,
 }
 
@@ -73,7 +77,14 @@ pub enum EventType {
     ToolResult,
     Usage,
     Meta,
+    /// snapshot_file 内容指纹变化时产出（带新旧 hash）。
     ConfigSnapshot,
+    /// 思考/推理块（Claude `thinking`、Codex `reasoning.summary[].text`）。
+    ///
+    /// 统一建模：`actor = Assistant`、`event_type = Thinking`（不另设 thinking actor，
+    /// 与 QuotaBar 的 role=thinking 气泡对齐但归一到 actor/event_type 二维）。
+    /// **opaque（明文不可得）**：Codex `encrypted_content` 等无明文场景，仍发 `Thinking`
+    /// 事件但 `content = None`——表示「推理发生过、但无正文」，下游据此区分明文思考与加密思考。
     Thinking,
 }
 
