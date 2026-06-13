@@ -486,12 +486,12 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 **风险点**（切换前必须有 fixture）：Codex 累计 token parser state、WSL 桥、增量 `safe_offset`——对应 QuotaBar `SESSION_MEMORY_ARCHITECTURE.md` §13 回归风险。
 
-**优先级与 P0 硬边界**（防止 P0 被总库/snapshot/sqlite/插件/隐私一起拖大）：
+**优先级与 P0 硬边界**（防止 P0 被总库/snapshot/sqlite/插件/隐私一起拖大）。**进度（截至 2026-06-13）**：
 
-- **P0（窄而硬）**：只冻 **`append_log` JSONL + WSL + Codex 累计 token** 的黄金语料 + `RawEvent` 字段定稿。`source_mode` / 多形态游标 / 派生路径 / 两层目录的**公开 API 预留**（ADR-025），但 `snapshot_file` / `sqlite_store` / `opaque_family` / derived-path 的**实现先返回 `planned` / `skipped`**，不进 P0 语料门槛。理由：抽取 QuotaBar 已验证的部分恰好就是 append_log 那套，先把它抽干净、契约预留扩展点，再逐步打开高风险来源。
-- **P1**：crate 抽取过 P0 语料（claude/codex append_log 解析器实装）。
-- **P2**：QuotaBar 影子并跑 → diff `cache.db` 一致才切（feature flag）。
-- **P3**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
+- **P0（窄而硬）✅ 基本完成**：`RawEvent` v0 字段已定稿（`src/rawevent.rs`）；`append_log` JSONL（Claude/Codex **Local**）+ Codex 累计 token 的黄金语料已落地（**21 单测全绿**：坏行冻结整批、半行 pending、续扫不重不漏、`(mtime,size)` 回退重读、Codex 跨批延续/跨 session 重置、字段映射、profile 正文开关）。`source_mode` / 多形态游标 / 派生路径 / 两层目录公开 API 已预留；`snapshot_file` / `sqlite_store` / `opaque_family` / derived-path 按设计返回 `planned` / `skipped`。**待补**：WSL 双位置的黄金语料。
+- **P1 🟡 进行中**：Local Claude/Codex `append_log` 解析器已实装并过语料（`parser.rs` / `scan.rs` / `discover.rs` / `cursor.rs`，`svault scan-all` 已能吐 `RawEvent` NDJSON 流）。**待抽取**：`wsl/mod.rs` WSL 桥（当前 `discover()` 仅扫 `Local`）。
+- **P2 ⬜ 未开始**：QuotaBar 影子并跑 → diff `cache.db` 一致才切（feature flag）。
+- **P3 ⬜ 未开始**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
 
