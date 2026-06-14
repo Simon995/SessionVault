@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::pathnorm;
+
 /// 工程根标记文件（命中即视为工程根；顺序即优先级展示，实际取最近祖先）。
 pub const MARKERS: [&str; 6] = [
     ".git",
@@ -27,9 +29,12 @@ pub struct ProjectRoot {
 
 /// 从对话记录里的 cwd 解析工程根。
 ///
+/// 入参 `cwd` 应是 [`pathnorm::normalize_cwd`] 的产物（规范形或本机路径）；本函数只在
+/// 其上做 marker 上溯，不再自带 UNC 解析（已收敛到 `pathnorm`，见该模块文档）。
+///
 /// - `cwd` 为 None/空 → `missing_cwd`。
-/// - WSL 规范路径（`//wsl$/<distro>/...` 或 `\\wsl.localhost\...`）→ 标 `wsl_cwd`，
-///   并在该路径下做 marker 上溯。
+/// - WSL 路径（规范形 `wsl:<distro>:/...` 或 UNC `//wsl$/...`）→ 标 `wsl_cwd`，
+///   并在该路径下做 marker 上溯（Windows 宿主上多半 stat 不到，回落 cwd 本身）。
 /// - 命中 `.git` → `git`；命中其它 marker → `marker:<file>`；都没有 → `cwd`（用 cwd 本身）。
 pub fn resolve_project_root(cwd: Option<&str>) -> ProjectRoot {
     let cwd = match cwd {
@@ -42,9 +47,19 @@ pub fn resolve_project_root(cwd: Option<&str>) -> ProjectRoot {
         }
     };
 
-    let is_wsl = split_canonical_wsl_cwd(cwd).is_some();
-    let base = PathBuf::from(cwd);
+    // WSL 路径（规范形或 UNC）在 **Windows 宿主上不可本地 stat**：
+    // - 规范形 `wsl:distro:/p` 会被 `PathBuf` 当成相对路径，`find_upward` 会误walk
+    //   进程 CWD（很可能是个 git 仓库）而误判 project_root —— 真实碰到过的坑。
+    // - 跨发行版的 marker 上溯属于**访问桥**（经 `\\wsl$\` stat，Windows 专属，未实装）。
+    // 故 v0 直接回落 `wsl_cwd`，不做本地 find_upward。
+    if pathnorm::split_canonical_wsl(cwd).is_some() || pathnorm::canonical_wsl_unc(cwd).is_some() {
+        return ProjectRoot {
+            path: Some(PathBuf::from(cwd)),
+            source: "wsl_cwd".to_string(),
+        };
+    }
 
+    let base = PathBuf::from(cwd);
     if let Some((dir, marker)) = find_upward(&base) {
         let source = if marker == ".git" {
             "git".to_string()
@@ -59,25 +74,8 @@ pub fn resolve_project_root(cwd: Option<&str>) -> ProjectRoot {
 
     ProjectRoot {
         path: Some(base),
-        source: if is_wsl { "wsl_cwd" } else { "cwd" }.to_string(),
+        source: "cwd".to_string(),
     }
-}
-
-/// 识别 WSL 规范路径并拆出 `(distro, rest)`；非 WSL 返回 None。
-///
-/// 支持 `//wsl$/<distro>/...`、`\\wsl$\<distro>\...`、`\\wsl.localhost\<distro>\...`。
-pub fn split_canonical_wsl_cwd(cwd: &str) -> Option<(String, String)> {
-    let norm = cwd.replace('\\', "/");
-    let rest = norm
-        .strip_prefix("//wsl$/")
-        .or_else(|| norm.strip_prefix("//wsl.localhost/"))?;
-    let mut parts = rest.splitn(2, '/');
-    let distro = parts.next()?.to_string();
-    if distro.is_empty() {
-        return None;
-    }
-    let tail = parts.next().unwrap_or("").to_string();
-    Some((distro, tail))
 }
 
 /// 从 `start` 向上逐级找最近的 marker 命中，返回 `(命中目录, marker 文件名)`。
@@ -105,23 +103,16 @@ mod tests {
     }
 
     #[test]
-    fn detects_wsl_canonical_paths() {
-        assert_eq!(
-            split_canonical_wsl_cwd("//wsl$/Ubuntu/home/me/proj"),
-            Some(("Ubuntu".to_string(), "home/me/proj".to_string()))
-        );
-        assert_eq!(
-            split_canonical_wsl_cwd(r"\\wsl.localhost\Debian\srv"),
-            Some(("Debian".to_string(), "srv".to_string()))
-        );
-        assert_eq!(split_canonical_wsl_cwd("C:/Users/me/proj"), None);
-    }
+    fn labels_wsl_paths_as_wsl_cwd() {
+        // UNC 形与规范形都该被标 wsl_cwd（无 marker 时回落 cwd 本身）。
+        // 用「不存在的发行版 + 不存在的路径」保证 find_upward 必然落空，
+        // 不依赖本机是否真有某发行版可达（曾因 \\wsl$\Ubuntu 实际可达而误命中 .git）。
+        let unc = resolve_project_root(Some("//wsl$/NoSuchDistro_xyz/nonexistent-abc-123"));
+        assert_eq!(unc.source, "wsl_cwd");
+        assert!(unc.path.is_some());
 
-    #[test]
-    fn falls_back_to_cwd_when_no_marker() {
-        // 用一个几乎不可能含 marker 的临时路径。
-        let r = resolve_project_root(Some("//wsl$/Ubuntu/nonexistent-xyz-123"));
-        assert_eq!(r.source, "wsl_cwd");
-        assert!(r.path.is_some());
+        let canonical = resolve_project_root(Some("wsl:NoSuchDistro_xyz:/nonexistent-abc-123"));
+        assert_eq!(canonical.source, "wsl_cwd");
+        assert!(canonical.path.is_some());
     }
 }

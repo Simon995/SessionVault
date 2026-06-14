@@ -12,6 +12,7 @@ pub mod cursor;
 pub mod discover;
 pub mod logging;
 pub mod parser;
+pub mod pathnorm;
 pub mod project_root;
 pub mod rawevent;
 pub mod report;
@@ -20,6 +21,7 @@ pub mod scan;
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
 pub use cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
 pub use discover::SourceRef;
+pub use pathnorm::HostPlatform;
 pub use rawevent::{
     Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
 };

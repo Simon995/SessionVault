@@ -10,6 +10,7 @@ use crate::cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
 use crate::discover::SourceRef;
 use crate::logging::tag;
 use crate::parser::{parse_lines, ParseCtx};
+use crate::pathnorm::HostPlatform;
 use crate::rawevent::SourceMode;
 use crate::report::SourceReport;
 use crate::Profile;
@@ -125,6 +126,7 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
         source_location: source.source_location.clone(),
         source_path: report.source_path.clone(),
         profile,
+        host: HostPlatform::current(),
     };
     let base_seq = cursor.next_seq;
     let codex_state_before = cursor.codex_state.clone();

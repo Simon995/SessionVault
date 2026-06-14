@@ -133,8 +133,9 @@ pub struct RawEvent {
     pub project_root: Option<String>,
     /// 工程根判定依据：git / marker:<file> / cwd / wsl_cwd / missing_cwd。
     pub project_root_source: Option<String>,
-    /// 工程物理位置（local | wsl:<distro>）与 transcript 存储位置的二分——
-    /// QuotaBar 有此分，但 WSL 项目记在 local transcript 下的检测是 greenfield，v0 恒 None。
+    /// 工程物理位置（`local` | `wsl:<distro>`）与 transcript 存储位置的二分。
+    /// 由 `pathnorm::workspace_location` 据规范化后的 project_root + 宿主平台判定
+    /// （见 `pathnorm` 模块的三层分离说明）；cwd 缺失时为 None。
     pub workspace_location: Option<String>,
 
     // --- 事件语义 ---

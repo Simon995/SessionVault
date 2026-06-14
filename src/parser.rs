@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::catalog::Profile;
 use crate::cursor::{CodexState, CodexUsage};
+use crate::pathnorm::{self, HostPlatform};
 use crate::project_root::{resolve_project_root, ProjectRoot};
 use crate::rawevent::{
     Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence, TokenUsage,
@@ -35,6 +36,8 @@ pub struct ParseCtx {
     pub source_location: SourceLocation,
     pub source_path: String,
     pub profile: Profile,
+    /// 宿主平台——决定裸 Unix 绝对路径归 `local` 还是 `wsl`（见 `pathnorm`）。
+    pub host: HostPlatform,
 }
 
 impl ParseCtx {
@@ -55,6 +58,12 @@ impl ParseCtx {
         pr: Option<&ProjectRoot>,
     ) -> RawEvent {
         let has_time = occurred_at.is_some();
+        // project_root 已是规范化路径（cwd 在 resolve_cached 里先过 pathnorm::normalize_cwd）。
+        // workspace_location 据此 + transcript 位置 + 宿主平台判定工程物理归属。
+        let project_root = pr.and_then(|p| p.path.as_ref().map(|x| x.display().to_string()));
+        let workspace_location = project_root
+            .as_deref()
+            .map(|root| pathnorm::workspace_location(root, &self.source_location, self.host));
         RawEvent {
             schema_version: SCHEMA_VERSION,
             source_type: self.source_type,
@@ -64,9 +73,9 @@ impl ParseCtx {
             seq,
             source_mode: SourceMode::AppendLog,
             cwd,
-            project_root: pr.and_then(|p| p.path.as_ref().map(|x| x.display().to_string())),
+            project_root,
             project_root_source: pr.map(|p| p.source.clone()),
-            workspace_location: None,
+            workspace_location,
             event_type,
             actor,
             occurred_at,
@@ -147,7 +156,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             .get("timestamp")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let pr = resolve_cached(&mut cache, cwd.as_deref());
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host);
 
         // 1) thinking（Claude `message.content[].type=thinking`）。
         if let Some(text) = extract_claude_thinking(&value) {
@@ -381,7 +390,7 @@ fn parse_codex(
             .clone()
             .unwrap_or_else(|| session_id_from_path(&ctx.source_path));
         let cwd = state.current_cwd.clone();
-        let pr = resolve_cached(&mut cache, cwd.as_deref());
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host);
 
         // response_item：reasoning→thinking / message / tool_use / tool_result。
         if entry_type == Some("response_item") {
@@ -653,14 +662,25 @@ fn session_id_from_path(path: &str) -> String {
 }
 
 /// 按 cwd 缓存工程根解析，避免逐行重复 find_upward 文件系统遍历。
-fn resolve_cached(cache: &mut Option<(String, ProjectRoot)>, cwd: Option<&str>) -> Option<ProjectRoot> {
+/// 解析工程根（带按原始 cwd 缓存）。先把原始 cwd 过 [`pathnorm::normalize_cwd`]
+/// 归一到规范形，再上溯 marker——这样产出的 `project_root` 是规范化路径，
+/// 供 `workspace_location` 正确判定 local/wsl。
+///
+/// `default_distro` 暂传 `None`（访问桥未实装，不枚举 WSL 发行版）：UNC 路径仍能精确
+/// 还原 distro，裸 Linux 路径在 Windows 宿主上回落泛 `wsl`。
+fn resolve_cached(
+    cache: &mut Option<(String, ProjectRoot)>,
+    cwd: Option<&str>,
+    host: HostPlatform,
+) -> Option<ProjectRoot> {
     let cwd = cwd?;
     if let Some((c, pr)) = cache.as_ref() {
         if c == cwd {
             return Some(pr.clone());
         }
     }
-    let pr = resolve_project_root(Some(cwd));
+    let normalized = pathnorm::normalize_cwd(Some(cwd), host, None);
+    let pr = resolve_project_root(normalized.as_deref());
     *cache = Some((cwd.to_string(), pr.clone()));
     Some(pr)
 }
@@ -683,6 +703,7 @@ mod tests {
             source_location: SourceLocation::Local,
             source_path: "/tmp/abc-session.jsonl".to_string(),
             profile,
+            host: HostPlatform::current(),
         }
     }
 
@@ -725,6 +746,34 @@ mod tests {
         assert_eq!((u.input, u.output, u.cache_creation, u.cache_read), (100, 50, 5, 20));
         assert_eq!(usage.message_id.as_deref(), Some("msg_1"));
         assert_eq!(usage.request_id.as_deref(), Some("req_1"));
+    }
+
+    #[test]
+    fn workspace_location_populated_from_cwd() {
+        // UNC cwd → 规范化 → project_root 标 wsl_cwd、workspace_location = wsl:<distro>。
+        // 这条断言锁住 cwd → normalize_cwd → resolve_project_root → workspace_location 全链路。
+        let unc = serde_json::json!({
+            "type": "user",
+            "sessionId": "s",
+            "cwd": r"\\wsl$\Ubuntu\home\me\proj",
+            "message": {"role": "user", "content": "hi"}
+        })
+        .to_string();
+        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[unc.as_str()], 0, None);
+        let ev = &out.events[0];
+        assert_eq!(ev.project_root_source.as_deref(), Some("wsl_cwd"));
+        assert_eq!(ev.workspace_location.as_deref(), Some("wsl:Ubuntu"));
+
+        // /mnt/<drive> 是挂载的 Windows 盘 → local（不被误标 wsl）。
+        let mnt = serde_json::json!({
+            "type": "user",
+            "sessionId": "s",
+            "cwd": "/mnt/c/code/proj",
+            "message": {"role": "user", "content": "hi"}
+        })
+        .to_string();
+        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[mnt.as_str()], 0, None);
+        assert_eq!(out.events[0].workspace_location.as_deref(), Some("local"));
     }
 
     #[test]
