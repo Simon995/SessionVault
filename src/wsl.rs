@@ -77,19 +77,15 @@ pub fn list_distros() -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
-/// 列出发行版内 `$HOME/<rel_subpath>` 下的全部 `*.jsonl` 绝对路径（仅发现、不读内容）。
+/// 把 `script` 经 stdin 喂给发行版内的 `bash` 并取回 `Output`。
 ///
-/// 脚本经 stdin 喂给 `bash`（规避 `$HOME` 被 Windows 侧预替换 + `find|while` 的 fd0 坑）。
-/// 目录不存在 → `Ok(vec![])`（脚本 `exit 0`）。
+/// stdin 喂脚本是关键：wsl.exe 会用 Windows 侧环境预替换 argv 里的 `$VAR`，且
+/// `find|while` 在 `bash -c` 下 drain 不到 fd0——脚本走 stdin 两者皆避。含 `$` 的脚本
+/// 一律走这里。退出码由调用方判（含 exit-7 哨兵）。
 #[cfg(windows)]
-pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<String>, String> {
+fn run_bash_stdin(distro: &str, script: &str) -> Result<std::process::Output, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-
-    let script = format!(
-        "set -eu\nDIR=\"$HOME/{rel}\"\n[ -d \"$DIR\" ] || exit 0\nfind \"$DIR\" -type f -name '*.jsonl' -print0\n",
-        rel = shell_escape(rel_subpath)
-    );
 
     let mut cmd = Command::new("wsl.exe");
     cmd.args(["-d", distro, "--", "bash"])
@@ -110,10 +106,20 @@ pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<Stri
             .write_all(script.as_bytes())
             .map_err(|e| format!("write to wsl.exe stdin failed: {e}"))?;
     }
-    let output = child
+    child
         .wait_with_output()
-        .map_err(|e| format!("wsl.exe wait failed: {e}"))?;
+        .map_err(|e| format!("wsl.exe wait failed: {e}"))
+}
 
+/// 列出发行版内 `$HOME/<rel_subpath>` 下的全部 `*.jsonl` 绝对路径（仅发现、不读内容）。
+/// 目录不存在 → `Ok(vec![])`（脚本 `exit 0`）。
+#[cfg(windows)]
+pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<String>, String> {
+    let script = format!(
+        "set -eu\nDIR=\"$HOME/{rel}\"\n[ -d \"$DIR\" ] || exit 0\nfind \"$DIR\" -type f -name '*.jsonl' -print0\n",
+        rel = shell_escape(rel_subpath)
+    );
+    let output = run_bash_stdin(distro, &script)?;
     if !output.status.success() {
         return Err(format!(
             "wsl.exe -d {distro} find exited {:?}: {}",
@@ -127,6 +133,75 @@ pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<Stri
 #[cfg(not(windows))]
 pub fn list_jsonl_under_home(_distro: &str, _rel_subpath: &str) -> Result<Vec<String>, String> {
     Ok(Vec::new())
+}
+
+/// 取发行版内**绝对路径**文件的 `(size, mtime_secs)`；`Ok(None)` = 文件不存在（exit 7）。
+/// 供增量扫描的 `(size,mtime)` 回退检测用（对应本地 `fs::metadata`）。
+#[cfg(windows)]
+pub fn stat(distro: &str, abs_path: &str) -> Result<Option<(u64, i64)>, String> {
+    let esc = shell_escape(abs_path);
+    let script = format!(
+        "set -eu\nF=\"{esc}\"\n[ -f \"$F\" ] || exit 7\nprintf '%s\\t%s\\n' \"$(stat -c %Y \"$F\")\" \"$(stat -c %s \"$F\")\"\n"
+    );
+    let out = run_bash_stdin(distro, &script)?;
+    match out.status.code() {
+        Some(0) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let line = text.trim();
+            let (m, s) = line
+                .split_once('\t')
+                .ok_or_else(|| format!("wsl stat {distro}:{abs_path} bad output: {line:?}"))?;
+            let mtime = m
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| format!("wsl stat bad mtime {m:?}: {e}"))?;
+            let size = s
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| format!("wsl stat bad size {s:?}: {e}"))?;
+            Ok(Some((size, mtime)))
+        }
+        Some(7) => Ok(None),
+        Some(code) => Err(format!(
+            "wsl stat {distro}:{abs_path} exited {code}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        None => Err(format!("wsl stat {distro}:{abs_path} terminated by signal")),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn stat(_distro: &str, _abs_path: &str) -> Result<Option<(u64, i64)>, String> {
+    Err("wsl.exe access is only available on Windows builds".to_string())
+}
+
+/// 读发行版内绝对路径文件的字节区间 `[start, end)`（对应本地 `read_range`/`Seek`）。
+///
+/// `tail -c +K`（1-indexed）取 `[start, EOF)`，再 `head -c (end-start)` 截到 `end`——
+/// append-only 文件下即精确 `[start, end)`。`end <= start` 直接空。
+#[cfg(windows)]
+pub fn read_range(distro: &str, abs_path: &str, start: u64, end: u64) -> Result<Vec<u8>, String> {
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    let esc = shell_escape(abs_path);
+    let from = start + 1; // tail -c + 是 1-indexed
+    let take = end - start;
+    let script = format!("set -eu\ntail -c +{from} \"{esc}\" | head -c {take}\n");
+    let out = run_bash_stdin(distro, &script)?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl read_range {distro}:{abs_path} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(not(windows))]
+pub fn read_range(_distro: &str, _abs_path: &str, _start: u64, _end: u64) -> Result<Vec<u8>, String> {
+    Err("wsl.exe access is only available on Windows builds".to_string())
 }
 
 /// 读发行版内**绝对路径**文件的全文。`Ok(None)` = 文件不存在（exit 7 哨兵），

@@ -15,33 +15,19 @@ use crate::rawevent::{SourceLocation, SourceMode};
 use crate::report::SourceReport;
 use crate::Profile;
 
-/// scan 主入口：按形态分派。
+/// scan 主入口：按形态分派。append_log 的字节来源（本地 `File` vs WSL `wsl.exe`）
+/// 经 [`ByteSource`] 抽象，游标/回退/坏行冻结逻辑两者**共用同一份**。
 pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
-    // WSL 来源的**读取**路径（经 wsl.exe 增量 tail）尚未接线——`discover` 已能发现，
-    // 但 `scan_append_log` 走的是本地 `File`/`Seek`，对发行版内路径无效。此处显式回落，
-    // 不去本地 stat 一个不存在的路径。摄取路径是下一步（需在 WSL 内备合成 fixture 验证）。
-    if let SourceLocation::Wsl(distro) = &source.source_location {
-        let mut report = SourceReport {
-            source_path: source.path.display().to_string(),
-            source_mode: Some(source.source_mode),
-            cursor_kind: Some(CursorKind::NoCursor),
-            ..Default::default()
-        };
-        report
-            .warnings
-            .push(format!("wsl source discovered, read not yet wired (distro={distro})"));
-        return ScanResult {
-            status: ScanStatus::Ok,
-            events: Vec::new(),
-            cursor_out: Cursor {
-                kind: CursorKind::NoCursor,
-                ..Cursor::new_byte_offset()
-            },
-            report,
-        };
-    }
     match source.source_mode {
-        SourceMode::AppendLog => scan_append_log(source, cursor_in, profile),
+        SourceMode::AppendLog => match &source.source_location {
+            SourceLocation::Local => {
+                scan_append_log(&LocalSource { path: &source.path }, source, cursor_in, profile)
+            }
+            SourceLocation::Wsl(distro) => {
+                let abs = source.path.to_string_lossy().into_owned();
+                scan_append_log(&WslSource { distro, abs: &abs }, source, cursor_in, profile)
+            }
+        },
         // 其余形态骨架未实装：返回 NoCursor，事件空。
         SourceMode::SnapshotFile | SourceMode::SqliteStore | SourceMode::OpaqueFamily => {
             let mut report = SourceReport {
@@ -66,11 +52,65 @@ pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
     }
 }
 
-/// 追加型日志增量扫描。
-fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
-    let path = &source.path;
+/// append_log 的字节来源抽象：把「stat 取 (size,mtime)」与「读 `[start,end)` 字节」
+/// 从扫描逻辑里剥出来，本地（`File`/`Seek`）与 WSL（`wsl.exe`）各实现一份，
+/// 游标/回退/坏行冻结逻辑则在 [`scan_append_log`] 里**共用同一份**。
+trait ByteSource {
+    /// `(size, mtime_secs)`；失败返回人类可读错误串。
+    fn stat(&self) -> Result<(u64, Option<i64>), String>;
+    /// 读字节区间 `[start, end)`。
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String>;
+}
+
+/// 本机文件字节来源。
+struct LocalSource<'a> {
+    path: &'a std::path::Path,
+}
+
+impl ByteSource for LocalSource<'_> {
+    fn stat(&self) -> Result<(u64, Option<i64>), String> {
+        let meta = std::fs::metadata(self.path).map_err(|e| e.to_string())?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        Ok((meta.len(), mtime))
+    }
+
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        read_range(self.path, start, end).map_err(|e| e.to_string())
+    }
+}
+
+/// WSL 发行版内文件字节来源（经 `wsl.exe`）。`abs` 是发行版内 Linux 绝对路径。
+struct WslSource<'a> {
+    distro: &'a str,
+    abs: &'a str,
+}
+
+impl ByteSource for WslSource<'_> {
+    fn stat(&self) -> Result<(u64, Option<i64>), String> {
+        match crate::wsl::stat(self.distro, self.abs)? {
+            Some((size, mtime)) => Ok((size, Some(mtime))),
+            None => Err(format!("wsl file missing: {}:{}", self.distro, self.abs)),
+        }
+    }
+
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        crate::wsl::read_range(self.distro, self.abs, start, end)
+    }
+}
+
+/// 追加型日志增量扫描（字节来源经 [`ByteSource`] 抽象，本地/WSL 共用此函数）。
+fn scan_append_log<S: ByteSource>(
+    src: &S,
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    profile: Profile,
+) -> ScanResult {
     let mut report = SourceReport {
-        source_path: path.display().to_string(),
+        source_path: source.path.display().to_string(),
         source_mode: Some(SourceMode::AppendLog),
         cursor_kind: Some(CursorKind::ByteOffset),
         ..Default::default()
@@ -78,8 +118,8 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
 
     let mut cursor = cursor_in.unwrap_or_else(Cursor::new_byte_offset);
 
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
+    let (size, mtime) = match src.stat() {
+        Ok(v) => v,
         Err(e) => {
             report.warnings.push(format!("stat failed: {e}"));
             return ScanResult {
@@ -90,12 +130,6 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
             };
         }
     };
-    let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64);
 
     // 回退/截断检测：size 变小，或 mtime 倒退 → 从头重读。
     let rollback = size < cursor.safe_offset
@@ -125,7 +159,7 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
     }
 
     // 读 [start, size) 尾部。
-    let tail = match read_range(path, start, size) {
+    let tail = match src.read_range(start, size) {
         Ok(b) => b,
         Err(e) => {
             report.warnings.push(format!("read failed: {e}"));
@@ -144,9 +178,9 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
     report.pending_tail_bytes = pending as u64;
 
     let lines: Vec<&str> = complete.lines().collect();
-    // default_distro：把 distro 未知的裸 Linux cwd 打成精确 wsl:<distro>（见 parser）。
-    // 今日 WSL 来源在 scan_source 顶部已短路（读取未接线），故走到这里的恒是 Local → None；
-    // 待 WSL 读取路径接通后，该来源自身发行版（权威）即由这里的 Wsl 臂注入。
+    // default_distro：WSL 来源用其自身发行版（权威），把 distro 未知的裸 Linux cwd 打成
+    // 精确 wsl:<distro>（见 parser）；本地来源为 None（裸 Linux cwd 记在 local transcript
+    // 下的边角由 host/CLI 决定是否注入 wsl::default_distro）。
     let default_distro = match &source.source_location {
         SourceLocation::Wsl(distro) => Some(distro.clone()),
         SourceLocation::Local => None,
