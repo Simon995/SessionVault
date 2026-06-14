@@ -1,4 +1,4 @@
-//! SessionVault — 共享摄取内核 + RawEvent 契约（骨架）。
+//! SessionVault — 共享摄取内核 + RawEvent 契约。
 //!
 //! 设计契约见 `docs/INGEST_KERNEL.md`；字段对账见 `docs/rawevent-reconciliation.md`；
 //! 日志规范见 `docs/LOGGING.md`（对齐 QuotaBar）。
@@ -47,7 +47,7 @@ pub fn catalog() -> Vec<ProviderDescriptor> {
     catalog::builtin_descriptors()
 }
 
-/// §9 `discover()`：发现来源清单（骨架：仅本地内置 session 根）。
+/// §9 `discover()`：发现来源清单（本地内置 session 根 + WSL 各发行版）。
 pub fn discover() -> Result<Vec<SourceRef>> {
     discover::discover_all()
 }

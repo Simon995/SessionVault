@@ -1,7 +1,7 @@
 # SessionVault — 共享摄取内核与 RawEvent 总库
 
-状态：初始设计
-最后更新：2026-06-13
+状态：摄取核心已落地（P0 ✅ / P1 ✅，见 §15）；绞杀者迁移与总库（P2 / P3）待启动
+最后更新：2026-06-14
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
 > - `DECISIONS.md` / `SYSTEM_DESIGN.md` / `INTEGRATION.md` → [TumeFlow `docs/`](https://github.com/Simon995/TumeFlow/tree/main/docs)（ADR-024/025/026 与本内核直接相关；其摘要见本仓 [README](../README.md) 与 [LOGGING.md](LOGGING.md)）。
@@ -33,7 +33,7 @@
 | 增量字节读、`safe_offset`、坏行 / 半截行处理 | 写任何数据库 |
 | Codex 累计 token parser state | 候选 / 记忆 / Dream（TumeFlow） |
 | WSL `wsl.exe` 桥接（只回传 `safe_offset` 后新字节） | `usage_facts` / 成本 / ROI 投影（QuotaBar） |
-| 项目根解析（`.git` / marker / `cwd` + confidence） | 游标持久化（消费者各存各的库） |
+| 项目根解析（`.git` / marker / `cwd` + confidence） | 游标持久化（消费者各存各的库；`svault` CLI 自带默认实现 `--state`） |
 | 归一化为 `RawEvent`、产出结构化扫描报告 | LLM 调用、联网 |
 
 内核是**无状态纯函数式**的：不持有数据库、不落盘游标、不发网络、不弹界面。详细来源发现与探测规则见 `SYSTEM_DESIGN.md` §11.2–§11.5（那是本内核的来源契约参考）。
@@ -469,12 +469,13 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 **核心原则：一个扫描器，总库是它的输出。** 不要先用新代码建总库、却让 QuotaBar 继续跑旧扫描器——那会变成同机两个扫描器（正是本项目要消灭的重复）。先让 QuotaBar 改用共享扫描器，总库只是其额外输出。
 
-**待抽取的 QuotaBar 源**（→ `session-vault`）：
+**QuotaBar 源抽取对照**（→ `session-vault`，✅ = 已抽取并实测）：
 
-- `session_index.rs`（会话索引 / 扫描主体）、`session_transcript.rs`
-- `jsonl_cache.rs`（增量 `safe_offset`）
-- `providers/claude.rs`、`providers/codex.rs`（Codex 累计 token）
-- `wsl/mod.rs`（WSL 桥）、`paths.rs`（路径发现）
+- ✅ `session_index.rs`（会话索引/扫描主体）→ `scan.rs` / `discover.rs` / `project_root.rs`
+- ✅ `jsonl_cache.rs`（增量 `safe_offset`）→ `scan.rs` 游标逻辑 + `cursor.rs`
+- ✅ `providers/claude.rs`、`providers/codex.rs`（Codex 累计 token）→ `parser.rs`
+- ✅ `wsl/mod.rs`（WSL 桥）→ `wsl.rs`；`paths.rs`（路径发现）→ `pathnorm.rs` + `catalog.rs`
+- ⬜ `session_transcript.rs`（正文/线程重建的更深部分）——`full` profile 正文已通，线程/`parent_ref` 重建属 greenfield
 
 **绞杀者迁移五步**（保住成熟功能）：
 

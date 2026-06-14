@@ -88,7 +88,7 @@ pub enum EventType {
     Thinking,
 }
 
-/// 时间置信度（§7 greenfield）。骨架阶段一律 `Low`，待 occurred_at 来源细化后提升。
+/// 时间置信度（§7）。有 `occurred_at` 判 `High`、无则 `Low`；后续可按来源进一步细化。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeConfidence {

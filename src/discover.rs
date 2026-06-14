@@ -1,6 +1,6 @@
 //! 来源发现（§9 discover）。遍历内置描述符的配置根，递归发现 `*.jsonl` 来源。
 //!
-//! 首次只发现、不读内容（供宿主弹授权）。骨架阶段仅本机 Local；WSL 桥后续接入。
+//! 首次只发现、不读内容（供宿主弹授权）。本机 Local + WSL 各发行版（`Wsl(distro)`）。
 
 use std::path::{Path, PathBuf};
 

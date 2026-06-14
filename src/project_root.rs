@@ -55,7 +55,8 @@ pub fn resolve_project_root(cwd: Option<&str>, host: HostPlatform) -> ProjectRoo
     // ① 规范形 `wsl:distro:/p` / UNC `//wsl$/..`（与宿主无关，恒是 WSL）；
     // ② Windows 宿主上 distro 未知的裸 Linux 路径 `/home/..`（host-dependent：
     //    Unix 宿主上它是真实本机路径，不在此列）。
-    // 跨发行版的真实 marker 上溯属于**访问桥**（经 `\\wsl$\` stat，Windows 专属，未实装）。
+    // 跨发行版的真实 marker 上溯需经访问桥 stat（`wsl.rs` 已有 stat/read，但 project_root
+    // 暂不为 WSL 做逐级 marker 上溯——直接回落 wsl_cwd，避免本地误判）。
     let is_unstattable_wsl = pathnorm::split_canonical_wsl(cwd).is_some()
         || pathnorm::canonical_wsl_unc(cwd).is_some()
         || (host == HostPlatform::Windows && pathnorm::is_bare_linux_path(cwd));

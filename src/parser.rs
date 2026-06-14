@@ -665,13 +665,12 @@ fn session_id_from_path(path: &str) -> String {
         .to_string()
 }
 
-/// 按 cwd 缓存工程根解析，避免逐行重复 find_upward 文件系统遍历。
-/// 解析工程根（带按原始 cwd 缓存）。先把原始 cwd 过 [`pathnorm::normalize_cwd`]
-/// 归一到规范形，再上溯 marker——这样产出的 `project_root` 是规范化路径，
-/// 供 `workspace_location` 正确判定 local/wsl。
+/// 解析工程根（带按原始 cwd 缓存，避免逐行重复 find_upward 文件系统遍历）。
+/// 先把原始 cwd 过 [`pathnorm::normalize_cwd`] 归一到规范形，再上溯 marker——
+/// 这样产出的 `project_root` 是规范化路径，供 `workspace_location` 正确判定 local/wsl。
 ///
-/// `default_distro` 暂传 `None`（访问桥未实装，不枚举 WSL 发行版）：UNC 路径仍能精确
-/// 还原 distro，裸 Linux 路径在 Windows 宿主上回落泛 `wsl`。
+/// `default_distro` 由调用方注入（WSL 来源取其自身发行版，见 `scan`）：有值时裸 Linux
+/// cwd 在 Windows 宿主上被打成精确 `wsl:<distro>`，无值则回落泛 `wsl`；UNC 路径恒能精确还原。
 fn resolve_cached(
     cache: &mut Option<(String, ProjectRoot)>,
     cwd: Option<&str>,
