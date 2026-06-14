@@ -250,6 +250,29 @@ parser_version            # 解析器版本，绑定字段语义
 
 > **thinking / reasoning 建模（闭合 `rawevent-reconciliation.md` §3.3 的取舍）**：思考块（Claude `thinking`、Codex `reasoning.summary[].text`）统一记为 `actor=assistant` + `event_type=thinking`——**不另设 thinking actor**（QuotaBar 的 role=thinking 气泡归一到 actor/event_type 二维）。**opaque（明文不可得）**：Codex `encrypted_content` 等无明文场景，仍产 `thinking` 事件但 `content=None`，表示"推理发生过、无正文"，下游据此区分明文思考与加密思考。黄金语料 §11 已含该用例。
 
+### 7.1 时间保真度与两类几何（time fidelity）
+
+时间是记忆系统的命根子——冲突裁决（latest-wins）、可复现评测、**行为归因**都靠它，且**不止对话与 memory 需要时间**：规则 / 配置 / 技能 / 计划 / 用量等控制面与状态数据同样要时间（解释"agent 当时为什么这么做"）。但**不同来源能提供的时间精度不同**，内核必须**诚实标注、不伪造精度**。记忆层完整时间模型见 TumeFlow **ADR-029**（本节是其在内核侧的落点；三类时钟与 latest-wins 基础见 ADR-020）。
+
+**两类时间几何**：
+
+- **点事件（point event）**：`append_log` 的 message / usage / tool_use / thinking——单点 `occurred_at` + `time_confidence`。
+- **状态制品（stateful artifact）**：`snapshot_file` / `sqlite_store` 的 instruction / rules / config / skill / memory / task——语义上是**有效期区间**而非点。内核只产**变更点**（`config_snapshot` 事件，带 `content_hash` + 检测到变更的时间）；把变更点序列折叠成 `[valid_from, valid_until)` 区间、做 supersedes 与 as-of 重建，是 **TumeFlow 物化层**的职责（ADR-029），内核不算区间。
+
+**保真度按 `source_mode` 分档**：
+
+| source_mode | 时间信号 | 保真度 |
+|---|---|---|
+| `append_log` | 每行 `occurred_at`（Claude 顶层 `timestamp` / Codex `value.timestamp`） | 高（精确点） |
+| `sqlite_store` | 行级时间戳（有则用）+ `rowid`/`wal_lsn` 顺序 | 中 |
+| `snapshot_file` | 仅"内容变了"（`content_hash` 变）；真实 `valid_from` 被扫描节奏 + 文件 mtime 框住 | 低（近似区间，须带 `valid_from_confidence`，不得伪造成精确点） |
+| `opaque_family` | 仅 `observed_at`（何时见到） | 仅 provenance，不进语义时间 |
+
+**两条铁律**：
+
+- **文件 mtime 永不作语义时间**：它只用于增量 / 回退检测（§8）；copy / sync / `touch` / WSL 9P 都会搅乱甚至令其倒退，拿来当事件时间必错。
+- **缺失 / 不可信即降级**：点事件 `occurred_at` 缺失 → `time_confidence=low`；snapshot `valid_from` 不确定 → 带 `valid_from_confidence`；一律不默认当"现在"（ADR-020）。`occurred_at` v0 存原始时间串，归一到 UTC unix 秒是后续细化。
+
 ## 8. 无状态游标 API
 
 ```text
