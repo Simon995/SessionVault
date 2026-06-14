@@ -93,7 +93,9 @@ pub fn is_windows_drive_mount(path: &str) -> bool {
         return false;
     };
     let bytes = rest.as_bytes();
-    bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1).is_none_or(|b| *b == b'/')
+    // 用 `map_or(true, ..)`（1.0 起）而非 `is_none_or`（1.82 才稳定）：等价且更保守，
+    // 不给 MSRV 添约束。
+    bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1).map_or(true, |b| *b == b'/')
 }
 
 /// 裸 Linux 绝对路径（`/home`、`/root`…），且不是挂载的 Windows 盘。

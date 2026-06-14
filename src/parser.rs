@@ -680,7 +680,7 @@ fn resolve_cached(
         }
     }
     let normalized = pathnorm::normalize_cwd(Some(cwd), host, None);
-    let pr = resolve_project_root(normalized.as_deref());
+    let pr = resolve_project_root(normalized.as_deref(), host);
     *cache = Some((cwd.to_string(), pr.clone()));
     Some(pr)
 }
