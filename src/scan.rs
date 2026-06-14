@@ -11,12 +11,35 @@ use crate::discover::SourceRef;
 use crate::logging::tag;
 use crate::parser::{parse_lines, ParseCtx};
 use crate::pathnorm::HostPlatform;
-use crate::rawevent::SourceMode;
+use crate::rawevent::{SourceLocation, SourceMode};
 use crate::report::SourceReport;
 use crate::Profile;
 
 /// scan 主入口：按形态分派。
 pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
+    // WSL 来源的**读取**路径（经 wsl.exe 增量 tail）尚未接线——`discover` 已能发现，
+    // 但 `scan_append_log` 走的是本地 `File`/`Seek`，对发行版内路径无效。此处显式回落，
+    // 不去本地 stat 一个不存在的路径。摄取路径是下一步（需在 WSL 内备合成 fixture 验证）。
+    if let SourceLocation::Wsl(distro) = &source.source_location {
+        let mut report = SourceReport {
+            source_path: source.path.display().to_string(),
+            source_mode: Some(source.source_mode),
+            cursor_kind: Some(CursorKind::NoCursor),
+            ..Default::default()
+        };
+        report
+            .warnings
+            .push(format!("wsl source discovered, read not yet wired (distro={distro})"));
+        return ScanResult {
+            status: ScanStatus::Ok,
+            events: Vec::new(),
+            cursor_out: Cursor {
+                kind: CursorKind::NoCursor,
+                ..Cursor::new_byte_offset()
+            },
+            report,
+        };
+    }
     match source.source_mode {
         SourceMode::AppendLog => scan_append_log(source, cursor_in, profile),
         // 其余形态骨架未实装：返回 NoCursor，事件空。
@@ -121,12 +144,20 @@ fn scan_append_log(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
     report.pending_tail_bytes = pending as u64;
 
     let lines: Vec<&str> = complete.lines().collect();
+    // default_distro：把 distro 未知的裸 Linux cwd 打成精确 wsl:<distro>（见 parser）。
+    // 今日 WSL 来源在 scan_source 顶部已短路（读取未接线），故走到这里的恒是 Local → None；
+    // 待 WSL 读取路径接通后，该来源自身发行版（权威）即由这里的 Wsl 臂注入。
+    let default_distro = match &source.source_location {
+        SourceLocation::Wsl(distro) => Some(distro.clone()),
+        SourceLocation::Local => None,
+    };
     let ctx = ParseCtx {
         source_type: source.source_type,
         source_location: source.source_location.clone(),
         source_path: report.source_path.clone(),
         profile,
         host: HostPlatform::current(),
+        default_distro,
     };
     let base_seq = cursor.next_seq;
     let codex_state_before = cursor.codex_state.clone();

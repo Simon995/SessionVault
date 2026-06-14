@@ -17,6 +17,7 @@ pub mod project_root;
 pub mod rawevent;
 pub mod report;
 pub mod scan;
+pub mod wsl;
 
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
 pub use cursor::{Cursor, CursorKind, ScanResult, ScanStatus};

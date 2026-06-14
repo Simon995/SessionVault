@@ -38,6 +38,10 @@ pub struct ParseCtx {
     pub profile: Profile,
     /// 宿主平台——决定裸 Unix 绝对路径归 `local` 还是 `wsl`（见 `pathnorm`）。
     pub host: HostPlatform,
+    /// 注入给 `normalize_cwd` 的默认 WSL 发行版：Windows 宿主上把 distro 未知的裸
+    /// Linux cwd 打成 `wsl:<distro>:..` 而非泛 `wsl`。WSL 来源取自身发行版；本地来源
+    /// 一般为 None（除非宿主只有一个用户发行版，见 `wsl::default_distro`）。
+    pub default_distro: Option<String>,
 }
 
 impl ParseCtx {
@@ -156,7 +160,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             .get("timestamp")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host);
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host, ctx.default_distro.as_deref());
 
         // 1) thinking（Claude `message.content[].type=thinking`）。
         if let Some(text) = extract_claude_thinking(&value) {
@@ -390,7 +394,7 @@ fn parse_codex(
             .clone()
             .unwrap_or_else(|| session_id_from_path(&ctx.source_path));
         let cwd = state.current_cwd.clone();
-        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host);
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host, ctx.default_distro.as_deref());
 
         // response_item：reasoning→thinking / message / tool_use / tool_result。
         if entry_type == Some("response_item") {
@@ -672,6 +676,7 @@ fn resolve_cached(
     cache: &mut Option<(String, ProjectRoot)>,
     cwd: Option<&str>,
     host: HostPlatform,
+    default_distro: Option<&str>,
 ) -> Option<ProjectRoot> {
     let cwd = cwd?;
     if let Some((c, pr)) = cache.as_ref() {
@@ -679,7 +684,7 @@ fn resolve_cached(
             return Some(pr.clone());
         }
     }
-    let normalized = pathnorm::normalize_cwd(Some(cwd), host, None);
+    let normalized = pathnorm::normalize_cwd(Some(cwd), host, default_distro);
     let pr = resolve_project_root(normalized.as_deref(), host);
     *cache = Some((cwd.to_string(), pr.clone()));
     Some(pr)
@@ -704,6 +709,23 @@ mod tests {
             source_path: "/tmp/abc-session.jsonl".to_string(),
             profile,
             host: HostPlatform::current(),
+            default_distro: None,
+        }
+    }
+
+    /// 显式宿主 + default_distro 的构造（路径归属断言用，避免依赖运行环境）。
+    fn ctx_host(
+        source_type: SourceType,
+        host: HostPlatform,
+        default_distro: Option<&str>,
+    ) -> ParseCtx {
+        ParseCtx {
+            source_type,
+            source_location: SourceLocation::Local,
+            source_path: "/tmp/abc-session.jsonl".to_string(),
+            profile: Profile::Metadata,
+            host,
+            default_distro: default_distro.map(str::to_string),
         }
     }
 
@@ -774,6 +796,38 @@ mod tests {
         .to_string();
         let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[mnt.as_str()], 0, None);
         assert_eq!(out.events[0].workspace_location.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn default_distro_upgrades_bare_linux_to_precise_wsl() {
+        // Windows 宿主 + 已知 default_distro：distro 未知的裸 /home cwd 被精确打标，
+        // workspace_location 升级成 wsl:<distro> 而非泛 wsl。
+        let line = serde_json::json!({
+            "type": "user",
+            "sessionId": "s",
+            "cwd": "/home/me/proj",
+            "message": {"role": "user", "content": "hi"}
+        })
+        .to_string();
+
+        let with = parse_lines(
+            &ctx_host(SourceType::ClaudeCode, HostPlatform::Windows, Some("Ubuntu")),
+            &[line.as_str()],
+            0,
+            None,
+        );
+        assert_eq!(with.events[0].workspace_location.as_deref(), Some("wsl:Ubuntu"));
+        assert_eq!(with.events[0].project_root_source.as_deref(), Some("wsl_cwd"));
+
+        // 无 default_distro：回落泛 wsl（仍不做错盘本地上溯，P2 修复仍生效）。
+        let without = parse_lines(
+            &ctx_host(SourceType::ClaudeCode, HostPlatform::Windows, None),
+            &[line.as_str()],
+            0,
+            None,
+        );
+        assert_eq!(without.events[0].workspace_location.as_deref(), Some("wsl"));
+        assert_eq!(without.events[0].project_root_source.as_deref(), Some("wsl_cwd"));
     }
 
     #[test]
