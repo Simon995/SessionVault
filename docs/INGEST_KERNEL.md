@@ -1,6 +1,7 @@
 # SessionVault — 共享摄取内核与 RawEvent 总库
 
-状态：摄取核心已落地（P0 ✅ / P1 ✅，见 §15）；绞杀者迁移与总库（P2 / P3）待启动
+状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移**已启动**——step 1（冻结 QuotaBar 黄金基线 +
+`parity` diff 工具）完成，首测 must-match=0（见 §15 与 [parity-contract.md](parity-contract.md)）；总库（P3）待启动
 最后更新：2026-06-14
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
@@ -479,7 +480,9 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 **绞杀者迁移五步**（保住成熟功能）：
 
-1. 冻结 QuotaBar 当前输出为**黄金语料**（零运行时改动，纯安全网 + 规格）。
+1. 冻结 QuotaBar 当前输出为**黄金语料**（零运行时改动，纯安全网 + 规格）。**✅ 已完成**：冻结
+   `cache.db` 的 `usage_facts`（9134 行）为基线 + 写 [parity-contract.md](parity-contract.md) 对账契约 +
+   建 `parity` diff 工具，首测 9134 条对齐 fact **must-match=0**（计费字段字节级一致，含 Codex 累计 token）。
 2. **抽取而非重写**，crate 输出 `RawEvent`。
 3. QuotaBar 在**现有接口后**调用，`agent_sessions` / `usage_facts` schema 与 UI 不变。
 4. **影子并跑**：新 crate 与老扫描器并行，输出 diff 老 `cache.db`，一致才切；切换走 feature flag，老路径留回退。
@@ -491,7 +494,10 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 - **P0（窄而硬）✅ 基本完成**：`RawEvent` v0 字段已定稿（`src/rawevent.rs`）；`append_log` JSONL（Claude/Codex **Local**）+ Codex 累计 token 的黄金语料已落地（**31 单测全绿**：坏行冻结整批、半行 pending、续扫不重不漏、`(mtime,size)` 回退重读、Codex 跨批延续/跨 session 重置、字段映射、profile 正文开关、**宿主感知路径规范化**）。`source_mode` / 多形态游标 / 派生路径 / 两层目录公开 API 已预留；`snapshot_file` / `sqlite_store` / `opaque_family` / derived-path 按设计返回 `planned` / `skipped`。**待补**：WSL 双位置的真实黄金语料（规范化逻辑已单测覆盖，缺端到端 fixture）。
 - **P1 ✅ 基本完成**：Local Claude/Codex `append_log` 解析器已实装并过语料（`parser.rs` / `scan.rs` / `discover.rs` / `cursor.rs`，`svault scan-all` 已能吐 `RawEvent` NDJSON 流）。**游标已持久化**：`scan-all --state <file>`（默认 `<data_local_dir>/svault/cursors.json`，`--stateless` 关）跨运行续扫——实测二次扫描 23476→**0** 事件（全 cache-hit），Codex 累计 token 状态/`next_seq` 随游标存活。**路径规范化层已抽取并标准化**：`src/pathnorm.rs` 宿主感知（`HostPlatform`），UNC↔规范形互转、`workspace_location` 已接线产出（修掉了 QuotaBar「裸 `/abs` 一律当 WSL」的 Windows 宿主假设——Linux 原生跑时同路径正确判 `local`）。**WSL 访问桥已通（端到端实测）**：`src/wsl.rs`（移植 QuotaBar `wsl/mod.rs`）——纯逻辑（发行版名/UTF-16LE/`find -print0` 解析、`default_distro` 选择，跨平台单测）+ 实时层（`#[cfg(windows)]` spawn `wsl.exe`：`list_distros`/`list_jsonl_under_home`/`stat`/`read_range`/`read_file_at`，非 Windows 给桩）。`discover()` 枚举 `Wsl(distro)` 来源；扫描经 **`ByteSource` 抽象**（`scan.rs`）让本地（`File`/`Seek`）与 WSL（`wsl.exe stat` + `tail -c +K | head -c N`）**共用同一份**游标/回退/坏行冻结逻辑；`default_distro` 用来源自身发行版把裸 Linux cwd 打成精确 `wsl:<distro>`。**实测（2026-06-14，真实本机数据，metadata profile 无正文）**：48 来源（19 local + 29 WSL）→ 23373 事件，其中 **8102 来自 WSL**（Ubuntu-24.04 codex 7726 + Ubuntu-OpenClaw claude 376），**零 warning/error**。WSL 增量 tail（`read_range` start>0）由 env-gated 实机 IT（`SVAULT_WSL_IT=1`，`/tmp` 一次性文件）验证。**P1 剩余尾巴**：WSL 双位置真实**黄金语料** fixture（逻辑已全验，缺归档式回归 fixture）；snapshot/sqlite/其它 provider 属 P3 后续。
-- **P2 ⬜ 未开始**：QuotaBar 影子并跑 → diff `cache.db` 一致才切（feature flag）。
+- **P2 🟡 进行中**：绞杀者 **step 1 ✅**——冻结 QuotaBar `cache.db` 输出为黄金基线、写对账契约
+  （[parity-contract.md](parity-contract.md)）、建 `parity` diff 工具，**首测 9134 条 usage must-match=0**
+  （advisory 全是 cwd 原始 vs 规范化的设计差异；活跃文件增长尾按字节边界归类）。**待办**：step 2–4
+  ——QuotaBar 改用共享扫描器（现有接口后调用，schema/UI 不变）→ 影子并跑 → must-match 全绿才切（feature flag，留回退）。
 - **P3 ⬜ 未开始**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。

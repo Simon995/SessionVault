@@ -9,3 +9,11 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# P2 影子并跑黄金基线（QuotaBar cache.db 真实输出快照）。
+# 含真实路径 / cwd / project_root（agent_sessions 还含正文片段），不入库——
+# 见 docs/parity-contract.md「隐私」。可分享的只有契约文档里的无正文聚合指标。
+/baseline/
+*.snapshot.db
+*.snapshot.db-wal
+*.snapshot.db-shm

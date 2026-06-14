@@ -18,6 +18,18 @@ path = "src/lib.rs"
 name = "svault"
 path = "src/bin/svault.rs"
 
+# P2 影子并跑 diff 工具：比对 QuotaBar cache.db 输出 ⇄ SessionVault RawEvent。
+# `required-features` 门控——默认构建/发布 lib 不含它，不引额外依赖面。
+# 见 docs/parity-contract.md。用法：`cargo run --features parity --bin parity -- ...`。
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
+required-features = ["parity"]
+
+[features]
+# 仅启用 parity diff 工具（纯逻辑，复用既有 serde_json/clap，无新依赖）。
+parity = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
