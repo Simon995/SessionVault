@@ -196,6 +196,16 @@ pub fn read_range(distro: &str, abs_path: &str, start: u64, end: u64) -> Result<
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    // 必须拿到恰好 `take` 字节，与本地 `read_exact` 同语义：若文件在 stat 与读取之间被
+    // 截断/轮转、或 start 已越过新 EOF，`tail|head` 仍会成功退出但少返回字节——直接返回
+    // 短读则上层会按**旧 size** 推进 safe_offset 而跳过数据。故短读即 Err，让上层不前进、
+    // 下轮重 stat 检测回退、从头重读。
+    let got = out.stdout.len() as u64;
+    if got != take {
+        return Err(format!(
+            "wsl read_range {distro}:{abs_path} short read: got {got} want {take} (truncated/rotated between stat and read?)"
+        ));
+    }
     Ok(out.stdout)
 }
 
@@ -458,6 +468,14 @@ mod tests {
         // 区间到中段 [6, 12)：恰 "line2\n"。
         let mid = read_range(distro, path, 6, 12).expect("mid read");
         assert_eq!(mid, b"line2\n", "bounded read_range wrong");
+
+        // 短读必须报错（P1 修复）：请求超出文件实际字节（截断/轮转/越过 EOF 的模拟）→ Err，
+        // 与本地 read_exact 同语义，绝不静默返回少于 take 的字节。
+        let short = read_range(distro, path, 0, 1000);
+        assert!(
+            short.is_err(),
+            "read_range asking 1000B from an 18B file must Err (short read), got {short:?}"
+        );
 
         // 不存在文件 → stat 返回 None（exit-7 哨兵）。
         assert!(

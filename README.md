@@ -78,6 +78,8 @@ CLI：
 - `svault scan-all --profile metadata|full [--state <file> | --stateless]` —— 一轮增量扫描，
   逐条吐 `RawEvent` + 每来源 `SourceReport` + 汇总。游标默认持久化到
   `<data_local_dir>/svault/cursors.json`（`--state` 覆盖、`--stateless` 关），跨运行真增量。
+  退出码：`0` 成功 / `1` 发现失败 / `2` **游标保存失败**（`summary.state_saved=false`，
+  本轮增量游标未推进，下游应重试或预期重复）。
 
 ## 落地路线（绞杀者迁移）
 

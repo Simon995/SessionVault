@@ -78,6 +78,9 @@ enum Out<'a> {
     Summary {
         sources: usize,
         events: u64,
+        /// 游标状态是否成功落盘：`Some(true/false)`；`None` = stateless（未持久化）。
+        /// `false` 时进程以非 0 退出——下游据此知道本轮增量游标**未推进**，需重试或预期重复。
+        state_saved: Option<bool>,
     },
 }
 
@@ -130,6 +133,7 @@ fn run_discover() -> i32 {
             emit(&Out::Summary {
                 sources: sources.len(),
                 events: 0,
+                state_saved: None,
             });
             0
         }
@@ -171,19 +175,34 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
         cursors.insert(key, res.cursor_out);
     }
 
-    if let Some(p) = &state_path {
-        if let Err(e) = save_cursors(p, &cursors) {
-            log::error!(target: tag::CLI, "save state failed: path={} err={e}", p.display());
-        } else {
-            log::info!(target: tag::CLI, "state saved: path={} entries={}", p.display(), cursors.len());
-        }
-    }
+    // 状态持久化结果：None=stateless；Some(true/false)=尝试落盘的成败。
+    let state_saved = match &state_path {
+        None => None,
+        Some(p) => match save_cursors(p, &cursors) {
+            Ok(()) => {
+                log::info!(target: tag::CLI, "state saved: path={} entries={}", p.display(), cursors.len());
+                Some(true)
+            }
+            Err(e) => {
+                log::error!(target: tag::CLI, "save state failed: path={} err={e}", p.display());
+                Some(false)
+            }
+        },
+    };
 
     emit(&Out::Summary {
         sources: sources.len(),
         events: total_events,
+        state_saved,
     });
-    0
+
+    // 游标保存失败 → 非 0 退出（码 2，区别于 discover 失败的 1）。否则调用方会把本轮
+    // 当成功，下轮因游标未推进而重复吐已消费事件——尤其权限/磁盘/rename 失败时极难发现。
+    if state_saved == Some(false) {
+        2
+    } else {
+        0
+    }
 }
 
 /// 来源的稳定身份键（跨运行定位游标）：`<type>|<location>|<path>`。
