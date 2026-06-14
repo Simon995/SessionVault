@@ -417,4 +417,56 @@ mod tests {
         assert_eq!(shell_escape("$HOME/x"), "\\$HOME/x");
         assert_eq!(shell_escape("a`b\\c"), "a\\`b\\\\c");
     }
+
+    /// 实机集成测试：验证 `stat` + `read_range`（含 `start>0` 增量 tail）打通真实
+    /// `wsl.exe`。用 `/tmp` 一次性文件（**非**会话数据），用完即删。
+    ///
+    /// 默认跳过——需 Windows+WSL 实机且置 `SVAULT_WSL_IT=1` 才跑（普通 `cargo test`
+    /// 不 spawn wsl.exe）。这正是冷扫覆盖不到的 `read_range(start>0)` 支线的兜底验证。
+    #[test]
+    #[cfg(windows)]
+    fn wsl_stat_and_read_range_roundtrip_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let distros = list_distros().expect("list_distros");
+        let distro = distros
+            .iter()
+            .find(|d| is_user_distro(d))
+            .expect("need at least one user distro");
+
+        let path = "/tmp/svault-it-roundtrip.txt";
+        // 写 18 字节："line1\nline2\nline3\n"。
+        run_bash_stdin(
+            distro,
+            &format!("set -eu\nprintf 'line1\\nline2\\nline3\\n' > {path}\n"),
+        )
+        .expect("write throwaway file");
+
+        let (size, mtime) = stat(distro, path).expect("stat ok").expect("file exists");
+        assert_eq!(size, 18, "size mismatch");
+        assert!(mtime > 0, "mtime should be a real epoch second");
+
+        // 全读 [0, size)。
+        let full = read_range(distro, path, 0, size).expect("full read");
+        assert_eq!(full, b"line1\nline2\nline3\n");
+
+        // 增量 tail [6, size)：跳过 "line1\n"，得 "line2\nline3\n"（12 字节）。
+        let tail = read_range(distro, path, 6, size).expect("tail read");
+        assert_eq!(tail, b"line2\nline3\n", "read_range(start>0) wrong");
+
+        // 区间到中段 [6, 12)：恰 "line2\n"。
+        let mid = read_range(distro, path, 6, 12).expect("mid read");
+        assert_eq!(mid, b"line2\n", "bounded read_range wrong");
+
+        // 不存在文件 → stat 返回 None（exit-7 哨兵）。
+        assert!(
+            stat(distro, "/tmp/svault-it-does-not-exist-xyz.txt")
+                .expect("stat missing ok")
+                .is_none(),
+            "missing file should stat to None"
+        );
+
+        let _ = run_bash_stdin(distro, &format!("rm -f {path}\n"));
+    }
 }
