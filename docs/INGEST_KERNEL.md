@@ -524,10 +524,11 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
   - **step 2 🟡（QuotaBar `p2/svault-shadow` 分支，feature `svault_shadow` 默认关）**：SessionVault 经
     submodule + 可选依赖接进 QuotaBar；建 **seam**（`project_events`：`&[RawEvent]` 流 → `usage_facts` 适配器 +
     复用 QuotaBar `summarize_sessions` 产 `agent_sessions`，事件源抽象、总库落地后只换源）+ **影子 runner**
-    （`run_shadow_diff`：`scan(full)` → 投影 → diff `cache.db` 两表 → 打日志，只读不写）+ **一键 debug 触发**
-    （后端命令 `svault_shadow_diff` + QuotaBar Settings 的 dev 按钮「跑影子 diff」，按钮受 `import.meta.env.DEV`
-    门控、生产构建剔除；`cargo tauri dev --features svault_shadow` 后点按钮即看 `ShadowReport` 绿灯）。
-    GNU+MSVC 双工具链编过、默认构建零影响、`vite build` 验证 dev 码不进发版包。
+    （`run_shadow_diff`：`scan(full)` → 投影 → diff `cache.db` 两表 + 逐源/逐会话 drill-down 日志，只读不写）
+    + **一键 debug 触发**（后端命令 `svault_shadow_diff` + QuotaBar Settings 的 dev 按钮「跑影子 diff」，按钮受
+    `import.meta.env.DEV` 门控、生产构建剔除）。**首次在线影子实测（50 源真实数据）：`facts_must_mismatch=0`
+    绿灯**（usage 主对账通过；§1/§6：绿灯只看 usage_facts，`session_diff=10` 的会话首尾时间戳漂移属 advisory、
+    +2 facts 是本会话 transcript 实时增长）。GNU+MSVC 双工具链编过、默认构建零影响、`vite build` 验证 dev 码不进发版包。
   - **待办 step 3–4**：让 QuotaBar **真实索引路径**走 seam（不只影子）→ 影子并跑 must-match 全绿才切（feature flag，留回退）。
 - **P3 ⬜ 未开始**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
