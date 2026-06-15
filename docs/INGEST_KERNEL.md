@@ -1,8 +1,9 @@
 # SessionVault — 共享摄取内核与 RawEvent 总库
 
-状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移**已启动**——step 1（冻结 QuotaBar 黄金基线 +
-`parity` diff 工具）完成，首测 must-match=0（见 §15 与 [parity-contract.md](parity-contract.md)）；总库（P3）待启动
-最后更新：2026-06-14
+状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移 step 1-3 ✅、**step 4 切换完成、soak 中**
+（QuotaBar 已翻默认 `svault_index`，`parse_native` 留作回退；CI 三配置全绿；见 §15 与
+[parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；总库（P3）待启动
+最后更新：2026-06-15
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
 > - `DECISIONS.md` / `SYSTEM_DESIGN.md` / `INTEGRATION.md` → [TumeFlow `docs/`](https://github.com/Simon995/TumeFlow/tree/main/docs)（ADR-024/025/026 与本内核直接相关；其摘要见本仓 [README](../README.md) 与 [LOGGING.md](LOGGING.md)）。
@@ -529,12 +530,17 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
     `import.meta.env.DEV` 门控、生产构建剔除）。**首次在线影子实测（50 源真实数据）：`facts_must_mismatch=0`
     绿灯**（usage 主对账通过；§1/§6：绿灯只看 usage_facts，`session_diff=10` 的会话首尾时间戳漂移属 advisory、
     +2 facts 是本会话 transcript 实时增长）。GNU+MSVC 双工具链编过、默认构建零影响、`vite build` 验证 dev 码不进发版包。
-  - **step 3 🟡（feature `svault_index` 默认关）**：真实索引**写库路径**走 seam（增量保真版）——
+  - **step 3 ✅（feature `svault_index`；step 4 已翻默认）**：真实索引**写库路径**走 seam（增量保真版）——
     `parse_source_file` 的解析步经 `dispatch_parse` 切到 `svault_bridge::parse_complete`（复用
     `session_vault::parse_lines` + `CodexParserState⇄CodexState` 桥接），字节游标/`safe_offset`/`base_seq`/
     坏行冻结/合并/summarize 全复用 QuotaBar 原逻辑，只换解析；出错回落原生。default/shadow/index/both
-    四组合均编过；正确性依据 step 2 影子 `mm=0`。**待办**：写库端到端运行验证（本机 Tauri 测试 exe 受限）
-    → **step 4** 影子并跑 must-match 全绿 + advisory 复核 → 翻默认、拆旧路径。
+    四组合均编过；L3 桥接 index_tests CI 绿。
+  - **step 4 🟡 切换完成、soak 中**：`Cargo.toml` `default = ["svault_index"]`（svault 写库成正式路径，
+    `parse_native` 留作出错回退）；`release.yml` 补 submodule init、`ci.yml` 测三配置（默认/原生/诊断）
+    且缺 `SUBMODULE_TOKEN` 时降级，**CI 全绿**。证据台账：翻默认前影子 svault-vs-原生 `mm=0` + L1/L2/L3。
+    **soak 闸门**：写库路径端到端 = 原生构建 vs svault 默认构建各重索引、逐字段 diff `cache.db`（手动 GUI，
+    Tauri exe 受限）。⚠ 翻默认后影子 diff 已退化为 svault-vs-svault，**不能**再当闸门。过闸 → **最终绞杀**
+    （删 `parse_native` + `not(svault_index)` 分支 + ci.yml 原生回退步骤）。
 - **P3 ⬜ 未开始**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
