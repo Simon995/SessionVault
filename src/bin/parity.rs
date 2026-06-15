@@ -405,19 +405,47 @@ fn main() {
 
     print_human(&report);
 
+    let mut report_io_failed = false;
     if let Some(rp) = &cli.report {
         match serde_json::to_string_pretty(&report) {
             Ok(s) => {
                 if let Err(e) = std::fs::write(rp, s) {
                     eprintln!("write report failed: {e}");
+                    report_io_failed = true;
                 }
             }
-            Err(e) => eprintln!("serialize report failed: {e}"),
+            Err(e) => {
+                eprintln!("serialize report failed: {e}");
+                report_io_failed = true;
+            }
         }
     }
 
-    // 红线：must-match 不符即非 0 退出。增长尾 / advisory / 计数分歧只报不判败。
-    std::process::exit(if report.total_must_mismatch > 0 { 1 } else { 0 });
+    std::process::exit(exit_code(&report, report_io_failed));
+}
+
+/// 退出码判定（纯函数，便于测试）。
+///
+/// 红线（判败 → 1）：
+///   - `total_must_mismatch` > 0：must-match 字段不符（parity-contract §3/§6）。
+///   - `total_qb_extra` > 0：SV 漏发了 QB 有的 usage（整文件 / 桶缺失也落这里）。
+///     空的 SV 输出会让每个 combo 全进 qb_extra → 判败，避免被自动化误当绿灯。
+///   - `total_sv_extra_unknown` > 0：SV 多发且非增长尾、未归类的 usage（疑似重复 / 过度提取）。
+/// 非判败：`sv_growth_tail`（SV 扫到冻结基线之后的新增数据，合法）/ advisory（ts/cwd/root）。
+///
+/// `report_io_failed`：传了 `--report` 但序列化 / 写入失败 → 2，避免调用方误以为报告已生成。
+/// parity 红线优先于 report I/O。
+fn exit_code(report: &Report, report_io_failed: bool) -> i32 {
+    let parity_failed = report.total_must_mismatch > 0
+        || report.total_qb_extra > 0
+        || report.total_sv_extra_unknown > 0;
+    if parity_failed {
+        1
+    } else if report_io_failed {
+        2
+    } else {
+        0
+    }
 }
 
 fn print_human(r: &Report) {
@@ -558,5 +586,59 @@ mod tests {
         let fields: Vec<&str> = must.iter().map(|d| d.field.as_str()).collect();
         assert!(fields.contains(&"model"));
         assert!(fields.contains(&"message_id"));
+    }
+
+    fn report_with(must: usize, qb_extra: usize, sv_extra_unknown: usize, growth: usize) -> Report {
+        Report {
+            quotabar_facts: 0,
+            sessionvault_usage: 0,
+            combos: BTreeMap::new(),
+            total_must_mismatch: must,
+            total_advisory_diff: 0,
+            total_sv_growth_tail: growth,
+            total_sv_extra_unknown: sv_extra_unknown,
+            total_qb_extra: qb_extra,
+            must_examples: vec![],
+            advisory_examples: vec![],
+        }
+    }
+
+    #[test]
+    fn clean_report_passes() {
+        assert_eq!(exit_code(&report_with(0, 0, 0, 0), false), 0);
+    }
+
+    #[test]
+    fn growth_tail_does_not_fail() {
+        // 增长尾即便很大也不判败：SV 扫到冻结基线之后的新增数据是合法的。
+        assert_eq!(exit_code(&report_with(0, 0, 0, 999), false), 0);
+    }
+
+    #[test]
+    fn must_mismatch_fails() {
+        assert_eq!(exit_code(&report_with(1, 0, 0, 0), false), 1);
+    }
+
+    #[test]
+    fn qb_extra_fails_so_empty_sv_is_not_green() {
+        // SV 漏发 QB 有的 fact（空 SV 输出 → 全进 qb_extra）必须判败，否则被自动化误当绿灯。
+        assert_eq!(exit_code(&report_with(0, 3, 0, 0), false), 1);
+    }
+
+    #[test]
+    fn unknown_sv_extra_fails() {
+        // 非增长尾、未归类的 SV 多发（疑似重复 / 过度提取）判败。
+        assert_eq!(exit_code(&report_with(0, 0, 2, 0), false), 1);
+    }
+
+    #[test]
+    fn report_io_failure_fails_with_distinct_code() {
+        // parity 干净但 --report 写失败 → 2（区别于 parity 红线的 1）。
+        assert_eq!(exit_code(&report_with(0, 0, 0, 0), true), 2);
+    }
+
+    #[test]
+    fn parity_failure_takes_precedence_over_report_io() {
+        assert_eq!(exit_code(&report_with(1, 0, 0, 0), true), 1);
     }
 }
