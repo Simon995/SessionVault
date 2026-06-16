@@ -116,6 +116,10 @@ fn scan_append_log<S: ByteSource>(
         ..Default::default()
     };
 
+    // 一次性全扫（`cursor_in=None`，如影子全量对账 / 总库首扫）没有「下一轮重读」——坏行不能
+    // 丢好行事件（一行坏 = 整文件 N 条全丢，会比 native/parse_lines 少数据）。增量（`Some`）仍需
+    // 冻结+丢弃：保留事件又冻结游标的话下轮会把同一批好行再发一遍 → 事件流重复。
+    let one_shot = cursor_in.is_none();
     let mut cursor = cursor_in.unwrap_or_else(Cursor::new_byte_offset);
 
     let (size, mtime) = match src.stat() {
@@ -204,12 +208,36 @@ fn scan_append_log<S: ByteSource>(
     report.items_skipped = parsed.skipped;
     report.warnings.extend(parsed.warnings);
 
-    // P1：坏 JSON 行 → **冻结整批尾**（对齐 QuotaBar 实证，见 rawevent-reconciliation §2 / §8 规则 2）。
-    // append-only 的完整行不可变，坏了就永远坏；保守契约选「保持起点 offset + status=error +
-    // 本轮不发事件 + 下轮重读整段尾」，宁可重读也不静默跳过/错解。
-    // （已知取舍：永久损坏的完整行会让该来源停在原地——这是从 QuotaBar 继承的行为，
-    //   将来可在游标加 retry 计数做「毒行」跳过，属后续阶段。）
+    // P1：坏 JSON 行的处理按读取形态分两路（坏行总是 status≠Ok + 留 warning，不静默）：
+    //
+    // - **增量**（`Some(cursor)`）→ **冻结整批尾**（对齐 QuotaBar 实证，见 rawevent-reconciliation
+    //   §2 / §8 规则 2）：保持起点 offset + status=error + 本轮不发事件 + 下轮重读整段尾。
+    //   append-only 的完整行不可变，坏了就永远坏；宁可重读也不静默跳过/错解。保留事件又冻结游标
+    //   会让下轮把同一批好行再发一遍（事件流重复），所以增量必须丢弃。
+    //   （已知取舍：永久损坏行会让增量来源停在原地——继承自 QuotaBar；将来可在游标加 retry 计数
+    //     做「毒行」跳过，属后续阶段。）
+    // - **一次性全扫**（`cursor_in=None`，影子对账 / 总库首扫）→ **保留好行事件**：没有下一轮、
+    //   不存在重复发；丢弃只会平白少数据（一行坏 = 整文件 N 条全丢，比 native/parse_lines 还差）。
+    //   游标推进与否对一次性调用无意义（调用方丢弃 cursor_out）。status=Partial 标记「有坏行但已尽量
+    //   解析」，与「半行 pending」的 Partial 同语义档位（带事件、非 Ok），供上层按需降级而非整文件作废。
     if parsed.skipped > 0 {
+        if one_shot {
+            cursor.safe_offset = size - pending as u64;
+            cursor.next_seq = base_seq + parsed.events.len() as u64;
+            cursor.codex_state = parsed.codex_state;
+            report.events_emitted = parsed.events.len() as u64;
+            log::warn!(
+                target: tag::SCAN,
+                "append_log one-shot kept good events despite bad json: path={} skipped={} events={}",
+                report.source_path, parsed.skipped, parsed.events.len()
+            );
+            return ScanResult {
+                status: ScanStatus::Partial,
+                events: parsed.events,
+                cursor_out: cursor,
+                report,
+            };
+        }
         cursor.safe_offset = start; // 不前进
         cursor.codex_state = codex_state_before; // 不吃进坏批的状态推进
         report.events_emitted = 0;
@@ -348,17 +376,41 @@ mod tests {
     }
 
     #[test]
-    fn bad_json_freezes_batch_and_keeps_offset() {
-        // 两条好行 + 一条坏 JSON（均完整行）→ 整批冻结：offset 不前进、status=error、无事件。
-        let (path, src) = temp_source(
-            "bad",
-            "{\"a\":1}\n{\"b\":2}\nnot-json-here\n",
+    fn bad_json_one_shot_keeps_good_events() {
+        // 一次性全扫（cursor=None，影子对账 / 总库首扫）：两条好行 + 一条坏 JSON →
+        // **保留好行事件**、status=Partial、offset 推进。没有下一轮、不会重复发,丢弃只会
+        // 平白少数据（一行坏 = 整文件全丢，比 native/parse_lines 还差）。
+        let body = format!(
+            "{}\n{}\nnot-json-here\n",
+            claude_line("s1", "alpha"),
+            claude_line("s1", "beta")
         );
-        let res = scan_source(&src, None, Profile::Metadata);
-        assert_eq!(res.status, ScanStatus::Error);
-        assert_eq!(res.cursor_out.safe_offset, 0, "坏行应保持起点 offset");
-        assert!(res.events.is_empty());
+        let (path, src) = temp_source("badoneshot", &body);
+        let res = scan_source(&src, None, Profile::Full);
+        assert_eq!(res.status, ScanStatus::Partial);
+        assert_eq!(res.events.len(), 2, "两条好行事件应保留");
         assert_eq!(res.report.items_skipped, 1);
+        assert!(res.cursor_out.safe_offset > 0, "好行 offset 应推进");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bad_json_incremental_freezes_batch_and_keeps_offset() {
+        // 增量（带游标续扫）：坏行整批冻结 —— offset 不前进、status=error、不发事件。
+        // 保留事件 + 冻结游标会让下轮把同一批好行再发一遍（事件流重复），故增量必须丢弃。
+        let (path, src) = temp_source("badincr", &format!("{}\n", claude_line("s", "alpha")));
+        let r1 = scan_source(&src, None, Profile::Full);
+        assert_eq!(r1.status, ScanStatus::Ok);
+        let prev_offset = r1.cursor_out.safe_offset;
+
+        append(&path, &format!("{}\nnot-json-here\n", claude_line("s", "beta")));
+        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
+        assert_eq!(r2.status, ScanStatus::Error);
+        assert!(r2.events.is_empty(), "增量坏行批不发事件");
+        assert_eq!(
+            r2.cursor_out.safe_offset, prev_offset,
+            "offset 冻结在上轮完整行边界"
+        );
         let _ = std::fs::remove_file(path);
     }
 
