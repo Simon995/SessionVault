@@ -47,7 +47,7 @@
 |---|---|---|
 | `safe_offset` 字节游标 | `safe_offset` / `mtime` / `size` / `parser_state_json` / `parse_status` 持久化 | ✓ 完全一致 |
 | 只解析完整行，半截不推进 | `split_complete_jsonl`：无尾换行则回退到最后 `\n` | ✓ |
-| 坏行跳过、不推进、待重试 | 坏行计数 + `parse_status=error`，`safe_offset` 保持 `known_offset`（整批不前进） | ✓（注意：一坏行冻结**整批**尾，下轮重读整段尾） |
+| 坏行跳过、不推进、待重试 | 坏行计数 + `parse_status=error`，`safe_offset` 保持 `known_offset`（整批不前进） | ✓（增量路径：一坏行冻结**整批**尾，下轮重读整段尾；SV `scan` **一次性全扫**另走 `Partial` 保留好行，见 INGEST_KERNEL §8 规则 2） |
 | `(mtime,size)` 回退→归零重建 | 两处：①`row.mtime>file.mtime && row.size<=file.size` → `metadata_rollback_marker`（offset=0、error、安排全rebuild）；②`read_local_*` 仅当 `size<=` 且 `mtime<=` 且 ok 才复用 offset，否则 0 | ✓ 但判据是 **(mtime,size) 回退**，非内容哈希 |
 | WSL 增量 | `WslReadMode{CacheHit,Append,Full}`，由 `(size,known)` 决定；`tail -c +k`；截断→Full | ✓ 与 §8 截断检测对应 |
 | Codex `codex_state.previous_total` 为标量 | **实为结构体 `CodexRawUsage{input,cached,output}`** | **改 §8/§7**：`previous_total` 是三元组累计 |

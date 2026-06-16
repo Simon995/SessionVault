@@ -101,9 +101,12 @@ log::warn!("[sv-cursor][{prov}/{loc}/{run}] rolled back: reason={reason} from={o
 
 ### 2. 坏 JSON 行（`sv-scan`）
 ```rust
-log::warn!("[sv-scan][{prov}/{loc}/{run}] bad line skipped: path={path} line={n} err={kind}");
+// 增量（cursor_in=Some，常态轮询）：冻结整批
+log::warn!("[sv-scan][{prov}/{loc}/{run}] append_log batch frozen (bad json): path={path} skipped={n} kept_offset={k}");
+// 一次性全扫（cursor_in=None，影子对账 / 总库首扫）：保留好行
+log::warn!("[sv-scan][{prov}/{loc}/{run}] append_log one-shot kept good events despite bad json: path={path} skipped={n} events={m}");
 ```
-跳过该行、`status=error`、**不推进 safe_offset**——这条对应"为什么 events 比预期少"。
+两路（见 INGEST_KERNEL §8 规则 2）：**增量** `status=error`、**不推进 safe_offset**、本轮不发事件——这条对应"为什么 events 比预期少"；**一次性全扫** `status=partial`、跳过坏行保留前后好行、推进到完整行边界——这条对应"有坏行但仍出了事件（影子对账不被误判漏发）"。
 
 ### 3. WSL 桥失败（`sv-wsl`）
 ```rust

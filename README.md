@@ -30,7 +30,7 @@ must-match=0**）；总库（P3）待启动。
 | `parser` | 行级 JSONL → `RawEvent`（Claude / Codex 字段映射、Codex 累计 token delta） | ✅ |
 | `pathnorm` | 宿主感知路径规范化（`HostPlatform`、UNC↔规范形、`workspace_location`） | ✅ |
 | `wsl` | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码） | ✅ 实机实测 |
-| `scan` | 增量扫描（`ByteSource` 抽象，本地/WSL 共用游标·回退·坏行冻结） | ✅ append_log |
+| `scan` | 增量扫描（`ByteSource` 抽象，本地/WSL 共用游标·回退·坏行处理：增量冻结 / 一次性全扫保留好行） | ✅ append_log |
 | `cursor` | 多形态游标（字节偏移 + Codex 状态 + `next_seq`） | ✅ append_log |
 | `svault` CLI | `discover` / `scan-all`（NDJSON 出 stdout），跨运行游标持久化 | ✅ |
 | `parity` 工具 | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0 |

@@ -312,7 +312,10 @@ Cursor {
 推进规则（与 QuotaBar 实机验证一致）：
 
 1. **append_log** — 只解析**完整 JSONL 行**；末行半截写入本轮不解析、不推进 `safe_offset`。
-2. **append_log 坏 JSON** — 本轮所读尾批中**任一完整行**解析失败 → **冻结整批**：`safe_offset` 保持本轮起点、`status=error`、**本轮不发事件**，下轮重读整段尾（与 QuotaBar 实证一致，见 `rawevent-reconciliation.md` §2："一坏行冻结整批尾"）。append-only 完整行不可变、retry 对永久损坏无效，这是"宁可重读、不静默跳过/错解"的保守取舍；**已知代价**：永久损坏的完整行会让该来源停在原地，将来可在游标加 retry 计数做"毒行"跳过（后续阶段）。（半截尾行属规则 1 的 pending，不在此列。）
+2. **append_log 坏 JSON** — 本轮所读尾批中**任一完整行**解析失败,按**有无传入游标**(`cursor_in`)分两路：
+   - **增量扫描**（`cursor_in=Some`，常态轮询）→ **冻结整批**：`safe_offset` 保持本轮起点、`status=error`、**本轮不发事件**，下轮重读整段尾（与 QuotaBar 实证一致，见 `rawevent-reconciliation.md` §2："一坏行冻结整批尾"）。append-only 完整行不可变、retry 对永久损坏无效，这是"宁可重读、不静默跳过/错解"的保守取舍。
+   - **一次性全扫**（`cursor_in=None`，影子对账 / 总库首扫）→ **保留好行事件**：没有"下一轮"可重读，丢弃只会平白少数据（一行坏 = 整文件 N 条全丢，比 native `parse_lines` 还差），故跳过坏行、保留前后所有好行，`status=partial`（与"半行 pending"同档：带事件、非 Ok），供上层按需降级而非整文件作废；`safe_offset` 推进到完整行边界（游标推进对一次性调用无意义，调用方丢弃 `cursor_out`）。
+   **已知代价**（仅增量路径）：永久损坏的完整行会让该来源停在原地，将来可在游标加 retry 计数做"毒行"跳过（后续阶段；QuotaBar `ROADMAP §E.5.5` 已记此 backlog）。（半截尾行属规则 1 的 pending，不在此列。）
 3. `(mtime, size)` 未变且游标已到尾（byte_offset 满足 `safe_offset >= size`；fingerprint 满足 `content_hash` 未变）时跳过该文件。
 4. **append_log 截断 / 重写 / 压缩检测**（关键）：判据以 **`(mtime, size)` 回退**为准（QuotaBar 实证：缓存 `mtime > 当前` 或 `size <` 缓存即触发 `safe_offset` 归零、全量重建；WSL 侧 `size < known` → Full 重读）。压缩场景如 Codex `history.jsonl` 超 `max_bytes` 丢最旧。重建后用 `(occurred_at, message_id, request_id)` 去重，**不把旧尾当新事件**。（`content_hash` 不用于 append_log 截断判定，仅用于 snapshot_file，见规则 5。）
 5. **snapshot_file** — 比 `content_hash`；变了产一条 `config_snapshot` 事件（带新旧哈希），未变跳过。整体重写是常态，不用字节游标。
@@ -378,7 +381,7 @@ ScanReport {
 - 一文件多 session：Claude `--resume`/fork 把父 `sessionId` 行重放进子文件、Codex 多个 `session_meta` → 按**行级** `session_id` 归属，不串话。
 - thinking/reasoning：Claude `thinking` 块、Codex `reasoning.summary[].text` → 按取舍策略产 `thinking` 事件或排除；Codex `encrypted_content` 无明文 → 不产正文（opaque）。
 - 末行半截写入 → 本轮不解析、`safe_offset` 不前进。
-- 单行坏 JSON（完整行）→ **冻结整批**：`status=error`、`safe_offset` 不前进、本轮不发事件、下轮重读整段尾（见 §8 规则 2）。
+- 单行坏 JSON（完整行）→ 按游标分两路（见 §8 规则 2），各一条 fixture：**增量**（`cursor_in=Some`）**冻结整批**（`status=error`、`safe_offset` 不前进、本轮不发事件、下轮重读整段尾）；**一次性全扫**（`cursor_in=None`）**保留好行事件**（`status=partial`、跳过坏行、`safe_offset` 推进到完整行边界）。
 - `(mtime, size)` 回退 / 文件被截断 → 归零重建。
 - 同 `session_id` 在 `local` 与 `wsl:<distro>` 各一份 → 靠 `source_location` 区分，不互相覆盖。
 - Claude `parentUuid` 分支 / 重试 / 编辑 → 父子树，区分采纳与废弃分支。
