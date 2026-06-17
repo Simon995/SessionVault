@@ -29,6 +29,9 @@ required-features = ["parity"]
 [features]
 # 仅启用 parity diff 工具（纯逻辑，复用既有 serde_json/clap，无新依赖）。
 parity = []
+# 不可变 RawEvent 总库（§13 / ADR-020）。门控 rusqlite——纯 parser 用户不被迫拉它，
+# 保住「解析内核无状态」（§14）；QuotaBar 作总库默认写者时开此 feature。
+store = ["dep:rusqlite"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -40,5 +43,8 @@ dirs-next = "2"
 # CLI-only (used by the `svault` bin; kept minimal)
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
+
+# `store` feature only — 不可变 RawEvent 总库的持久化后端（与 QuotaBar 同版本）。
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]

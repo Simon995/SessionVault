@@ -544,7 +544,10 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
     **soak 闸门**：写库路径端到端 = 原生构建 vs svault 默认构建各重索引、逐字段 diff `cache.db`（手动 GUI，
     Tauri exe 受限）。⚠ 翻默认后影子 diff 已退化为 svault-vs-svault，**不能**再当闸门。过闸 → **最终绞杀**
     （删 `parse_native` + `not(svault_index)` 分支 + ci.yml 原生回退步骤）。
-- **P3 ⬜ 未开始**：总库落地 + TumeFlow 消费；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
+- **P3 🟡 进行中**：
+  - **step① IO 委托 ✅**（QuotaBar 侧）：QuotaBar `refresh_index` 改调 `discover()`/`scan()`，删自管 read/游标，`scan()` 成其唯一 IO+解析路径。
+  - **P3-② 总库写入侧 🟡**：`src/store.rs`（`store` feature 门控 rusqlite）落地 `TotalStore`——append-only `raw_events`（`offset` AUTOINCREMENT 同步游标 / `ingested_at` / `dedup_key` UNIQUE 幂等 / `event_json` 整条 RawEvent + 投影索引列）+ `tombstones` 脚手架；`append_events`（`INSERT OR IGNORE` 幂等）/ `read_since`（pull 种子，跳过墓碑）/ `status`。QuotaBar 作默认写者，把 `scan()` 产出的 `RawEvent` 流 append 入库（MVP 明文正文）。**⬜ 待**：at-rest 加密（aes-gcm + keychain 分密钥 crypto-shred，ADR-027）、erase 全量传播、TumeFlow `pull --since` 消费（P3-③）。
+  - **P3-④ ⬜**：transcript-from-RawEvent；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
 

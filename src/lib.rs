@@ -17,6 +17,9 @@ pub mod project_root;
 pub mod rawevent;
 pub mod report;
 pub mod scan;
+/// 不可变 RawEvent 总库（§13 / ADR-020）——`store` feature 门控（持久化组件，内核仍无状态）。
+#[cfg(feature = "store")]
+pub mod store;
 pub mod wsl;
 
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
@@ -27,6 +30,8 @@ pub use rawevent::{
     Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
 };
 pub use report::ScanReport;
+#[cfg(feature = "store")]
+pub use store::{AppendStats, StoreStatus, TotalStore};
 
 use thiserror::Error;
 
