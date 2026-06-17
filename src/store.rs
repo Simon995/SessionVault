@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use crate::rawevent::{EventType, RawEvent, SourceType};
+use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceType};
 
 /// 总库错误。
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +218,54 @@ impl TotalStore {
         Ok(out)
     }
 
+    /// 读单个 (file, session) 的全部事件（按 `seq` 升序 = 文件内事件顺序）。作用域**四列精确**：
+    /// 一张会话卡 = 一个 `(source_type, source_location, source_path, session_id)` 对——session_id
+    /// 可跨文件 replay（Claude `--resume`），故必须连 `source_path` 一起 scope，不能只按 session_id
+    /// 串话。供 QuotaBar transcript 从总库重建（不再重读 JSONL）。墓碑此处**不过滤**：transcript 是
+    /// 宿主对自己已索引会话的展示，erase 语义作用于下游 pull（`read_since`），不该让某条墓碑令一张
+    /// 仍在列表里的卡片打不开。反序列化失败的行 skip+warn（同 `read_since` 韧性口径）。
+    pub fn read_session(
+        &self,
+        source_type: SourceType,
+        source_location: &SourceLocation,
+        source_path: &str,
+        session_id: &str,
+    ) -> StoreResult<Vec<RawEvent>> {
+        let conn = self.conn.lock().unwrap();
+        // 按 `seq`（文件内单调序号 = 气泡顺序）升序，**非** `offset`（append 顺序，乱序重扫时会偏）；
+        // `offset` 作次序稳定 tiebreak。
+        let mut stmt = conn.prepare(
+            r#"SELECT offset, event_json
+                 FROM raw_events
+                WHERE source_type = ?1
+                  AND source_location = ?2
+                  AND source_path = ?3
+                  AND source_session_id = ?4
+                ORDER BY seq ASC, offset ASC"#,
+        )?;
+        let rows = stmt.query_map(
+            params![
+                source_type_key(source_type),
+                source_location.as_key(),
+                source_path,
+                session_id,
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (offset, json) = row?;
+            match serde_json::from_str::<RawEvent>(&json) {
+                Ok(ev) => out.push(ev),
+                Err(e) => log::warn!(
+                    target: crate::logging::tag::SQLITE,
+                    "raw_events offset={offset} skipped (deserialize failed, likely schema drift): {e}"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// 总库状态（条数 / 最大 offset / 最近入库时间）。
     pub fn status(&self) -> StoreResult<StoreStatus> {
         let conn = self.conn.lock().unwrap();
@@ -387,6 +435,46 @@ mod tests {
         let mut ev = mk_event(seq, session, None);
         ev.source_path = source_path.to_string();
         ev
+    }
+
+    #[test]
+    fn read_session_orders_by_offset_and_scopes_by_file() {
+        let store = TotalStore::open_in_memory().unwrap();
+        // 文件 A 的 session "s"（seq 乱序入库，验证按 offset/seq 升序取回）。
+        let a0 = mk_event_at(0, "s", "/a.jsonl");
+        let mut a1 = mk_event_at(1, "s", "/a.jsonl");
+        a1.content = Some("second".to_string());
+        let mut a0c = a0.clone();
+        a0c.content = Some("first".to_string());
+        // 文件 B 的同名 session "s"（--resume replay）+ 文件 A 的另一 session "t"。
+        let b0 = mk_event_at(0, "s", "/b.jsonl");
+        let t0 = mk_event_at(0, "t", "/a.jsonl");
+        store.append_events(&[a1, a0c, b0, t0]).unwrap();
+
+        let got = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/a.jsonl",
+                "s",
+            )
+            .unwrap();
+        // 只 A 文件的 session s 两条，按 seq 升序。
+        assert_eq!(got.len(), 2, "只取 (A, s)，不串 (B, s) / (A, t)");
+        assert_eq!(got[0].content.as_deref(), Some("first"));
+        assert_eq!(got[1].content.as_deref(), Some("second"));
+        assert!(got[0].seq < got[1].seq, "按 seq 升序");
+
+        // 跨文件 replay 的同名 session 各自独立。
+        let from_b = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/b.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(from_b.len(), 1);
     }
 
     #[test]
