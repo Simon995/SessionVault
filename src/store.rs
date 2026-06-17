@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::rawevent::{EventType, RawEvent, SourceType};
@@ -25,6 +25,8 @@ use crate::rawevent::{EventType, RawEvent, SourceType};
 /// 总库错误。
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("serde: {0}")]
@@ -58,11 +60,17 @@ pub struct TotalStore {
 
 impl TotalStore {
     /// 打开（或新建）磁盘总库，WAL 模式，建表幂等。父目录自动创建。
+    ///
+    /// **隐私（明文 MVP）**：总库 `event_json` 含会话正文。unix 下把父目录设 `0700`、库文件设
+    /// `0600`——共享机器上其它账户不可读（WAL/SHM 在 `0700` 目录内同受保护）。Windows 下
+    /// `%LOCALAPPDATA%` 已是按用户隔离，依赖其 ACL。at-rest 加密见 ADR-027（后续）。
     pub fn open(path: &Path) -> StoreResult<Self> {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
+            restrict_permissions(parent, 0o700);
         }
         let conn = Connection::open(path)?;
+        restrict_permissions(path, 0o600);
         Self::from_conn(conn)
     }
 
@@ -89,7 +97,6 @@ impl TotalStore {
             CREATE TABLE IF NOT EXISTS raw_events (
                 offset            INTEGER PRIMARY KEY AUTOINCREMENT,
                 ingested_at       INTEGER NOT NULL,
-                dedup_key         TEXT    NOT NULL UNIQUE,
                 schema_version    INTEGER NOT NULL,
                 source_type       TEXT    NOT NULL,
                 source_location   TEXT    NOT NULL,
@@ -99,21 +106,34 @@ impl TotalStore {
                 event_type        TEXT    NOT NULL,
                 occurred_at       TEXT,
                 project_root      TEXT,
-                event_json        TEXT    NOT NULL
+                event_json        TEXT    NOT NULL,
+                -- 去重唯一键 = 五列复合（§7）。**不**拼成单个 `dedup_key` 串——可变字段里的
+                -- 分隔符会歧义碰撞（`/a|b`+`c` 撞 `/a`+`b|c`），UNIQUE 会误判重复静默丢事件。
+                UNIQUE (source_type, source_location, source_path, source_session_id, seq)
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
             CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
 
+            -- 墓碑带作用域：同一字符串值在不同维度（会话 vs 路径 vs 项目根）含义不同，
+            -- 不带 scope 会让删 project_root=/work 误连带隐藏 source_path=/work 的无关事件。
             CREATE TABLE IF NOT EXISTS tombstones (
-                key           TEXT    PRIMARY KEY,
-                tombstoned_at INTEGER NOT NULL
+                scope         TEXT    NOT NULL,
+                key           TEXT    NOT NULL,
+                tombstoned_at INTEGER NOT NULL,
+                PRIMARY KEY (scope, key)
+            );
+
+            -- 总库自身的元数据（回填/catch-up 状态等）。
+            CREATE TABLE IF NOT EXISTS store_meta (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL
             );
             "#,
         )?;
         Ok(())
     }
 
-    /// 批量追加事件。`INSERT OR IGNORE` 命中 `dedup_key` 唯一约束即跳过——**幂等**：
+    /// 批量追加事件。`INSERT OR IGNORE` 命中五列复合唯一约束即跳过——**幂等**：
     /// force 全量重扫时旧事件全 skip、增量只落新尾。单事务批量插。
     pub fn append_events(&self, events: &[RawEvent]) -> StoreResult<AppendStats> {
         let now = now_unix_secs();
@@ -124,16 +144,15 @@ impl TotalStore {
         {
             let mut stmt = tx.prepare(
                 r#"INSERT OR IGNORE INTO raw_events
-                     (ingested_at, dedup_key, schema_version, source_type, source_location,
+                     (ingested_at, schema_version, source_type, source_location,
                       source_path, source_session_id, seq, event_type, occurred_at,
                       project_root, event_json)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
             )?;
             for ev in events {
                 let json = serde_json::to_string(ev)?;
                 let changed = stmt.execute(params![
                     now,
-                    ev.dedup_key(),
                     ev.schema_version,
                     source_type_key(ev.source_type),
                     ev.source_location.as_key(),
@@ -161,8 +180,12 @@ impl TotalStore {
         })
     }
 
-    /// 读 `offset` 之后的事件（升序、最多 `limit` 条），跳过被墓碑标记的来源。
+    /// 读 `offset` 之后的事件（升序、最多 `limit` 条），跳过被**按作用域**墓碑标记的来源。
     /// 这是最小读 API——验证总库可读，亦是 P3-③ TumeFlow `pull --since` 的种子。
+    ///
+    /// **韧性**：单行 `event_json` 反序列化失败（损坏 / 未来不兼容 `schema_version`）只 **skip+warn**，
+    /// 不让整批 `read_since` 失败。跨版本升级 DTO（把旧 `schema_version` 行 up-convert 到当前）是
+    /// 首次破坏性 schema 升级前的前置工作（届时按 `schema_version` 分派解析），当前 v1 单版本不需要。
     pub fn read_since(&self, after_offset: i64, limit: usize) -> StoreResult<Vec<(i64, RawEvent)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -171,7 +194,9 @@ impl TotalStore {
                 WHERE r.offset > ?1
                   AND NOT EXISTS (
                       SELECT 1 FROM tombstones t
-                       WHERE t.key IN (r.source_session_id, r.source_path, r.project_root)
+                       WHERE (t.scope = 'session'      AND t.key = r.source_session_id)
+                          OR (t.scope = 'source_path'  AND t.key = r.source_path)
+                          OR (t.scope = 'project_root' AND t.key = r.project_root)
                   )
                 ORDER BY r.offset ASC
                 LIMIT ?2"#,
@@ -182,7 +207,13 @@ impl TotalStore {
         let mut out = Vec::new();
         for row in rows {
             let (offset, json) = row?;
-            out.push((offset, serde_json::from_str::<RawEvent>(&json)?));
+            match serde_json::from_str::<RawEvent>(&json) {
+                Ok(ev) => out.push((offset, ev)),
+                Err(e) => log::warn!(
+                    target: crate::logging::tag::SQLITE,
+                    "raw_events offset={offset} skipped (deserialize failed, likely schema drift): {e}"
+                ),
+            }
         }
         Ok(out)
     }
@@ -208,17 +239,78 @@ impl TotalStore {
         })
     }
 
-    /// 写一条墓碑（erase 传播脚手架）。`key` 可为 `source_session_id` / `source_path` /
-    /// `project_root`；`read_since` 据此跳过。全量 erase（跨分库 + crypto-shred）见 ADR-027，留后续。
-    pub fn tombstone(&self, key: &str) -> StoreResult<()> {
+    /// 写一条**带作用域**墓碑（erase 传播脚手架）。`scope ∈ {session, source_path, project_root}`，
+    /// `key` 是该维度下的值；`read_since` 按 scope 精确匹配跳过（避免跨维度误伤）。
+    /// 全量 erase（跨分库 + crypto-shred）见 ADR-027，留后续。
+    pub fn tombstone(&self, scope: TombstoneScope, key: &str) -> StoreResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO tombstones (key, tombstoned_at) VALUES (?1, ?2)",
-            params![key, now_unix_secs()],
+            "INSERT OR REPLACE INTO tombstones (scope, key, tombstoned_at) VALUES (?1, ?2, ?3)",
+            params![scope.as_str(), key, now_unix_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// 回填标志（写者侧 catch-up 用，见 QuotaBar `refresh_index`）：宿主据此判断总库是否已与
+    /// 索引一致。新建库默认 `false` → 宿主触发一次 force 全量回填；任一 append 失败时宿主 `set` 回
+    /// `false`，下轮再 force 重发（dedup 幂等补回丢失批）。
+    pub fn is_backfilled(&self) -> StoreResult<bool> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'backfilled'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.as_deref() == Some("1"))
+    }
+
+    /// 设置回填标志（`true` = 已与索引一致；`false` = 需下轮 force 回填/补偿）。
+    pub fn set_backfilled(&self, done: bool) -> StoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('backfilled', ?1)",
+            params![if done { "1" } else { "0" }],
         )?;
         Ok(())
     }
 }
+
+/// 墓碑作用域（`read_since` 按此精确匹配）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneScope {
+    Session,
+    SourcePath,
+    ProjectRoot,
+}
+
+impl TombstoneScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            TombstoneScope::Session => "session",
+            TombstoneScope::SourcePath => "source_path",
+            TombstoneScope::ProjectRoot => "project_root",
+        }
+    }
+}
+
+/// unix 下把路径权限收窄到 `mode`（目录 0700 / 文件 0600）；非 unix no-op（Windows 依赖
+/// `%LOCALAPPDATA%` 的按用户 ACL）。best-effort——设权限失败不致命（warn）。
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        log::warn!(
+            target: crate::logging::tag::SQLITE,
+            "set permissions {mode:o} on {} failed: {e}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path, _mode: u32) {}
 
 fn max_offset_on(conn: &Connection) -> StoreResult<i64> {
     Ok(
@@ -291,8 +383,14 @@ mod tests {
         }
     }
 
+    fn mk_event_at(seq: u64, session: &str, source_path: &str) -> RawEvent {
+        let mut ev = mk_event(seq, session, None);
+        ev.source_path = source_path.to_string();
+        ev
+    }
+
     #[test]
-    fn append_is_idempotent_by_dedup_key() {
+    fn append_is_idempotent_by_identity() {
         let store = TotalStore::open_in_memory().unwrap();
         let batch = vec![
             mk_event(0, "s1", Some("hello")),
@@ -306,6 +404,18 @@ mod tests {
         let again = store.append_events(&batch).unwrap();
         assert_eq!(again.appended, 0);
         assert_eq!(again.skipped_dup, 2);
+        assert_eq!(store.status().unwrap().count, 2);
+    }
+
+    #[test]
+    fn identity_uses_composite_key_not_ambiguous_concat() {
+        // 回归 [P1]：字符串拼接 `path|session|seq` 会让 (`/a|b`,`c`) 撞 (`/a`,`b|c`)，
+        // 静默丢一条。五列复合 UNIQUE 不歧义——两条都得保留。
+        let store = TotalStore::open_in_memory().unwrap();
+        let a = mk_event_at(0, "c", "/a|b");
+        let b = mk_event_at(0, "b|c", "/a");
+        let stats = store.append_events(&[a, b]).unwrap();
+        assert_eq!(stats.appended, 2, "含 `|` 的两条不同身份必须都入库（不碰撞）");
         assert_eq!(store.status().unwrap().count, 2);
     }
 
@@ -341,12 +451,42 @@ mod tests {
             .append_events(&[mk_event(0, "keep", None), mk_event(0, "drop", None)])
             .unwrap();
         assert_eq!(store.read_since(0, 100).unwrap().len(), 2);
-        store.tombstone("drop").unwrap();
+        store.tombstone(TombstoneScope::Session, "drop").unwrap();
         let visible = store.read_since(0, 100).unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].1.source_session_id, "keep");
         // 物理仍在（逻辑 append-only，墓碑只读时跳过）。
         assert_eq!(store.status().unwrap().count, 2);
+    }
+
+    #[test]
+    fn tombstone_scope_does_not_cross_dimensions() {
+        // 回归 [P2]：墓碑带 scope。session 名恰等于另一条的 project_root 值时，
+        // 删 project_root 不得连带隐藏 session（反之亦然）。
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut by_session = mk_event(0, "/work", None); // session_id 恰为 "/work"
+        by_session.project_root = Some("/other".to_string());
+        let mut by_project = mk_event(0, "sess-y", None);
+        by_project.project_root = Some("/work".to_string());
+        store.append_events(&[by_session, by_project]).unwrap();
+
+        // 只墓碑 project_root=/work → 只隐藏 by_project，不碰 session 名为 /work 的那条。
+        store
+            .tombstone(TombstoneScope::ProjectRoot, "/work")
+            .unwrap();
+        let visible = store.read_since(0, 100).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1.source_session_id, "/work", "session 维度不应被 project 墓碑误伤");
+    }
+
+    #[test]
+    fn backfilled_flag_defaults_false_and_round_trips() {
+        let store = TotalStore::open_in_memory().unwrap();
+        assert!(!store.is_backfilled().unwrap(), "新库默认未回填");
+        store.set_backfilled(true).unwrap();
+        assert!(store.is_backfilled().unwrap());
+        store.set_backfilled(false).unwrap();
+        assert!(!store.is_backfilled().unwrap(), "append 失败后可清回未回填");
     }
 
     #[test]

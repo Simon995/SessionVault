@@ -31,7 +31,7 @@ pub use rawevent::{
 };
 pub use report::ScanReport;
 #[cfg(feature = "store")]
-pub use store::{AppendStats, StoreStatus, TotalStore};
+pub use store::{AppendStats, StoreStatus, TombstoneScope, TotalStore};
 
 use thiserror::Error;
 
