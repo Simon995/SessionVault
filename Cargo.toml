@@ -6,7 +6,7 @@ edition = "2021"
 # 已实测 `cargo +1.85.0 check --all-targets` 通过；本 crate 自身代码不依赖 >1.85 的 API。
 rust-version = "1.85"
 description = "Shared ingestion kernel + immutable RawEvent contract for agent session data (QuotaBar / TumeFlow)"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/Simon995/SessionVault"
 readme = "README.md"
 
