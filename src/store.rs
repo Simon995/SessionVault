@@ -52,6 +52,18 @@ pub struct StoreStatus {
     pub last_ingested_at: Option<i64>,
 }
 
+/// [`TotalStore::read_session`] 的结果。`skipped > 0` = 有行反序列化失败被跳过，事件流**不完整**。
+///
+/// 为什么不直接静默返回 `Vec`：transcript 这类「正确性优先 + 有完整 live 回落」的消费者，宁可
+/// 回落 live JSONL 也不该展示缺气泡的半截 transcript——故把不完整性**显式暴露**给调用方决策，
+/// 而非降级成「看似成功的部分结果」。（`read_since` 走 pull 流则相反：单坏行不能中断整条增量同步，
+/// 所以那边内部 skip+warn；两个读 API 的策略按消费者需求分流。）
+#[derive(Debug, Clone, Default)]
+pub struct SessionRead {
+    pub events: Vec<RawEvent>,
+    pub skipped: usize,
+}
+
 /// 不可变 RawEvent 总库句柄。`.clone()` 不提供——单写者持有（ADR-020：同一时刻单写者）；
 /// 读者经只读连接或 WAL 并发读，不与写竞争。
 pub struct TotalStore {
@@ -223,14 +235,17 @@ impl TotalStore {
     /// 可跨文件 replay（Claude `--resume`），故必须连 `source_path` 一起 scope，不能只按 session_id
     /// 串话。供 QuotaBar transcript 从总库重建（不再重读 JSONL）。墓碑此处**不过滤**：transcript 是
     /// 宿主对自己已索引会话的展示，erase 语义作用于下游 pull（`read_since`），不该让某条墓碑令一张
-    /// 仍在列表里的卡片打不开。反序列化失败的行 skip+warn（同 `read_since` 韧性口径）。
+    /// 仍在列表里的卡片打不开。
+    ///
+    /// 反序列化失败的行 skip 但**计入 [`SessionRead::skipped`]**（不静默吞）——调用方据此判断
+    /// 事件流是否完整、是否回落 live（见 `SessionRead` 文档）。
     pub fn read_session(
         &self,
         source_type: SourceType,
         source_location: &SourceLocation,
         source_path: &str,
         session_id: &str,
-    ) -> StoreResult<Vec<RawEvent>> {
+    ) -> StoreResult<SessionRead> {
         let conn = self.conn.lock().unwrap();
         // 按 `seq`（文件内单调序号 = 气泡顺序）升序，**非** `offset`（append 顺序，乱序重扫时会偏）；
         // `offset` 作次序稳定 tiebreak。
@@ -252,18 +267,22 @@ impl TotalStore {
             ],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )?;
-        let mut out = Vec::new();
+        let mut events = Vec::new();
+        let mut skipped = 0usize;
         for row in rows {
             let (offset, json) = row?;
             match serde_json::from_str::<RawEvent>(&json) {
-                Ok(ev) => out.push(ev),
-                Err(e) => log::warn!(
-                    target: crate::logging::tag::SQLITE,
-                    "raw_events offset={offset} skipped (deserialize failed, likely schema drift): {e}"
-                ),
+                Ok(ev) => events.push(ev),
+                Err(e) => {
+                    skipped += 1;
+                    log::warn!(
+                        target: crate::logging::tag::SQLITE,
+                        "raw_events offset={offset} skipped (deserialize failed, likely schema drift): {e}"
+                    );
+                }
             }
         }
-        Ok(out)
+        Ok(SessionRead { events, skipped })
     }
 
     /// 总库状态（条数 / 最大 offset / 最近入库时间）。
@@ -459,11 +478,12 @@ mod tests {
                 "s",
             )
             .unwrap();
-        // 只 A 文件的 session s 两条，按 seq 升序。
-        assert_eq!(got.len(), 2, "只取 (A, s)，不串 (B, s) / (A, t)");
-        assert_eq!(got[0].content.as_deref(), Some("first"));
-        assert_eq!(got[1].content.as_deref(), Some("second"));
-        assert!(got[0].seq < got[1].seq, "按 seq 升序");
+        // 只 A 文件的 session s 两条，按 seq 升序，无跳过。
+        assert_eq!(got.events.len(), 2, "只取 (A, s)，不串 (B, s) / (A, t)");
+        assert_eq!(got.skipped, 0);
+        assert_eq!(got.events[0].content.as_deref(), Some("first"));
+        assert_eq!(got.events[1].content.as_deref(), Some("second"));
+        assert!(got.events[0].seq < got.events[1].seq, "按 seq 升序");
 
         // 跨文件 replay 的同名 session 各自独立。
         let from_b = store
@@ -474,7 +494,40 @@ mod tests {
                 "s",
             )
             .unwrap();
-        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_b.events.len(), 1);
+    }
+
+    #[test]
+    fn read_session_reports_skipped_on_corrupt_row() {
+        // 评审 [P2]：损坏的 event_json 行不得静默吞成「部分成功」——须计入 skipped，让 transcript
+        // 调用方据此回落 live（而非展示缺气泡的半截 transcript）。
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(&[mk_event(0, "s", Some("ok")), mk_event(1, "s", Some("also ok"))])
+            .unwrap();
+        // 直接往库里塞一行无法反序列化为 RawEvent 的 event_json（模拟损坏 / 未来不兼容 schema）。
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                r#"INSERT INTO raw_events
+                     (ingested_at, schema_version, source_type, source_location, source_path,
+                      source_session_id, seq, event_type, occurred_at, project_root, event_json)
+                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 's', 2, 'message',
+                           NULL, NULL, '{ not valid json for RawEvent }')"#,
+                [],
+            )
+            .unwrap();
+        }
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read.events.len(), 2, "好行仍取回");
+        assert_eq!(read.skipped, 1, "损坏行计入 skipped，不静默");
     }
 
     #[test]
