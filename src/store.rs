@@ -64,6 +64,29 @@ pub struct SessionRead {
     pub skipped: usize,
 }
 
+/// `raw_events` 表 DDL（建库 + 迁移共用）。唯一键含 `generation`：文件回退/重写时新代同 `seq`
+/// 事件不被旧代 dedup 挡掉、照样入库；`read_session` 取当前代，旧代留存（append-only 不可变）。
+const RAW_EVENTS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS raw_events (
+    offset            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ingested_at       INTEGER NOT NULL,
+    schema_version    INTEGER NOT NULL,
+    source_type       TEXT    NOT NULL,
+    source_location   TEXT    NOT NULL,
+    source_path       TEXT    NOT NULL,
+    source_session_id TEXT    NOT NULL,
+    seq               INTEGER NOT NULL,
+    generation        INTEGER NOT NULL DEFAULT 0,
+    event_type        TEXT    NOT NULL,
+    occurred_at       TEXT,
+    project_root      TEXT,
+    event_json        TEXT    NOT NULL,
+    UNIQUE (source_type, source_location, source_path, source_session_id, seq, generation)
+);
+CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
+CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
+"#;
+
 /// 不可变 RawEvent 总库句柄。`.clone()` 不提供——单写者持有（ADR-020：同一时刻单写者）；
 /// 读者经只读连接或 WAL 并发读，不与写竞争。
 pub struct TotalStore {
@@ -106,26 +129,6 @@ impl TotalStore {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS raw_events (
-                offset            INTEGER PRIMARY KEY AUTOINCREMENT,
-                ingested_at       INTEGER NOT NULL,
-                schema_version    INTEGER NOT NULL,
-                source_type       TEXT    NOT NULL,
-                source_location   TEXT    NOT NULL,
-                source_path       TEXT    NOT NULL,
-                source_session_id TEXT    NOT NULL,
-                seq               INTEGER NOT NULL,
-                event_type        TEXT    NOT NULL,
-                occurred_at       TEXT,
-                project_root      TEXT,
-                event_json        TEXT    NOT NULL,
-                -- 去重唯一键 = 五列复合（§7）。**不**拼成单个 `dedup_key` 串——可变字段里的
-                -- 分隔符会歧义碰撞（`/a|b`+`c` 撞 `/a`+`b|c`），UNIQUE 会误判重复静默丢事件。
-                UNIQUE (source_type, source_location, source_path, source_session_id, seq)
-            );
-            CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
-            CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
-
             -- 墓碑带作用域：同一字符串值在不同维度（会话 vs 路径 vs 项目根）含义不同，
             -- 不带 scope 会让删 project_root=/work 误连带隐藏 source_path=/work 的无关事件。
             CREATE TABLE IF NOT EXISTS tombstones (
@@ -134,7 +137,6 @@ impl TotalStore {
                 tombstoned_at INTEGER NOT NULL,
                 PRIMARY KEY (scope, key)
             );
-
             -- 总库自身的元数据（回填/catch-up 状态等）。
             CREATE TABLE IF NOT EXISTS store_meta (
                 k TEXT PRIMARY KEY,
@@ -142,14 +144,73 @@ impl TotalStore {
             );
             "#,
         )?;
+
+        let raw_exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_events'")?
+            .query_row([], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        let has_generation: bool = raw_exists
+            && conn
+                .prepare("SELECT 1 FROM pragma_table_info('raw_events') WHERE name='generation'")?
+                .query_row([], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+
+        if !raw_exists {
+            // 全新库：直接建带 generation 的表。
+            conn.execute_batch(RAW_EVENTS_DDL)?;
+        } else if !has_generation {
+            // 既有库（generation 之前的五列唯一）→ **保数据**重建为六列唯一（含 generation）。
+            // 文件回退/重写时，新代同 seq 事件不再被旧代 dedup 挡掉；老事件全归第 0 代。
+            // append-only 不可变性不破（旧代留存，TumeFlow pull 仍见全历史），read_session 取当前代。
+            conn.execute_batch(&format!(
+                r#"
+                ALTER TABLE raw_events RENAME TO raw_events_pre_gen;
+                {RAW_EVENTS_DDL}
+                INSERT INTO raw_events
+                    (offset, ingested_at, schema_version, source_type, source_location,
+                     source_path, source_session_id, seq, generation, event_type, occurred_at,
+                     project_root, event_json)
+                SELECT offset, ingested_at, schema_version, source_type, source_location,
+                       source_path, source_session_id, seq, 0, event_type, occurred_at,
+                       project_root, event_json
+                  FROM raw_events_pre_gen;
+                DROP TABLE raw_events_pre_gen;
+                "#
+            ))?;
+        }
         Ok(())
     }
 
-    /// 批量追加事件。`INSERT OR IGNORE` 命中五列复合唯一约束即跳过——**幂等**：
-    /// force 全量重扫时旧事件全 skip、增量只落新尾。单事务批量插。
-    pub fn append_events(&self, events: &[RawEvent]) -> StoreResult<AppendStats> {
+    /// 批量追加事件（一批 = 一个文件，所有事件共享 source_type/location/path）。
+    ///
+    /// **代（generation）**：常态用文件当前最大代（增量事件并入当前代，与既有事件一起被读）；
+    /// `is_rollback=true`（扫描器检测到截断/重写、从 `seq=0` 重建）则用 当前代+1 —— 新代事件
+    /// 因唯一键含 generation 而**不**被旧代同 seq 挡掉，照样入库；`read_session` 取当前代 →
+    /// 用户看到重写后的内容。旧代留存（append-only 不可变，TumeFlow pull 仍见全历史）。
+    ///
+    /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同代旧事件全 skip、增量只落新尾。
+    pub fn append_events(&self, events: &[RawEvent], is_rollback: bool) -> StoreResult<AppendStats> {
         let now = now_unix_secs();
         let mut conn = self.conn.lock().unwrap();
+        // 文件当前最大代（批内所有事件同文件，取第一条的 source 定位）。
+        let generation = match events.first() {
+            None => return Ok(AppendStats::default()),
+            Some(first) => {
+                let file_max: i64 = conn.query_row(
+                    "SELECT COALESCE(MAX(generation), 0) FROM raw_events
+                       WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3",
+                    params![
+                        source_type_key(first.source_type),
+                        first.source_location.as_key(),
+                        first.source_path,
+                    ],
+                    |r| r.get(0),
+                )?;
+                file_max + i64::from(is_rollback)
+            }
+        };
         let tx = conn.transaction()?;
         let mut appended = 0u64;
         let mut skipped_dup = 0u64;
@@ -157,9 +218,9 @@ impl TotalStore {
             let mut stmt = tx.prepare(
                 r#"INSERT OR IGNORE INTO raw_events
                      (ingested_at, schema_version, source_type, source_location,
-                      source_path, source_session_id, seq, event_type, occurred_at,
+                      source_path, source_session_id, seq, generation, event_type, occurred_at,
                       project_root, event_json)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
             )?;
             for ev in events {
                 let json = serde_json::to_string(ev)?;
@@ -171,6 +232,7 @@ impl TotalStore {
                     ev.source_path,
                     ev.source_session_id,
                     ev.seq as i64,
+                    generation,
                     event_type_key(ev.event_type),
                     ev.occurred_at,
                     ev.project_root,
@@ -247,16 +309,22 @@ impl TotalStore {
         session_id: &str,
     ) -> StoreResult<SessionRead> {
         let conn = self.conn.lock().unwrap();
-        // 按 `seq`（文件内单调序号 = 气泡顺序）升序，**非** `offset`（append 顺序，乱序重扫时会偏）；
-        // `offset` 作次序稳定 tiebreak。
+        // 只取文件**当前代**（per-file max generation）——回退/重写后旧代被新代取代。按 `seq`
+        // （文件内单调序号 = 气泡顺序）升序，`offset` 作稳定 tiebreak。
         let mut stmt = conn.prepare(
-            r#"SELECT offset, event_json
-                 FROM raw_events
-                WHERE source_type = ?1
-                  AND source_location = ?2
-                  AND source_path = ?3
-                  AND source_session_id = ?4
-                ORDER BY seq ASC, offset ASC"#,
+            r#"SELECT r.offset, r.event_json
+                 FROM raw_events r
+                WHERE r.source_type = ?1
+                  AND r.source_location = ?2
+                  AND r.source_path = ?3
+                  AND r.source_session_id = ?4
+                  AND r.generation = (
+                      SELECT COALESCE(MAX(generation), 0) FROM raw_events r2
+                       WHERE r2.source_type = ?1
+                         AND r2.source_location = ?2
+                         AND r2.source_path = ?3
+                  )
+                ORDER BY r.seq ASC, r.offset ASC"#,
         )?;
         let rows = stmt.query_map(
             params![
@@ -468,7 +536,7 @@ mod tests {
         // 文件 B 的同名 session "s"（--resume replay）+ 文件 A 的另一 session "t"。
         let b0 = mk_event_at(0, "s", "/b.jsonl");
         let t0 = mk_event_at(0, "t", "/a.jsonl");
-        store.append_events(&[a1, a0c, b0, t0]).unwrap();
+        store.append_events(&[a1, a0c, b0, t0], false).unwrap();
 
         let got = store
             .read_session(
@@ -503,7 +571,7 @@ mod tests {
         // 调用方据此回落 live（而非展示缺气泡的半截 transcript）。
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "s", Some("ok")), mk_event(1, "s", Some("also ok"))])
+            .append_events(&[mk_event(0, "s", Some("ok")), mk_event(1, "s", Some("also ok"))], false)
             .unwrap();
         // 直接往库里塞一行无法反序列化为 RawEvent 的 event_json（模拟损坏 / 未来不兼容 schema）。
         {
@@ -537,12 +605,12 @@ mod tests {
             mk_event(0, "s1", Some("hello")),
             mk_event(1, "s1", Some("world")),
         ];
-        let first = store.append_events(&batch).unwrap();
+        let first = store.append_events(&batch, false).unwrap();
         assert_eq!(first.appended, 2);
         assert_eq!(first.skipped_dup, 0);
 
         // 重放同批（force 重扫场景）→ 全部 dedup，count 不变。
-        let again = store.append_events(&batch).unwrap();
+        let again = store.append_events(&batch, false).unwrap();
         assert_eq!(again.appended, 0);
         assert_eq!(again.skipped_dup, 2);
         assert_eq!(store.status().unwrap().count, 2);
@@ -555,7 +623,7 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         let a = mk_event_at(0, "c", "/a|b");
         let b = mk_event_at(0, "b|c", "/a");
-        let stats = store.append_events(&[a, b]).unwrap();
+        let stats = store.append_events(&[a, b], false).unwrap();
         assert_eq!(stats.appended, 2, "含 `|` 的两条不同身份必须都入库（不碰撞）");
         assert_eq!(store.status().unwrap().count, 2);
     }
@@ -565,7 +633,7 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         for seq in 0..5u64 {
             store
-                .append_events(&[mk_event(seq, "s1", Some(&format!("m{seq}")))])
+                .append_events(&[mk_event(seq, "s1", Some(&format!("m{seq}")))], false)
                 .unwrap();
         }
         let all = store.read_since(0, 100).unwrap();
@@ -589,7 +657,7 @@ mod tests {
     fn tombstoned_source_is_skipped_on_read() {
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "keep", None), mk_event(0, "drop", None)])
+            .append_events(&[mk_event(0, "keep", None), mk_event(0, "drop", None)], false)
             .unwrap();
         assert_eq!(store.read_since(0, 100).unwrap().len(), 2);
         store.tombstone(TombstoneScope::Session, "drop").unwrap();
@@ -609,7 +677,7 @@ mod tests {
         by_session.project_root = Some("/other".to_string());
         let mut by_project = mk_event(0, "sess-y", None);
         by_project.project_root = Some("/work".to_string());
-        store.append_events(&[by_session, by_project]).unwrap();
+        store.append_events(&[by_session, by_project], false).unwrap();
 
         // 只墓碑 project_root=/work → 只隐藏 by_project，不碰 session 名为 /work 的那条。
         store
@@ -635,11 +703,124 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         assert_eq!(store.status().unwrap().count, 0);
         let stats = store
-            .append_events(&[mk_event(0, "s", None), mk_event(1, "s", None)])
+            .append_events(&[mk_event(0, "s", None), mk_event(1, "s", None)], false)
             .unwrap();
         let st = store.status().unwrap();
         assert_eq!(st.count, 2);
         assert_eq!(st.max_offset, stats.max_offset);
         assert!(st.last_ingested_at.is_some());
+    }
+
+    #[test]
+    fn rollback_supersedes_old_generation_in_read_session() {
+        // 评审 [P1]：文件回退（截断/重写）后，总库不能再展示旧内容。
+        let store = TotalStore::open_in_memory().unwrap();
+        // 第 0 代：原内容（seq 0/1）。
+        store
+            .append_events(
+                &[mk_event(0, "s", Some("old-0")), mk_event(1, "s", Some("old-1"))],
+                false,
+            )
+            .unwrap();
+        // 文件被重写 → 扫描器 is_rollback=true，新代同 seq 但不同内容。
+        let stats = store
+            .append_events(
+                &[mk_event(0, "s", Some("new-0")), mk_event(1, "s", Some("new-1"))],
+                true,
+            )
+            .unwrap();
+        assert_eq!(stats.appended, 2, "新代事件不被旧代 dedup 挡（唯一键含 generation）");
+
+        // read_session 只取当前代 → 重写后的内容，不是旧的。
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read.events.len(), 2);
+        assert_eq!(read.events[0].content.as_deref(), Some("new-0"));
+        assert_eq!(read.events[1].content.as_deref(), Some("new-1"));
+
+        // 旧代仍物理留存（append-only 不可变；TumeFlow pull 经 read_since 见全历史 4 条）。
+        assert_eq!(store.status().unwrap().count, 4);
+        assert_eq!(store.read_since(0, 100).unwrap().len(), 4);
+
+        // 再增量（非回退）→ 并入当前代，与新代一起读。
+        store
+            .append_events(&[mk_event(2, "s", Some("new-2"))], false)
+            .unwrap();
+        let read2 = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read2.events.len(), 3, "增量并入当前代");
+        assert_eq!(read2.events[2].content.as_deref(), Some("new-2"));
+    }
+
+    #[test]
+    fn migration_from_pre_generation_store_preserves_data() {
+        // 模拟 generation 之前的库（五列唯一、无 generation 列），open 时应保数据重建。
+        let dir = std::env::temp_dir().join(format!("sv_store_mig_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("total_store.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE raw_events (
+                    offset INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ingested_at INTEGER NOT NULL, schema_version INTEGER NOT NULL,
+                    source_type TEXT NOT NULL, source_location TEXT NOT NULL,
+                    source_path TEXT NOT NULL, source_session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL, event_type TEXT NOT NULL, occurred_at TEXT,
+                    project_root TEXT, event_json TEXT NOT NULL,
+                    UNIQUE (source_type, source_location, source_path, source_session_id, seq)
+                );
+                "#,
+            )
+            .unwrap();
+            let ev = mk_event(0, "s", Some("legacy"));
+            conn.execute(
+                r#"INSERT INTO raw_events (ingested_at, schema_version, source_type, source_location,
+                       source_path, source_session_id, seq, event_type, occurred_at, project_root, event_json)
+                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 's', 0, 'message', NULL, NULL, ?1)"#,
+                params![serde_json::to_string(&ev).unwrap()],
+            )
+            .unwrap();
+        }
+        // open → migrate 重建为含 generation 的六列唯一，数据保留。
+        let store = TotalStore::open(&path).unwrap();
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read.events.len(), 1, "迁移保留旧数据");
+        assert_eq!(read.events[0].content.as_deref(), Some("legacy"));
+        // 迁移后 generation 机制可用：回退取代。
+        store
+            .append_events(&[mk_event(0, "s", Some("rewritten"))], true)
+            .unwrap();
+        let read2 = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read2.events[0].content.as_deref(), Some("rewritten"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
