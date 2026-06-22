@@ -446,6 +446,37 @@ ScanReport {
 - **两条同步路径**：**增量**（日常拉 offset 之后的新事件，轻）/ **全量重建**（落后过多 / 版本升级 / 分库损坏 / 换钉版本时，从 offset 0 重物化）。总库不可变 → 重建恒为确定性结果，是增量的可靠底座。
 - **时间敏感**：记忆冲突裁决（latest-wins，如用户后来更新规则以最新为准）按事件 `occurred_at`，**不按入库顺序 / offset**；详见 `DECISIONS.md` ADR-020 时间语义。
 
+#### 13.2.1 具体命令：`svault pull --since`（P3-③，已落地生产侧）
+
+增量拉取的**跨语言入口**就是 `svault` CLI 的 `pull` 子命令（§12 子进程 + NDJSON 形态，`store` feature 门控）。它把 `TotalStore::read_since` 暴露成带 `offset` 的流，**只读**总库（QuotaBar 是默认写者），游标由调用方（TumeFlow）持久化——符合 §8「内核不落盘游标」与 §14「消费者负责游标」。
+
+```bash
+svault pull [--since <offset>] [--limit <N>] [--store <path>]
+```
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--since` | `0` | 只拉 offset **严格大于**此值的事件；首次全量同步传 `0`，之后传上轮 `last_offset`。 |
+| `--limit` | `0`（不限） | 本轮最多吐多少条，把大回填切成有界批次；`0` = 一次拉到追平总库尾。 |
+| `--store` | `<data_local_dir>/svault/total_store.db` | 总库路径，**与 QuotaBar 写者同址**（宿主集成时通常显式传）。 |
+
+**stdout NDJSON**（每行一对象，按 `kind` 分流）：
+
+```jsonc
+// 每条事件——offset 是消费者持久化的游标 token
+{"kind":"pulled","offset":42,"event":{ /* 整条 RawEvent */ }}
+// 收尾摘要——消费者据 last_offset 推进游标、据 caught_up 决定是否再拉
+{"kind":"pull_summary","since":10,"last_offset":42,"events":5,
+ "store_max_offset":42,"caught_up":true}
+```
+
+- **`offset` 单调递增**、墓碑事件（`erase`）在 `read_since` 内被跳过、不出流。
+- **`caught_up`**：`true` = 已读尽 `since` 之后的可读事件；`false` = 仅因 `--limit` 截断（还有），消费者应带新 `last_offset` 再拉一轮。
+- **退出码**：`0` 正常（含「无新事件」）；`1` 定位/打开/读取失败（库不存在 = 宿主还没扫过一轮）。
+- **坏行容忍**：单条 `event_json` 反序列化失败（schema drift）在 `read_since` 内 skip+warn，不中断整条增量同步（与 `read_session` 的「显式暴露 skipped」策略相反——pull 是流式同步、不能因一行断流）。
+
+> **消费侧（P3-③ 余下）⬜**：TumeFlow `sources/` adapter 子进程调本命令、解析流、持久化游标、物化进分库。生产侧契约已由本节 + bin 单测（`pull_ndjson_wire_shape_is_stable` 等）锁定。
+
 ### 13.3 为什么同时满足"新"和"稳"
 
 - QuotaBar 要新 → 总库一直最新，直接用。
@@ -546,7 +577,8 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
     （删 `parse_native` + `not(svault_index)` 分支 + ci.yml 原生回退步骤）。
 - **P3 🟡 进行中**：
   - **step① IO 委托 ✅**（QuotaBar 侧）：QuotaBar `refresh_index` 改调 `discover()`/`scan()`，删自管 read/游标，`scan()` 成其唯一 IO+解析路径。
-  - **P3-② 总库写入侧 🟡**：`src/store.rs`（`store` feature 门控 rusqlite）落地 `TotalStore`——append-only `raw_events`（`offset` AUTOINCREMENT 同步游标 / `ingested_at` / `dedup_key` UNIQUE 幂等 / `event_json` 整条 RawEvent + 投影索引列）+ `tombstones` 脚手架；`append_events`（`INSERT OR IGNORE` 幂等）/ `read_since`（pull 种子，跳过墓碑）/ `status`。QuotaBar 作默认写者，把 `scan()` 产出的 `RawEvent` 流 append 入库（MVP 明文正文）。**⬜ 待**：at-rest 加密（aes-gcm + keychain 分密钥 crypto-shred，ADR-027）、erase 全量传播、TumeFlow `pull --since` 消费（P3-③）。
+  - **P3-② 总库写入侧 🟡**：`src/store.rs`（`store` feature 门控 rusqlite）落地 `TotalStore`——append-only `raw_events`（`offset` AUTOINCREMENT 同步游标 / `ingested_at` / `dedup_key` UNIQUE 幂等 / `event_json` 整条 RawEvent + 投影索引列）+ `tombstones` 脚手架；`append_events`（`INSERT OR IGNORE` 幂等）/ `read_since`（pull 种子，跳过墓碑）/ `status`。QuotaBar 作默认写者，把 `scan()` 产出的 `RawEvent` 流 append 入库（MVP 明文正文）。**⬜ 待**：at-rest 加密（aes-gcm + keychain 分密钥 crypto-shred，ADR-027）、erase 全量传播。
+  - **P3-③ TumeFlow 消费 🟡**：**生产侧 ✅** —— `svault pull --since <offset> [--limit N] [--store <path>]` 子命令（`src/bin/svault.rs`，`store` feature 门控）把 `read_since` 暴露成带 `offset` 的 NDJSON 流 + `pull_summary`（`last_offset`/`caught_up`），契约见 §13.2.1、线外形由 bin 单测锁定（`pull_ndjson_wire_shape_is_stable` / `pull_since_filters…` / `pull_limit_caps…`）。**消费侧 ⬜** —— TumeFlow `sources/` adapter 子进程调它、持久化游标、物化分库。**这是解锁 TumeFlow 整条主线（摄取→Episode→Dream）的关键路径**。
   - **P3-④ ⬜**：transcript-from-RawEvent；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。

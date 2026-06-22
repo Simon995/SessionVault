@@ -64,6 +64,22 @@ pub struct SessionRead {
     pub skipped: usize,
 }
 
+/// [`TotalStore::read_since`] 的一页结果。
+///
+/// `max_scanned_offset` 是本页 SQL **实际返回**的最大 `offset`（无论该行是否反序列化成功），
+/// `None` = SQL 返回零行。pull 流消费者据此区分「真追平」与「整窗坏行」：`read_since` 在 SQL
+/// `LIMIT` **之后**才 skip 反序列化失败的行，故 `events` 为空**不**代表其后无更多行——一窗全是
+/// 坏行时 `events=[]` 但 `max_scanned_offset=Some(...)`。消费者必须把游标推进到
+/// `max_scanned_offset`（越过坏行），只在 `max_scanned_offset==None` 时才判定追平；否则坏行之后
+/// 的有效事件将**永久不可达**（评审 [P1]）。
+#[derive(Debug, Clone, Default)]
+pub struct ReadPage {
+    /// 成功反序列化的事件（坏行已 skip+warn）。
+    pub events: Vec<(i64, RawEvent)>,
+    /// 本页 SQL 扫描到的最大 offset（含坏行）；`None` = SQL 零行（真追平）。
+    pub max_scanned_offset: Option<i64>,
+}
+
 /// `raw_events` 表 DDL（建库 + 迁移共用）。唯一键含 `generation`：文件回退/重写时新代同 `seq`
 /// 事件不被旧代 dedup 挡掉、照样入库；`read_session` 取当前代，旧代留存（append-only 不可变）。
 const RAW_EVENTS_DDL: &str = r#"
@@ -255,12 +271,21 @@ impl TotalStore {
     }
 
     /// 读 `offset` 之后的事件（升序、最多 `limit` 条），跳过被**按作用域**墓碑标记的来源。
-    /// 这是最小读 API——验证总库可读，亦是 P3-③ TumeFlow `pull --since` 的种子。
+    /// 这是最小读 API——验证总库可读。**返回成功反序列化的事件**；需要「SQL 扫描进度」
+    /// （翻页越过坏行窗口）的 pull 流走 [`read_since_page`]。保持此签名向后兼容，QuotaBar
+    /// 既有调用方零改动。
+    pub fn read_since(&self, after_offset: i64, limit: usize) -> StoreResult<Vec<(i64, RawEvent)>> {
+        Ok(self.read_since_page(after_offset, limit)?.events)
+    }
+
+    /// [`read_since`] 的富返回版：除事件外还报告 `max_scanned_offset`（SQL 实际扫描到的最大
+    /// offset，含坏行）。P3-③ TumeFlow `pull --since` 的种子——`pull_stream` 据此推进游标
+    /// 越过**整窗坏行**，只在 SQL 零行时判追平（评审 [P1]；详见 [`ReadPage`]）。
     ///
     /// **韧性**：单行 `event_json` 反序列化失败（损坏 / 未来不兼容 `schema_version`）只 **skip+warn**，
-    /// 不让整批 `read_since` 失败。跨版本升级 DTO（把旧 `schema_version` 行 up-convert 到当前）是
-    /// 首次破坏性 schema 升级前的前置工作（届时按 `schema_version` 分派解析），当前 v1 单版本不需要。
-    pub fn read_since(&self, after_offset: i64, limit: usize) -> StoreResult<Vec<(i64, RawEvent)>> {
+    /// 不让整批失败。跨版本升级 DTO（把旧 `schema_version` 行 up-convert 到当前）是首次破坏性 schema
+    /// 升级前的前置工作（届时按 `schema_version` 分派解析），当前 v1 单版本不需要。
+    pub fn read_since_page(&self, after_offset: i64, limit: usize) -> StoreResult<ReadPage> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.event_json
@@ -279,8 +304,12 @@ impl TotalStore {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut out = Vec::new();
+        // 记录 SQL 实际扫描到的最大 offset（含坏行）——行按 offset ASC，故最后一行即最大。
+        // 即便整窗都反序列化失败，max_scanned 仍非 None，让 pull 流推进游标越过坏行窗口。
+        let mut max_scanned: Option<i64> = None;
         for row in rows {
             let (offset, json) = row?;
+            max_scanned = Some(offset);
             match serde_json::from_str::<RawEvent>(&json) {
                 Ok(ev) => out.push((offset, ev)),
                 Err(e) => log::warn!(
@@ -289,7 +318,10 @@ impl TotalStore {
                 ),
             }
         }
-        Ok(out)
+        Ok(ReadPage {
+            events: out,
+            max_scanned_offset: max_scanned,
+        })
     }
 
     /// 读单个 (file, session) 的全部事件（按 `seq` 升序 = 文件内事件顺序）。作用域**四列精确**：
@@ -596,6 +628,56 @@ mod tests {
             .unwrap();
         assert_eq!(read.events.len(), 2, "好行仍取回");
         assert_eq!(read.skipped, 1, "损坏行计入 skipped，不静默");
+    }
+
+    #[test]
+    fn read_since_page_reports_max_scanned_offset_across_a_bad_row_window() {
+        // 评审 [P1]：read_since_page 在 SQL LIMIT 之后才 skip 坏行，故一窗全坏时 events 为空，
+        // 但 max_scanned_offset 必须仍指向扫描到的最大 offset——否则 pull 流会把「整窗坏行」
+        // 误判成「追平」，坏行之后的有效事件永久不可达。
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(&[mk_event(0, "s", Some("good-0"))], false)
+            .unwrap();
+        // 直接塞两行坏 event_json（offset 紧随 good-0）。
+        {
+            let conn = store.conn.lock().unwrap();
+            for seq in 1..=2 {
+                conn.execute(
+                    r#"INSERT INTO raw_events
+                         (ingested_at, schema_version, source_type, source_location, source_path,
+                          source_session_id, seq, event_type, occurred_at, project_root, event_json)
+                       VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 's', ?1, 'message',
+                               NULL, NULL, '{ corrupt }')"#,
+                    params![seq],
+                )
+                .unwrap();
+            }
+        }
+        store
+            .append_events(&[mk_event(3, "s", Some("good-3"))], false)
+            .unwrap();
+
+        // good-0 在 offset 1；坏行在 offset 2、3；good-3 在 offset 4。
+        // 用 limit=2 的窗口，从 good-0 之后取 → 命中两条坏行：events 空、max_scanned=Some(3)。
+        let g0 = store.read_since_page(0, 1).unwrap();
+        assert_eq!(g0.events.len(), 1);
+        let after_g0 = g0.max_scanned_offset.unwrap();
+
+        let bad_window = store.read_since_page(after_g0, 2).unwrap();
+        assert!(bad_window.events.is_empty(), "整窗坏行 → events 空");
+        assert!(
+            bad_window.max_scanned_offset.is_some()
+                && bad_window.max_scanned_offset.unwrap() > after_g0,
+            "但 max_scanned_offset 仍推进，让消费者越过坏行"
+        );
+
+        // 从坏行窗口的 max_scanned 续读 → 拿到 good-3（证明坏行之后的事件可达）。
+        let after_bad = store
+            .read_since_page(bad_window.max_scanned_offset.unwrap(), 100)
+            .unwrap();
+        assert_eq!(after_bad.events.len(), 1);
+        assert_eq!(after_bad.events[0].1.content.as_deref(), Some("good-3"));
     }
 
     #[test]
