@@ -39,6 +39,21 @@ enum Command {
         #[arg(long)]
         stateless: bool,
     },
+    /// 从不可变总库增量拉取 `--since` offset 之后的 `RawEvent`（NDJSON），供 TumeFlow
+    /// 物化分库（P3-③ / §13.2）。**只读**总库（QuotaBar 是默认写者），游标由调用方持久化。
+    /// 需 `store` feature（rusqlite）；未启用时本子命令不存在（clap 报未知子命令）。
+    #[cfg(feature = "store")]
+    Pull {
+        /// 只拉 offset 严格大于此值的事件；首次全量同步传 `0`（默认）。
+        #[arg(long, default_value_t = 0)]
+        since: i64,
+        /// 本轮最多吐多少条事件（`0` = 不限，一次拉到追平总库尾）。用于把大回填切成有界批次。
+        #[arg(long, default_value_t = 0)]
+        limit: u64,
+        /// 总库路径（覆盖默认 `<data_local_dir>/svault/total_store.db`，与 QuotaBar 写者同址）。
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -69,9 +84,7 @@ enum Out<'a> {
         path: String,
     },
     /// scan 产出的一条归一化事件（TumeFlow 依赖的事件流契约）。
-    Event {
-        event: &'a RawEvent,
-    },
+    Event { event: &'a RawEvent },
     SourceReport {
         report: &'a session_vault::report::SourceReport,
     },
@@ -81,6 +94,26 @@ enum Out<'a> {
         /// 游标状态是否成功落盘：`Some(true/false)`；`None` = stateless（未持久化）。
         /// `false` 时进程以非 0 退出——下游据此知道本轮增量游标**未推进**，需重试或预期重复。
         state_saved: Option<bool>,
+    },
+    /// `pull` 产出的一条带 `offset` 的总库事件（P3-③）。`offset` 是消费者（TumeFlow）
+    /// 持久化的**游标 token**：下次 `pull --since <offset>` 从此续拉。比 `Event` 多 `offset`，
+    /// 因为增量同步靠 offset 定位，而 `scan` 的事件流靠各来源游标、无全局 offset。
+    #[cfg(feature = "store")]
+    Pulled { offset: i64, event: &'a RawEvent },
+    /// `pull` 收尾摘要。消费者据 `last_offset` 持久化游标、据 `caught_up` 判断是否已追平总库尾。
+    /// `caught_up=false` 仅因 `--limit` 截断（可能还有），消费者据此决定是否再拉一轮。
+    #[cfg(feature = "store")]
+    PullSummary {
+        /// 本轮请求的起点（回显入参）。
+        since: i64,
+        /// 本轮吐出的最大 offset（无事件时 = `since`）——消费者据此推进游标。
+        last_offset: i64,
+        /// 本轮吐出的事件条数。
+        events: u64,
+        /// 当前总库最大 offset（信息性：宿主可显示「落后多少」）。
+        store_max_offset: i64,
+        /// 是否已读尽 `since` 之后的可读事件（`false` = 被 `--limit` 截断，需再拉）。
+        caught_up: bool,
     },
 }
 
@@ -94,6 +127,12 @@ fn main() {
             state,
             stateless,
         } => run_scan_all(profile.into(), state, stateless),
+        #[cfg(feature = "store")]
+        Command::Pull {
+            since,
+            limit,
+            store,
+        } => run_pull(since, limit, store),
     };
     std::process::exit(code);
 }
@@ -105,9 +144,7 @@ fn init_logging() {
         .unwrap_or_else(|_| "info".to_string());
     env_logger::Builder::new()
         .parse_filters(&filter)
-        .format(|buf, record| {
-            writeln!(buf, "[{}] {}", record.target(), record.args())
-        })
+        .format(|buf, record| writeln!(buf, "[{}] {}", record.target(), record.args()))
         .target(env_logger::Target::Stderr)
         .init();
 }
@@ -154,7 +191,11 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
     };
 
     // 状态：source_key → Cursor。stateless 时为空 map 且不落盘（每次全量）。
-    let state_path = if stateless { None } else { resolve_state_path(state_arg) };
+    let state_path = if stateless {
+        None
+    } else {
+        resolve_state_path(state_arg)
+    };
     let mut cursors: HashMap<String, Cursor> = match &state_path {
         Some(p) => load_cursors(p),
         None => HashMap::new(),
@@ -170,7 +211,9 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
         for ev in &res.events {
             emit(&Out::Event { event: ev });
         }
-        emit(&Out::SourceReport { report: &res.report });
+        emit(&Out::SourceReport {
+            report: &res.report,
+        });
         // 更新游标（即便本轮无新增也写回，刷新 size/mtime）。
         cursors.insert(key, res.cursor_out);
     }
@@ -203,6 +246,127 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
     } else {
         0
     }
+}
+
+/// `pull`：从总库增量拉 `since` 之后的事件，流式吐 NDJSON，收尾报摘要。
+///
+/// 退出码：`0` 正常（含「无新事件」）；`1` 定位/打开/读取失败。游标推进是**调用方**的事
+/// （持久化 `last_offset` 作下次 `--since`）——本命令无状态、只读，符合 §8「内核不落盘游标」。
+#[cfg(feature = "store")]
+fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
+    let store_path = match resolve_store_path(store_arg) {
+        Some(p) => p,
+        None => {
+            log::error!(
+                target: tag::CLI,
+                "no data_local_dir; pass --store to locate the total store"
+            );
+            return 1;
+        }
+    };
+    // 库不存在 = 宿主还没扫过一轮（写者尚未建库）。明确报错而非静默吐空，便于排查。
+    if !store_path.exists() {
+        log::error!(
+            target: tag::CLI,
+            "total store not found: path={} (host writes it on first scan)",
+            store_path.display()
+        );
+        return 1;
+    }
+    let store = match session_vault::TotalStore::open(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: path={} err={e}", store_path.display());
+            return 1;
+        }
+    };
+    let store_max_offset = match store.status() {
+        Ok(s) => s.max_offset,
+        Err(e) => {
+            log::error!(target: tag::CLI, "store status failed: {e}");
+            return 1;
+        }
+    };
+
+    let mut events = 0u64;
+    let mut last_offset = since;
+    let pulled = pull_stream(&store, since, limit, |offset, ev| {
+        emit(&Out::Pulled { offset, event: ev });
+        last_offset = offset;
+        events += 1;
+    });
+    let caught_up = match pulled {
+        Ok(hit_limit) => !hit_limit,
+        Err(e) => {
+            log::error!(target: tag::CLI, "pull read failed: {e}");
+            return 1;
+        }
+    };
+
+    emit(&Out::PullSummary {
+        since,
+        last_offset,
+        events,
+        store_max_offset,
+        caught_up,
+    });
+    log::info!(
+        target: tag::CLI,
+        "pull done: since={since} last_offset={last_offset} events={events} caught_up={caught_up}"
+    );
+    0
+}
+
+/// `pull` 的可测核心：循环 `read_since` 翻页，逐条回调 `on_event(offset, event)`。
+///
+/// 返回 `Ok(true)` = 被 `limit` 截断（可能还有，调用方应再拉）；`Ok(false)` = 读尽
+/// `since` 之后的可读事件（已追平）。
+///
+/// **翻页只以「空批」为终止条件，不以「半批」**：`read_since` 的 `LIMIT` 作用在 SQL 层、
+/// 在 deserialize-skip **之前**，故一窗内若有坏行（schema drift）会返回少于请求数的行——
+/// 此时不能误判为到尾，须推进游标到本批最大 offset 后继续，否则会漏掉坏行之后的好事件。
+/// 仅当某窗 `read_since` 返回空（其后无任何可读事件）才停止。游标每轮严格增（offset 单调），
+/// 必然终止。（退化角标：连续整窗皆坏行才可能卡住，schema drift 下极罕见。）
+#[cfg(feature = "store")]
+fn pull_stream(
+    store: &session_vault::TotalStore,
+    since: i64,
+    limit: u64,
+    mut on_event: impl FnMut(i64, &RawEvent),
+) -> Result<bool, session_vault::store::StoreError> {
+    const BATCH: usize = 1000;
+    let mut cursor = since;
+    let mut emitted = 0u64;
+    loop {
+        let want = if limit == 0 {
+            BATCH
+        } else {
+            let remaining = limit - emitted;
+            if remaining == 0 {
+                return Ok(true); // 被 limit 截断
+            }
+            (remaining as usize).min(BATCH)
+        };
+        let rows = store.read_since(cursor, want)?;
+        if rows.is_empty() {
+            return Ok(false); // 读尽，已追平
+        }
+        for (offset, ev) in &rows {
+            on_event(*offset, ev);
+            cursor = *offset;
+            emitted += 1;
+        }
+    }
+}
+
+/// 解析总库路径：`--store` 优先，否则 `<data_local_dir>/svault/total_store.db`
+/// （与 QuotaBar 写者 `main.rs` 同址）。无法确定数据目录时返回 `None`。
+#[cfg(feature = "store")]
+fn resolve_store_path(arg: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(p) = arg {
+        return Some(p);
+    }
+    dirs_next::data_local_dir().map(|d| d.join("svault").join("total_store.db"))
 }
 
 /// 来源的稳定身份键（跨运行定位游标）：`<type>|<location>|<path>`。
@@ -265,4 +429,148 @@ fn save_cursors(path: &std::path::Path, cursors: &HashMap<String, Cursor>) -> st
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "store"))]
+mod tests {
+    use super::*;
+    use session_vault::rawevent::{Actor, EventType, TimeConfidence, TokenUsage, SCHEMA_VERSION};
+    use session_vault::TotalStore;
+
+    fn mk_event(seq: u64, session: &str) -> RawEvent {
+        RawEvent {
+            schema_version: SCHEMA_VERSION,
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+            source_session_id: session.to_string(),
+            seq,
+            source_mode: SourceMode::AppendLog,
+            cwd: Some("/work".to_string()),
+            project_root: Some("/work".to_string()),
+            project_root_source: Some("cwd".to_string()),
+            workspace_location: Some("local".to_string()),
+            event_type: EventType::Message,
+            actor: Some(Actor::User),
+            occurred_at: Some("2026-06-01T10:00:00Z".to_string()),
+            time_confidence: TimeConfidence::High,
+            model: None,
+            effort: None,
+            usage: Some(TokenUsage::default()),
+            content: Some(format!("c{seq}")),
+            parent_ref: None,
+            message_id: None,
+            request_id: None,
+        }
+    }
+
+    /// 收集 `pull_stream` 的回调到 `(offset, RawEvent)` 列表，便于断言。
+    fn collect(store: &TotalStore, since: i64, limit: u64) -> (Vec<(i64, RawEvent)>, bool) {
+        let mut out = Vec::new();
+        let hit_limit = pull_stream(store, since, limit, |offset, ev| {
+            out.push((offset, ev.clone()));
+        })
+        .unwrap();
+        (out, hit_limit)
+    }
+
+    #[test]
+    fn pull_since_filters_and_offsets_are_monotonic() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(
+                &[mk_event(0, "s"), mk_event(1, "s"), mk_event(2, "s")],
+                false,
+            )
+            .unwrap();
+
+        // since=0：拉全部 3 条，offset 严格递增。
+        let (all, caught) = collect(&store, 0, 0);
+        assert_eq!(all.len(), 3, "since=0 拉全部");
+        assert!(!caught, "limit=0 读尽 → hit_limit=false（已追平）");
+        assert!(
+            all[0].0 < all[1].0 && all[1].0 < all[2].0,
+            "offset 单调递增"
+        );
+        assert_eq!(all[0].1.content.as_deref(), Some("c0"));
+
+        // since=第 1 条的 offset：只拉其后的 2 条（严格大于，不含等于）。
+        let after_first = all[0].0;
+        let (rest, _) = collect(&store, after_first, 0);
+        assert_eq!(rest.len(), 2, "since=offset0 → 只剩 c1/c2");
+        assert_eq!(rest[0].1.content.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn pull_limit_caps_batch_and_reports_hit_limit() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(
+                &[
+                    mk_event(0, "s"),
+                    mk_event(1, "s"),
+                    mk_event(2, "s"),
+                    mk_event(3, "s"),
+                ],
+                false,
+            )
+            .unwrap();
+
+        // limit=2：只吐前 2 条，hit_limit=true（可能还有，调用方据此再拉）。
+        let (first, caught) = collect(&store, 0, 2);
+        assert_eq!(first.len(), 2);
+        assert!(caught, "被 limit 截断 → caught_up=false");
+
+        // 从上一轮 last_offset 续拉，把剩下的拉完。
+        let next_since = first.last().unwrap().0;
+        let (second, caught2) = collect(&store, next_since, 2);
+        assert_eq!(second.len(), 2, "续拉剩余 2 条");
+        assert!(
+            caught2,
+            "恰好 limit=2 取完 4 条中后 2 条 → 仍报截断（下一轮空确认追平）"
+        );
+
+        // 再拉一轮 → 空，确认追平。
+        let (third, caught3) = collect(&store, second.last().unwrap().0, 2);
+        assert!(third.is_empty());
+        assert!(!caught3, "空批 → 已追平");
+    }
+
+    #[test]
+    fn pull_empty_store_is_caught_up_immediately() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let (out, caught) = collect(&store, 0, 0);
+        assert!(out.is_empty());
+        assert!(!caught, "空库即追平");
+    }
+
+    /// 锁定 NDJSON 线契约：TumeFlow（P3-③ 消费侧）按 `kind` 分流并读这些字段名，
+    /// 改名 = 破坏跨语言契约，故用断言钉死 `pulled` / `pull_summary` 的外形。
+    #[test]
+    fn pull_ndjson_wire_shape_is_stable() {
+        let ev = mk_event(0, "s");
+        let pulled = serde_json::to_value(Out::Pulled {
+            offset: 42,
+            event: &ev,
+        })
+        .unwrap();
+        assert_eq!(pulled["kind"], "pulled");
+        assert_eq!(pulled["offset"], 42);
+        assert_eq!(pulled["event"]["source_session_id"], "s");
+
+        let summary = serde_json::to_value(Out::PullSummary {
+            since: 10,
+            last_offset: 42,
+            events: 5,
+            store_max_offset: 42,
+            caught_up: true,
+        })
+        .unwrap();
+        assert_eq!(summary["kind"], "pull_summary");
+        assert_eq!(summary["since"], 10);
+        assert_eq!(summary["last_offset"], 42);
+        assert_eq!(summary["events"], 5);
+        assert_eq!(summary["store_max_offset"], 42);
+        assert_eq!(summary["caught_up"], true);
+    }
 }
