@@ -290,11 +290,16 @@ fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
 
     let mut events = 0u64;
     let mut last_offset = since;
-    let pulled = pull_stream(&store, since, limit, |offset, ev| {
-        emit(&Out::Pulled { offset, event: ev });
-        last_offset = offset;
-        events += 1;
-    });
+    let pulled = pull_stream(
+        |cursor, want| store.read_since_page(cursor, want),
+        since,
+        limit,
+        |offset, ev| {
+            emit(&Out::Pulled { offset, event: ev });
+            last_offset = offset;
+            events += 1;
+        },
+    );
     let caught_up = match pulled {
         Ok(hit_limit) => !hit_limit,
         Err(e) => {
@@ -317,44 +322,49 @@ fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
     0
 }
 
-/// `pull` 的可测核心：循环 `read_since` 翻页，逐条回调 `on_event(offset, event)`。
+/// `pull` 的可测核心：循环翻页（`read_page(cursor, want)` 注入，便于脱库单测），逐条回调
+/// `on_event(offset, event)`。
 ///
 /// 返回 `Ok(true)` = 被 `limit` 截断（可能还有，调用方应再拉）；`Ok(false)` = 读尽
 /// `since` 之后的可读事件（已追平）。
 ///
-/// **翻页只以「空批」为终止条件，不以「半批」**：`read_since` 的 `LIMIT` 作用在 SQL 层、
-/// 在 deserialize-skip **之前**，故一窗内若有坏行（schema drift）会返回少于请求数的行——
-/// 此时不能误判为到尾，须推进游标到本批最大 offset 后继续，否则会漏掉坏行之后的好事件。
-/// 仅当某窗 `read_since` 返回空（其后无任何可读事件）才停止。游标每轮严格增（offset 单调），
-/// 必然终止。（退化角标：连续整窗皆坏行才可能卡住，schema drift 下极罕见。）
+/// **追平判定只认 `max_scanned_offset==None`（SQL 零行），不认 `events` 空**（评审 [P1]）：
+/// `read_since` 在 SQL `LIMIT` **之后**才 skip 反序列化失败的行，故一窗全是坏行（schema drift）
+/// 时 `events=[]` 但 `max_scanned_offset=Some(...)`——若把它当追平，坏行之后的有效事件将
+/// **永久不可达**。因此每轮把游标推进到 `max_scanned_offset`（越过坏行）而非最后一条**好**事件的
+/// offset。`read_since` 只返 `offset>cursor` 的行 → `max_scanned>cursor` → 游标严格增 → 必然终止。
 #[cfg(feature = "store")]
-fn pull_stream(
-    store: &session_vault::TotalStore,
+fn pull_stream<F>(
+    mut read_page: F,
     since: i64,
     limit: u64,
     mut on_event: impl FnMut(i64, &RawEvent),
-) -> Result<bool, session_vault::store::StoreError> {
+) -> Result<bool, session_vault::store::StoreError>
+where
+    F: FnMut(i64, usize) -> Result<session_vault::ReadPage, session_vault::store::StoreError>,
+{
     const BATCH: usize = 1000;
     let mut cursor = since;
     let mut emitted = 0u64;
     loop {
+        if limit != 0 && emitted >= limit {
+            return Ok(true); // 已吐满 limit，可能还有 → 调用方据 caught_up=false 再拉
+        }
         let want = if limit == 0 {
             BATCH
         } else {
-            let remaining = limit - emitted;
-            if remaining == 0 {
-                return Ok(true); // 被 limit 截断
-            }
-            (remaining as usize).min(BATCH)
+            ((limit - emitted) as usize).min(BATCH)
         };
-        let rows = store.read_since(cursor, want)?;
-        if rows.is_empty() {
-            return Ok(false); // 读尽，已追平
-        }
-        for (offset, ev) in &rows {
-            on_event(*offset, ev);
-            cursor = *offset;
-            emitted += 1;
+        let page = read_page(cursor, want)?;
+        match page.max_scanned_offset {
+            None => return Ok(false), // SQL 零行 → 真追平
+            Some(max) => {
+                for (offset, ev) in &page.events {
+                    on_event(*offset, ev);
+                    emitted += 1;
+                }
+                cursor = max; // 推进到扫描到的最大 offset（越过整窗坏行）
+            }
         }
     }
 }
@@ -467,11 +477,55 @@ mod tests {
     /// 收集 `pull_stream` 的回调到 `(offset, RawEvent)` 列表，便于断言。
     fn collect(store: &TotalStore, since: i64, limit: u64) -> (Vec<(i64, RawEvent)>, bool) {
         let mut out = Vec::new();
-        let hit_limit = pull_stream(store, since, limit, |offset, ev| {
-            out.push((offset, ev.clone()));
-        })
+        let hit_limit = pull_stream(
+            |cursor, want| store.read_since_page(cursor, want),
+            since,
+            limit,
+            |offset, ev| out.push((offset, ev.clone())),
+        )
         .unwrap();
         (out, hit_limit)
+    }
+
+    #[test]
+    fn pull_advances_past_all_bad_row_window() {
+        // 评审 [P1]：一窗全是坏行时 read_since 返回 events=[] 但 max_scanned_offset=Some(_)。
+        // pull_stream 必须据 max_scanned 推进游标越过坏行，最终拉到坏行之后的好事件——
+        // 不能把空 events 误判成追平。用注入式 pager 精确复现该场景（不依赖真库注坏行）。
+        use session_vault::ReadPage;
+        let pages = vec![
+            // 窗口1：两条好事件（offset 1、2）。
+            ReadPage {
+                events: vec![(1, mk_event(0, "s")), (2, mk_event(1, "s"))],
+                max_scanned_offset: Some(2),
+            },
+            // 窗口2：整窗坏行 → events 空，但扫描到了 offset 4。
+            ReadPage {
+                events: vec![],
+                max_scanned_offset: Some(4),
+            },
+            // 窗口3：坏行之后的好事件（offset 5）。
+            ReadPage {
+                events: vec![(5, mk_event(2, "s"))],
+                max_scanned_offset: Some(5),
+            },
+            // 窗口4：SQL 零行 → 真追平。
+            ReadPage {
+                events: vec![],
+                max_scanned_offset: None,
+            },
+        ];
+        let mut it = pages.into_iter();
+        let mut got: Vec<i64> = Vec::new();
+        let hit_limit = pull_stream(
+            |_cursor, _want| Ok(it.next().expect("pager called more than expected")),
+            0,
+            0,
+            |offset, _ev| got.push(offset),
+        )
+        .unwrap();
+        assert_eq!(got, vec![1, 2, 5], "必须越过坏行窗口拉到 offset 5");
+        assert!(!hit_limit, "最终 SQL 零行 → 追平（caught_up=true）");
     }
 
     #[test]
