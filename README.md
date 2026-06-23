@@ -5,9 +5,12 @@
 > 这件最容易踩坑的事，**只实现一次**。
 
 状态：摄取核心已落地（P0 ✅ / P1 ✅ —— 本地 + WSL 双位置摄取、游标持久化端到端实测）；
-P2 绞杀者迁移 **step 1 ✅**（冻结 QuotaBar 黄金基线 + `parity` diff 工具，**首测 9134 条 usage
-must-match=0**）；总库（P3）待启动。
-最后更新：2026-06-14
+P2 绞杀者迁移 **step 1-4 ✅，切换完成、soak 中**（QuotaBar 已改用共享扫描器，闸门 = 原生 vs
+svault 构建 diff `cache.db` 一致后删旧路径；首测 9134 条 usage must-match=0）；**P3 🟡**：
+总库写入侧 `TotalStore` 已落地（QuotaBar 作默认写者，随 QuotaBar 0.8.0-beta.8 发布 soak），
+TumeFlow `svault pull --since` 消费拉取环已通。待办 = P2 soak 删旧路径 + P3-③ 物化环
+（RawEvent→Episode）+ at-rest 加密 / erase。
+最后更新：2026-06-23
 
 ---
 
@@ -34,7 +37,7 @@ must-match=0**）；总库（P3）待启动。
 | `cursor` | 多形态游标（字节偏移 + Codex 状态 + `next_seq`） | ✅ append_log |
 | `svault` CLI | `discover` / `scan-all`（NDJSON 出 stdout），跨运行游标持久化 | ✅ |
 | `parity` 工具 | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0 |
-| 总库（持久化输出库） | append-only RawEvent 库 | ⬜ 规划（P3） |
+| 总库（持久化输出库） | append-only RawEvent 库 | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak） |
 | snapshot_file / sqlite_store / 其它 provider | 契约预留 | ⬜ `planned` |
 
 **实机实测（2026-06-14，真实本机数据）**：48 来源（19 local + 29 WSL）→ 23373 事件
@@ -54,10 +57,13 @@ must-match=0**）；总库（P3）待启动。
 | **扫描报告** | 内核无头，但每轮产出结构化 `SourceReport`，由宿主（QuotaBar / TumeFlow）渲染 GUI。 |
 | **黄金 fixture** | tricky case 做成样例输入 + 期望输出，消费者升级内核前必须全绿——"坑只有一处"的物理保证。 |
 
-## 总库 / 分库（规划，P3）
+## 总库 / 分库（P3 🟡）
 
-内核之上将提供一个可选持久化组件——共享 **RawEvent 总库**（"Vault" 即指这个永不删、不可变的库）。
-**当前尚未落地**：`svault scan-all` 现把 `RawEvent` 以 NDJSON 吐到 stdout，由消费者接走。
+内核之上提供一个可选持久化组件——共享 **RawEvent 总库**（"Vault" 即指这个永不删、不可变的库）。
+**写入侧（P3-②）已落地**：QuotaBar 作默认写者把扫描出的 `RawEvent` append 进 `TotalStore`
+（随 QuotaBar 0.8.0-beta.8 发布 soak）；TumeFlow 经 `svault pull --since` 增量消费的拉取环（P3-③）
+已通。`svault scan-all` 仍把 `RawEvent` 以 NDJSON 吐到 stdout，供无总库的消费者直接接走。
+待办：P3-③ 物化环（RawEvent→Episode）+ at-rest 加密 / erase。
 
 - **总库（活、最新、中立）**：只存 `RawEvent`，append-only 不可变，**默认永不删 / 不压缩 / 不过期**
   （用户主动删除是一等操作，见 TumeFlow ADR-027）；以 `full` 物化（含正文）；QuotaBar 常驻当默认写者。
@@ -92,11 +98,13 @@ SessionVault **不从零写**，而是**抽取 QuotaBar 已实机验证的扫描
 - **P1 ✅** crate 抽取过语料：本地 + WSL × Claude + Codex 发现/解析/归一化、宿主感知路径规范化、
   WSL 访问桥、跨运行游标持久化——全部实机实测（`session_index.rs` / `jsonl_cache.rs` /
   `providers/{claude,codex}.rs` / `wsl/mod.rs` / `paths.rs` 对应能力已抽取）
-- **P2 🟡 进行中** 绞杀者 **step 1 ✅**：冻结 QuotaBar `cache.db` 黄金基线 + 对账契约
-  （[docs/parity-contract.md](docs/parity-contract.md)）+ `parity` diff 工具，**首测 9134 条 usage
-  must-match=0**（计费字段字节级一致，含 Codex 累计 token）。**待办** step 2–4：QuotaBar 改用共享扫描器 →
-  影子并跑 diff `cache.db` 一致才切（feature flag，留回退）
-- **P3 ⬜** 总库作为输出打开，TumeFlow 开始消费
+- **P2 🟡 step 1-4 ✅，切换完成、soak 中** 绞杀者迁移：冻结 QuotaBar `cache.db` 黄金基线 + 对账契约
+  （[docs/parity-contract.md](docs/parity-contract.md)）+ `parity` diff 工具（**首测 9134 条 usage
+  must-match=0**，计费字段字节级一致，含 Codex 累计 token）→ QuotaBar 已改用共享扫描器、影子并跑
+  diff `cache.db` 一致后切换（feature flag，留回退）。**待办**：soak 收尾删旧路径
+- **P3 🟡 写入侧已落地、消费拉取环已通** 总库 `TotalStore`（QuotaBar 默认写者，随 0.8.0-beta.8 soak）+
+  TumeFlow `svault pull --since` 增量消费已端到端实测。**待办**：P3-③ 物化环（RawEvent→Episode）+
+  at-rest 加密 / erase（ADR-027）
 
 ## 构建
 
