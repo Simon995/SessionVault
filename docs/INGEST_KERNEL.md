@@ -2,7 +2,7 @@
 
 状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移 step 1-3 ✅、**step 4 切换完成、soak 中**
 （QuotaBar 已翻默认 `svault_index`，`parse_native` 留作回退；CI 三配置全绿；见 §15 与
-[parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；**P3 🟡**：总库写入侧 `TotalStore` 已落地（QuotaBar 默认写者，随 QuotaBar 0.8.0-beta.8 soak）+ TumeFlow `svault pull --since` 消费拉取环已通；待办 = P3-③ 物化环（RawEvent→Episode）+ at-rest 加密 / erase
+[parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；**P3 🟡**：总库写入侧 `TotalStore` 已落地（QuotaBar 默认写者，随 QuotaBar 0.8.0-beta.8 soak）+ TumeFlow `svault pull --since` 消费拉取环已通；待办 = at-rest 加密 / erase（P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，见 TumeFlow ROADMAP Phase 2）
 最后更新：2026-06-23
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
@@ -475,7 +475,7 @@ svault pull [--since <offset>] [--limit <N>] [--store <path>]
 - **退出码**：`0` 正常（含「无新事件」）；`1` 定位/打开/读取失败（库不存在 = 宿主还没扫过一轮）。
 - **坏行容忍**：单条 `event_json` 反序列化失败（schema drift）在 `read_since` 内 skip+warn，不中断整条增量同步（与 `read_session` 的「显式暴露 skipped」策略相反——pull 是流式同步、不能因一行断流）。
 
-> **消费侧（P3-③）🟡**：拉取环已通——TumeFlow `sources/svault.py` 子进程调本命令、解析 NDJSON 流、持久化游标（端到端实测，含 CJK 正文 + WSL location + 增量）。**余下 ⬜**：物化进分库（RawEvent→Episode）。生产侧契约已由本节 + bin 单测（`pull_ndjson_wire_shape_is_stable` 等）锁定。
+> **消费侧（P3-③）🟡**：拉取环已通——TumeFlow `sources/svault.py` 子进程调本命令、解析 NDJSON 流、持久化游标（端到端实测，含 CJK 正文 + WSL location + 增量）。**下游物化进分库（RawEvent→Episode）在 TumeFlow 侧、已落地**（`tumeflow/materialize/episode.py` + 候选提取，见 TumeFlow ROADMAP Phase 2）——非 SessionVault 待办。生产侧契约已由本节 + bin 单测（`pull_ndjson_wire_shape_is_stable` 等）锁定。
 
 ### 13.3 为什么同时满足"新"和"稳"
 
@@ -578,7 +578,7 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 - **P3 🟡 进行中**：
   - **step① IO 委托 ✅**（QuotaBar 侧）：QuotaBar `refresh_index` 改调 `discover()`/`scan()`，删自管 read/游标，`scan()` 成其唯一 IO+解析路径。
   - **P3-② 总库写入侧 🟡**：`src/store.rs`（`store` feature 门控 rusqlite）落地 `TotalStore`——append-only `raw_events`（`offset` AUTOINCREMENT 同步游标 / `ingested_at` / `dedup_key` UNIQUE 幂等 / `event_json` 整条 RawEvent + 投影索引列）+ `tombstones` 脚手架；`append_events`（`INSERT OR IGNORE` 幂等）/ `read_since`（pull 种子，跳过墓碑）/ `status`。QuotaBar 作默认写者，把 `scan()` 产出的 `RawEvent` 流 append 入库（MVP 明文正文）。**⬜ 待**：at-rest 加密（aes-gcm + keychain 分密钥 crypto-shred，ADR-027）、erase 全量传播。
-  - **P3-③ TumeFlow 消费 🟡**：**生产侧 ✅** —— `svault pull --since <offset> [--limit N] [--store <path>]` 子命令（`src/bin/svault.rs`，`store` feature 门控）把 `read_since` 暴露成带 `offset` 的 NDJSON 流 + `pull_summary`（`last_offset`/`caught_up`），契约见 §13.2.1、线外形由 bin 单测锁定（`pull_ndjson_wire_shape_is_stable` / `pull_since_filters…` / `pull_limit_caps…`）。**消费侧拉取环 ✅** —— TumeFlow `sources/svault.py` 子进程调它、解析流、持久化游标（端到端实测，含 CJK 正文 + WSL location + 增量）；**余下 ⬜** 物化分库（RawEvent→Episode）。**这是解锁 TumeFlow 整条主线（摄取→Episode→Dream）的关键路径**。
+  - **P3-③ TumeFlow 消费 🟡**：**生产侧 ✅** —— `svault pull --since <offset> [--limit N] [--store <path>]` 子命令（`src/bin/svault.rs`，`store` feature 门控）把 `read_since` 暴露成带 `offset` 的 NDJSON 流 + `pull_summary`（`last_offset`/`caught_up`），契约见 §13.2.1、线外形由 bin 单测锁定（`pull_ndjson_wire_shape_is_stable` / `pull_since_filters…` / `pull_limit_caps…`）。**消费侧拉取环 ✅** —— TumeFlow `sources/svault.py` 子进程调它、解析流、持久化游标（端到端实测，含 CJK 正文 + WSL location + 增量）；**下游物化分库（RawEvent→Episode）已在 TumeFlow 落地**（`materialize/episode.py` + 候选提取 + Dream，见 TumeFlow ROADMAP Phase 2-3）——非 SessionVault 待办。**这是解锁 TumeFlow 整条主线（摄取→Episode→Dream）的关键路径，现已贯通**。
   - **P3-④ ⬜**：transcript-from-RawEvent；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
