@@ -1,5 +1,8 @@
 # SessionVault — 共享摄取内核与 RawEvent 总库
 
+> 🔴 **跨三仓「现状 + 优先级」权威文档在宿主仓：`QuotaBar/docs/MASTER_PLAN.md`。** 本文 §15 的
+> SessionVault 内部 P0-P3 状态仍是 SV 细节准绳；跨仓全局（与 TumeFlow/QuotaBar 衔接、下一步）以 MASTER_PLAN 为准。
+
 状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移 step 1-3 ✅、**step 4 切换完成、soak 中**
 （QuotaBar 已翻默认 `svault_index`，`parse_native` 留作回退；CI 三配置全绿；见 §15 与
 [parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；**P3 🟡**：总库写入侧 `TotalStore` 已落地（QuotaBar 默认写者，随 QuotaBar 0.8.0-beta.8 soak）+ TumeFlow `svault pull --since` 消费拉取环已通；待办 = at-rest 加密 / erase（P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，见 TumeFlow ROADMAP Phase 2）
