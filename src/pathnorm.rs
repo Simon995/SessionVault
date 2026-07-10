@@ -301,7 +301,11 @@ mod tests {
         );
         // Windows 宿主 + transcript 在本地：distro 不明 → 泛 wsl。
         assert_eq!(
-            workspace_location("/home/me/proj", &SourceLocation::Local, HostPlatform::Windows),
+            workspace_location(
+                "/home/me/proj",
+                &SourceLocation::Local,
+                HostPlatform::Windows
+            ),
             "wsl"
         );
         // Windows 宿主 + transcript 在某发行版：补全该 distro。
@@ -319,7 +323,10 @@ mod tests {
     fn workspace_location_windows_drive_path_is_local() {
         let local = SourceLocation::Local;
         for host in [HostPlatform::Windows, HostPlatform::Unix] {
-            assert_eq!(workspace_location(r"C:\Users\me\proj", &local, host), "local");
+            assert_eq!(
+                workspace_location(r"C:\Users\me\proj", &local, host),
+                "local"
+            );
         }
     }
 }
