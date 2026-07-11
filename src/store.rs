@@ -207,7 +207,11 @@ impl TotalStore {
     /// 用户看到重写后的内容。旧代留存（append-only 不可变，TumeFlow pull 仍见全历史）。
     ///
     /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同代旧事件全 skip、增量只落新尾。
-    pub fn append_events(&self, events: &[RawEvent], is_rollback: bool) -> StoreResult<AppendStats> {
+    pub fn append_events(
+        &self,
+        events: &[RawEvent],
+        is_rollback: bool,
+    ) -> StoreResult<AppendStats> {
         let now = now_unix_secs();
         let mut conn = self.conn.lock().unwrap();
         // 文件当前最大代（批内所有事件同文件，取第一条的 source 定位）。
@@ -424,11 +428,9 @@ impl TotalStore {
     pub fn is_backfilled(&self) -> StoreResult<bool> {
         let conn = self.conn.lock().unwrap();
         let v: Option<String> = conn
-            .query_row(
-                "SELECT v FROM store_meta WHERE k = 'backfilled'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT v FROM store_meta WHERE k = 'backfilled'", [], |r| {
+                r.get(0)
+            })
             .optional()?;
         Ok(v.as_deref() == Some("1"))
     }
@@ -603,7 +605,13 @@ mod tests {
         // 调用方据此回落 live（而非展示缺气泡的半截 transcript）。
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "s", Some("ok")), mk_event(1, "s", Some("also ok"))], false)
+            .append_events(
+                &[
+                    mk_event(0, "s", Some("ok")),
+                    mk_event(1, "s", Some("also ok")),
+                ],
+                false,
+            )
             .unwrap();
         // 直接往库里塞一行无法反序列化为 RawEvent 的 event_json（模拟损坏 / 未来不兼容 schema）。
         {
@@ -706,7 +714,10 @@ mod tests {
         let a = mk_event_at(0, "c", "/a|b");
         let b = mk_event_at(0, "b|c", "/a");
         let stats = store.append_events(&[a, b], false).unwrap();
-        assert_eq!(stats.appended, 2, "含 `|` 的两条不同身份必须都入库（不碰撞）");
+        assert_eq!(
+            stats.appended, 2,
+            "含 `|` 的两条不同身份必须都入库（不碰撞）"
+        );
         assert_eq!(store.status().unwrap().count, 2);
     }
 
@@ -739,7 +750,10 @@ mod tests {
     fn tombstoned_source_is_skipped_on_read() {
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "keep", None), mk_event(0, "drop", None)], false)
+            .append_events(
+                &[mk_event(0, "keep", None), mk_event(0, "drop", None)],
+                false,
+            )
             .unwrap();
         assert_eq!(store.read_since(0, 100).unwrap().len(), 2);
         store.tombstone(TombstoneScope::Session, "drop").unwrap();
@@ -759,7 +773,9 @@ mod tests {
         by_session.project_root = Some("/other".to_string());
         let mut by_project = mk_event(0, "sess-y", None);
         by_project.project_root = Some("/work".to_string());
-        store.append_events(&[by_session, by_project], false).unwrap();
+        store
+            .append_events(&[by_session, by_project], false)
+            .unwrap();
 
         // 只墓碑 project_root=/work → 只隐藏 by_project，不碰 session 名为 /work 的那条。
         store
@@ -767,7 +783,10 @@ mod tests {
             .unwrap();
         let visible = store.read_since(0, 100).unwrap();
         assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].1.source_session_id, "/work", "session 维度不应被 project 墓碑误伤");
+        assert_eq!(
+            visible[0].1.source_session_id, "/work",
+            "session 维度不应被 project 墓碑误伤"
+        );
     }
 
     #[test]
@@ -800,18 +819,27 @@ mod tests {
         // 第 0 代：原内容（seq 0/1）。
         store
             .append_events(
-                &[mk_event(0, "s", Some("old-0")), mk_event(1, "s", Some("old-1"))],
+                &[
+                    mk_event(0, "s", Some("old-0")),
+                    mk_event(1, "s", Some("old-1")),
+                ],
                 false,
             )
             .unwrap();
         // 文件被重写 → 扫描器 is_rollback=true，新代同 seq 但不同内容。
         let stats = store
             .append_events(
-                &[mk_event(0, "s", Some("new-0")), mk_event(1, "s", Some("new-1"))],
+                &[
+                    mk_event(0, "s", Some("new-0")),
+                    mk_event(1, "s", Some("new-1")),
+                ],
                 true,
             )
             .unwrap();
-        assert_eq!(stats.appended, 2, "新代事件不被旧代 dedup 挡（唯一键含 generation）");
+        assert_eq!(
+            stats.appended, 2,
+            "新代事件不被旧代 dedup 挡（唯一键含 generation）"
+        );
 
         // read_session 只取当前代 → 重写后的内容，不是旧的。
         let read = store

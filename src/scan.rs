@@ -20,9 +20,12 @@ use crate::Profile;
 pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
     match source.source_mode {
         SourceMode::AppendLog => match &source.source_location {
-            SourceLocation::Local => {
-                scan_append_log(&LocalSource { path: &source.path }, source, cursor_in, profile)
-            }
+            SourceLocation::Local => scan_append_log(
+                &LocalSource { path: &source.path },
+                source,
+                cursor_in,
+                profile,
+            ),
             SourceLocation::Wsl(distro) => {
                 let abs = source.path.to_string_lossy().into_owned();
                 scan_append_log(&WslSource { distro, abs: &abs }, source, cursor_in, profile)
@@ -36,9 +39,10 @@ pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
                 cursor_kind: Some(CursorKind::NoCursor),
                 ..Default::default()
             };
-            report
-                .warnings
-                .push(format!("source_mode {:?} not implemented", source.source_mode));
+            report.warnings.push(format!(
+                "source_mode {:?} not implemented",
+                source.source_mode
+            ));
             ScanResult {
                 status: ScanStatus::Ok,
                 events: Vec::new(),
@@ -403,7 +407,10 @@ mod tests {
         assert_eq!(r1.status, ScanStatus::Ok);
         let prev_offset = r1.cursor_out.safe_offset;
 
-        append(&path, &format!("{}\nnot-json-here\n", claude_line("s", "beta")));
+        append(
+            &path,
+            &format!("{}\nnot-json-here\n", claude_line("s", "beta")),
+        );
         let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full);
         assert_eq!(r2.status, ScanStatus::Error);
         assert!(r2.events.is_empty(), "增量坏行批不发事件");
@@ -432,7 +439,11 @@ mod tests {
         // 两行 → 扫；追加一行 → 带游标续扫：只出新行、seq 续接、不重不漏。
         let (path, src) = temp_source(
             "incr",
-            &format!("{}\n{}\n", claude_line("s", "alpha"), claude_line("s", "beta")),
+            &format!(
+                "{}\n{}\n",
+                claude_line("s", "alpha"),
+                claude_line("s", "beta")
+            ),
         );
         let r1 = scan_source(&src, None, Profile::Full);
         assert_eq!(r1.status, ScanStatus::Ok);
@@ -447,7 +458,9 @@ mod tests {
         assert_eq!(r2.events[0].seq, n1 as u64, "seq 跨批续接（不重不漏）");
         assert_eq!(r2.events[0].content.as_deref(), Some("gamma"));
         assert!(
-            r2.events.iter().all(|e| e.content.as_deref() != Some("alpha")),
+            r2.events
+                .iter()
+                .all(|e| e.content.as_deref() != Some("alpha")),
             "旧行不被重发"
         );
         assert!(r2.cursor_out.safe_offset > off1, "offset 前进");
@@ -512,8 +525,10 @@ mod tests {
     #[test]
     fn codex_cumulative_token_persists_across_scans() {
         // 命门：Codex 累计 token 的 previous_total 必须跨增量批次延续。
-        let (path, src) =
-            temp_source_codex("codexincr", &format!("{}\n{}\n", codex_meta("cdx"), codex_token(100, 20, 50)));
+        let (path, src) = temp_source_codex(
+            "codexincr",
+            &format!("{}\n{}\n", codex_meta("cdx"), codex_token(100, 20, 50)),
+        );
         let r1 = scan_source(&src, None, Profile::Full);
         let u1: Vec<_> = r1
             .events
@@ -535,7 +550,11 @@ mod tests {
         assert_eq!(u2.len(), 1);
         // 用持久化 previous_total={100,20,50}：delta={50,10,30}→input=40,read=10
         let u = u2[0].usage.unwrap();
-        assert_eq!((u.input, u.output, u.cache_read), (40, 30, 10), "跨批次 delta 正确");
+        assert_eq!(
+            (u.input, u.output, u.cache_read),
+            (40, 30, 10),
+            "跨批次 delta 正确"
+        );
         assert_eq!(u2[0].source_session_id, "cdx", "session_id 跨批次保留");
         let _ = std::fs::remove_file(path);
     }

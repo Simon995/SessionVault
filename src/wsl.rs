@@ -210,7 +210,12 @@ pub fn read_range(distro: &str, abs_path: &str, start: u64, end: u64) -> Result<
 }
 
 #[cfg(not(windows))]
-pub fn read_range(_distro: &str, _abs_path: &str, _start: u64, _end: u64) -> Result<Vec<u8>, String> {
+pub fn read_range(
+    _distro: &str,
+    _abs_path: &str,
+    _start: u64,
+    _end: u64,
+) -> Result<Vec<u8>, String> {
     Err("wsl.exe access is only available on Windows builds".to_string())
 }
 

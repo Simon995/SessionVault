@@ -32,7 +32,10 @@ use serde_json::Value;
 use session_vault::rawevent::{EventType, RawEvent, SourceType};
 
 #[derive(Parser)]
-#[command(name = "parity", about = "QuotaBar usage_facts ⇄ SessionVault RawEvent parity diff (P2)")]
+#[command(
+    name = "parity",
+    about = "QuotaBar usage_facts ⇄ SessionVault RawEvent parity diff (P2)"
+)]
 struct Cli {
     /// QuotaBar `usage_facts` 冻结基线（NDJSON，逐行一 fact）。
     #[arg(long)]
@@ -182,7 +185,11 @@ fn cmp_facts(key: &Key, ordinal: usize, qb: &Fact, sv: &Fact) -> (Vec<FieldDiff>
         sv: b,
     };
     if qb.session_id != sv.session_id {
-        must.push(mk("session_id", qb.session_id.clone(), sv.session_id.clone()));
+        must.push(mk(
+            "session_id",
+            qb.session_id.clone(),
+            sv.session_id.clone(),
+        ));
     }
     if qb.model != sv.model {
         must.push(mk("model", os(&qb.model), os(&sv.model)));
@@ -191,16 +198,32 @@ fn cmp_facts(key: &Key, ordinal: usize, qb: &Fact, sv: &Fact) -> (Vec<FieldDiff>
         must.push(mk("effort", os(&qb.effort), os(&sv.effort)));
     }
     if qb.input != sv.input {
-        must.push(mk("input_tokens", qb.input.to_string(), sv.input.to_string()));
+        must.push(mk(
+            "input_tokens",
+            qb.input.to_string(),
+            sv.input.to_string(),
+        ));
     }
     if qb.output != sv.output {
-        must.push(mk("output_tokens", qb.output.to_string(), sv.output.to_string()));
+        must.push(mk(
+            "output_tokens",
+            qb.output.to_string(),
+            sv.output.to_string(),
+        ));
     }
     if qb.cache_creation != sv.cache_creation {
-        must.push(mk("cache_creation_tokens", qb.cache_creation.to_string(), sv.cache_creation.to_string()));
+        must.push(mk(
+            "cache_creation_tokens",
+            qb.cache_creation.to_string(),
+            sv.cache_creation.to_string(),
+        ));
     }
     if qb.cache_read != sv.cache_read {
-        must.push(mk("cache_read_tokens", qb.cache_read.to_string(), sv.cache_read.to_string()));
+        must.push(mk(
+            "cache_read_tokens",
+            qb.cache_read.to_string(),
+            sv.cache_read.to_string(),
+        ));
     }
     if qb.message_id != sv.message_id {
         must.push(mk("message_id", os(&qb.message_id), os(&sv.message_id)));
@@ -212,7 +235,11 @@ fn cmp_facts(key: &Key, ordinal: usize, qb: &Fact, sv: &Fact) -> (Vec<FieldDiff>
         adv.push(mk("cwd", os(&qb.cwd), os(&sv.cwd)));
     }
     if qb.project_root != sv.project_root {
-        adv.push(mk("project_root", os(&qb.project_root), os(&sv.project_root)));
+        adv.push(mk(
+            "project_root",
+            os(&qb.project_root),
+            os(&sv.project_root),
+        ));
     }
     (must, adv)
 }
@@ -230,9 +257,13 @@ fn load_quotabar(path: &PathBuf) -> std::io::Result<BTreeMap<Key, Vec<Fact>>> {
         if line.is_empty() {
             continue;
         }
-        let q: QbFact = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("quotabar line {}: {e}", i + 1));
-        let key = (q.provider.clone(), q.location.clone(), q.source_path.clone());
+        let q: QbFact =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("quotabar line {}: {e}", i + 1));
+        let key = (
+            q.provider.clone(),
+            q.location.clone(),
+            q.source_path.clone(),
+        );
         buckets.entry(key).or_default().push(q.into());
     }
     for v in buckets.values_mut() {
@@ -333,7 +364,8 @@ fn main() {
     let cli = Cli::parse();
 
     let qb = load_quotabar(&cli.quotabar).expect("read quotabar baseline");
-    let (sv, sv_usage_total) = load_sessionvault(&cli.sessionvault).expect("read sessionvault ndjson");
+    let (sv, sv_usage_total) =
+        load_sessionvault(&cli.sessionvault).expect("read sessionvault ndjson");
     let qb_files = load_files(&cli.files);
     let qb_total: usize = qb.values().map(Vec::len).sum();
 
@@ -450,7 +482,10 @@ fn exit_code(report: &Report, report_io_failed: bool) -> i32 {
 
 fn print_human(r: &Report) {
     println!("== parity: QuotaBar usage_facts ⇄ SessionVault RawEvent(usage) ==");
-    println!("quotabar_facts={}  sessionvault_usage={}", r.quotabar_facts, r.sessionvault_usage);
+    println!(
+        "quotabar_facts={}  sessionvault_usage={}",
+        r.quotabar_facts, r.sessionvault_usage
+    );
     println!();
     println!(
         "{:<34} {:>6} {:>6} {:>7} {:>5} {:>4} {:>7} {:>6} {:>5}",
@@ -480,7 +515,10 @@ fn print_human(r: &Report) {
         r.total_qb_extra,
     );
     if !r.must_examples.is_empty() {
-        println!("\n-- must-match 不符示例（最多 {} 条）--", r.must_examples.len());
+        println!(
+            "\n-- must-match 不符示例（最多 {} 条）--",
+            r.must_examples.len()
+        );
         for d in &r.must_examples {
             println!(
                 "[{}|{}] {} #{} {}: qb={} sv={}",
@@ -495,7 +533,10 @@ fn print_human(r: &Report) {
         }
     }
     if !r.advisory_examples.is_empty() {
-        println!("\n-- advisory 差异示例（最多 {} 条）--", r.advisory_examples.len());
+        println!(
+            "\n-- advisory 差异示例（最多 {} 条）--",
+            r.advisory_examples.len()
+        );
         for d in &r.advisory_examples {
             println!(
                 "[{}|{}] {} #{} {}: qb={} sv={}",

@@ -23,6 +23,14 @@ pub struct SourceRef {
 
 /// 发现全部内置 provider 的本地来源。
 pub fn discover_all() -> Result<Vec<SourceRef>> {
+    discover(false)
+}
+
+pub fn discover_local() -> Result<Vec<SourceRef>> {
+    discover(true)
+}
+
+fn discover(local_only: bool) -> Result<Vec<SourceRef>> {
     let mut out = Vec::new();
     for desc in catalog::builtin_descriptors() {
         let Some(root) = desc.config_dir.as_ref() else {
@@ -59,7 +67,11 @@ pub fn discover_all() -> Result<Vec<SourceRef>> {
             }
         }
     }
-    discover_wsl(&mut out);
+    if local_only {
+        log::debug!(target: tag::DISCOVER, "skip WSL discovery: local-only mode");
+    } else {
+        discover_wsl(&mut out);
+    }
     log::info!(target: tag::DISCOVER, "discover done: sources={}", out.len());
     Ok(out)
 }

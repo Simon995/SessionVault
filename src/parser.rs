@@ -160,7 +160,12 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             .get("timestamp")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host, ctx.default_distro.as_deref());
+        let pr = resolve_cached(
+            &mut cache,
+            cwd.as_deref(),
+            ctx.host,
+            ctx.default_distro.as_deref(),
+        );
 
         // 1) thinking（Claude `message.content[].type=thinking`）。
         if let Some(text) = extract_claude_thinking(&value) {
@@ -308,7 +313,10 @@ fn claude_usage(value: &Value) -> Option<ClaudeUsage> {
             cache_creation: read_u64(usage, "cache_creation_input_tokens"),
             cache_read: read_u64(usage, "cache_read_input_tokens"),
         },
-        message_id: message.get("id").and_then(Value::as_str).map(str::to_string),
+        message_id: message
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         request_id: value
             .get("requestId")
             .and_then(Value::as_str)
@@ -394,7 +402,12 @@ fn parse_codex(
             .clone()
             .unwrap_or_else(|| session_id_from_path(&ctx.source_path));
         let cwd = state.current_cwd.clone();
-        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx.host, ctx.default_distro.as_deref());
+        let pr = resolve_cached(
+            &mut cache,
+            cwd.as_deref(),
+            ctx.host,
+            ctx.default_distro.as_deref(),
+        );
 
         // response_item：reasoning→thinking / message / tool_use / tool_result。
         if entry_type == Some("response_item") {
@@ -569,7 +582,11 @@ fn extract_codex_model(v: &Value) -> Option<String> {
     v.get("model")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| v.get("model_slug").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            v.get("model_slug")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn extract_codex_effort(v: &Value) -> Option<String> {
@@ -610,7 +627,10 @@ fn extract_text(content: &Value) -> String {
 fn extract_text_item(item: &Value) -> Option<String> {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
         "tool_use" => {
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("unknown");
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             return Some(format!("[Tool: {name}]"));
         }
         "tool_result" => {
@@ -748,7 +768,12 @@ mod tests {
             }
         })
         .to_string();
-        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[line.as_str()], 0, None);
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Full),
+            &[line.as_str()],
+            0,
+            None,
+        );
         assert_eq!(out.skipped, 0);
         assert_eq!(out.events.len(), 2, "assistant line → message + usage");
 
@@ -764,7 +789,10 @@ mod tests {
         assert_eq!(usage.event_type, EventType::Usage);
         assert_eq!(usage.seq, 1);
         let u = usage.usage.unwrap();
-        assert_eq!((u.input, u.output, u.cache_creation, u.cache_read), (100, 50, 5, 20));
+        assert_eq!(
+            (u.input, u.output, u.cache_creation, u.cache_read),
+            (100, 50, 5, 20)
+        );
         assert_eq!(usage.message_id.as_deref(), Some("msg_1"));
         assert_eq!(usage.request_id.as_deref(), Some("req_1"));
     }
@@ -780,7 +808,12 @@ mod tests {
             "message": {"role": "user", "content": "hi"}
         })
         .to_string();
-        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[unc.as_str()], 0, None);
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Full),
+            &[unc.as_str()],
+            0,
+            None,
+        );
         let ev = &out.events[0];
         assert_eq!(ev.project_root_source.as_deref(), Some("wsl_cwd"));
         assert_eq!(ev.workspace_location.as_deref(), Some("wsl:Ubuntu"));
@@ -793,7 +826,12 @@ mod tests {
             "message": {"role": "user", "content": "hi"}
         })
         .to_string();
-        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[mnt.as_str()], 0, None);
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Full),
+            &[mnt.as_str()],
+            0,
+            None,
+        );
         assert_eq!(out.events[0].workspace_location.as_deref(), Some("local"));
     }
 
@@ -810,13 +848,23 @@ mod tests {
         .to_string();
 
         let with = parse_lines(
-            &ctx_host(SourceType::ClaudeCode, HostPlatform::Windows, Some("Ubuntu")),
+            &ctx_host(
+                SourceType::ClaudeCode,
+                HostPlatform::Windows,
+                Some("Ubuntu"),
+            ),
             &[line.as_str()],
             0,
             None,
         );
-        assert_eq!(with.events[0].workspace_location.as_deref(), Some("wsl:Ubuntu"));
-        assert_eq!(with.events[0].project_root_source.as_deref(), Some("wsl_cwd"));
+        assert_eq!(
+            with.events[0].workspace_location.as_deref(),
+            Some("wsl:Ubuntu")
+        );
+        assert_eq!(
+            with.events[0].project_root_source.as_deref(),
+            Some("wsl_cwd")
+        );
 
         // 无 default_distro：回落泛 wsl（仍不做错盘本地上溯，P2 修复仍生效）。
         let without = parse_lines(
@@ -826,7 +874,10 @@ mod tests {
             None,
         );
         assert_eq!(without.events[0].workspace_location.as_deref(), Some("wsl"));
-        assert_eq!(without.events[0].project_root_source.as_deref(), Some("wsl_cwd"));
+        assert_eq!(
+            without.events[0].project_root_source.as_deref(),
+            Some("wsl_cwd")
+        );
     }
 
     #[test]
@@ -837,11 +888,20 @@ mod tests {
             "message": {"role": "user", "content": "secret text"}
         })
         .to_string();
-        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Metadata), &[line.as_str()], 0, None);
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Metadata),
+            &[line.as_str()],
+            0,
+            None,
+        );
         assert_eq!(out.events.len(), 1);
         assert_eq!(out.events[0].event_type, EventType::Message);
         assert_eq!(out.events[0].content, None, "metadata 档不带正文");
-        assert_eq!(out.events[0].time_confidence, TimeConfidence::Low, "无时间戳→low");
+        assert_eq!(
+            out.events[0].time_confidence,
+            TimeConfidence::Low,
+            "无时间戳→low"
+        );
     }
 
     #[test]
@@ -854,7 +914,12 @@ mod tests {
             ]}
         })
         .to_string();
-        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[line.as_str()], 0, None);
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Full),
+            &[line.as_str()],
+            0,
+            None,
+        );
         assert_eq!(out.events.len(), 2, "thinking + message");
         assert_eq!(out.events[0].event_type, EventType::Thinking);
         assert_eq!(out.events[0].content.as_deref(), Some("let me reason"));
@@ -929,7 +994,11 @@ mod tests {
             .iter()
             .filter(|e| e.event_type == EventType::Usage)
             .collect();
-        assert_eq!(usages.len(), 2, "两个 session 各出一条 usage（无重置则第二条会被减成 0 而丢失）");
+        assert_eq!(
+            usages.len(),
+            2,
+            "两个 session 各出一条 usage（无重置则第二条会被减成 0 而丢失）"
+        );
         assert_eq!(usages[1].source_session_id, "s2");
         // s2 从 0 起算：delta={30,5,10} → cached=min(5,30)=5, input=25, read=5
         let u = usages[1].usage.unwrap();
@@ -963,7 +1032,12 @@ mod tests {
             "message": {"role": "user", "content": "hi"}
         })
         .to_string();
-        let out = parse_lines(&ctx(SourceType::ClaudeCode, Profile::Full), &[line.as_str()], 42, None);
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Full),
+            &[line.as_str()],
+            42,
+            None,
+        );
         assert_eq!(out.events[0].seq, 42, "seq 从 base_seq 起");
     }
 }

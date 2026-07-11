@@ -57,6 +57,11 @@ pub fn discover() -> Result<Vec<SourceRef>> {
     discover::discover_all()
 }
 
+/// 仅发现宿主系统本机来源，不调用 WSL。用于需要确定性和文件系统隔离的宿主测试。
+pub fn discover_local() -> Result<Vec<SourceRef>> {
+    discover::discover_local()
+}
+
 /// §9 `scan()`：单来源增量扫描（按 source_mode 分派）。
 pub fn scan(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
     scan::scan_source(source, cursor_in, profile)
