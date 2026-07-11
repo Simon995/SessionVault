@@ -7,6 +7,8 @@ use base64::Engine;
 use zeroize::Zeroizing;
 
 const ENVELOPE_PREFIX: &str = "sv1";
+const DATA_ENVELOPE_PREFIX: &str = "sv2";
+const WRAPPED_KEY_PREFIX: &str = "svk1";
 const KEYCHAIN_SERVICE: &str = "session-vault";
 const KEYCHAIN_ACCOUNT: &str = "total-store-master-v1";
 
@@ -50,6 +52,10 @@ impl StoreKey {
         let bytes: [u8; 32] = decoded.try_into().map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self::from_bytes(bytes))
     }
+
+    pub fn from_encoded(value: &str) -> Result<Self, CryptoError> {
+        Self::decode(value)
+    }
 }
 
 pub(crate) struct StoreCipher {
@@ -84,9 +90,75 @@ impl StoreCipher {
     }
 
     pub(crate) fn decrypt(&self, envelope: &str, aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.decrypt_with_prefix(envelope, ENVELOPE_PREFIX, aad)
+    }
+
+    pub(crate) fn encrypt_data(
+        &self,
+        key_id: &str,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<String, CryptoError> {
+        self.encrypt_with_prefix(&format!("{DATA_ENVELOPE_PREFIX}:{key_id}"), plaintext, aad)
+    }
+
+    pub(crate) fn decrypt_data(
+        &self,
+        envelope: &str,
+        key_id: &str,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let prefix = format!("{DATA_ENVELOPE_PREFIX}:{key_id}");
+        self.decrypt_with_prefix(envelope, &prefix, aad)
+    }
+
+    pub(crate) fn wrap_key(&self, key: &StoreKey, aad: &[u8]) -> Result<String, CryptoError> {
+        self.encrypt_with_prefix(WRAPPED_KEY_PREFIX, key.0.as_ref(), aad)
+    }
+
+    pub(crate) fn unwrap_key(&self, wrapped: &str, aad: &[u8]) -> Result<StoreKey, CryptoError> {
+        let plaintext = self.decrypt_with_prefix(wrapped, WRAPPED_KEY_PREFIX, aad)?;
+        let bytes: [u8; 32] = plaintext.try_into().map_err(|_| CryptoError::InvalidKey)?;
+        Ok(StoreKey::from_bytes(bytes))
+    }
+
+    fn encrypt_with_prefix(
+        &self,
+        prefix: &str,
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<String, CryptoError> {
+        use aes_gcm::aead::rand_core::RngCore;
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .map_err(|_| CryptoError::Encrypt)?;
+        Ok(format!(
+            "{prefix}:{}:{}",
+            STANDARD_NO_PAD.encode(nonce_bytes),
+            STANDARD_NO_PAD.encode(ciphertext)
+        ))
+    }
+
+    fn decrypt_with_prefix(
+        &self,
+        envelope: &str,
+        expected_prefix: &str,
+        aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         let mut parts = envelope.split(':');
-        if parts.next() != Some(ENVELOPE_PREFIX) {
-            return Err(CryptoError::Decrypt);
+        for expected in expected_prefix.split(':') {
+            if parts.next() != Some(expected) {
+                return Err(CryptoError::Decrypt);
+            }
         }
         let nonce = parts
             .next()
@@ -112,7 +184,26 @@ impl StoreCipher {
 }
 
 pub(crate) fn is_envelope(value: &str) -> bool {
-    value.starts_with("sv1:")
+    value.starts_with("sv1:") || value.starts_with("sv2:")
+}
+
+pub(crate) fn data_key_id(envelope: &str) -> Result<&str, CryptoError> {
+    let mut parts = envelope.split(':');
+    if parts.next() != Some(DATA_ENVELOPE_PREFIX) {
+        return Err(CryptoError::Decrypt);
+    }
+    let key_id = parts.next().ok_or(CryptoError::Decrypt)?;
+    if key_id.is_empty() {
+        return Err(CryptoError::Decrypt);
+    }
+    Ok(key_id)
+}
+
+pub(crate) fn new_data_key_id() -> String {
+    use aes_gcm::aead::rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    STANDARD_NO_PAD.encode(bytes)
 }
 
 pub(crate) fn load_os_key() -> Result<Option<StoreKey>, CryptoError> {

@@ -38,6 +38,9 @@ store = [
     "dep:rusqlite",
     "dep:zeroize",
 ]
+# 仅供隔离验收构建：允许从环境注入合成主密钥，并从 JSON 文件写入合成 RawEvent。
+# QuotaBar/发布构建不启用，正式 CLI 不包含 fixture 子命令或环境密钥入口。
+acceptance-fixtures = ["store"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

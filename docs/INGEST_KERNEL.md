@@ -5,8 +5,8 @@
 
 状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移 step 1-3 ✅、**step 4 切换完成、soak 中**
 （QuotaBar 已翻默认 `svault_index`，`parse_native` 留作回退；CI 三配置全绿；见 §15 与
-[parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；**P3 🟡**：总库写入侧 `TotalStore` 已落地（QuotaBar 默认写者，随 QuotaBar 0.8.0-beta.8 soak）+ TumeFlow `svault pull --since` 消费拉取环已通；ADR-027 第一阶段的静态加密、明文迁移、erase 墓碑/物理删除和防复活已落地，待办 = 隔离 E2E + 每来源/项目分密钥 crypto-shred（P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，见 TumeFlow ROADMAP Phase 2）
-最后更新：2026-06-23
+[parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；**P3 🟡**：总库写入侧 `TotalStore` 已落地（QuotaBar 默认写者，随 QuotaBar 0.8.0-beta.8 soak）+ TumeFlow `svault pull --since` 消费拉取环已通；ADR-027 C5 技术安全门已完成：`sv2` 按来源/项目分组数据密钥、`sv1→sv2` 迁移、crypto-shred、跨库 erase 传播、防复活与合成隔离跨进程 E2E 10/10 PASS（P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，见 TumeFlow ROADMAP Phase 2）
+最后更新：2026-07-11
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
 > - `DECISIONS.md` / `SYSTEM_DESIGN.md` / `INTEGRATION.md` → [TumeFlow `docs/`](https://github.com/Simon995/TumeFlow/tree/main/docs)（ADR-024/025/026 与本内核直接相关；其摘要见本仓 [README](../README.md) 与 [LOGGING.md](LOGGING.md)）。
@@ -503,7 +503,7 @@ TumeFlow 运行时不依赖 QuotaBar 是否存在：
 - **状态行**——显示"已固化至 offset / 时间、落后总库 N 条、上次固化时间"（数据取自同步游标 + `ScanReport`）。
 - **"锁定版本"开关**——评测 / 开发期暂停自动同步、冻住分库，满足"钉固定版本"诉求。
 
-### 13.6 隐私 / 删除 / 加密（ADR-027 第一阶段已落地）
+### 13.6 隐私 / 删除 / 加密（ADR-027 C5 技术安全门已落地）
 
 总库默认 `full`、含正文、永不删——架构上强，但隐私风险也最大。"证据最终归宿"与"用户对本机数据的掌控"必须靠下列机制调和，**否则二者打架**。这些是总库组件的硬要求（解析内核仍无状态、不涉隐私存储）：
 
@@ -513,9 +513,10 @@ TumeFlow 运行时不依赖 QuotaBar 是否存在：
 - **导出 / 销毁**：提供"导出整库"与"销毁整库 / 按来源删除"两类操作。**永不删是默认保留策略、不是不可删**——用户主动销毁是一等公民操作（与"逻辑 append-only"不矛盾：销毁是用户对物理存储的控制权）。
 - **正文存储档位可配**：除全局 `metadata` / `full`（§6）外，允许**按来源**关正文（只留元数据），满足"想留用量、不想留正文"的折中。
 
-> 落点：权威决策见 TumeFlow `DECISIONS.md` 的 **ADR-027 隐私与删除**。第一阶段已实现
-> `full` 正文加密、敏感源排除、项目/来源销毁和 QuotaBar 双重确认界面；授权清单、导出、
-> 每来源/项目分密钥 crypto-shred 与隔离 E2E 仍是关闭 ADR 前的剩项。
+> 落点：权威决策见 TumeFlow `DECISIONS.md` 的 **ADR-027 隐私与删除**。C5 已实现 `full`
+> 正文 `sv2` 分组密钥加密、敏感源排除、项目/来源销毁、crypto-shred、隔离 E2E 和 QuotaBar
+> 双重确认界面。授权清单、导出与五级删除中尚未产品化的粒度属于后续隐私控制面扩展，不阻塞
+> 当前 C5 技术门，但公开发布仍由产品所有者的独立禁令阻断。
 
 ## 14. 非目标
 
@@ -582,7 +583,7 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
     （删 `parse_native` + `not(svault_index)` 分支 + ci.yml 原生回退步骤）。
 - **P3 🟡 进行中**：
   - **step① IO 委托 ✅**（QuotaBar 侧）：QuotaBar `refresh_index` 改调 `discover()`/`scan()`，删自管 read/游标，`scan()` 成其唯一 IO+解析路径。
-  - **P3-② 总库写入侧 🟡**：`src/store.rs`（`store` feature）落地 `TotalStore`。ADR-027 第一阶段已实现：`event_json` 仅以 AES-256-GCM `sv1` 信封落盘，密钥存 OS keychain，身份列作为 AAD；旧明文库事务迁移后 `secure_delete + WAL truncate + VACUUM`；错误/缺失密钥硬失败。`svault erase` 写无正文墓碑并物理删除，`append_events` 在写入前检查墓碑以阻止原始文件重扫复活。**⬜ 待**：隔离数据 E2E、每来源/项目分密钥 crypto-shred。
+  - **P3-② 总库写入侧 ✅ C5 技术门完成**：`src/store.rs`（`store` feature）落地 `TotalStore`。`event_json` 仅以 AES-256-GCM `sv2` 信封落盘；OS keychain 主密钥包裹按来源类型/位置/路径/项目分组的随机数据密钥，事件身份与密钥分组均进 AAD；旧明文/`sv1` 库事务迁移后 `secure_delete + WAL truncate + VACUUM`；错误/缺失密钥硬失败。`svault erase` 写无正文墓碑、物理删除并回收孤立数据密钥，`append_events` 在写入前检查墓碑以阻止原始文件重扫复活。合成隔离跨进程 E2E 10/10 PASS。
   - **P3-③ TumeFlow 消费 🟡**：**生产侧 ✅** —— `svault pull --since <offset> [--limit N] [--store <path>]` 子命令（`src/bin/svault.rs`，`store` feature 门控）把 `read_since` 暴露成带 `offset` 的 NDJSON 流 + `pull_summary`（`last_offset`/`caught_up`），契约见 §13.2.1、线外形由 bin 单测锁定（`pull_ndjson_wire_shape_is_stable` / `pull_since_filters…` / `pull_limit_caps…`）。**消费侧拉取环 ✅** —— TumeFlow `sources/svault.py` 子进程调它、解析流、持久化游标（端到端实测，含 CJK 正文 + WSL location + 增量）；**下游物化分库（RawEvent→Episode）已在 TumeFlow 落地**（`materialize/episode.py` + 候选提取 + Dream，见 TumeFlow ROADMAP Phase 2-3）——非 SessionVault 待办。**这是解锁 TumeFlow 整条主线（摄取→Episode→Dream）的关键路径，现已贯通**。
   - **P3-④ ⬜**：transcript-from-RawEvent；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
 

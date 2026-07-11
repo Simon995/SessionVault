@@ -13,6 +13,7 @@
 //! - `event_json` 只以版本化 AES-256-GCM 信封落盘；密钥由 OS keychain 持久化，SQLite 内不留
 //!   密钥或明文。旧明文库首次打开时原地迁移并清理空闲页（ADR-027）。
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,7 +23,8 @@ use serde::Serialize;
 
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceType};
 use crate::store_crypto::{
-    create_os_key, is_envelope, load_os_key, CryptoError, StoreCipher, StoreKey,
+    create_os_key, data_key_id, is_envelope, load_os_key, new_data_key_id, CryptoError,
+    StoreCipher, StoreKey,
 };
 
 /// 总库错误。
@@ -58,12 +60,15 @@ pub struct StoreStatus {
     pub last_ingested_at: Option<i64>,
     pub encrypted: bool,
     pub encryption_version: u8,
+    pub active_data_keys: u64,
+    pub key_scheme: &'static str,
 }
 
 /// 一次用户主动擦除的结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct EraseStats {
     pub deleted_events: u64,
+    pub keys_destroyed: u64,
     pub tombstone_written: bool,
 }
 
@@ -75,6 +80,7 @@ struct EncryptedRow {
     source_session_id: String,
     seq: i64,
     generation: i64,
+    project_root: String,
     envelope: String,
 }
 
@@ -88,7 +94,8 @@ impl EncryptedRow {
             source_session_id: row.get(4)?,
             seq: row.get(5)?,
             generation: row.get(6)?,
-            envelope: row.get(7)?,
+            project_root: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            envelope: row.get(8)?,
         })
     }
 
@@ -101,6 +108,34 @@ impl EncryptedRow {
             self.seq,
             self.generation,
         )
+    }
+}
+
+#[derive(Clone)]
+struct DataKeyGroup {
+    source_type: String,
+    source_location: String,
+    source_path: String,
+    project_root: String,
+}
+
+impl DataKeyGroup {
+    fn from_event(event: &RawEvent) -> Self {
+        Self {
+            source_type: source_type_key(event.source_type).to_string(),
+            source_location: event.source_location.as_key(),
+            source_path: event.source_path.clone(),
+            project_root: event.project_root.clone().unwrap_or_default(),
+        }
+    }
+
+    fn from_row(row: &EncryptedRow) -> Self {
+        Self {
+            source_type: row.source_type.clone(),
+            source_location: row.source_location.clone(),
+            source_path: row.source_path.clone(),
+            project_root: row.project_root.clone(),
+        }
     }
 }
 
@@ -153,6 +188,21 @@ CREATE TABLE IF NOT EXISTS raw_events (
 );
 CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
+"#;
+
+const DATA_KEYS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS data_keys (
+    key_id          TEXT PRIMARY KEY,
+    source_type     TEXT NOT NULL,
+    source_location TEXT NOT NULL,
+    source_path     TEXT NOT NULL,
+    project_root    TEXT NOT NULL,
+    wrapped_key     TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    UNIQUE (source_type, source_location, source_path, project_root)
+);
+CREATE INDEX IF NOT EXISTS idx_data_keys_source ON data_keys(source_path);
+CREATE INDEX IF NOT EXISTS idx_data_keys_project ON data_keys(project_root);
 "#;
 
 /// 不可变 RawEvent 总库句柄。`.clone()` 不提供——单写者持有（ADR-020：同一时刻单写者）；
@@ -217,13 +267,14 @@ impl TotalStore {
         let conn = self.conn.lock().unwrap();
         let sample: Option<EncryptedRow> = conn
             .query_row(
-                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, event_json FROM raw_events ORDER BY offset LIMIT 1",
+                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, project_root, event_json FROM raw_events ORDER BY offset LIMIT 1",
                 [],
                 EncryptedRow::from_sql,
             )
             .optional()?;
         if let Some(row) = sample {
-            self.cipher.decrypt(&row.envelope, &row.aad())?;
+            let mut cache = HashMap::new();
+            self.decode_event_on(&conn, &mut cache, &row)?;
         }
         Ok(())
     }
@@ -283,24 +334,25 @@ impl TotalStore {
                 "#
             ))?;
         }
+        conn.execute_batch(DATA_KEYS_DDL)?;
         drop(conn);
-        self.encrypt_plaintext_rows()?;
+        self.migrate_event_envelopes()?;
         Ok(())
     }
 
-    fn encrypt_plaintext_rows(&self) -> StoreResult<()> {
+    fn migrate_event_envelopes(&self) -> StoreResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let plaintext_rows = {
+        let legacy_rows = {
             let mut stmt = conn.prepare(
-                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, event_json FROM raw_events WHERE event_json NOT LIKE 'sv1:%'",
+                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, project_root, event_json FROM raw_events WHERE event_json NOT LIKE 'sv2:%'",
             )?;
             let rows = stmt.query_map([], EncryptedRow::from_sql)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
 
-        if plaintext_rows.is_empty() {
+        if legacy_rows.is_empty() {
             conn.execute(
-                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('encryption_version', '1')",
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('encryption_version', '2')",
                 [],
             )?;
             return Ok(());
@@ -308,29 +360,106 @@ impl TotalStore {
 
         log::info!(
             target: crate::logging::tag::SQLITE,
-            "migrating {} total-store rows to encrypted envelopes",
-            plaintext_rows.len()
+            "migrating {} total-store rows to per-group encrypted envelopes",
+            legacy_rows.len()
         );
         let tx = conn.transaction()?;
         {
             let mut update =
                 tx.prepare("UPDATE raw_events SET event_json = ?1 WHERE offset = ?2")?;
-            for row in &plaintext_rows {
-                let envelope = self.cipher.encrypt(row.envelope.as_bytes(), &row.aad())?;
+            for row in &legacy_rows {
+                let plaintext = if row.envelope.starts_with("sv1:") {
+                    self.cipher.decrypt(&row.envelope, &row.aad())?
+                } else {
+                    row.envelope.as_bytes().to_vec()
+                };
+                let (key_id, data_cipher) =
+                    self.data_cipher_for_group(&tx, &DataKeyGroup::from_row(row))?;
+                let envelope = data_cipher.encrypt_data(&key_id, &plaintext, &row.aad())?;
                 update.execute(params![envelope, row.offset])?;
             }
         }
         tx.execute(
-            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('encryption_version', '1')",
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('encryption_version', '2')",
             [],
         )?;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
         log::info!(
             target: crate::logging::tag::SQLITE,
-            "total-store plaintext migration completed"
+            "total-store per-group envelope migration completed"
         );
         Ok(())
+    }
+
+    fn data_cipher_for_group(
+        &self,
+        conn: &Connection,
+        group: &DataKeyGroup,
+    ) -> StoreResult<(String, StoreCipher)> {
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                r#"SELECT key_id, wrapped_key FROM data_keys
+                    WHERE source_type = ?1 AND source_location = ?2
+                      AND source_path = ?3 AND project_root = ?4"#,
+                params![
+                    group.source_type,
+                    group.source_location,
+                    group.source_path,
+                    group.project_root,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((key_id, wrapped)) = existing {
+            let aad = data_key_aad(&key_id, group);
+            let key = self.cipher.unwrap_key(&wrapped, &aad)?;
+            return Ok((key_id, StoreCipher::new(key)));
+        }
+
+        let key_id = new_data_key_id();
+        let key = StoreKey::generate();
+        let aad = data_key_aad(&key_id, group);
+        let wrapped = self.cipher.wrap_key(&key, &aad)?;
+        conn.execute(
+            r#"INSERT INTO data_keys
+                 (key_id, source_type, source_location, source_path, project_root,
+                  wrapped_key, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            params![
+                key_id,
+                group.source_type,
+                group.source_location,
+                group.source_path,
+                group.project_root,
+                wrapped,
+                now_unix_secs(),
+            ],
+        )?;
+        Ok((key_id, StoreCipher::new(key)))
+    }
+
+    fn data_cipher_by_id(&self, conn: &Connection, key_id: &str) -> StoreResult<StoreCipher> {
+        let (wrapped, group): (String, DataKeyGroup) = conn.query_row(
+            r#"SELECT wrapped_key, source_type, source_location, source_path, project_root
+                 FROM data_keys WHERE key_id = ?1"#,
+            params![key_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    DataKeyGroup {
+                        source_type: row.get(1)?,
+                        source_location: row.get(2)?,
+                        source_path: row.get(3)?,
+                        project_root: row.get(4)?,
+                    },
+                ))
+            },
+        )?;
+        let key = self
+            .cipher
+            .unwrap_key(&wrapped, &data_key_aad(key_id, &group))?;
+        Ok(StoreCipher::new(key))
     }
 
     /// 批量追加事件（一批 = 一个文件，所有事件共享 source_type/location/path）。
@@ -403,7 +532,9 @@ impl TotalStore {
                     ev.seq as i64,
                     generation,
                 );
-                let envelope = self.cipher.encrypt(json.as_bytes(), &aad)?;
+                let group = DataKeyGroup::from_event(ev);
+                let (key_id, data_cipher) = self.data_cipher_for_group(&tx, &group)?;
+                let envelope = data_cipher.encrypt_data(&key_id, json.as_bytes(), &aad)?;
                 let changed = stmt.execute(params![
                     now,
                     ev.schema_version,
@@ -454,7 +585,7 @@ impl TotalStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
-                      r.source_session_id, r.seq, r.generation, r.event_json
+                      r.source_session_id, r.seq, r.generation, r.project_root, r.event_json
                  FROM raw_events r
                 WHERE r.offset > ?1
                   AND NOT EXISTS (
@@ -468,13 +599,14 @@ impl TotalStore {
         )?;
         let rows = stmt.query_map(params![after_offset, limit as i64], EncryptedRow::from_sql)?;
         let mut out = Vec::new();
+        let mut key_cache = HashMap::new();
         // 记录 SQL 实际扫描到的最大 offset（含坏行）——行按 offset ASC，故最后一行即最大。
         // 即便整窗都反序列化失败，max_scanned 仍非 None，让 pull 流推进游标越过坏行窗口。
         let mut max_scanned: Option<i64> = None;
         for row in rows {
             let row = row?;
             max_scanned = Some(row.offset);
-            match self.decode_event(&row) {
+            match self.decode_event_on(&conn, &mut key_cache, &row) {
                 Ok(ev) => out.push((row.offset, ev)),
                 Err(e) => log::warn!(
                     target: crate::logging::tag::SQLITE,
@@ -509,7 +641,7 @@ impl TotalStore {
         // （文件内单调序号 = 气泡顺序）升序，`offset` 作稳定 tiebreak。
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
-                      r.source_session_id, r.seq, r.generation, r.event_json
+                      r.source_session_id, r.seq, r.generation, r.project_root, r.event_json
                  FROM raw_events r
                 WHERE r.source_type = ?1
                   AND r.source_location = ?2
@@ -534,9 +666,10 @@ impl TotalStore {
         )?;
         let mut events = Vec::new();
         let mut skipped = 0usize;
+        let mut key_cache = HashMap::new();
         for row in rows {
             let row = row?;
-            match self.decode_event(&row) {
+            match self.decode_event_on(&conn, &mut key_cache, &row) {
                 Ok(ev) => events.push(ev),
                 Err(e) => {
                     skipped += 1;
@@ -550,8 +683,24 @@ impl TotalStore {
         Ok(SessionRead { events, skipped })
     }
 
-    fn decode_event(&self, row: &EncryptedRow) -> StoreResult<RawEvent> {
-        let plaintext = self.cipher.decrypt(&row.envelope, &row.aad())?;
+    fn decode_event_on(
+        &self,
+        conn: &Connection,
+        key_cache: &mut HashMap<String, StoreCipher>,
+        row: &EncryptedRow,
+    ) -> StoreResult<RawEvent> {
+        let plaintext = if row.envelope.starts_with("sv2:") {
+            let key_id = data_key_id(&row.envelope)?.to_string();
+            if !key_cache.contains_key(&key_id) {
+                key_cache.insert(key_id.clone(), self.data_cipher_by_id(conn, &key_id)?);
+            }
+            key_cache
+                .get(&key_id)
+                .expect("data key inserted")
+                .decrypt_data(&row.envelope, &key_id, &row.aad())?
+        } else {
+            self.cipher.decrypt(&row.envelope, &row.aad())?
+        };
         Ok(serde_json::from_slice(&plaintext)?)
     }
 
@@ -569,12 +718,18 @@ impl TotalStore {
                 ))
             },
         )?;
+        let active_data_keys: u64 =
+            conn.query_row("SELECT COUNT(*) FROM data_keys", [], |row| {
+                Ok(row.get::<_, i64>(0)? as u64)
+            })?;
         Ok(StoreStatus {
             count,
             max_offset,
             last_ingested_at,
             encrypted: true,
-            encryption_version: 1,
+            encryption_version: 2,
+            active_data_keys,
+            key_scheme: "per-source-project",
         })
     }
 
@@ -596,15 +751,27 @@ impl TotalStore {
             &format!("DELETE FROM raw_events WHERE {} = ?1", scope.column()),
             params![key],
         )?;
+        let keys_destroyed = tx.execute(
+            r#"DELETE FROM data_keys
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM raw_events r
+                     WHERE r.source_type = data_keys.source_type
+                       AND r.source_location = data_keys.source_location
+                       AND r.source_path = data_keys.source_path
+                       AND COALESCE(r.project_root, '') = data_keys.project_root
+                )"#,
+            [],
+        )?;
         tx.commit()?;
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         log::info!(
             target: crate::logging::tag::SQLITE,
-            "total-store erase committed: scope={} deleted_events={deleted}",
-            scope.as_str()
+            "total-store erase committed: scope={} deleted_events={deleted} keys_destroyed={keys_destroyed}",
+            scope.as_str(),
         );
         Ok(EraseStats {
             deleted_events: deleted as u64,
+            keys_destroyed: keys_destroyed as u64,
             tombstone_written: true,
         })
     }
@@ -674,7 +841,7 @@ fn store_has_encrypted_rows(path: &Path) -> StoreResult<bool> {
     }
     let sample: Option<String> = conn
         .query_row(
-            "SELECT event_json FROM raw_events WHERE event_json LIKE 'sv1:%' LIMIT 1",
+            "SELECT event_json FROM raw_events WHERE event_json LIKE 'sv1:%' OR event_json LIKE 'sv2:%' LIMIT 1",
             [],
             |row| row.get(0),
         )
@@ -725,6 +892,21 @@ fn event_aad(
         source_session_id.as_bytes(),
         &seq_bytes,
         &generation_bytes,
+    ] {
+        aad.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        aad.extend_from_slice(part);
+    }
+    aad
+}
+
+fn data_key_aad(key_id: &str, group: &DataKeyGroup) -> Vec<u8> {
+    let mut aad = b"session-vault:data-key:v1".to_vec();
+    for part in [
+        key_id.as_bytes(),
+        group.source_type.as_bytes(),
+        group.source_location.as_bytes(),
+        group.source_path.as_bytes(),
+        group.project_root.as_bytes(),
     ] {
         aad.extend_from_slice(&(part.len() as u64).to_be_bytes());
         aad.extend_from_slice(part);
@@ -1001,6 +1183,10 @@ mod tests {
         assert_eq!(store.read_since(0, 100).unwrap().len(), 2);
         let erased = store.tombstone(TombstoneScope::Session, "drop").unwrap();
         assert_eq!(erased.deleted_events, 1);
+        assert_eq!(
+            erased.keys_destroyed, 0,
+            "同组仍有事件时不得销毁共享数据密钥"
+        );
         let visible = store.read_since(0, 100).unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].1.source_session_id, "keep");
@@ -1061,7 +1247,9 @@ mod tests {
         assert_eq!(st.max_offset, stats.max_offset);
         assert!(st.last_ingested_at.is_some());
         assert!(st.encrypted);
-        assert_eq!(st.encryption_version, 1);
+        assert_eq!(st.encryption_version, 2);
+        assert_eq!(st.active_data_keys, 1);
+        assert_eq!(st.key_scheme, "per-source-project");
     }
 
     #[test]
@@ -1076,7 +1264,7 @@ mod tests {
             .unwrap()
             .query_row("SELECT event_json FROM raw_events", [], |row| row.get(0))
             .unwrap();
-        assert!(stored.starts_with("sv1:"));
+        assert!(stored.starts_with("sv2:"));
         assert!(!stored.contains("private-marker-027"));
         assert_eq!(
             store.read_since(0, 10).unwrap()[0].1.content.as_deref(),
@@ -1127,6 +1315,36 @@ mod tests {
     }
 
     #[test]
+    fn project_and_source_erase_destroy_only_orphaned_group_keys() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut project_a = mk_event(0, "a", Some("project-a-secret"));
+        project_a.project_root = Some("/work/a".into());
+        let mut project_b = mk_event(1, "b", Some("project-b-secret"));
+        project_b.project_root = Some("/work/b".into());
+        store
+            .append_events(&[project_a.clone(), project_b.clone()], false)
+            .unwrap();
+        assert_eq!(store.status().unwrap().active_data_keys, 2);
+
+        let erased = store
+            .tombstone(TombstoneScope::ProjectRoot, "/work/a")
+            .unwrap();
+        assert_eq!(erased.deleted_events, 1);
+        assert_eq!(erased.keys_destroyed, 1);
+        assert_eq!(store.status().unwrap().active_data_keys, 1);
+        let visible = store.read_since(0, 10).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].1.content.as_deref(), Some("project-b-secret"));
+
+        let erased = store
+            .tombstone(TombstoneScope::SourcePath, &project_b.source_path)
+            .unwrap();
+        assert_eq!(erased.deleted_events, 1);
+        assert_eq!(erased.keys_destroyed, 1);
+        assert_eq!(store.status().unwrap().active_data_keys, 0);
+    }
+
+    #[test]
     fn ciphertext_cannot_be_swapped_between_rows() {
         let store = TotalStore::open_in_memory().unwrap();
         store
@@ -1155,6 +1373,30 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_data_keys_cannot_be_swapped_between_groups() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut first = mk_event_at(0, "first", "/a.jsonl");
+        first.content = Some("first-secret".into());
+        let mut second = mk_event_at(0, "second", "/b.jsonl");
+        second.content = Some("second-secret".into());
+        store.append_events(&[first, second], false).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TEMP TABLE swap_key(v TEXT);\
+                 INSERT INTO swap_key SELECT wrapped_key FROM data_keys WHERE source_path = '/a.jsonl';\
+                 UPDATE data_keys SET wrapped_key = (SELECT wrapped_key FROM data_keys WHERE source_path = '/b.jsonl') WHERE source_path = '/a.jsonl';\
+                 UPDATE data_keys SET wrapped_key = (SELECT v FROM swap_key) WHERE source_path = '/b.jsonl';",
+            )
+            .unwrap();
+        }
+        assert!(
+            store.read_since(0, 10).unwrap().is_empty(),
+            "wrapped data keys are authenticated to their source/project group"
+        );
+    }
+
+    #[test]
     fn wrong_key_fails_open_instead_of_returning_empty_data() {
         let dir = std::env::temp_dir().join(format!("sv_wrong_key_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -1172,6 +1414,60 @@ mod tests {
             "wrong key must fail closed"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sv1_master_envelopes_migrate_to_sv2_group_keys() {
+        let dir = std::env::temp_dir().join(format!("sv_v2_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let event = mk_event(0, "legacy-v1", Some("legacy-v1-private"));
+        let aad = event_aad(
+            source_type_key(event.source_type),
+            &event.source_location.as_key(),
+            &event.source_path,
+            &event.source_session_id,
+            event.seq as i64,
+            0,
+        );
+        let legacy = StoreCipher::new(StoreKey::from_bytes([9u8; 32]))
+            .encrypt(serde_json::to_string(&event).unwrap().as_bytes(), &aad)
+            .unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(RAW_EVENTS_DDL).unwrap();
+            conn.execute(
+                r#"INSERT INTO raw_events
+                     (ingested_at, schema_version, source_type, source_location, source_path,
+                      source_session_id, seq, generation, event_type, occurred_at, project_root,
+                      event_json)
+                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 'legacy-v1', 0, 0,
+                           'message', NULL, NULL, ?1)"#,
+                params![legacy],
+            )
+            .unwrap();
+        }
+
+        let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([9u8; 32])).unwrap();
+        let envelope: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT event_json FROM raw_events", [], |row| row.get(0))
+            .unwrap();
+        assert!(envelope.starts_with("sv2:"));
+        assert_eq!(store.status().unwrap().active_data_keys, 1);
+        assert_eq!(
+            store.read_since(0, 10).unwrap()[0].1.content.as_deref(),
+            Some("legacy-v1-private")
+        );
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes
+            .windows(b"legacy-v1-private".len())
+            .any(|window| window == b"legacy-v1-private"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

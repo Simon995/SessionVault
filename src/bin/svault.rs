@@ -67,6 +67,15 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 仅用于 ADR-027 隔离验收构建；正式发布不包含此命令。
+    #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+    #[command(hide = true)]
+    FixtureAppend {
+        #[arg(long)]
+        event_file: PathBuf,
+        #[arg(long)]
+        store: PathBuf,
+    },
 }
 
 #[cfg(feature = "store")]
@@ -150,7 +159,14 @@ enum Out<'a> {
     #[cfg(feature = "store")]
     EraseSummary {
         deleted_events: u64,
+        keys_destroyed: u64,
         tombstone_written: bool,
+    },
+    #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+    FixtureSummary {
+        appended: u64,
+        skipped_dup: u64,
+        skipped_erased: u64,
     },
 }
 
@@ -177,6 +193,8 @@ fn main() {
             confirm,
             store,
         } => run_erase(scope, key, confirm, store),
+        #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+        Command::FixtureAppend { event_file, store } => run_fixture_append(event_file, store),
     };
     std::process::exit(code);
 }
@@ -317,7 +335,7 @@ fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
         );
         return 1;
     }
-    let store = match session_vault::TotalStore::open(&store_path) {
+    let store = match open_total_store(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: path={} err={e}", store_path.display());
@@ -383,8 +401,8 @@ fn run_erase(
     }
     let store_path = match resolve_store_path(store_arg) {
         Some(path) if path.exists() => path,
-        Some(path) => {
-            log::error!(target: tag::CLI, "total store not found: path={}", path.display());
+        Some(_) => {
+            log::error!(target: tag::CLI, "total store not found for erase");
             return 1;
         }
         None => {
@@ -392,7 +410,7 @@ fn run_erase(
             return 1;
         }
     };
-    let store = match session_vault::TotalStore::open(&store_path) {
+    let store = match open_total_store(&store_path) {
         Ok(store) => store,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store for erase failed: {e}");
@@ -403,12 +421,64 @@ fn run_erase(
         Ok(stats) => {
             emit(&Out::EraseSummary {
                 deleted_events: stats.deleted_events,
+                keys_destroyed: stats.keys_destroyed,
                 tombstone_written: stats.tombstone_written,
             });
             0
         }
         Err(e) => {
             log::error!(target: tag::CLI, "erase failed: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(feature = "store")]
+fn open_total_store(
+    path: &std::path::Path,
+) -> session_vault::store::StoreResult<session_vault::TotalStore> {
+    #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+    if let Ok(encoded) = std::env::var("SVAULT_ACCEPTANCE_KEY") {
+        let key = session_vault::StoreKey::from_encoded(&encoded)?;
+        return session_vault::TotalStore::open_with_key(path, key);
+    }
+    session_vault::TotalStore::open(path)
+}
+
+#[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+fn run_fixture_append(event_file: PathBuf, store_path: PathBuf) -> i32 {
+    let bytes = match std::fs::read(&event_file) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!(target: tag::CLI, "read synthetic fixture failed: {e}");
+            return 1;
+        }
+    };
+    let event: RawEvent = match serde_json::from_slice(&bytes) {
+        Ok(event) => event,
+        Err(e) => {
+            log::error!(target: tag::CLI, "parse synthetic fixture failed: {e}");
+            return 1;
+        }
+    };
+    let store = match open_total_store(&store_path) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open isolated fixture store failed: {e}");
+            return 1;
+        }
+    };
+    match store.append_events(&[event], false) {
+        Ok(stats) => {
+            emit(&Out::FixtureSummary {
+                appended: stats.appended,
+                skipped_dup: stats.skipped_dup,
+                skipped_erased: stats.skipped_erased,
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "append isolated fixture failed: {e}");
             1
         }
     }
@@ -721,11 +791,13 @@ mod tests {
 
         let erased = serde_json::to_value(Out::EraseSummary {
             deleted_events: 3,
+            keys_destroyed: 2,
             tombstone_written: true,
         })
         .unwrap();
         assert_eq!(erased["kind"], "erase_summary");
         assert_eq!(erased["deleted_events"], 3);
+        assert_eq!(erased["keys_destroyed"], 2);
         assert_eq!(erased["tombstone_written"], true);
     }
 }

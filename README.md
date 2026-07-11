@@ -102,10 +102,12 @@ SessionVault **不从零写**，而是**抽取 QuotaBar 已实机验证的扫描
   （[docs/parity-contract.md](docs/parity-contract.md)）+ `parity` diff 工具（**首测 9134 条 usage
   must-match=0**，计费字段字节级一致，含 Codex 累计 token）→ QuotaBar 已改用共享扫描器、影子并跑
   diff `cache.db` 一致后切换（feature flag，留回退）。**待办**：soak 收尾删旧路径
-- **P3 🟡 ADR-027 第一阶段已落地** 总库 `TotalStore`（QuotaBar 默认写者）使用 AES-256-GCM
-  版本化信封 + OS keychain 密钥，旧明文库事务迁移并清理空闲页；来源身份作为 AAD 防密文调换。
-  `svault erase` 在同一事务写无正文墓碑并物理删除，后续 `append_events` 也按墓碑拒绝重扫复活。
-  **待办**：隔离数据 E2E、每来源/项目分密钥 crypto-shred；TumeFlow 删除传播在其私有仓同步开发。
+- **P3 ✅ ADR-027 C5 技术安全门已落地** 总库 `TotalStore`（QuotaBar 默认写者）使用
+  AES-256-GCM `sv2` 信封；OS keychain 主密钥只包裹按 `(source_type, location, path,
+  project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并清理空闲页；事件身份与数据密钥
+  分组均作为 AAD 防调换。`svault erase` 同事务写无正文墓碑、物理删除并回收孤立数据密钥，
+  后续 `append_events` 按墓碑拒绝重扫复活。合成隔离跨进程 E2E 10/10 PASS；正式构建不包含
+  fixture 密钥入口。TumeFlow 删除传播与 QuotaBar 双重确认已同步落地。
 
 ## 构建
 
