@@ -8,19 +8,22 @@
 //!   门控——纯 parser 用户（`parse_lines`）不被迫拉 `rusqlite`。
 //! - `offset`（追加序）是**同步游标，不是时间**；冲突裁决（latest-wins）由下游按 `occurred_at`
 //!   裁，store 只忠实记录（§13.1 / ADR-020）。
-//! - 永不删/不压缩/不过期是默认保留策略（ADR-016）；用户主动 erase 经 `tombstones` 传播
-//!   （本版仅建表 + 读时跳过的脚手架，全量 crypto-shred 见 ADR-027，留后续）。
-//! - **MVP 明文**：`content` 明文落 `event_json`（与 QuotaBar `cache.db` 的 `search_text` 同等
-//!   本地姿态）；at-rest 加密留作后续独立分支。
+//! - 永不删/不压缩/不过期是默认保留策略（ADR-016）；用户主动 erase 在同一事务写墓碑并物理
+//!   删除命中正文，后续重建按墓碑跳过，禁止复活。
+//! - `event_json` 只以版本化 AES-256-GCM 信封落盘；密钥由 OS keychain 持久化，SQLite 内不留
+//!   密钥或明文。旧明文库首次打开时原地迁移并清理空闲页（ADR-027）。
 
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceType};
+use crate::store_crypto::{
+    create_os_key, is_envelope, load_os_key, CryptoError, StoreCipher, StoreKey,
+};
 
 /// 总库错误。
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +34,8 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("crypto: {0}")]
+    Crypto(#[from] CryptoError),
 }
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
@@ -41,6 +46,7 @@ pub type StoreResult<T> = std::result::Result<T, StoreError>;
 pub struct AppendStats {
     pub appended: u64,
     pub skipped_dup: u64,
+    pub skipped_erased: u64,
     pub max_offset: i64,
 }
 
@@ -50,6 +56,52 @@ pub struct StoreStatus {
     pub count: u64,
     pub max_offset: i64,
     pub last_ingested_at: Option<i64>,
+    pub encrypted: bool,
+    pub encryption_version: u8,
+}
+
+/// 一次用户主动擦除的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EraseStats {
+    pub deleted_events: u64,
+    pub tombstone_written: bool,
+}
+
+struct EncryptedRow {
+    offset: i64,
+    source_type: String,
+    source_location: String,
+    source_path: String,
+    source_session_id: String,
+    seq: i64,
+    generation: i64,
+    envelope: String,
+}
+
+impl EncryptedRow {
+    fn from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            offset: row.get(0)?,
+            source_type: row.get(1)?,
+            source_location: row.get(2)?,
+            source_path: row.get(3)?,
+            source_session_id: row.get(4)?,
+            seq: row.get(5)?,
+            generation: row.get(6)?,
+            envelope: row.get(7)?,
+        })
+    }
+
+    fn aad(&self) -> Vec<u8> {
+        event_aad(
+            &self.source_type,
+            &self.source_location,
+            &self.source_path,
+            &self.source_session_id,
+            self.seq,
+            self.generation,
+        )
+    }
 }
 
 /// [`TotalStore::read_session`] 的结果。`skipped > 0` = 有行反序列化失败被跳过，事件流**不完整**。
@@ -107,38 +159,73 @@ CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
 /// 读者经只读连接或 WAL 并发读，不与写竞争。
 pub struct TotalStore {
     conn: Mutex<Connection>,
+    cipher: StoreCipher,
 }
 
 impl TotalStore {
     /// 打开（或新建）磁盘总库，WAL 模式，建表幂等。父目录自动创建。
     ///
-    /// **隐私（明文 MVP）**：总库 `event_json` 含会话正文。unix 下把父目录设 `0700`、库文件设
-    /// `0600`——共享机器上其它账户不可读（WAL/SHM 在 `0700` 目录内同受保护）。Windows 下
-    /// `%LOCALAPPDATA%` 已是按用户隔离，依赖其 ACL。at-rest 加密见 ADR-027（后续）。
+    /// 密钥只从 OS keychain 读取。全新库或既有明文库可创建首把密钥；若检测到已有密文但
+    /// keychain 中没有对应密钥则硬失败，绝不生成新钥匙覆盖并造成静默数据丢失。
     pub fn open(path: &Path) -> StoreResult<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            restrict_permissions(parent, 0o700);
+        }
+        let encrypted_store = store_has_encrypted_rows(path)?;
+        let key = match load_os_key()? {
+            Some(key) => key,
+            None if encrypted_store => return Err(CryptoError::MissingKey.into()),
+            None => create_os_key()?,
+        };
+        let conn = Connection::open(path)?;
+        restrict_permissions(path, 0o600);
+        Self::from_conn(conn, key)
+    }
+
+    /// 使用宿主提供的密钥打开数据库。适用于测试和不由默认 OS keychain 管理密钥的嵌入方。
+    pub fn open_with_key(path: &Path, key: StoreKey) -> StoreResult<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
             restrict_permissions(parent, 0o700);
         }
         let conn = Connection::open(path)?;
         restrict_permissions(path, 0o600);
-        Self::from_conn(conn)
+        Self::from_conn(conn, key)
     }
 
     /// 内存库（测试用）。
     pub fn open_in_memory() -> StoreResult<Self> {
-        Self::from_conn(Connection::open_in_memory()?)
+        Self::from_conn(Connection::open_in_memory()?, StoreKey::generate())
     }
 
-    fn from_conn(conn: Connection) -> StoreResult<Self> {
+    fn from_conn(conn: Connection, key: StoreKey) -> StoreResult<Self> {
         // WAL 让读不挡写（QuotaBar 常驻写、未来 TumeFlow 并发读）。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "secure_delete", "ON")?;
         let store = Self {
             conn: Mutex::new(conn),
+            cipher: StoreCipher::new(key),
         };
         store.migrate()?;
+        store.validate_cipher()?;
         Ok(store)
+    }
+
+    fn validate_cipher(&self) -> StoreResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let sample: Option<EncryptedRow> = conn
+            .query_row(
+                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, event_json FROM raw_events ORDER BY offset LIMIT 1",
+                [],
+                EncryptedRow::from_sql,
+            )
+            .optional()?;
+        if let Some(row) = sample {
+            self.cipher.decrypt(&row.envelope, &row.aad())?;
+        }
+        Ok(())
     }
 
     fn migrate(&self) -> StoreResult<()> {
@@ -196,6 +283,53 @@ impl TotalStore {
                 "#
             ))?;
         }
+        drop(conn);
+        self.encrypt_plaintext_rows()?;
+        Ok(())
+    }
+
+    fn encrypt_plaintext_rows(&self) -> StoreResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let plaintext_rows = {
+            let mut stmt = conn.prepare(
+                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, event_json FROM raw_events WHERE event_json NOT LIKE 'sv1:%'",
+            )?;
+            let rows = stmt.query_map([], EncryptedRow::from_sql)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        if plaintext_rows.is_empty() {
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('encryption_version', '1')",
+                [],
+            )?;
+            return Ok(());
+        }
+
+        log::info!(
+            target: crate::logging::tag::SQLITE,
+            "migrating {} total-store rows to encrypted envelopes",
+            plaintext_rows.len()
+        );
+        let tx = conn.transaction()?;
+        {
+            let mut update =
+                tx.prepare("UPDATE raw_events SET event_json = ?1 WHERE offset = ?2")?;
+            for row in &plaintext_rows {
+                let envelope = self.cipher.encrypt(row.envelope.as_bytes(), &row.aad())?;
+                update.execute(params![envelope, row.offset])?;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('encryption_version', '1')",
+            [],
+        )?;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        log::info!(
+            target: crate::logging::tag::SQLITE,
+            "total-store plaintext migration completed"
+        );
         Ok(())
     }
 
@@ -234,7 +368,16 @@ impl TotalStore {
         let tx = conn.transaction()?;
         let mut appended = 0u64;
         let mut skipped_dup = 0u64;
+        let mut skipped_erased = 0u64;
         {
+            let mut tombstoned = tx.prepare(
+                r#"SELECT EXISTS(
+                       SELECT 1 FROM tombstones t
+                        WHERE (t.scope = 'session'      AND t.key = ?1)
+                           OR (t.scope = 'source_path'  AND t.key = ?2)
+                           OR (t.scope = 'project_root' AND t.key = ?3)
+                   )"#,
+            )?;
             let mut stmt = tx.prepare(
                 r#"INSERT OR IGNORE INTO raw_events
                      (ingested_at, schema_version, source_type, source_location,
@@ -243,7 +386,24 @@ impl TotalStore {
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
             )?;
             for ev in events {
+                let erased: bool = tombstoned.query_row(
+                    params![ev.source_session_id, ev.source_path, ev.project_root],
+                    |row| row.get(0),
+                )?;
+                if erased {
+                    skipped_erased += 1;
+                    continue;
+                }
                 let json = serde_json::to_string(ev)?;
+                let aad = event_aad(
+                    source_type_key(ev.source_type),
+                    &ev.source_location.as_key(),
+                    &ev.source_path,
+                    &ev.source_session_id,
+                    ev.seq as i64,
+                    generation,
+                );
+                let envelope = self.cipher.encrypt(json.as_bytes(), &aad)?;
                 let changed = stmt.execute(params![
                     now,
                     ev.schema_version,
@@ -256,7 +416,7 @@ impl TotalStore {
                     event_type_key(ev.event_type),
                     ev.occurred_at,
                     ev.project_root,
-                    json,
+                    envelope,
                 ])?;
                 if changed == 1 {
                     appended += 1;
@@ -270,6 +430,7 @@ impl TotalStore {
         Ok(AppendStats {
             appended,
             skipped_dup,
+            skipped_erased,
             max_offset,
         })
     }
@@ -292,7 +453,8 @@ impl TotalStore {
     pub fn read_since_page(&self, after_offset: i64, limit: usize) -> StoreResult<ReadPage> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            r#"SELECT r.offset, r.event_json
+            r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
+                      r.source_session_id, r.seq, r.generation, r.event_json
                  FROM raw_events r
                 WHERE r.offset > ?1
                   AND NOT EXISTS (
@@ -304,21 +466,19 @@ impl TotalStore {
                 ORDER BY r.offset ASC
                 LIMIT ?2"#,
         )?;
-        let rows = stmt.query_map(params![after_offset, limit as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map(params![after_offset, limit as i64], EncryptedRow::from_sql)?;
         let mut out = Vec::new();
         // 记录 SQL 实际扫描到的最大 offset（含坏行）——行按 offset ASC，故最后一行即最大。
         // 即便整窗都反序列化失败，max_scanned 仍非 None，让 pull 流推进游标越过坏行窗口。
         let mut max_scanned: Option<i64> = None;
         for row in rows {
-            let (offset, json) = row?;
-            max_scanned = Some(offset);
-            match serde_json::from_str::<RawEvent>(&json) {
-                Ok(ev) => out.push((offset, ev)),
+            let row = row?;
+            max_scanned = Some(row.offset);
+            match self.decode_event(&row) {
+                Ok(ev) => out.push((row.offset, ev)),
                 Err(e) => log::warn!(
                     target: crate::logging::tag::SQLITE,
-                    "raw_events offset={offset} skipped (deserialize failed, likely schema drift): {e}"
+                    "raw_events offset={} skipped (authentication/decode failed): {e}", row.offset
                 ),
             }
         }
@@ -348,7 +508,8 @@ impl TotalStore {
         // 只取文件**当前代**（per-file max generation）——回退/重写后旧代被新代取代。按 `seq`
         // （文件内单调序号 = 气泡顺序）升序，`offset` 作稳定 tiebreak。
         let mut stmt = conn.prepare(
-            r#"SELECT r.offset, r.event_json
+            r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
+                      r.source_session_id, r.seq, r.generation, r.event_json
                  FROM raw_events r
                 WHERE r.source_type = ?1
                   AND r.source_location = ?2
@@ -369,24 +530,29 @@ impl TotalStore {
                 source_path,
                 session_id,
             ],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            EncryptedRow::from_sql,
         )?;
         let mut events = Vec::new();
         let mut skipped = 0usize;
         for row in rows {
-            let (offset, json) = row?;
-            match serde_json::from_str::<RawEvent>(&json) {
+            let row = row?;
+            match self.decode_event(&row) {
                 Ok(ev) => events.push(ev),
                 Err(e) => {
                     skipped += 1;
                     log::warn!(
                         target: crate::logging::tag::SQLITE,
-                        "raw_events offset={offset} skipped (deserialize failed, likely schema drift): {e}"
+                        "raw_events offset={} skipped (authentication/decode failed): {e}", row.offset
                     );
                 }
             }
         }
         Ok(SessionRead { events, skipped })
+    }
+
+    fn decode_event(&self, row: &EncryptedRow) -> StoreResult<RawEvent> {
+        let plaintext = self.cipher.decrypt(&row.envelope, &row.aad())?;
+        Ok(serde_json::from_slice(&plaintext)?)
     }
 
     /// 总库状态（条数 / 最大 offset / 最近入库时间）。
@@ -407,19 +573,40 @@ impl TotalStore {
             count,
             max_offset,
             last_ingested_at,
+            encrypted: true,
+            encryption_version: 1,
         })
     }
 
-    /// 写一条**带作用域**墓碑（erase 传播脚手架）。`scope ∈ {session, source_path, project_root}`，
-    /// `key` 是该维度下的值；`read_since` 按 scope 精确匹配跳过（避免跨维度误伤）。
-    /// 全量 erase（跨分库 + crypto-shred）见 ADR-027，留后续。
-    pub fn tombstone(&self, scope: TombstoneScope, key: &str) -> StoreResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+    /// 在同一事务写墓碑并物理删除命中正文。墓碑不含正文，确保后续增量和全量重建都不会复活。
+    pub fn tombstone(&self, scope: TombstoneScope, key: &str) -> StoreResult<EraseStats> {
+        if key.trim().is_empty() {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "erase key must not be empty",
+            )));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO tombstones (scope, key, tombstoned_at) VALUES (?1, ?2, ?3)",
             params![scope.as_str(), key, now_unix_secs()],
         )?;
-        Ok(())
+        let deleted = tx.execute(
+            &format!("DELETE FROM raw_events WHERE {} = ?1", scope.column()),
+            params![key],
+        )?;
+        tx.commit()?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        log::info!(
+            target: crate::logging::tag::SQLITE,
+            "total-store erase committed: scope={} deleted_events={deleted}",
+            scope.as_str()
+        );
+        Ok(EraseStats {
+            deleted_events: deleted as u64,
+            tombstone_written: true,
+        })
     }
 
     /// 回填标志（写者侧 catch-up 用，见 QuotaBar `refresh_index`）：宿主据此判断总库是否已与
@@ -462,6 +649,37 @@ impl TombstoneScope {
             TombstoneScope::ProjectRoot => "project_root",
         }
     }
+
+    fn column(self) -> &'static str {
+        match self {
+            TombstoneScope::Session => "source_session_id",
+            TombstoneScope::SourcePath => "source_path",
+            TombstoneScope::ProjectRoot => "project_root",
+        }
+    }
+}
+
+fn store_has_encrypted_rows(path: &Path) -> StoreResult<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let raw_exists: bool = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_events'")?
+        .query_row([], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    if !raw_exists {
+        return Ok(false);
+    }
+    let sample: Option<String> = conn
+        .query_row(
+            "SELECT event_json FROM raw_events WHERE event_json LIKE 'sv1:%' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sample.as_deref().is_some_and(is_envelope))
 }
 
 /// unix 下把路径权限收窄到 `mode`（目录 0700 / 文件 0600）；非 unix no-op（Windows 依赖
@@ -487,6 +705,31 @@ fn max_offset_on(conn: &Connection) -> StoreResult<i64> {
             r.get(0)
         })?,
     )
+}
+
+fn event_aad(
+    source_type: &str,
+    source_location: &str,
+    source_path: &str,
+    source_session_id: &str,
+    seq: i64,
+    generation: i64,
+) -> Vec<u8> {
+    let mut aad = b"session-vault:event:v1".to_vec();
+    let seq_bytes = seq.to_be_bytes();
+    let generation_bytes = generation.to_be_bytes();
+    for part in [
+        source_type.as_bytes(),
+        source_location.as_bytes(),
+        source_path.as_bytes(),
+        source_session_id.as_bytes(),
+        &seq_bytes,
+        &generation_bytes,
+    ] {
+        aad.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        aad.extend_from_slice(part);
+    }
+    aad
 }
 
 fn now_unix_secs() -> i64 {
@@ -756,12 +999,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.read_since(0, 100).unwrap().len(), 2);
-        store.tombstone(TombstoneScope::Session, "drop").unwrap();
+        let erased = store.tombstone(TombstoneScope::Session, "drop").unwrap();
+        assert_eq!(erased.deleted_events, 1);
         let visible = store.read_since(0, 100).unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].1.source_session_id, "keep");
-        // 物理仍在（逻辑 append-only，墓碑只读时跳过）。
-        assert_eq!(store.status().unwrap().count, 2);
+        // 用户主动 erase 是默认 append-only 的例外：正文物理删除，只留不含正文的墓碑。
+        assert_eq!(store.status().unwrap().count, 1);
+        let replay = store
+            .append_events(&[mk_event(0, "drop", Some("must not return"))], false)
+            .unwrap();
+        assert_eq!(replay.appended, 0);
+        assert_eq!(replay.skipped_erased, 1);
+        assert_eq!(store.status().unwrap().count, 1, "墓碑阻止源文件重扫复活");
     }
 
     #[test]
@@ -810,6 +1060,118 @@ mod tests {
         assert_eq!(st.count, 2);
         assert_eq!(st.max_offset, stats.max_offset);
         assert!(st.last_ingested_at.is_some());
+        assert!(st.encrypted);
+        assert_eq!(st.encryption_version, 1);
+    }
+
+    #[test]
+    fn event_json_is_authenticated_ciphertext_at_rest() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(&[mk_event(0, "s", Some("private-marker-027"))], false)
+            .unwrap();
+        let stored: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT event_json FROM raw_events", [], |row| row.get(0))
+            .unwrap();
+        assert!(stored.starts_with("sv1:"));
+        assert!(!stored.contains("private-marker-027"));
+        assert_eq!(
+            store.read_since(0, 10).unwrap()[0].1.content.as_deref(),
+            Some("private-marker-027")
+        );
+    }
+
+    #[test]
+    fn plaintext_body_is_absent_from_sqlite_wal_and_shm() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_encrypted_files_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let marker = b"synthetic-private-marker-027-disk";
+        {
+            let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([11u8; 32])).unwrap();
+            store
+                .append_events(
+                    &[mk_event(
+                        0,
+                        "synthetic-session",
+                        Some(std::str::from_utf8(marker).unwrap()),
+                    )],
+                    false,
+                )
+                .unwrap();
+
+            for candidate in [
+                path.clone(),
+                path.with_extension("db-wal"),
+                path.with_extension("db-shm"),
+            ] {
+                if !candidate.exists() {
+                    continue;
+                }
+                let bytes = std::fs::read(&candidate).unwrap();
+                assert!(
+                    !bytes.windows(marker.len()).any(|window| window == marker),
+                    "plaintext body leaked into {}",
+                    candidate.display()
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ciphertext_cannot_be_swapped_between_rows() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(
+                &[
+                    mk_event(0, "s", Some("first")),
+                    mk_event(1, "s", Some("second")),
+                ],
+                false,
+            )
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TEMP TABLE swap(v TEXT);\
+                 INSERT INTO swap SELECT event_json FROM raw_events WHERE seq = 0;\
+                 UPDATE raw_events SET event_json = (SELECT event_json FROM raw_events WHERE seq = 1) WHERE seq = 0;\
+                 UPDATE raw_events SET event_json = (SELECT v FROM swap) WHERE seq = 1;",
+            )
+            .unwrap();
+        }
+        assert!(
+            store.read_since(0, 10).unwrap().is_empty(),
+            "row identity is authenticated as AAD; swapped ciphertext must fail closed"
+        );
+    }
+
+    #[test]
+    fn wrong_key_fails_open_instead_of_returning_empty_data() {
+        let dir = std::env::temp_dir().join(format!("sv_wrong_key_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("total_store.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([1u8; 32])).unwrap();
+            store
+                .append_events(&[mk_event(0, "s", Some("secret"))], false)
+                .unwrap();
+        }
+        let reopened = TotalStore::open_with_key(&path, StoreKey::from_bytes([2u8; 32]));
+        assert!(
+            matches!(reopened, Err(StoreError::Crypto(CryptoError::Decrypt))),
+            "wrong key must fail closed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -907,7 +1269,7 @@ mod tests {
             .unwrap();
         }
         // open → migrate 重建为含 generation 的六列唯一，数据保留。
-        let store = TotalStore::open(&path).unwrap();
+        let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([7u8; 32])).unwrap();
         let read = store
             .read_session(
                 SourceType::ClaudeCode,
@@ -931,6 +1293,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(read2.events[0].content.as_deref(), Some("rewritten"));
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes.windows(b"legacy".len()).any(|w| w == b"legacy"),
+            "迁移并 VACUUM 后数据库文件不得残留旧正文"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

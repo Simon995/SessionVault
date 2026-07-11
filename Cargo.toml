@@ -31,7 +31,13 @@ required-features = ["parity"]
 parity = []
 # 不可变 RawEvent 总库（§13 / ADR-020）。门控 rusqlite——纯 parser 用户不被迫拉它，
 # 保住「解析内核无状态」（§14）；QuotaBar 作总库默认写者时开此 feature。
-store = ["dep:rusqlite"]
+store = [
+    "dep:aes-gcm",
+    "dep:base64",
+    "dep:keyring",
+    "dep:rusqlite",
+    "dep:zeroize",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -46,5 +52,9 @@ env_logger = "0.11"
 
 # `store` feature only — 不可变 RawEvent 总库的持久化后端（与 QuotaBar 同版本）。
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+aes-gcm = { version = "0.10", features = ["std"], optional = true }
+base64 = { version = "0.22", optional = true }
+keyring = { version = "2.3", optional = true }
+zeroize = { version = "1.8", optional = true }
 
 [dev-dependencies]

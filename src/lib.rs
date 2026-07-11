@@ -20,6 +20,8 @@ pub mod scan;
 /// 不可变 RawEvent 总库（§13 / ADR-020）——`store` feature 门控（持久化组件，内核仍无状态）。
 #[cfg(feature = "store")]
 pub mod store;
+#[cfg(feature = "store")]
+mod store_crypto;
 pub mod wsl;
 
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
@@ -31,7 +33,11 @@ pub use rawevent::{
 };
 pub use report::ScanReport;
 #[cfg(feature = "store")]
-pub use store::{AppendStats, ReadPage, SessionRead, StoreStatus, TombstoneScope, TotalStore};
+pub use store::{
+    AppendStats, EraseStats, ReadPage, SessionRead, StoreStatus, TombstoneScope, TotalStore,
+};
+#[cfg(feature = "store")]
+pub use store_crypto::StoreKey;
 
 use thiserror::Error;
 

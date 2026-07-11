@@ -54,6 +54,38 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 用户主动彻底删除：同一事务写不含正文的墓碑并物理删除命中事件（ADR-027）。
+    #[cfg(feature = "store")]
+    Erase {
+        #[arg(long, value_enum)]
+        scope: EraseScopeArg,
+        #[arg(long)]
+        key: String,
+        /// 防止误调用；编排方必须显式传入 `ERASE`。
+        #[arg(long)]
+        confirm: String,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+}
+
+#[cfg(feature = "store")]
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum EraseScopeArg {
+    Session,
+    SourcePath,
+    ProjectRoot,
+}
+
+#[cfg(feature = "store")]
+impl From<EraseScopeArg> for session_vault::TombstoneScope {
+    fn from(value: EraseScopeArg) -> Self {
+        match value {
+            EraseScopeArg::Session => Self::Session,
+            EraseScopeArg::SourcePath => Self::SourcePath,
+            EraseScopeArg::ProjectRoot => Self::ProjectRoot,
+        }
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -115,6 +147,11 @@ enum Out<'a> {
         /// 是否已读尽 `since` 之后的可读事件（`false` = 被 `--limit` 截断，需再拉）。
         caught_up: bool,
     },
+    #[cfg(feature = "store")]
+    EraseSummary {
+        deleted_events: u64,
+        tombstone_written: bool,
+    },
 }
 
 fn main() {
@@ -133,6 +170,13 @@ fn main() {
             limit,
             store,
         } => run_pull(since, limit, store),
+        #[cfg(feature = "store")]
+        Command::Erase {
+            scope,
+            key,
+            confirm,
+            store,
+        } => run_erase(scope, key, confirm, store),
     };
     std::process::exit(code);
 }
@@ -320,6 +364,54 @@ fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
         "pull done: since={since} last_offset={last_offset} events={events} caught_up={caught_up}"
     );
     0
+}
+
+#[cfg(feature = "store")]
+fn run_erase(
+    scope: EraseScopeArg,
+    key: String,
+    confirm: String,
+    store_arg: Option<PathBuf>,
+) -> i32 {
+    if confirm != "ERASE" {
+        log::error!(target: tag::CLI, "erase rejected: explicit --confirm ERASE is required");
+        return 2;
+    }
+    if key.trim().is_empty() {
+        log::error!(target: tag::CLI, "erase rejected: --key must not be empty");
+        return 2;
+    }
+    let store_path = match resolve_store_path(store_arg) {
+        Some(path) if path.exists() => path,
+        Some(path) => {
+            log::error!(target: tag::CLI, "total store not found: path={}", path.display());
+            return 1;
+        }
+        None => {
+            log::error!(target: tag::CLI, "no data_local_dir; pass --store to locate the total store");
+            return 1;
+        }
+    };
+    let store = match session_vault::TotalStore::open(&store_path) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store for erase failed: {e}");
+            return 1;
+        }
+    };
+    match store.tombstone(scope.into(), &key) {
+        Ok(stats) => {
+            emit(&Out::EraseSummary {
+                deleted_events: stats.deleted_events,
+                tombstone_written: stats.tombstone_written,
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "erase failed: {e}");
+            1
+        }
+    }
 }
 
 /// `pull` 的可测核心：循环翻页（`read_page(cursor, want)` 注入，便于脱库单测），逐条回调
@@ -626,5 +718,14 @@ mod tests {
         assert_eq!(summary["events"], 5);
         assert_eq!(summary["store_max_offset"], 42);
         assert_eq!(summary["caught_up"], true);
+
+        let erased = serde_json::to_value(Out::EraseSummary {
+            deleted_events: 3,
+            tombstone_written: true,
+        })
+        .unwrap();
+        assert_eq!(erased["kind"], "erase_summary");
+        assert_eq!(erased["deleted_events"], 3);
+        assert_eq!(erased["tombstone_written"], true);
     }
 }
