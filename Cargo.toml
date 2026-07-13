@@ -48,6 +48,7 @@ serde_json = "1"
 log = "0.4"
 thiserror = "1"
 dirs-next = "2"
+sha2 = "0.10"
 
 # CLI-only (used by the `svault` bin; kept minimal)
 clap = { version = "4", features = ["derive"] }

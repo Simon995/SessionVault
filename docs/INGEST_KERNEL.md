@@ -53,7 +53,7 @@
 
 - **`source_mode`（形态）**：决定怎么读、用什么游标——
   - `append_log`：只增长的 JSONL（会话、history 的常态），按字节 `safe_offset` 增量读。
-  - `snapshot_file`：会被整体重写/覆盖的文本（CLAUDE.md / AGENTS.md / rules / settings / hooks / 自定义 commands、agents、skills），按内容指纹（`hash` / `mtime+size`）判变，变了产"快照变更事件"。**内容存哪里需定型**：`config_snapshot` 事件仅带新旧 `hash` 不足以回溯"改成了什么"——要做行为归因，须把（脱敏后的）配置正文存进 `RawEvent.content`（`full` 档）或单独的 `artifact_store`/`snapshot_blob`（按 `content_hash` 寻址、去重）。骨架暂只发 hash 变更事件，正文存储留作 snapshot 解析器实装时的设计点。
+  - `snapshot_file`：会被整体重写/覆盖的文本（CLAUDE.md / AGENTS.md / rules / memory 等），按 SHA-256 内容指纹判变，变了产 `config_snapshot`。**已落地选择**：`full` 档把正文写入 `RawEvent.content`，随事件一起进入 AES-256-GCM 加密总库；`content_hash` 用于版本和增量，`observed_at` 只表示扫描观测时间，不伪造真实生效时间。后续体积证明需要时再评估按 hash 去重的 `snapshot_blob`，当前不提前增加第二存储契约。
   - `sqlite_store`：SQLite 状态库（Codex `CODEX_SQLITE_HOME`、Cursor `state.vscdb`），用表游标（`rowid` / `wal_lsn` / `content_hash`），**不可按字节读**。
   - `opaque_family`：官方未公开稳定结构的状态族（Claude background/supervisor state、Codex plugin bundle），只登记为"保留来源族"先不写死 glob。
 - **两层契约**：§3 区分**来源族**（稳定层：session log / snapshot 指令 / rules / hooks / skill root / plugin root / sqlite state root / derived 任务根）与**已验证实现**（易变层：具体子目录 glob，如 Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`）。子目录漂移只动易变层，**不拖公开契约升 major**。
@@ -556,7 +556,7 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 **优先级与 P0 硬边界**（防止 P0 被总库/snapshot/sqlite/插件/隐私一起拖大）。**进度（截至 2026-06-14）**：
 
-- **P0（窄而硬）✅ 基本完成**：`RawEvent` v0 字段已定稿（`src/rawevent.rs`）；`append_log` JSONL（Claude/Codex **Local**）+ Codex 累计 token 的黄金语料已落地（**31 单测全绿**：坏行冻结整批、半行 pending、续扫不重不漏、`(mtime,size)` 回退重读、Codex 跨批延续/跨 session 重置、字段映射、profile 正文开关、**宿主感知路径规范化**）。`source_mode` / 多形态游标 / 派生路径 / 两层目录公开 API 已预留；`snapshot_file` / `sqlite_store` / `opaque_family` / derived-path 按设计返回 `planned` / `skipped`。**待补**：WSL 双位置的真实黄金语料（规范化逻辑已单测覆盖，缺端到端 fixture）。
+- **P0（窄而硬）✅ 基本完成**：`RawEvent` v1 字段已定稿；`append_log` JSONL 与 Codex 累计 token 黄金语料已落地。`snapshot_file` 于 2026-07-13 从预留升级为 experimental：新增 `content_hash/artifact_kind/observed_at`，mtime 不冒充语义时间。`sqlite_store` / `opaque_family` / derived-path 仍按设计返回 `planned` / `skipped`。
 - **P1 ✅ 基本完成**：Local Claude/Codex `append_log` 解析器已实装并过语料（`parser.rs` / `scan.rs` / `discover.rs` / `cursor.rs`，`svault scan-all` 已能吐 `RawEvent` NDJSON 流）。**游标已持久化**：`scan-all --state <file>`（默认 `<data_local_dir>/svault/cursors.json`，`--stateless` 关）跨运行续扫——实测二次扫描 23476→**0** 事件（全 cache-hit），Codex 累计 token 状态/`next_seq` 随游标存活。**路径规范化层已抽取并标准化**：`src/pathnorm.rs` 宿主感知（`HostPlatform`），UNC↔规范形互转、`workspace_location` 已接线产出（修掉了 QuotaBar「裸 `/abs` 一律当 WSL」的 Windows 宿主假设——Linux 原生跑时同路径正确判 `local`）。**WSL 访问桥已通（端到端实测）**：`src/wsl.rs`（移植 QuotaBar `wsl/mod.rs`）——纯逻辑（发行版名/UTF-16LE/`find -print0` 解析、`default_distro` 选择，跨平台单测）+ 实时层（`#[cfg(windows)]` spawn `wsl.exe`：`list_distros`/`list_jsonl_under_home`/`stat`/`read_range`/`read_file_at`，非 Windows 给桩）。`discover()` 枚举 `Wsl(distro)` 来源；扫描经 **`ByteSource` 抽象**（`scan.rs`）让本地（`File`/`Seek`）与 WSL（`wsl.exe stat` + `tail -c +K | head -c N`）**共用同一份**游标/回退/坏行冻结逻辑；`default_distro` 用来源自身发行版把裸 Linux cwd 打成精确 `wsl:<distro>`。**实测（2026-06-14，真实本机数据，metadata profile 无正文）**：48 来源（19 local + 29 WSL）→ 23373 事件，其中 **8102 来自 WSL**（Ubuntu-24.04 codex 7726 + Ubuntu-OpenClaw claude 376），**零 warning/error**。WSL 增量 tail（`read_range` start>0）由 env-gated 实机 IT（`SVAULT_WSL_IT=1`，`/tmp` 一次性文件）验证。**P1 剩余尾巴**：WSL 双位置真实**黄金语料** fixture（逻辑已全验，缺归档式回归 fixture）；snapshot/sqlite/其它 provider 属 P3 后续。
 - **P2 🟡 进行中**：
   - **step 1 ✅**：冻结 QuotaBar `cache.db` 黄金基线、写对账契约（[parity-contract.md](parity-contract.md)）、
@@ -585,7 +585,7 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
   - **step① IO 委托 ✅**（QuotaBar 侧）：QuotaBar `refresh_index` 改调 `discover()`/`scan()`，删自管 read/游标，`scan()` 成其唯一 IO+解析路径。
   - **P3-② 总库写入侧 ✅ C5 技术门完成**：`src/store.rs`（`store` feature）落地 `TotalStore`。`event_json` 仅以 AES-256-GCM `sv2` 信封落盘；OS keychain 主密钥包裹按来源类型/位置/路径/项目分组的随机数据密钥，事件身份与密钥分组均进 AAD；旧明文/`sv1` 库事务迁移后 `secure_delete + WAL truncate + VACUUM`；错误/缺失密钥硬失败。`svault erase` 写无正文墓碑、物理删除并回收孤立数据密钥，`append_events` 在写入前检查墓碑以阻止原始文件重扫复活。合成隔离跨进程 E2E 10/10 PASS。
   - **P3-③ TumeFlow 消费 🟡**：**生产侧 ✅** —— `svault pull --since <offset> [--limit N] [--store <path>]` 子命令（`src/bin/svault.rs`，`store` feature 门控）把 `read_since` 暴露成带 `offset` 的 NDJSON 流 + `pull_summary`（`last_offset`/`caught_up`），契约见 §13.2.1、线外形由 bin 单测锁定（`pull_ndjson_wire_shape_is_stable` / `pull_since_filters…` / `pull_limit_caps…`）。**消费侧拉取环 ✅** —— TumeFlow `sources/svault.py` 子进程调它、解析流、持久化游标（端到端实测，含 CJK 正文 + WSL location + 增量）；**下游物化分库（RawEvent→Episode）已在 TumeFlow 落地**（`materialize/episode.py` + 候选提取 + Dream，见 TumeFlow ROADMAP Phase 2-3）——非 SessionVault 待办。**这是解锁 TumeFlow 整条主线（摄取→Episode→Dream）的关键路径，现已贯通**。
-  - **P3-④ ⬜**：transcript-from-RawEvent；此后再按需实装 snapshot/sqlite/derived-path（各自补语料后从 `planned` 升 `stable`）。
+  - **P3-④ 🟡**：Class-B `snapshot_file` ✅——Claude/Codex memory、Codex rules、项目 CLAUDE.md/AGENTS.md 经 SHA-256 fingerprint 变更事件进入加密总库；QuotaBar 只触发同步并提供项目身份；`svault snapshots` / `read_active_latest_snapshots` 给 TumeFlow 当前态，源文件删除后不再返回，WSL 暂不可达保守保留。TumeFlow 语义解析仍归自身，adapter 仅作无总库回退（ADR-034）。transcript-from-RawEvent 与 sqlite/derived-path 仍待按需实现。
 
 > snapshot/sqlite/压缩/派生路径的 §11 用例是**契约预留 + 将来门槛**，不是 P0 的实现门槛——API 形状现在定全（避免后期撑破契约），实现按 provider 逐个补。
 

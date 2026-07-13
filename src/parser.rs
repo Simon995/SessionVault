@@ -93,6 +93,9 @@ impl ParseCtx {
             usage: None,
             content: None,
             parent_ref: None,
+            content_hash: None,
+            artifact_kind: None,
+            observed_at: None,
             message_id: None,
             request_id: None,
         }

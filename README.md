@@ -10,7 +10,8 @@ svault 构建 diff `cache.db` 一致后删旧路径；首测 9134 条 usage must
 总库写入侧 `TotalStore` 已落地（QuotaBar 作默认写者，随 QuotaBar 0.8.0-beta.8 发布 soak），
 TumeFlow `svault pull --since` 消费拉取环已通。待办 = P2 soak 删旧路径 + at-rest 加密 / erase
 （P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，非 SessionVault 待办）。
-最后更新：2026-06-23
+Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/指纹/入库，TumeFlow 只做语义解析。
+最后更新：2026-07-13
 
 ---
 
@@ -33,12 +34,13 @@ TumeFlow `svault pull --since` 消费拉取环已通。待办 = P2 soak 删旧�
 | `parser` | 行级 JSONL → `RawEvent`（Claude / Codex 字段映射、Codex 累计 token delta） | ✅ |
 | `pathnorm` | 宿主感知路径规范化（`HostPlatform`、UNC↔规范形、`workspace_location`） | ✅ |
 | `wsl` | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码） | ✅ 实机实测 |
-| `scan` | 增量扫描（`ByteSource` 抽象，本地/WSL 共用游标·回退·坏行处理：增量冻结 / 一次性全扫保留好行） | ✅ append_log |
-| `cursor` | 多形态游标（字节偏移 + Codex 状态 + `next_seq`） | ✅ append_log |
+| `scan` | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹 | ✅ append_log + snapshot_file |
+| `cursor` | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`） | ✅ |
 | `svault` CLI | `discover` / `scan-all`（NDJSON 出 stdout），跨运行游标持久化 | ✅ |
 | `parity` 工具 | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0 |
 | 总库（持久化输出库） | append-only RawEvent 库 | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak） |
-| snapshot_file / sqlite_store / 其它 provider | 契约预留 | ⬜ `planned` |
+| snapshot_file | Claude/Codex memory、rules、项目 instruction 状态快照 | ✅ experimental（Windows/WSL + 最新快照查询） |
+| sqlite_store / 其它 provider | 契约预留 | ⬜ `planned` |
 
 **实机实测（2026-06-14，真实本机数据）**：48 来源（19 local + 29 WSL）→ 23373 事件
 （8102 来自 WSL）；二次扫描借持久化游标 23476 → **0** 事件（全 cache-hit），增量端到端闭环。
@@ -78,7 +80,11 @@ CLI（NDJSON）与 lib 等价（PyO3 wheel 后置）：
 |---|---|
 | `catalog()` | 生效后的 provider 描述符列表（宿主据此渲染设置页） |
 | `discover()` | 发现来源清单（本地 + WSL），首次只发现不读内容 |
+| `discover_transcripts()` / `discover_snapshots()` | 分离会话与状态制品，防止 snapshot 污染会话投影 |
+| `discover_project_snapshots()` | 在宿主已确认的项目根内发现 CLAUDE.md / AGENTS.md；身份由宿主提供 |
 | `scan(source_ref, cursor_in, profile)` | 单来源增量摄取主接口（无状态：游标进、游标出） |
+| `TotalStore::sync_snapshots()` | 快照增量扫描并加密写入总库 |
+| `TotalStore::read_active_latest_snapshots()` | 每个来源的当前最新快照，删除文件不再返回 |
 
 CLI：
 
@@ -88,6 +94,8 @@ CLI：
   `<data_local_dir>/svault/cursors.json`（`--state` 覆盖、`--stateless` 关），跨运行真增量。
   退出码：`0` 成功 / `1` 发现失败 / `2` **游标保存失败**（`summary.state_saved=false`，
   本轮增量游标未推进，下游应重试或预期重复）。
+- `svault snapshots [--store <path>]` —— 输出每个 snapshot source 的当前最新版本；
+  供 TumeFlow Class-B 主路径消费，不要求从总库头扫描历史。
 
 ## 落地路线（绞杀者迁移）
 

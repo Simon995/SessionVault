@@ -54,6 +54,12 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 返回总库中每个 snapshot source 的最新版本，供 TumeFlow Class-B 主路径消费。
+    #[cfg(feature = "store")]
+    Snapshots {
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 用户主动彻底删除：同一事务写不含正文的墓碑并物理删除命中事件（ADR-027）。
     #[cfg(feature = "store")]
     Erase {
@@ -157,6 +163,10 @@ enum Out<'a> {
         caught_up: bool,
     },
     #[cfg(feature = "store")]
+    Snapshot { offset: i64, event: &'a RawEvent },
+    #[cfg(feature = "store")]
+    SnapshotSummary { snapshots: u64 },
+    #[cfg(feature = "store")]
     EraseSummary {
         deleted_events: u64,
         keys_destroyed: u64,
@@ -187,6 +197,8 @@ fn main() {
             store,
         } => run_pull(since, limit, store),
         #[cfg(feature = "store")]
+        Command::Snapshots { store } => run_snapshots(store),
+        #[cfg(feature = "store")]
         Command::Erase {
             scope,
             key,
@@ -197,6 +209,42 @@ fn main() {
         Command::FixtureAppend { event_file, store } => run_fixture_append(event_file, store),
     };
     std::process::exit(code);
+}
+
+#[cfg(feature = "store")]
+fn run_snapshots(store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if !store_path.exists() {
+        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
+        return 1;
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!(target: tag::CLI, "snapshot store open failed: {e}");
+            return 2;
+        }
+    };
+    let rows = match store.read_active_latest_snapshots() {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::error!(target: tag::CLI, "snapshot read failed: {e}");
+            return 2;
+        }
+    };
+    for (offset, event) in &rows {
+        emit(&Out::Snapshot {
+            offset: *offset,
+            event,
+        });
+    }
+    emit(&Out::SnapshotSummary {
+        snapshots: rows.len() as u64,
+    });
+    0
 }
 
 /// env_logger sink 到 **stderr**，stdout 留给 NDJSON。
@@ -631,6 +679,9 @@ mod tests {
             usage: Some(TokenUsage::default()),
             content: Some(format!("c{seq}")),
             parent_ref: None,
+            content_hash: None,
+            artifact_kind: None,
+            observed_at: None,
             message_id: None,
             request_id: None,
         }
@@ -788,6 +839,17 @@ mod tests {
         assert_eq!(summary["events"], 5);
         assert_eq!(summary["store_max_offset"], 42);
         assert_eq!(summary["caught_up"], true);
+
+        let snapshot = serde_json::to_value(Out::Snapshot {
+            offset: 43,
+            event: &ev,
+        })
+        .unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(snapshot["offset"], 43);
+        let snapshot_summary = serde_json::to_value(Out::SnapshotSummary { snapshots: 1 }).unwrap();
+        assert_eq!(snapshot_summary["kind"], "snapshot_summary");
+        assert_eq!(snapshot_summary["snapshots"], 1);
 
         let erased = serde_json::to_value(Out::EraseSummary {
             deleted_events: 3,

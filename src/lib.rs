@@ -26,7 +26,7 @@ pub mod wsl;
 
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
 pub use cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
-pub use discover::SourceRef;
+pub use discover::{ProjectSnapshotRoot, SourceRef};
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
     Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
@@ -34,7 +34,8 @@ pub use rawevent::{
 pub use report::ScanReport;
 #[cfg(feature = "store")]
 pub use store::{
-    AppendStats, EraseStats, ReadPage, SessionRead, StoreStatus, TombstoneScope, TotalStore,
+    AppendStats, EraseStats, ReadPage, SessionRead, SnapshotSyncStats, StoreStatus, TombstoneScope,
+    TotalStore,
 };
 #[cfg(feature = "store")]
 pub use store_crypto::StoreKey;
@@ -58,7 +59,7 @@ pub fn catalog() -> Vec<ProviderDescriptor> {
     catalog::builtin_descriptors()
 }
 
-/// §9 `discover()`：发现来源清单（本地内置 session 根 + WSL 各发行版）。
+/// §9 `discover()`：发现 transcript + snapshot 来源（本地 + WSL）。
 pub fn discover() -> Result<Vec<SourceRef>> {
     discover::discover_all()
 }
@@ -66,6 +67,22 @@ pub fn discover() -> Result<Vec<SourceRef>> {
 /// 仅发现宿主系统本机来源，不调用 WSL。用于需要确定性和文件系统隔离的宿主测试。
 pub fn discover_local() -> Result<Vec<SourceRef>> {
     discover::discover_local()
+}
+
+pub fn discover_transcripts() -> Result<Vec<SourceRef>> {
+    discover::discover_transcripts()
+}
+
+pub fn discover_transcripts_local() -> Result<Vec<SourceRef>> {
+    discover::discover_transcripts_local()
+}
+
+pub fn discover_snapshots() -> Result<Vec<SourceRef>> {
+    discover::discover_snapshots()
+}
+
+pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRef> {
+    discover::discover_project_snapshots(roots)
 }
 
 /// §9 `scan()`：单来源增量扫描（按 source_mode 分派）。

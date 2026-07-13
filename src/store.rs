@@ -13,7 +13,7 @@
 //! - `event_json` 只以版本化 AES-256-GCM 信封落盘；密钥由 OS keychain 持久化，SQLite 内不留
 //!   密钥或明文。旧明文库首次打开时原地迁移并清理空闲页（ADR-027）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,11 +21,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
-use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceType};
+use crate::cursor::{Cursor, ScanStatus};
+use crate::discover::SourceRef;
+use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
 use crate::store_crypto::{
     create_os_key, data_key_id, is_envelope, load_os_key, new_data_key_id, CryptoError,
     StoreCipher, StoreKey,
 };
+use crate::Profile;
 
 /// 总库错误。
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +168,15 @@ pub struct ReadPage {
     pub events: Vec<(i64, RawEvent)>,
     /// 本页 SQL 扫描到的最大 offset（含坏行）；`None` = SQL 零行（真追平）。
     pub max_scanned_offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SnapshotSyncStats {
+    pub sources: u64,
+    pub changed: u64,
+    pub unchanged: u64,
+    pub failed: u64,
+    pub appended: u64,
 }
 
 /// `raw_events` 表 DDL（建库 + 迁移共用）。唯一键含 `generation`：文件回退/重写时新代同 `seq`
@@ -620,6 +632,147 @@ impl TotalStore {
         })
     }
 
+    /// 每个 snapshot source 的最新版本。按 `(type, location, path)` 分组取最大
+    /// offset，并遵守 erase 墓碑。TumeFlow 用它读取当前 Class-B 状态，不必从总库头扫。
+    pub fn read_latest_snapshots(&self) -> StoreResult<Vec<(i64, RawEvent)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
+                      r.source_session_id, r.seq, r.generation, r.project_root, r.event_json
+                 FROM raw_events r
+                WHERE r.event_type = 'config_snapshot'
+                  AND r.offset = (
+                      SELECT MAX(r2.offset) FROM raw_events r2
+                       WHERE r2.event_type = 'config_snapshot'
+                         AND r2.source_type = r.source_type
+                         AND r2.source_location = r.source_location
+                         AND r2.source_path = r.source_path
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tombstones t
+                       WHERE (t.scope = 'source_path' AND t.key = r.source_path)
+                          OR (t.scope = 'project_root' AND t.key = r.project_root)
+                  )
+                ORDER BY r.source_type, r.source_location, r.source_path"#,
+        )?;
+        let rows = stmt.query_map([], EncryptedRow::from_sql)?;
+        let mut out = Vec::new();
+        let mut cache = HashMap::new();
+        for row in rows {
+            let row = row?;
+            match self.decode_event_on(&conn, &mut cache, &row) {
+                Ok(event) => out.push((row.offset, event)),
+                Err(e) => log::warn!(
+                    target: crate::logging::tag::SQLITE,
+                    "latest snapshot offset={} skipped (decode failed): {e}", row.offset
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `read_latest_snapshots` 的当前可见视图：已明确删除的源文件不返回；WSL
+    /// 探测暂时失败时保守保留，避免短暂离线被误判成删除。
+    pub fn read_active_latest_snapshots(&self) -> StoreResult<Vec<(i64, RawEvent)>> {
+        let rows = self.read_latest_snapshots()?;
+        let mut by_distro: HashMap<String, Vec<String>> = HashMap::new();
+        for (_, event) in &rows {
+            if let SourceLocation::Wsl(distro) = &event.source_location {
+                by_distro
+                    .entry(distro.clone())
+                    .or_default()
+                    .push(event.source_path.clone());
+            }
+        }
+        let mut existing: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+        for (distro, paths) in by_distro {
+            match crate::wsl::existing_files(&distro, &paths) {
+                Ok(found) => {
+                    existing.insert(distro, Some(found));
+                }
+                Err(error) => {
+                    log::warn!(
+                        target: crate::logging::tag::SNAPSHOT,
+                        "snapshot batch existence probe failed; keeping last versions: distro={} error={}",
+                        distro,
+                        error
+                    );
+                    existing.insert(distro, None);
+                }
+            }
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|(_, event)| match &event.source_location {
+                SourceLocation::Local => Path::new(&event.source_path).is_file(),
+                SourceLocation::Wsl(distro) => existing
+                    .get(distro)
+                    .and_then(Option::as_ref)
+                    .is_none_or(|paths| paths.contains(&event.source_path)),
+            })
+            .collect())
+    }
+
+    fn snapshot_cursor(&self, source: &SourceRef) -> StoreResult<Cursor> {
+        let latest = self
+            .read_latest_snapshots()?
+            .into_iter()
+            .map(|(_, event)| event)
+            .find(|event| {
+                event.source_type == source.source_type
+                    && event.source_location == source.source_location
+                    && event.source_path == source.path.to_string_lossy()
+            });
+        let mut cursor = Cursor::new_fingerprint();
+        if let Some(event) = latest {
+            // 内容未变但宿主补齐/修正了项目身份或 artifact kind 时也要发新版本；
+            // 否则早期无身份快照会永久挡住后续规范化元数据。
+            if event.project_root == source.project_root
+                && event.artifact_kind == source.artifact_kind
+            {
+                cursor.content_hash = event.content_hash;
+            }
+            cursor.next_seq = event.seq.saturating_add(1);
+        }
+        Ok(cursor)
+    }
+
+    /// 用 SessionVault 的 snapshot scanner 同步一组已授权来源到总库。宿主只负责
+    /// 触发与提供项目身份；发现、读取、指纹、增量和持久化都在本仓完成。
+    pub fn sync_snapshots(&self, sources: &[SourceRef]) -> StoreResult<SnapshotSyncStats> {
+        let mut stats = SnapshotSyncStats::default();
+        for source in sources {
+            if source.source_mode != SourceMode::SnapshotFile {
+                continue;
+            }
+            stats.sources += 1;
+            let cursor = self.snapshot_cursor(source)?;
+            let result = crate::scan::scan_source(source, Some(cursor), Profile::Full);
+            if result.status == ScanStatus::Error {
+                stats.failed += 1;
+                log::warn!(
+                    target: crate::logging::tag::SNAPSHOT,
+                    "snapshot sync failed: path={} warnings={:?}",
+                    source.path.display(), result.report.warnings
+                );
+                continue;
+            }
+            if result.events.is_empty() {
+                stats.unchanged += 1;
+                continue;
+            }
+            let appended = self.append_events(&result.events, false)?;
+            stats.changed += 1;
+            stats.appended += appended.appended;
+        }
+        log::info!(
+            target: crate::logging::tag::SNAPSHOT,
+            "snapshot sync done: sources={} changed={} unchanged={} failed={} appended={}",
+            stats.sources, stats.changed, stats.unchanged, stats.failed, stats.appended
+        );
+        Ok(stats)
+    }
+
     /// 读单个 (file, session) 的全部事件（按 `seq` 升序 = 文件内事件顺序）。作用域**四列精确**：
     /// 一张会话卡 = 一个 `(source_type, source_location, source_path, session_id)` 对——session_id
     /// 可跨文件 replay（Claude `--resume`），故必须连 `source_path` 一起 scope，不能只按 session_id
@@ -972,6 +1125,9 @@ mod tests {
             usage: Some(TokenUsage::default()),
             content: content.map(|s| s.to_string()),
             parent_ref: None,
+            content_hash: None,
+            artifact_kind: None,
+            observed_at: None,
             message_id: None,
             request_id: None,
         }
@@ -981,6 +1137,53 @@ mod tests {
         let mut ev = mk_event(seq, session, None);
         ev.source_path = source_path.to_string();
         ev
+    }
+
+    #[test]
+    fn snapshot_sync_is_incremental_and_latest_query_returns_current_version() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("svault-store-snapshot-{nanos}.md"));
+        std::fs::write(&path, "# memory\nv1\n").unwrap();
+        let source = SourceRef {
+            source_type: SourceType::Codex,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::SnapshotFile,
+            path: path.clone(),
+            project_root: None,
+            artifact_kind: Some("memory".into()),
+        };
+        let store = TotalStore::open_in_memory().unwrap();
+        let first = store.sync_snapshots(std::slice::from_ref(&source)).unwrap();
+        assert_eq!((first.changed, first.appended), (1, 1));
+        let second = store.sync_snapshots(std::slice::from_ref(&source)).unwrap();
+        assert_eq!((second.unchanged, second.appended), (1, 0));
+
+        std::fs::write(&path, "# memory\nv2\n").unwrap();
+        let third = store.sync_snapshots(std::slice::from_ref(&source)).unwrap();
+        assert_eq!((third.changed, third.appended), (1, 1));
+        let mut identified = source.clone();
+        identified.project_root = Some("C:/work/project".into());
+        let metadata = store
+            .sync_snapshots(std::slice::from_ref(&identified))
+            .unwrap();
+        assert_eq!((metadata.changed, metadata.appended), (1, 1));
+
+        let latest = store.read_latest_snapshots().unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].1.seq, 2);
+        assert_eq!(latest[0].1.project_root.as_deref(), Some("C:/work/project"));
+        assert_eq!(latest[0].1.content.as_deref(), Some("# memory\nv2\n"));
+        assert_eq!(
+            store.status().unwrap().count,
+            3,
+            "历史版本仍 append-only 保留"
+        );
+        std::fs::remove_file(path).unwrap();
+        assert!(store.read_active_latest_snapshots().unwrap().is_empty());
+        assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
     }
 
     #[test]

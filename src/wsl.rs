@@ -115,9 +115,21 @@ fn run_bash_stdin(distro: &str, script: &str) -> Result<std::process::Output, St
 /// 目录不存在 → `Ok(vec![])`（脚本 `exit 0`）。
 #[cfg(windows)]
 pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<String>, String> {
+    list_files_under_home(distro, rel_subpath, ".jsonl")
+}
+
+/// 递归列出 `$HOME/<rel_subpath>` 下指定后缀的普通文件。后缀来自内置 catalog，
+/// 统一走 `find -print0`，保留空格和非 ASCII 路径。
+#[cfg(windows)]
+pub fn list_files_under_home(
+    distro: &str,
+    rel_subpath: &str,
+    suffix: &str,
+) -> Result<Vec<String>, String> {
     let script = format!(
-        "set -eu\nDIR=\"$HOME/{rel}\"\n[ -d \"$DIR\" ] || exit 0\nfind \"$DIR\" -type f -name '*.jsonl' -print0\n",
-        rel = shell_escape(rel_subpath)
+        "set -eu\nDIR=\"$HOME/{rel}\"\n[ -d \"$DIR\" ] || exit 0\nfind \"$DIR\" -type f -name \"{pattern}\" -print0\n",
+        rel = shell_escape(rel_subpath),
+        pattern = shell_escape(&format!("*{suffix}")),
     );
     let output = run_bash_stdin(distro, &script)?;
     if !output.status.success() {
@@ -132,6 +144,15 @@ pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<Stri
 
 #[cfg(not(windows))]
 pub fn list_jsonl_under_home(_distro: &str, _rel_subpath: &str) -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(windows))]
+pub fn list_files_under_home(
+    _distro: &str,
+    _rel_subpath: &str,
+    _suffix: &str,
+) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
@@ -256,6 +277,39 @@ pub fn read_file_at(distro: &str, abs_path: &str) -> Result<Option<String>, Stri
 
 #[cfg(not(windows))]
 pub fn read_file_at(_distro: &str, _abs_path: &str) -> Result<Option<String>, String> {
+    Err("wsl.exe access is only available on Windows builds".to_string())
+}
+
+/// 一次 WSL 进程批量探测多条绝对路径，避免最新快照查询为每个文件各 spawn
+/// 一个 `wsl.exe`。返回实际存在的原始路径集合。
+#[cfg(windows)]
+pub fn existing_files(
+    distro: &str,
+    paths: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut script = String::from("set -eu\n");
+    for path in paths {
+        let escaped = shell_escape(path);
+        script.push_str(&format!(
+            "[ ! -f \"{escaped}\" ] || printf '%s\\0' \"{escaped}\"\n"
+        ));
+    }
+    let output = run_bash_stdin(distro, &script)?;
+    if !output.status.success() {
+        return Err(format!(
+            "wsl batch exists {distro} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(parse_nul_paths(&output.stdout).into_iter().collect())
+}
+
+#[cfg(not(windows))]
+pub fn existing_files(
+    _distro: &str,
+    _paths: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
     Err("wsl.exe access is only available on Windows builds".to_string())
 }
 

@@ -1,4 +1,4 @@
-//! 单来源增量扫描（§8）。按 `source_mode` 分派；append_log 是骨架唯一实装路径。
+//! 单来源增量扫描（§8）。按 `source_mode` 分派；已实现 append_log 与 snapshot_file。
 //!
 //! append_log 流程：stat 文件 → 比对 `(mtime, size)` 检测回退/截断 → 从 `safe_offset`
 //! 读尾部 → `split_complete_jsonl` 切出完整行（半行留下轮）→ 解析 → 推进游标。
@@ -11,7 +11,9 @@ use crate::discover::SourceRef;
 use crate::logging::tag;
 use crate::parser::{parse_lines, ParseCtx};
 use crate::pathnorm::HostPlatform;
-use crate::rawevent::{SourceLocation, SourceMode};
+use crate::rawevent::{
+    Actor, EventType, RawEvent, SourceLocation, SourceMode, TimeConfidence, SCHEMA_VERSION,
+};
 use crate::report::SourceReport;
 use crate::Profile;
 
@@ -31,8 +33,9 @@ pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
                 scan_append_log(&WslSource { distro, abs: &abs }, source, cursor_in, profile)
             }
         },
+        SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile),
         // 其余形态骨架未实装：返回 NoCursor，事件空。
-        SourceMode::SnapshotFile | SourceMode::SqliteStore | SourceMode::OpaqueFamily => {
+        SourceMode::SqliteStore | SourceMode::OpaqueFamily => {
             let mut report = SourceReport {
                 source_path: source.path.display().to_string(),
                 source_mode: Some(source.source_mode),
@@ -53,6 +56,124 @@ pub fn scan_source(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profi
                 report,
             }
         }
+    }
+}
+
+fn scan_snapshot_file(
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    profile: Profile,
+) -> ScanResult {
+    use sha2::{Digest, Sha256};
+
+    let mut cursor = cursor_in.unwrap_or_else(Cursor::new_fingerprint);
+    cursor.kind = CursorKind::Fingerprint;
+    let mut report = SourceReport {
+        source_path: source.path.display().to_string(),
+        source_mode: Some(SourceMode::SnapshotFile),
+        cursor_kind: Some(CursorKind::Fingerprint),
+        ..Default::default()
+    };
+    let read = match &source.source_location {
+        SourceLocation::Local => std::fs::read(&source.path).map_err(|e| e.to_string()),
+        SourceLocation::Wsl(distro) => {
+            crate::wsl::read_file_at(distro, &source.path.to_string_lossy())
+                .and_then(|v| v.ok_or_else(|| "snapshot file disappeared".to_string()))
+                .map(String::into_bytes)
+        }
+    };
+    let bytes = match read {
+        Ok(v) => v,
+        Err(e) => {
+            report.warnings.push(format!("read failed: {e}"));
+            return ScanResult {
+                status: ScanStatus::Error,
+                events: Vec::new(),
+                cursor_out: cursor,
+                report,
+            };
+        }
+    };
+    report.bytes_read = bytes.len() as u64;
+    report.items_examined = 1;
+    let hash = format!("sha256:{:x}", Sha256::digest(&bytes));
+    if cursor.content_hash.as_deref() == Some(&hash) {
+        report.fingerprint_changed = false;
+        return ScanResult {
+            status: ScanStatus::Ok,
+            events: Vec::new(),
+            cursor_out: cursor,
+            report,
+        };
+    }
+    let content = match String::from_utf8(bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            report
+                .warnings
+                .push(format!("snapshot is not valid UTF-8: {e}"));
+            return ScanResult {
+                status: ScanStatus::Error,
+                events: Vec::new(),
+                cursor_out: cursor,
+                report,
+            };
+        }
+    };
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let event = RawEvent {
+        schema_version: SCHEMA_VERSION,
+        source_type: source.source_type,
+        source_location: source.source_location.clone(),
+        source_path: report.source_path.clone(),
+        source_session_id: "snapshot".to_string(),
+        seq: cursor.next_seq,
+        source_mode: SourceMode::SnapshotFile,
+        cwd: None,
+        project_root: source.project_root.clone(),
+        project_root_source: source
+            .project_root
+            .as_ref()
+            .map(|_| "host_identity".to_string()),
+        workspace_location: source
+            .project_root
+            .as_ref()
+            .map(|_| source.source_location.as_key()),
+        event_type: EventType::ConfigSnapshot,
+        actor: Some(Actor::System),
+        occurred_at: None,
+        time_confidence: TimeConfidence::Low,
+        model: None,
+        effort: None,
+        usage: None,
+        content: matches!(profile, Profile::Full).then_some(content),
+        parent_ref: None,
+        content_hash: Some(hash.clone()),
+        artifact_kind: source.artifact_kind.clone(),
+        observed_at: Some(observed_at),
+        message_id: None,
+        request_id: None,
+    };
+    cursor.content_hash = Some(hash);
+    cursor.next_seq += 1;
+    report.fingerprint_changed = true;
+    report.events_emitted = 1;
+    log::info!(
+        target: tag::SNAPSHOT,
+        "snapshot changed: path={} kind={} seq={}",
+        report.source_path,
+        source.artifact_kind.as_deref().unwrap_or("unknown"),
+        event.seq
+    );
+    ScanResult {
+        status: ScanStatus::Ok,
+        events: vec![event],
+        cursor_out: cursor,
+        report,
     }
 }
 
@@ -335,6 +456,8 @@ mod tests {
             source_location: SourceLocation::Local,
             source_mode: SourceMode::AppendLog,
             path: path.clone(),
+            project_root: None,
+            artifact_kind: None,
         };
         (path, src)
     }
@@ -377,6 +500,54 @@ mod tests {
         let (path, mut src) = temp_source(name, body);
         src.source_type = SourceType::Codex;
         (path, src)
+    }
+
+    fn temp_snapshot(name: &str, body: &str) -> (PathBuf, SourceRef) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("svault-snapshot-{name}-{nanos}.md"));
+        std::fs::write(&path, body).unwrap();
+        let src = SourceRef {
+            source_type: SourceType::Codex,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::SnapshotFile,
+            path: path.clone(),
+            project_root: None,
+            artifact_kind: Some("memory".into()),
+        };
+        (path, src)
+    }
+
+    #[test]
+    fn snapshot_emits_only_on_hash_change_and_keeps_versions() {
+        let (path, src) = temp_snapshot("changed", "# preference\nuse uv\n");
+        let first = scan_source(&src, None, Profile::Full);
+        assert_eq!(first.status, ScanStatus::Ok);
+        assert_eq!(first.events.len(), 1);
+        assert!(first.report.fingerprint_changed);
+        assert_eq!(first.events[0].event_type, EventType::ConfigSnapshot);
+        assert_eq!(first.events[0].seq, 0);
+        assert_eq!(
+            first.events[0].content.as_deref(),
+            Some("# preference\nuse uv\n")
+        );
+        assert!(first.events[0]
+            .content_hash
+            .as_deref()
+            .is_some_and(|hash| hash.starts_with("sha256:")));
+
+        let unchanged = scan_source(&src, Some(first.cursor_out), Profile::Full);
+        assert!(unchanged.events.is_empty());
+        assert!(!unchanged.report.fingerprint_changed);
+
+        std::fs::write(&path, "# preference\nuse uv only\n").unwrap();
+        let changed = scan_source(&src, Some(unchanged.cursor_out), Profile::Full);
+        assert_eq!(changed.events.len(), 1);
+        assert_eq!(changed.events[0].seq, 1);
+        assert_ne!(changed.events[0].content_hash, first.events[0].content_hash);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -80,6 +80,12 @@ impl Cursor {
             next_seq: 0,
         }
     }
+
+    pub fn new_fingerprint() -> Self {
+        let mut cursor = Self::new_byte_offset();
+        cursor.kind = CursorKind::Fingerprint;
+        cursor
+    }
 }
 
 /// 单来源扫描状态。

@@ -157,6 +157,18 @@ pub struct RawEvent {
     /// 父事件引用（线程/分支重建）——greenfield。
     pub parent_ref: Option<String>,
 
+    // --- snapshot_file-only ---
+    /// 快照正文的 SHA-256；用于变更检测与下游版本证据，不是语义时间。
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    /// `memory` / `rules` / `instruction`；append_log 为 None。
+    #[serde(default)]
+    pub artifact_kind: Option<String>,
+    /// SessionVault 观测到该快照版本的时间（Unix 秒字符串）。它不是文件的
+    /// 真实生效时间，因此 `time_confidence` 保持 low、`occurred_at` 不伪造。
+    #[serde(default)]
+    pub observed_at: Option<String>,
+
     // --- Claude-only ---
     pub message_id: Option<String>,
     pub request_id: Option<String>,
