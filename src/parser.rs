@@ -20,6 +20,29 @@ use crate::rawevent::{
     SCHEMA_VERSION,
 };
 
+/// 解析器语义版本。**从同一份字节里能提取出什么**发生变化时 +1。
+///
+/// 🔴 与 [`SCHEMA_VERSION`] 是两件事，不能互相顶替：
+///
+/// - `SCHEMA_VERSION` 是 `RawEvent` **DTO 的契约版本**，面向 TumeFlow 等消费者；
+///   它变了意味着字段形状变了，下游要改代码。
+/// - `PARSER_REVISION` 是**提取能力的版本**。DTO 一字未动，但同一行 JSONL 现在
+///   能解析出以前解析不出的东西，所以**已经扫过的文件需要重扫**。
+///
+/// 为什么必须分开：修 Claude `effort` 时 DTO 完全没变，若挪用 `SCHEMA_VERSION`
+/// 就会向 TumeFlow 谎报一次破坏性变更；而若不加版本号，增量扫描按
+/// `(path, mtime, size)` 判定命中，文件没动就永不重解析 —— 一年的历史数据会
+/// 永远停在旧解析器的结果上，而界面上看不出任何异常。
+///
+/// 消费者（QuotaBar 的 session index）把它连同游标一起持久化，发现存量 revision
+/// 落后于当前值时按 full rebuild 处理该文件。
+///
+/// | rev | 变更 |
+/// |-----|------|
+/// | 1   | 基线 |
+/// | 2   | Claude assistant 行的顶层 `effort` 开始被提取（此前整条链路丢弃） |
+pub const PARSER_REVISION: u32 = 2;
+
 /// 解析产物：本批事件 + 更新后的 Codex 状态 + 跳过计数 + 告警。
 #[derive(Debug, Clone, Default)]
 pub struct ParseOut {
@@ -219,6 +242,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
                 pr.as_ref(),
             );
             ev.model = u.model;
+            ev.effort = u.effort;
             ev.usage = Some(u.usage);
             ev.message_id = u.message_id;
             ev.request_id = u.request_id;
@@ -293,12 +317,26 @@ fn claude_message(value: &Value) -> Option<(Option<Actor>, String)> {
 
 struct ClaudeUsage {
     model: Option<String>,
+    effort: Option<String>,
     usage: TokenUsage,
     message_id: Option<String>,
     request_id: Option<String>,
 }
 
 /// usage 提取；mirror `parse_claude_jsonl_entry`（但不因缺时间戳而丢弃）。
+///
+/// 🔴 `effort` 在 assistant 行的**顶层**，与 `requestId` 同层，**不在 `message`
+/// 里** —— 和 Codex 把它埋进 `turn_context` 的形状不同，所以不能套用
+/// `extract_codex_effort`。
+///
+/// 这个字段此前被整条链路丢弃：本函数不读，QuotaBar 的回退解析器则硬编码
+/// `effort: None`，注释还写着「Anthropic JSONL doesn't record reasoning effort
+/// today」。那句话写的时候大概是真的，之后 Claude Code 加了 `/effort` 而没有
+/// 任何东西会因此报错 —— 又一次「注释断言外部世界，世界变了却无人知道」。
+///
+/// 取值不枚举：实测样本里有 `max` / `xhigh` / `high`，且 `max` 是 Claude 独有
+/// （Codex 只有 low/medium/high/xhigh）。任何非空字符串都原样透传，展示层按
+/// effective token 排序，未来新增档位不需要改解析器。
 fn claude_usage(value: &Value) -> Option<ClaudeUsage> {
     if value.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
@@ -309,6 +347,11 @@ fn claude_usage(value: &Value) -> Option<ClaudeUsage> {
         model: message
             .get("model")
             .and_then(Value::as_str)
+            .map(str::to_string),
+        effort: value
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(str::to_string),
         usage: TokenUsage {
             input: read_u64(usage, "input_tokens"),
@@ -748,6 +791,82 @@ mod tests {
             profile: Profile::Metadata,
             host,
             default_distro: default_distro.map(str::to_string),
+        }
+    }
+
+    #[test]
+    /// 🔴 Claude 的 `effort` 曾被整条链路丢弃。
+    ///
+    /// 它在 assistant 行的**顶层**（与 `requestId` 同层），不在 `message` 里；
+    /// 本函数此前根本不读它，而 QuotaBar 的回退解析器硬编码 `effort: None`，
+    /// 注释还写着 Anthropic 不记录它 —— 那句话曾经是真的。
+    ///
+    /// 断言用 `max`：实测样本里最常见的取值，且是 **Claude 独有**（Codex 只有
+    /// low/medium/high/xhigh），所以任何「照抄 Codex 枚举」的实现都会在这里红。
+    #[test]
+    fn claude_usage_carries_top_level_effort() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "sessionId": "sess-effort",
+            "timestamp": "2026-08-04T10:00:00.000Z",
+            "requestId": "req_e",
+            "effort": "max",
+            "message": {
+                "id": "msg_e",
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "usage": {"input_tokens": 1, "output_tokens": 2,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+            }
+        })
+        .to_string();
+        let out = parse_lines(
+            &ctx(SourceType::ClaudeCode, Profile::Full),
+            &[line.as_str()],
+            0,
+            None,
+        );
+        let usage = out
+            .events
+            .iter()
+            .find(|e| e.event_type == EventType::Usage)
+            .expect("usage event");
+        assert_eq!(usage.effort.as_deref(), Some("max"));
+    }
+
+    /// 没有 `effort` 的行必须留 `None`，不能落成空串 —— 下游按「有没有标注」
+    /// 分母，空串会把未标注的行算进已标注里。
+    #[test]
+    fn claude_usage_without_effort_stays_none() {
+        for line in [
+            serde_json::json!({
+                "type": "assistant", "sessionId": "s", "timestamp": "2026-08-04T10:00:00.000Z",
+                "message": {"id": "m", "role": "assistant", "model": "claude-opus-5",
+                            "usage": {"input_tokens": 1, "output_tokens": 1,
+                                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+            }),
+            // 空串等同于缺失。
+            serde_json::json!({
+                "type": "assistant", "sessionId": "s", "timestamp": "2026-08-04T10:00:00.000Z",
+                "effort": "",
+                "message": {"id": "m", "role": "assistant", "model": "claude-opus-5",
+                            "usage": {"input_tokens": 1, "output_tokens": 1,
+                                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+            }),
+        ] {
+            let s = line.to_string();
+            let out = parse_lines(
+                &ctx(SourceType::ClaudeCode, Profile::Full),
+                &[s.as_str()],
+                0,
+                None,
+            );
+            let usage = out
+                .events
+                .iter()
+                .find(|e| e.event_type == EventType::Usage)
+                .expect("usage event");
+            assert_eq!(usage.effort, None, "line: {s}");
         }
     }
 

@@ -27,6 +27,7 @@ pub mod wsl;
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
 pub use cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
 pub use discover::{ProjectSnapshotRoot, SourceRef};
+pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
     Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
