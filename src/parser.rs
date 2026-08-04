@@ -794,7 +794,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// 🔴 Claude 的 `effort` 曾被整条链路丢弃。
     ///
     /// 它在 assistant 行的**顶层**（与 `requestId` 同层），不在 `message` 里；

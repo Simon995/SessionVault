@@ -14,6 +14,8 @@ use session_vault::catalog::Profile;
 use session_vault::cursor::Cursor;
 use session_vault::logging::tag;
 use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
+#[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+use session_vault::store::Projection;
 use session_vault::SourceRef;
 
 #[derive(Parser)]
@@ -516,7 +518,13 @@ fn run_fixture_append(event_file: PathBuf, store_path: PathBuf) -> i32 {
             return 1;
         }
     };
-    match store.append_events(&[event], false) {
+    // 固件只发一条事件、走增量语义。
+    //
+    // 🔴 这个调用点（连同下方两个测试里的）在 `acceptance-fixtures` feature 后面，
+    // 默认构建与 `cargo check --bins` 都不编译它 —— 所以把签名从 `bool` 换成
+    // `Projection` 时，它静默失配了一整个提交，`cargo test --lib` 全绿。
+    // feature 门后的代码不在默认闸的覆盖里，改公共签名时要单独编一遍。
+    match store.append_events(&[event], Projection::Append) {
         Ok(stats) => {
             emit(&Out::FixtureSummary {
                 appended: stats.appended,
@@ -747,7 +755,7 @@ mod tests {
         store
             .append_events(
                 &[mk_event(0, "s"), mk_event(1, "s"), mk_event(2, "s")],
-                false,
+                Projection::Append,
             )
             .unwrap();
 
@@ -779,7 +787,7 @@ mod tests {
                     mk_event(2, "s"),
                     mk_event(3, "s"),
                 ],
-                false,
+                Projection::Append,
             )
             .unwrap();
 
