@@ -45,6 +45,39 @@ pub enum StoreError {
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 
+/// 一批事件相对该文件既有事件的关系 —— 决定它们落在**哪一代**。
+///
+/// 🔴 这里曾是一个裸 `is_rollback: bool`，而两种「需要开新代」的原因在语义上
+/// 完全不同：一种是外部世界变了（文件被截断/重写），另一种是我们变了（解析器
+/// 升级，同一份字节现在能读出更多东西）。用 bool 表达时，第二种只能伪装成
+/// 第一种 —— 于是 `rollback` 这个词会开始撒谎，而日志、报表、以后每一个读
+/// 这段代码的人都被误导。
+///
+/// 具名之后，调用点必须说出理由，且新增第三种原因时编译器会指出所有分支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Projection {
+    /// 增量：并入文件当前代，与既有事件一起被 `read_session` 读到。
+    Append,
+    /// 扫描器检测到文件变小/被重写，已从 `seq=0` 重建。开新代 —— 新代事件因
+    /// 唯一键含 generation 而不被旧代同 seq 挡掉；旧代留存（append-only）。
+    Rollback,
+    /// **同一份字节，更好的解析器**（`PARSER_REVISION` 提升后的重扫）。
+    ///
+    /// 必须开新代，否则 `INSERT OR IGNORE` 会把每一条重发事件当成旧代的重复
+    /// 全部丢弃 —— 文件没变、seq 没变、代没变，唯一键完全相同。结果是解析器
+    /// 修好了而总库纹丝不动，且没有任何错误可查。
+    Reparse,
+}
+
+impl Projection {
+    fn opens_new_generation(self) -> bool {
+        match self {
+            Projection::Append => false,
+            Projection::Rollback | Projection::Reparse => true,
+        }
+    }
+}
+
 /// 一次 `append_events` 的结果。`skipped_dup` = 命中 `dedup_key` 唯一约束被忽略的条数
 /// （force 全量重扫时旧事件全走这里 → 幂等）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -476,16 +509,13 @@ impl TotalStore {
 
     /// 批量追加事件（一批 = 一个文件，所有事件共享 source_type/location/path）。
     ///
-    /// **代（generation）**：常态用文件当前最大代（增量事件并入当前代，与既有事件一起被读）；
-    /// `is_rollback=true`（扫描器检测到截断/重写、从 `seq=0` 重建）则用 当前代+1 —— 新代事件
-    /// 因唯一键含 generation 而**不**被旧代同 seq 挡掉，照样入库；`read_session` 取当前代 →
-    /// 用户看到重写后的内容。旧代留存（append-only 不可变，TumeFlow pull 仍见全历史）。
+    /// **代（generation）** 由 [`Projection`] 决定，见其文档。
     ///
     /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同代旧事件全 skip、增量只落新尾。
     pub fn append_events(
         &self,
         events: &[RawEvent],
-        is_rollback: bool,
+        projection: Projection,
     ) -> StoreResult<AppendStats> {
         let now = now_unix_secs();
         let mut conn = self.conn.lock().unwrap();
@@ -503,7 +533,7 @@ impl TotalStore {
                     ],
                     |r| r.get(0),
                 )?;
-                file_max + i64::from(is_rollback)
+                file_max + i64::from(projection.opens_new_generation())
             }
         };
         let tx = conn.transaction()?;
@@ -761,7 +791,7 @@ impl TotalStore {
                 stats.unchanged += 1;
                 continue;
             }
-            let appended = self.append_events(&result.events, false)?;
+            let appended = self.append_events(&result.events, Projection::Append)?;
             stats.changed += 1;
             stats.appended += appended.appended;
         }
@@ -1198,7 +1228,9 @@ mod tests {
         // 文件 B 的同名 session "s"（--resume replay）+ 文件 A 的另一 session "t"。
         let b0 = mk_event_at(0, "s", "/b.jsonl");
         let t0 = mk_event_at(0, "t", "/a.jsonl");
-        store.append_events(&[a1, a0c, b0, t0], false).unwrap();
+        store
+            .append_events(&[a1, a0c, b0, t0], Projection::Append)
+            .unwrap();
 
         let got = store
             .read_session(
@@ -1238,7 +1270,7 @@ mod tests {
                     mk_event(0, "s", Some("ok")),
                     mk_event(1, "s", Some("also ok")),
                 ],
-                false,
+                Projection::Append,
             )
             .unwrap();
         // 直接往库里塞一行无法反序列化为 RawEvent 的 event_json（模拟损坏 / 未来不兼容 schema）。
@@ -1273,7 +1305,7 @@ mod tests {
         // 误判成「追平」，坏行之后的有效事件永久不可达。
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "s", Some("good-0"))], false)
+            .append_events(&[mk_event(0, "s", Some("good-0"))], Projection::Append)
             .unwrap();
         // 直接塞两行坏 event_json（offset 紧随 good-0）。
         {
@@ -1291,7 +1323,7 @@ mod tests {
             }
         }
         store
-            .append_events(&[mk_event(3, "s", Some("good-3"))], false)
+            .append_events(&[mk_event(3, "s", Some("good-3"))], Projection::Append)
             .unwrap();
 
         // good-0 在 offset 1；坏行在 offset 2、3；good-3 在 offset 4。
@@ -1323,12 +1355,12 @@ mod tests {
             mk_event(0, "s1", Some("hello")),
             mk_event(1, "s1", Some("world")),
         ];
-        let first = store.append_events(&batch, false).unwrap();
+        let first = store.append_events(&batch, Projection::Append).unwrap();
         assert_eq!(first.appended, 2);
         assert_eq!(first.skipped_dup, 0);
 
         // 重放同批（force 重扫场景）→ 全部 dedup，count 不变。
-        let again = store.append_events(&batch, false).unwrap();
+        let again = store.append_events(&batch, Projection::Append).unwrap();
         assert_eq!(again.appended, 0);
         assert_eq!(again.skipped_dup, 2);
         assert_eq!(store.status().unwrap().count, 2);
@@ -1341,7 +1373,7 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         let a = mk_event_at(0, "c", "/a|b");
         let b = mk_event_at(0, "b|c", "/a");
-        let stats = store.append_events(&[a, b], false).unwrap();
+        let stats = store.append_events(&[a, b], Projection::Append).unwrap();
         assert_eq!(
             stats.appended, 2,
             "含 `|` 的两条不同身份必须都入库（不碰撞）"
@@ -1354,7 +1386,10 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         for seq in 0..5u64 {
             store
-                .append_events(&[mk_event(seq, "s1", Some(&format!("m{seq}")))], false)
+                .append_events(
+                    &[mk_event(seq, "s1", Some(&format!("m{seq}")))],
+                    Projection::Append,
+                )
                 .unwrap();
         }
         let all = store.read_since(0, 100).unwrap();
@@ -1380,7 +1415,7 @@ mod tests {
         store
             .append_events(
                 &[mk_event(0, "keep", None), mk_event(0, "drop", None)],
-                false,
+                Projection::Append,
             )
             .unwrap();
         assert_eq!(store.read_since(0, 100).unwrap().len(), 2);
@@ -1396,7 +1431,10 @@ mod tests {
         // 用户主动 erase 是默认 append-only 的例外：正文物理删除，只留不含正文的墓碑。
         assert_eq!(store.status().unwrap().count, 1);
         let replay = store
-            .append_events(&[mk_event(0, "drop", Some("must not return"))], false)
+            .append_events(
+                &[mk_event(0, "drop", Some("must not return"))],
+                Projection::Append,
+            )
             .unwrap();
         assert_eq!(replay.appended, 0);
         assert_eq!(replay.skipped_erased, 1);
@@ -1413,7 +1451,7 @@ mod tests {
         let mut by_project = mk_event(0, "sess-y", None);
         by_project.project_root = Some("/work".to_string());
         store
-            .append_events(&[by_session, by_project], false)
+            .append_events(&[by_session, by_project], Projection::Append)
             .unwrap();
 
         // 只墓碑 project_root=/work → 只隐藏 by_project，不碰 session 名为 /work 的那条。
@@ -1443,7 +1481,10 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         assert_eq!(store.status().unwrap().count, 0);
         let stats = store
-            .append_events(&[mk_event(0, "s", None), mk_event(1, "s", None)], false)
+            .append_events(
+                &[mk_event(0, "s", None), mk_event(1, "s", None)],
+                Projection::Append,
+            )
             .unwrap();
         let st = store.status().unwrap();
         assert_eq!(st.count, 2);
@@ -1459,7 +1500,10 @@ mod tests {
     fn event_json_is_authenticated_ciphertext_at_rest() {
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "s", Some("private-marker-027"))], false)
+            .append_events(
+                &[mk_event(0, "s", Some("private-marker-027"))],
+                Projection::Append,
+            )
             .unwrap();
         let stored: String = store
             .conn
@@ -1494,7 +1538,7 @@ mod tests {
                         "synthetic-session",
                         Some(std::str::from_utf8(marker).unwrap()),
                     )],
-                    false,
+                    Projection::Append,
                 )
                 .unwrap();
 
@@ -1525,7 +1569,7 @@ mod tests {
         let mut project_b = mk_event(1, "b", Some("project-b-secret"));
         project_b.project_root = Some("/work/b".into());
         store
-            .append_events(&[project_a.clone(), project_b.clone()], false)
+            .append_events(&[project_a.clone(), project_b.clone()], Projection::Append)
             .unwrap();
         assert_eq!(store.status().unwrap().active_data_keys, 2);
 
@@ -1556,7 +1600,7 @@ mod tests {
                     mk_event(0, "s", Some("first")),
                     mk_event(1, "s", Some("second")),
                 ],
-                false,
+                Projection::Append,
             )
             .unwrap();
         {
@@ -1582,7 +1626,9 @@ mod tests {
         first.content = Some("first-secret".into());
         let mut second = mk_event_at(0, "second", "/b.jsonl");
         second.content = Some("second-secret".into());
-        store.append_events(&[first, second], false).unwrap();
+        store
+            .append_events(&[first, second], Projection::Append)
+            .unwrap();
         {
             let conn = store.conn.lock().unwrap();
             conn.execute_batch(
@@ -1608,7 +1654,7 @@ mod tests {
         {
             let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([1u8; 32])).unwrap();
             store
-                .append_events(&[mk_event(0, "s", Some("secret"))], false)
+                .append_events(&[mk_event(0, "s", Some("secret"))], Projection::Append)
                 .unwrap();
         }
         let reopened = TotalStore::open_with_key(&path, StoreKey::from_bytes([2u8; 32]));
@@ -1684,7 +1730,7 @@ mod tests {
                     mk_event(0, "s", Some("old-0")),
                     mk_event(1, "s", Some("old-1")),
                 ],
-                false,
+                Projection::Append,
             )
             .unwrap();
         // 文件被重写 → 扫描器 is_rollback=true，新代同 seq 但不同内容。
@@ -1694,7 +1740,7 @@ mod tests {
                     mk_event(0, "s", Some("new-0")),
                     mk_event(1, "s", Some("new-1")),
                 ],
-                true,
+                Projection::Rollback,
             )
             .unwrap();
         assert_eq!(
@@ -1721,7 +1767,7 @@ mod tests {
 
         // 再增量（非回退）→ 并入当前代，与新代一起读。
         store
-            .append_events(&[mk_event(2, "s", Some("new-2"))], false)
+            .append_events(&[mk_event(2, "s", Some("new-2"))], Projection::Append)
             .unwrap();
         let read2 = store
             .read_session(
@@ -1781,7 +1827,7 @@ mod tests {
         assert_eq!(read.events[0].content.as_deref(), Some("legacy"));
         // 迁移后 generation 机制可用：回退取代。
         store
-            .append_events(&[mk_event(0, "s", Some("rewritten"))], true)
+            .append_events(&[mk_event(0, "s", Some("rewritten"))], Projection::Rollback)
             .unwrap();
         let read2 = store
             .read_session(
@@ -1799,5 +1845,56 @@ mod tests {
             "迁移并 VACUUM 后数据库文件不得残留旧正文"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 解析器升级必须开新代，否则总库纹丝不动而没有任何错误可查。
+    ///
+    /// 这是本次改动的全部理由：文件没变、seq 没变，若沿用当前代，
+    /// `INSERT OR IGNORE` 会把每一条重发事件都当成旧代的重复丢弃。
+    /// 断言写成「读到的是新内容」而不是「代号 +1」—— 后者是实现细节，
+    /// 前者才是用户/下游真正依赖的性质。
+    #[test]
+    fn reparse_opens_a_new_generation_so_re_emitted_events_are_not_deduped() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let old = mk_event(0, "s", Some("parsed-by-rev-1"));
+        assert_eq!(
+            store
+                .append_events(&[old], Projection::Append)
+                .unwrap()
+                .appended,
+            1
+        );
+
+        // 同一个 (source, session, seq)，只是解析器更好了。
+        let reparsed = mk_event(0, "s", Some("parsed-by-rev-2"));
+
+        // 先证明「当成增量」会静默丢弃 —— 没有这一半，下面那一半可能只是碰巧过。
+        let as_append = store
+            .append_events(&[reparsed.clone()], Projection::Append)
+            .unwrap();
+        assert_eq!(
+            as_append.appended, 0,
+            "同代同 seq 必然被 INSERT OR IGNORE 丢掉"
+        );
+        assert_eq!(as_append.skipped_dup, 1);
+
+        let as_reparse = store
+            .append_events(&[reparsed], Projection::Reparse)
+            .unwrap();
+        assert_eq!(as_reparse.appended, 1, "Reparse 必须落库");
+
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(
+            read.events[0].content.as_deref(),
+            Some("parsed-by-rev-2"),
+            "读到的应是新解析器的结果"
+        );
     }
 }
