@@ -629,6 +629,15 @@ impl TotalStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
+        // 🔴 WAL 文件默认**停在历史最高水位**（`journal_size_limit = -1`），checkpoint 只
+        // 把页搬回主库、不截断文件。一次 schema 迁移是一个覆盖全表的大事务，于是 2.8 GB
+        // 的真库把 WAL 撑到 **5.33 GB 并且再也不还** —— 实测那之后 WAL 里有效的只剩 653 页
+        // （2.6 MB），也就是 5.3 GB 纯占盘。它不拖慢读（SQLite 只读有效区），所以**没有任何
+        // 迹象**会提示这件事，只有 `du` 看得见。
+        //
+        // 每提一次 `PARSER_REVISION` 就会再撑一次，因此这里必须设上限而不是事后手工收拾。
+        // 64 MB 足够常态写入批量用，超出的部分在 checkpoint 后归还。
+        conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
         register_sql_functions(&conn)?;
         let store = Self {
             conn: Mutex::new(conn),
@@ -4409,5 +4418,27 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 WAL 必须有大小上限，否则一次迁移撑出的高水位**再也不还**。
+    ///
+    /// 默认 `journal_size_limit = -1`：checkpoint 只把页搬回主库、不截断文件。一个覆盖
+    /// 全表的迁移事务因此在 2.8 GB 的真库上留下 **5.33 GB 的 WAL**，而其中有效的只有
+    /// 653 页（2.6 MB）。它不拖慢读，所以没有任何迹象会提示 —— 只有 `du` 看得见，而每提
+    /// 一次 `PARSER_REVISION` 就再撑一次。
+    #[test]
+    #[cfg(feature = "store")]
+    fn the_wal_has_a_size_limit_so_a_migration_high_water_mark_is_returned() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let limit: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_size_limit", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            limit > 0,
+            "journal_size_limit = {limit}（-1 = 不限）—— WAL 会停在历史最高水位，             一次全表迁移之后就是几 GB 纯占盘，且没有任何迹象提示"
+        );
     }
 }
