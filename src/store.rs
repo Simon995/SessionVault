@@ -47,6 +47,20 @@ pub enum StoreError {
     /// 安静地写进另一个文件的投影里。作用域一旦显式，它就变成一个可以拒绝的错误。
     #[error("batch declares source {declared} but carries an event from {found}")]
     ForeignEvent { declared: String, found: String },
+    /// 新投影比它要取代的那份**少了事件** —— 拒绝替换，旧投影原样保留。
+    ///
+    /// 这是解析器退化最直接的可观测信号。退化本身可以修，但「退化 + 此后源文件被
+    /// 自动清理」就再也回不去了（ADR-016：原始来源会定时自删）。
+    // 🔴 字段不能叫 `source`：`thiserror` 会把它当成错误源链（`Error::source()`），
+    // 于是要求 `String: Error`。命名与派生宏的约定冲突时，改名比加标注清楚。
+    #[error(
+        "reparse of {source_path} would drop events ({before} → {after}); refusing to replace"
+    )]
+    ProjectionLosesEvents {
+        source_path: String,
+        before: u64,
+        after: u64,
+    },
 }
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
@@ -167,6 +181,15 @@ pub struct ProjectionStats {
     pub projection_revision: i64,
     /// 头是否指向了一个新的 `(source_revision, projection_revision)`。
     pub head_moved: bool,
+    /// 被这次 `Reparse` 取代并删除的旧投影行数。`Rollback` 恒为 0 —— 它的旧版本是
+    /// 已消失内容的唯一副本，永不回收。
+    pub superseded_removed: u64,
+    /// 新投影比被它取代的那份**少了事件** → `Some((before, after))`。
+    ///
+    /// 此时头照切（当前答案必须是最新那份解析），但**旧投影不删** —— 事件变少既可能
+    /// 是新解析器合法地不再产出某类事件，也可能是一次退化，而两者在这个观测上完全
+    /// 一样。不可逆的那一步在可疑时不做。调用方据此上报/告警。
+    pub loses_events: Option<(u64, u64)>,
 }
 
 /// [`TotalStore::recent_sessions`] 的一行。
@@ -979,6 +1002,86 @@ impl TotalStore {
                 }
             }
         }
+        // 🔴 `Reparse` 取代被它超越的那份投影（ADR-044 决定 2）。
+        //
+        // 为什么只有 Reparse 能删：
+        //
+        // - `Rollback` 的旧版本是磁盘上**已消失内容的唯一副本** —— 删了真没了；
+        // - `Reparse` 的旧投影是**同一批字节的一份更差的解析**，可再生。`Reparse`
+        //   按定义就是重读源字节，源没了根本不会发生 —— 所以替换那一刻字节必然可读。
+        //
+        // 🔴 **丢事件时：头照切，旧投影不删。**
+        //
+        // ADR-044 决定 2 原本写作「拒绝替换」，而实现时发现那句话内部矛盾：一个
+        // **合法产出零事件**的新解析器（G2）与一次**解析器退化**（G3）在「事件变少」
+        // 这个观测上完全一样。按字面拒绝，G2 就永远做不成 —— 库会一直服务旧解析，
+        // 正是本 ADR 要治的病；而 `parser_revision` 不推进，还会无限重试。
+        //
+        // 拆开之后两个目标都能满足：
+        //
+        // - **当前答案**永远是最新那份解析（正确、诚实）；
+        // - **不可逆的那一步**（删旧行）在可疑时不做，于是退化可恢复。
+        //
+        // 护栏保护的是删除，不是切换。代价是可疑情形下磁盘多留一份 —— 只在可疑情形，
+        // 不是常态。
+        //
+        // 与插入同一事务：失败时头与旧投影一并原样保留。
+        let mut superseded_removed = 0u64;
+        let mut loses_events: Option<(u64, u64)> = None;
+        if projection == Projection::Reparse && (source_revision, projection_revision) != head {
+            let (prev_source, prev_projection) = head;
+            let prev_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM raw_events
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                params![
+                    source_type,
+                    source_location,
+                    source_path,
+                    prev_source,
+                    prev_projection
+                ],
+                |r| r.get(0),
+            )?;
+            let new_count = appended as i64;
+            if new_count < prev_count {
+                loses_events = Some((prev_count as u64, new_count as u64));
+                log::warn!(
+                    "[total-store] reparse of {source_path} yields fewer events                      ({prev_count} → {new_count}); keeping the superseded projection                      so the regression stays recoverable"
+                );
+            }
+            superseded_removed = if loses_events.is_some() {
+                0
+            } else {
+                tx.execute(
+                    "DELETE FROM raw_events
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                    params![
+                        source_type,
+                        source_location,
+                        source_path,
+                        prev_source,
+                        prev_projection
+                    ],
+                )? as u64
+            };
+            if loses_events.is_none() {
+                tx.execute(
+                    "DELETE FROM projections
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                    params![
+                        source_type,
+                        source_location,
+                        source_path,
+                        prev_source,
+                        prev_projection
+                    ],
+                )?;
+            }
+        }
+
         // 切头。与事件插入同一事务：插入失败则头原样保留，读侧永远看不到「头指向一份
         // 没写成的投影」这种中间态。
         tx.execute(
@@ -1009,6 +1112,8 @@ impl TotalStore {
             source_revision,
             projection_revision,
             head_moved: (source_revision, projection_revision) != head,
+            superseded_removed,
+            loses_events,
         })
     }
 
@@ -2524,8 +2629,11 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (0, 0, "append".to_string()),
+                // `append` 那份**已被 reparse 取代并删除**（ADR-044 决定 2）——
+                // 台账与行一起走，不留悬空的账。
                 (0, 1, "reparse".to_string()),
+                // `rollback` 开的是新**源版本**：前一个源版本是磁盘上已消失内容的
+                // 唯一副本，所以 reparse 那份仍在。
                 (1, 0, "rollback".to_string()),
             ]
         );
@@ -2839,10 +2947,8 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![
-                (0, Some(1), "append".to_string()),
-                (1, Some(2), "reparse".to_string()),
-            ]
+            vec![(1, Some(2), "reparse".to_string())],
+            "被取代的那份投影连同它的台账一起消失 —— 留着台账而删了行，会造出一条             指向不存在数据的记录"
         );
     }
 
@@ -2946,23 +3052,207 @@ mod tests {
     /// CLI 换掉返回内容，按旧语义写的消费者不会报错，只会悄悄拿到不同的数据。
     #[test]
     fn the_current_projection_read_filters_superseded_rows_while_the_legacy_one_does_not() {
+        // 🔴 用 `Rollback` 而不是 `Reparse` 造「两代并存」。
+        //
+        // 决定 2 落地后，`Reparse` 会**删掉**被取代的投影，所以它造不出并存状态了 ——
+        // 用它当 fixture，这条测试会变成一条恒真的空断言。而 `Rollback` 的旧版本是
+        // 已消失内容的唯一副本，永远留存，正是「并存」的真实来源。
         let store = TotalStore::open_in_memory().unwrap();
         store
-            .append_events(&[mk_event(0, "s", Some("old-parse"))], Projection::Append)
+            .append_events(
+                &[mk_event(0, "s", Some("before-rewrite"))],
+                Projection::Append,
+            )
             .unwrap();
         store
-            .append_events(&[mk_event(0, "s", Some("new-parse"))], Projection::Reparse)
+            .append_events(
+                &[mk_event(0, "s", Some("after-rewrite"))],
+                Projection::Rollback,
+            )
             .unwrap();
 
         let current = store.read_current_since_page(0, 100).unwrap();
         assert_eq!(current.events.len(), 1, "当前投影只有一条");
-        assert_eq!(current.events[0].1.content.as_deref(), Some("new-parse"));
+        assert_eq!(
+            current.events[0].1.content.as_deref(),
+            Some("after-rewrite")
+        );
 
         let legacy = store.read_since_page(0, 100).unwrap();
         assert_eq!(
             legacy.events.len(),
             2,
-            "旧接口必须原样返回两代 —— 静默改变它的语义比不修 D1 更糟"
+            "旧接口必须原样返回两个源版本 —— 静默改变它的语义比不修 D1 更糟"
         );
+    }
+
+    /// 🔴 **护栏 G7（ADR-044 决定 1/2）：`Reparse` 取代旧投影，`Rollback` 保留旧版本。**
+    ///
+    /// 两条**互为镜像**，必须一起断言。只测其中一条，把另一条写成同样的语义也照样绿 ——
+    /// 而它们的留存价值恰好相反：
+    ///
+    /// - `Reparse` 的旧投影是同一批字节的更差解析，可再生 → 删；
+    /// - `Rollback` 的旧版本是磁盘上**已消失内容的唯一副本** → 留。
+    #[test]
+    fn reparse_replaces_while_rollback_retains() {
+        let rows = |s: &TotalStore| -> i64 {
+            s.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(
+                &[mk_event(0, "s", Some("v1")), mk_event(1, "s", Some("v1b"))],
+                Projection::Append,
+            )
+            .unwrap();
+        assert_eq!(rows(&store), 2);
+
+        let stats = store
+            .append_events(
+                &[mk_event(0, "s", Some("v2")), mk_event(1, "s", Some("v2b"))],
+                Projection::Reparse,
+            )
+            .unwrap();
+        assert_eq!(rows(&store), 2, "Reparse 取代 —— 总行数不增长");
+        assert_eq!(stats.appended, 2);
+
+        let store2 = TotalStore::open_in_memory().unwrap();
+        store2
+            .append_events(&[mk_event(0, "s", Some("v1"))], Projection::Append)
+            .unwrap();
+        store2
+            .append_events(&[mk_event(0, "s", Some("rewritten"))], Projection::Rollback)
+            .unwrap();
+        assert_eq!(rows(&store2), 2, "Rollback 保留 —— 旧版本是唯一副本");
+    }
+
+    /// 🔴 **解析器升级带来的存储增长必须是零** —— 这是决定 2 的全部意义。
+    ///
+    /// 实机上一次重投影把总库从 1.54 GB 推到 2.72 GB，并承诺「每次 PARSER_REVISION
+    /// 升版再攒一份」。断言「连续多次重投影后行数不变」，而不是断言某个具体数字：
+    /// 前者说的是**无界增长被消除了**，后者只是一次快照。
+    #[test]
+    fn repeated_reparses_do_not_accumulate() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let batch = |tag: &str| {
+            vec![
+                mk_event(0, "s", Some(tag)),
+                mk_event(1, "s", Some(tag)),
+                mk_event(2, "s", Some(tag)),
+            ]
+        };
+        store
+            .append_events(&batch("v1"), Projection::Append)
+            .unwrap();
+        let baseline = store.status().unwrap().count;
+        for tag in ["v2", "v3", "v4", "v5"] {
+            store
+                .append_events(&batch(tag), Projection::Reparse)
+                .unwrap();
+        }
+        assert_eq!(
+            store.status().unwrap().count,
+            baseline,
+            "四次重投影之后行数必须不变；增长了说明旧投影仍在累积"
+        );
+    }
+
+    /// 🔴 **丢事件时：头照切，旧投影不删。**
+    ///
+    /// ADR 原本写作「拒绝替换」，而实现时发现那句话内部矛盾：一个**合法产出零事件**的
+    /// 新解析器与一次**解析器退化**，在「事件变少」这个观测上完全一样。按字面拒绝，
+    /// 前者就永远做不成 —— 库会一直服务旧解析，正是本 ADR 要治的病。
+    ///
+    /// 拆开之后两个目标都满足：当前答案是最新那份解析（正确），不可逆的删除在可疑时
+    /// 不做（可恢复）。这条同时断言两半 —— 只测一半，另一半可以被写反而不被发现。
+    #[test]
+    fn a_shrinking_reparse_switches_the_head_but_keeps_the_old_rows() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(
+                &[mk_event(0, "s", Some("a")), mk_event(1, "s", Some("b"))],
+                Projection::Append,
+            )
+            .unwrap();
+
+        // 用 `apply_projection`：兼容层 `append_events` 返回的 `AppendStats` 里没有
+        // `loses_events` / `head_moved` —— 而这条测试要断言的正是那两个。
+        let stats = store
+            .apply_projection(FileProjectionBatch {
+                source: SourceKey {
+                    source_type: SourceType::ClaudeCode,
+                    source_location: SourceLocation::Local,
+                    source_path: "/p/file.jsonl".to_string(),
+                },
+                parser_revision: Some(2),
+                mode: Projection::Reparse,
+                events: vec![mk_event(0, "s", Some("only-a"))],
+            })
+            .unwrap();
+
+        assert_eq!(stats.loses_events, Some((2, 1)), "必须如实上报「变少了」");
+        assert_eq!(stats.superseded_removed, 0, "可疑时不做不可逆的那一步");
+        assert!(stats.head_moved, "但头照切 —— 当前答案必须是最新那份解析");
+
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read.events.len(), 1);
+        assert_eq!(
+            read.events[0].content.as_deref(),
+            Some("only-a"),
+            "当前答案是新解析；返回旧内容说明头没切，库还在服务已被取代的解析"
+        );
+
+        let total: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "旧投影的两行仍在 —— 退化可恢复");
+    }
+
+    /// 空的重投影是「丢事件」的极端情形：头切到空投影，旧行留着。
+    ///
+    /// 这条与 `a_reparse_with_no_events_empties_the_current_projection` 互补：那条说
+    /// 「当前投影变空了」，这条说「变空的同时旧数据没被销毁」。
+    #[test]
+    fn an_empty_reparse_is_the_extreme_case_of_shrinking() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        store
+            .apply_projection(FileProjectionBatch {
+                source: source.clone(),
+                parser_revision: Some(1),
+                mode: Projection::Append,
+                events: vec![mk_event(0, "s", Some("v1"))],
+            })
+            .unwrap();
+        let stats = store
+            .apply_projection(FileProjectionBatch {
+                source,
+                parser_revision: Some(2),
+                mode: Projection::Reparse,
+                events: vec![],
+            })
+            .unwrap();
+        assert_eq!(stats.loses_events, Some((1, 0)));
+        assert_eq!(stats.superseded_removed, 0);
+        assert!(stats.head_moved);
     }
 }
