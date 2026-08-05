@@ -16,8 +16,8 @@ use crate::cursor::{CodexState, CodexUsage};
 use crate::pathnorm::{self, HostPlatform};
 use crate::project_root::{resolve_project_root, ProjectRoot};
 use crate::rawevent::{
-    Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence, TokenUsage,
-    SCHEMA_VERSION,
+    Actor, EventKey, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
+    TokenUsage, EVENT_KEY_VERSION, SCHEMA_VERSION,
 };
 
 /// 解析器语义版本。**从同一份字节里能提取出什么**发生变化时 +1。
@@ -115,12 +115,52 @@ impl ParseCtx {
             effort: None,
             usage: None,
             content: None,
+            event_key: None,
             parent_ref: None,
             content_hash: None,
             artifact_kind: None,
             observed_at: None,
             message_id: None,
             request_id: None,
+        }
+    }
+}
+
+/// 一条源记录（JSONL 的一行）内的槽位分配器。
+///
+/// 🔴 **按 `event_type` 分别计数**，不是一个总计数。这一条就是 [`EventKey`] 稳定而 `seq`
+/// 不稳定的全部差别：`seq` 数「本次产出的第几条」，所以在既有事件**之前**新增一种类型
+/// 会把其后所有编号推走；按类型计数则各算各的，新增一种类型不影响任何既有类型的编号。
+struct RecordSlots {
+    fingerprint: String,
+    /// `(event_type, 已分配数)`。类型只有个位数，线性扫比 HashMap 便宜且无需 Hash 约束。
+    counts: Vec<(EventType, u32)>,
+}
+
+impl RecordSlots {
+    fn new(record: &str) -> Self {
+        Self {
+            fingerprint: EventKey::fingerprint_of(record),
+            counts: Vec::new(),
+        }
+    }
+
+    /// 取这条记录里下一个该类型的槽位。
+    fn next(&mut self, event_type: EventType) -> EventKey {
+        let ordinal = match self.counts.iter_mut().find(|(ty, _)| *ty == event_type) {
+            Some((_, n)) => {
+                *n += 1;
+                *n - 1
+            }
+            None => {
+                self.counts.push((event_type, 1));
+                0
+            }
+        };
+        EventKey {
+            version: EVENT_KEY_VERSION,
+            record_fingerprint: self.fingerprint.clone(),
+            slot_ordinal: ordinal,
         }
     }
 }
@@ -178,6 +218,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             }
         };
 
+        let mut slots = RecordSlots::new(line);
         let session_id = extract_claude_session_id(&value)
             .map(str::to_string)
             .unwrap_or_else(|| fallback.clone());
@@ -207,6 +248,9 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             if ctx.want_content() {
                 ev.content = Some(text);
             }
+            // 槽位取自  本身，不重复写字面量 —— 六个发射点里有一个
+            // 用的是变量类型（codex 的 message 分支），照抄字面量会静默配错槽位。
+            ev.event_key = Some(slots.next(ev.event_type));
             out.events.push(ev);
             seq += 1;
         }
@@ -226,6 +270,9 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             if ctx.want_content() {
                 ev.content = Some(content);
             }
+            // 槽位取自  本身，不重复写字面量 —— 六个发射点里有一个
+            // 用的是变量类型（codex 的 message 分支），照抄字面量会静默配错槽位。
+            ev.event_key = Some(slots.next(ev.event_type));
             out.events.push(ev);
             seq += 1;
         }
@@ -246,6 +293,9 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             ev.usage = Some(u.usage);
             ev.message_id = u.message_id;
             ev.request_id = u.request_id;
+            // 槽位取自  本身，不重复写字面量 —— 六个发射点里有一个
+            // 用的是变量类型（codex 的 message 分支），照抄字面量会静默配错槽位。
+            ev.event_key = Some(slots.next(ev.event_type));
             out.events.push(ev);
             seq += 1;
         }
@@ -401,6 +451,8 @@ fn parse_codex(
                 continue;
             }
         };
+
+        let mut slots = RecordSlots::new(line);
         let entry_type = value.get("type").and_then(Value::as_str);
         let payload = value.get("payload").unwrap_or(&null);
         let occurred_at = value
@@ -475,6 +527,9 @@ fn parse_codex(
                 }
                 ev.model = state.current_model.clone();
                 ev.effort = state.current_effort.clone();
+                // 槽位取自  本身，不重复写字面量 —— 六个发射点里有一个
+                // 用的是变量类型（codex 的 message 分支），照抄字面量会静默配错槽位。
+                ev.event_key = Some(slots.next(ev.event_type));
                 out.events.push(ev);
                 seq += 1;
             } else if let Some((event_type, actor, content)) = codex_message(payload, ptype) {
@@ -492,6 +547,9 @@ fn parse_codex(
                 if ctx.want_content() {
                     ev.content = Some(content);
                 }
+                // 槽位取自  本身，不重复写字面量 —— 六个发射点里有一个
+                // 用的是变量类型（codex 的 message 分支），照抄字面量会静默配错槽位。
+                ev.event_key = Some(slots.next(ev.event_type));
                 out.events.push(ev);
                 seq += 1;
             }
@@ -519,6 +577,9 @@ fn parse_codex(
                 ev.model = state.current_model.clone();
                 ev.effort = state.current_effort.clone();
                 ev.usage = Some(usage);
+                // 槽位取自  本身，不重复写字面量 —— 六个发射点里有一个
+                // 用的是变量类型（codex 的 message 分支），照抄字面量会静默配错槽位。
+                ev.event_key = Some(slots.next(ev.event_type));
                 out.events.push(ev);
                 seq += 1;
             }
@@ -1160,5 +1221,124 @@ mod tests {
             None,
         );
         assert_eq!(out.events[0].seq, 42, "seq 从 base_seq 起");
+    }
+
+    /// 🔴 **护栏 G1（ADR-044 决定 4）：解析器在既有事件之前新增一种类型时，既有
+    /// `EventKey` 必须一字不变 —— 而 `seq` 会全部漂移。**
+    ///
+    /// 这是整条 EventKey 存在的理由，也是评审推翻「用 `(identity, seq)` 当身份」那个
+    /// 结论的依据。`seq` 数的是「本次产出的第几条」，所以任何前插都会把其后编号推走；
+    /// 一次实测「升级前后 seq 一致」只能说明那次恰好没改变事件组成。
+    ///
+    /// 🔴 **测试的形状很关键**：不能只断言「同一份输入两次解析结果相同」——那对 `seq`
+    /// 也成立，测了等于没测。必须**模拟一次会改变事件组成的升级**：这里直接用
+    /// `RecordSlots` 走两遍同一条记录，第二遍在既有类型之前先分配一个新类型，
+    /// 然后断言既有类型的槽位号没动。
+    #[test]
+    fn a_new_event_type_inserted_before_existing_ones_does_not_move_their_keys() {
+        let record = r#"{"sessionId":"s","message":{"role":"assistant"}}"#;
+
+        // 升级前：这条记录产出 Thinking、Message、Usage 各一条。
+        let before: Vec<EventKey> = {
+            let mut slots = RecordSlots::new(record);
+            [EventType::Thinking, EventType::Message, EventType::Usage]
+                .into_iter()
+                .map(|ty| slots.next(ty))
+                .collect()
+        };
+
+        // 升级后：新解析器学会了在最前面先产出一条 ToolUse。
+        let after: Vec<EventKey> = {
+            let mut slots = RecordSlots::new(record);
+            [
+                EventType::ToolUse, // ← 新增，插在最前
+                EventType::Thinking,
+                EventType::Message,
+                EventType::Usage,
+            ]
+            .into_iter()
+            .map(|ty| slots.next(ty))
+            .collect()
+        };
+
+        assert_eq!(
+            &after[1..],
+            &before[..],
+            "既有三种事件的 EventKey 必须完全不变；变了说明槽位是按产出顺序编的，\
+             那和 seq 是同一个东西，等于什么都没修"
+        );
+        assert_eq!(
+            after[0].slot_ordinal, 0,
+            "新类型自己从 0 起，不占用别人的编号"
+        );
+    }
+
+    /// 同一记录内**同类型**的多条各自递增；不同记录的同类型互不干扰。
+    ///
+    /// ⚠️ **覆盖边界，明写而不是假装**：这条测的是分配器本身。今天**没有任何解析器**会在
+    /// 一条记录里产出同类型的两条事件（Claude 的多个 thinking 块被 `join("\n")` 成一条，
+    /// Codex 的两个发射点分属不同 `response_item` 行），所以「每条事件都重建一次分配器」
+    /// 这种退化在解析器层**不可观测** —— 变异验证时它确实没能变红，原因是没有可分辨的
+    /// 输出，不是护栏失效。
+    ///
+    /// 一旦哪个解析器开始逐块发 thinking，`slot_ordinal` 立刻变得可观测，届时应补一条
+    /// 解析器层的用例。在此之前，把边界写在这里比留一个看起来全覆盖的假象好。
+    #[test]
+    fn slots_count_per_type_and_reset_per_record() {
+        let mut a = RecordSlots::new("line-a");
+        assert_eq!(a.next(EventType::Message).slot_ordinal, 0);
+        assert_eq!(a.next(EventType::Message).slot_ordinal, 1);
+        assert_eq!(a.next(EventType::Usage).slot_ordinal, 0, "换类型从 0 起");
+        assert_eq!(a.next(EventType::Message).slot_ordinal, 2);
+
+        let mut b = RecordSlots::new("line-b");
+        assert_eq!(b.next(EventType::Message).slot_ordinal, 0, "换记录从 0 起");
+        assert_ne!(
+            a.fingerprint, b.fingerprint,
+            "不同记录必须有不同指纹，否则两条记录的槽位会互相冒充"
+        );
+    }
+
+    /// 指纹只认记录的字节，不认它周围的空白 —— 解析器读的是 `trim()` 之后的串，
+    /// 指纹若认原始串，行尾多一个空格就会让整行事件换身份。
+    #[test]
+    fn the_fingerprint_ignores_surrounding_whitespace() {
+        let a = EventKey::fingerprint_of(r#"{"a":1}"#);
+        let b = EventKey::fingerprint_of("  {\"a\":1}\t\n");
+        assert_eq!(a, b);
+        assert_ne!(a, EventKey::fingerprint_of(r#"{"a":2}"#));
+        assert_eq!(a.len(), 16, "截断到 64 位；全长只是纯开销");
+    }
+
+    /// 端到端：真实解析出来的事件都带 key，且同一行内按类型分槽。
+    #[test]
+    fn parsed_events_carry_keys_scoped_to_their_record() {
+        let ctx = ctx(SourceType::ClaudeCode, Profile::Full);
+        let line = r#"{"sessionId":"s","cwd":"/w","timestamp":"2026-06-01T10:00:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"t"},{"type":"text","text":"a"}],"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        let out = parse_lines(&ctx, &[line], 0, None);
+
+        assert!(!out.events.is_empty());
+        let expected = EventKey::fingerprint_of(line);
+        for ev in &out.events {
+            let key = ev.event_key.as_ref().expect("append-log 事件必须带 key");
+            assert_eq!(key.record_fingerprint, expected);
+            assert_eq!(key.version, EVENT_KEY_VERSION);
+        }
+        // 每种类型各自从 0 起。
+        for ty in [EventType::Thinking, EventType::Message, EventType::Usage] {
+            let ordinals: Vec<u32> = out
+                .events
+                .iter()
+                .filter(|e| e.event_type == ty)
+                .map(|e| e.event_key.as_ref().unwrap().slot_ordinal)
+                .collect();
+            if !ordinals.is_empty() {
+                assert_eq!(
+                    ordinals,
+                    (0..ordinals.len() as u32).collect::<Vec<_>>(),
+                    "{ty:?} 的槽位应是 0..n"
+                );
+            }
+        }
     }
 }

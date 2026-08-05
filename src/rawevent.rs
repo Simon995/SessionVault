@@ -7,7 +7,61 @@
 use serde::{Deserialize, Serialize};
 
 /// schema 版本。破坏性变更即 +1，并写入 TumeFlow 分库的复现戳。
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2：新增 [`EventKey`]（ADR-044 决定 4）。
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// [`EventKey`] 编码本身的版本。与 [`SCHEMA_VERSION`] 分开，因为「键怎么编」和
+/// 「DTO 有哪些字段」是两件会各自变化的事。
+pub const EVENT_KEY_VERSION: u32 = 1;
+
+/// 一条事件的**稳定身份** —— 跨解析器升级不变。
+///
+/// 🔴 为什么不能用 `seq`。`seq` 是「本次解析产出的第几条事件」，逐事件条件递增：
+///
+/// ```ignore
+/// if let Some(text) = extract_claude_thinking(&value) { …; seq += 1; }
+/// if let Some(u)    = extract_claude_usage(&value)    { …; seq += 1; }
+/// ```
+///
+/// 下次升级只要**新增、删除或重排任一前序事件类型**，其后所有 `seq` 全部漂移。
+/// 一次实测「升级前后 seq 一致」只能说明那一次恰好没改变事件的组成 —— 把它当契约，
+/// 既有证据会在下次升级后**静默指向另一条事件**（不是失链，是指向错误内容）。
+///
+/// 稳定性来自两段各自不依赖产出顺序的坐标：
+///
+/// - `record_fingerprint` —— 产出这条事件的**源记录**（JSONL 的一行）的指纹。同一行
+///   字节永远得到同一个指纹，与解析器怎么读它无关。
+/// - `slot_ordinal` —— 该记录内、**同 `event_type`** 的第几条（从 0 起）。新增一种
+///   事件类型不会改变既有类型的编号，这正是 `seq` 做不到的。
+///
+/// `None` 表示这条事件没有稳定身份（v1 遗留行、以及非 append-log 的快照类事件）。
+/// 用 `Option<EventKey>` 而不是三个可空字段：要么整套齐备，要么没有 —— 「有指纹但
+/// 没版本号」这种半拉状态从类型上就不存在。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventKey {
+    pub version: u32,
+    /// 源记录的指纹（截断的十六进制 SHA-256）。
+    pub record_fingerprint: String,
+    /// 该记录内同 `event_type` 的序号，从 0 起。
+    pub slot_ordinal: u32,
+}
+
+impl EventKey {
+    /// 一条源记录（JSONL 的一行）的指纹。
+    ///
+    /// 截断到 16 个十六进制字符（64 位）：一个文件里的记录数远小于生日界
+    /// （约 2^32），而全长会给每条事件多加 48 字节 —— 实测 93 万条事件时那是 44 MB
+    /// 的纯开销，换不来任何可分辨性。
+    ///
+    /// 对 `record.trim()` 求值，与解析器读它时用的是同一个串 —— 否则行尾空白的变化
+    /// 会让同一条记录换指纹。
+    pub fn fingerprint_of(record: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(record.trim().as_bytes());
+        digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+}
 
 /// 数据来源 provider。新增 provider = 加一个枚举值 + 一个描述符 + 一个解析器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,8 +174,14 @@ pub struct RawEvent {
     /// 转录文件物理路径（transcript 存放处，非工程目录）。
     pub source_path: String,
     pub source_session_id: String,
-    /// 文件内单调序号（行号 / 解析序）。
+    /// 文件内单调序号（行号 / 解析序）。**只做排序，不是身份** —— 见 [`EventKey`]。
     pub seq: u64,
+    /// 稳定身份 —— **凡是要活过解析器升级的引用都必须用它，不能用 `seq`**。
+    ///
+    /// `None`：v1 遗留事件，以及非 append-log 的快照类事件（它们没有「源记录内的槽位」
+    /// 这个概念）。见 [`EventKey`]。
+    #[serde(default)]
+    pub event_key: Option<EventKey>,
 
     // --- 来源形态 ---
     pub source_mode: SourceMode,

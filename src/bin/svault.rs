@@ -684,6 +684,7 @@ mod tests {
             source_path: "/p/file.jsonl".to_string(),
             source_session_id: session.to_string(),
             seq,
+            event_key: None,
             source_mode: SourceMode::AppendLog,
             cwd: Some("/work".to_string()),
             project_root: Some("/work".to_string()),

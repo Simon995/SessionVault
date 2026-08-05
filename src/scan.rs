@@ -132,6 +132,10 @@ fn scan_snapshot_file(
         source_path: report.source_path.clone(),
         source_session_id: "snapshot".to_string(),
         seq: cursor.next_seq,
+        // 快照类事件没有 `EventKey`：它不是「某条源记录内的第几个槽位」，整个文件才是
+        // 一条记录，且它已经由 `content_hash` 标识。硬套一个键只会造出一个没人能解析
+        // 的坐标。见 `rawevent::EventKey`。
+        event_key: None,
         source_mode: SourceMode::SnapshotFile,
         cwd: None,
         project_root: source.project_root.clone(),
