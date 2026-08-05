@@ -41,7 +41,16 @@ use crate::rawevent::{
 /// |-----|------|
 /// | 1   | 基线 |
 /// | 2   | Claude assistant 行的顶层 `effort` 开始被提取（此前整条链路丢弃） |
-pub const PARSER_REVISION: u32 = 2;
+/// | 3   | 每条事件带上 [`EventKey`]（记录指纹 + 记录内槽位），ADR-044 决定 4 |
+///
+/// 🔴 rev 3 是必须的，不是形式（评审 [P1]）：加 `EventKey` 时若不提版本，从 rev 2
+/// 升上来的安装会认为既有文件**没过期**，只扫增量尾巴 —— 于是绝大多数历史事件永远
+/// `event_key = None`，而 `EvidenceRefV2` 正是靠它定位。表现是「新写的记忆能核实、
+/// 老记忆全部不可核实」，且不报任何错。
+///
+/// 判据就是本常量文档第一句：**从同一份字节里能提取出什么发生了变化** —— 加一个新
+/// 字段正是这种变化。
+pub const PARSER_REVISION: u32 = 3;
 
 /// 解析产物：本批事件 + 更新后的 Codex 状态 + 跳过计数 + 告警。
 #[derive(Debug, Clone, Default)]

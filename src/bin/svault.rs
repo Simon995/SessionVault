@@ -88,9 +88,40 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 按会话身份读它们的**当前投影全部事件**。
+    ///
+    /// 与 `pull --limit N` 的差别不是效率是正确性：消费者先用 `sessions-recent` 选出
+    /// 要处理的会话，再用这个命令拿它们的完整事件。用 offset 前缀去凑，选中的会话若
+    /// 排在前缀之后就整个不在结果里，而且不报错 —— 只是那个会话静默消失。
+    #[cfg(feature = "store")]
+    SessionsRead {
+        /// `<type>/<location>/<path>/<session_id>` 形式，可重复。
+        #[arg(long = "session", value_name = "SPEC")]
+        sessions: Vec<String>,
+        /// 事件总数上界（防一个超大会话吃光内存 / LLM 上下文）。
+        #[arg(long, default_value_t = 50000)]
+        max_events: usize,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 返回总库中每个 snapshot source 的最新版本，供 TumeFlow Class-B 主路径消费。
     #[cfg(feature = "store")]
     Snapshots {
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// 投影替换的变更流（ADR-044 决定 6）。
+    ///
+    /// 只读「当前投影」不足以让消费者收敛：一次重投影把 `{A,B}` 换成 `{A}` 之后，
+    /// 增量流最多重发 A，**没有任何记录要求删除已物化的 B**。这条流补的就是那半边。
+    ///
+    /// `--since-seq` 是这条流自己的游标，与 `pull --since` 的 offset 无关。
+    #[cfg(feature = "store")]
+    Changes {
+        #[arg(long, default_value_t = 0)]
+        since_seq: i64,
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
         #[arg(long)]
         store: Option<PathBuf>,
     },
@@ -239,10 +270,40 @@ enum Out<'a> {
     },
     #[cfg(feature = "store")]
     RecentSessionsSummary { sessions: usize },
+    /// `sessions-read` 的收尾摘要。`truncated = true` 说明撞到了 `--max-events`
+    /// 上界，**还有事件没发** —— 消费者必须据此判断结果是否完整，而不是默认它完整。
+    #[cfg(feature = "store")]
+    SessionsReadSummary {
+        sessions: usize,
+        events: u64,
+        truncated: bool,
+    },
     #[cfg(feature = "store")]
     Snapshot { offset: i64, event: &'a RawEvent },
     #[cfg(feature = "store")]
     SnapshotSummary { snapshots: u64 },
+    /// 一条投影替换记录。消费者读到它就按 `source_*` **原子替换**自己那份物化。
+    #[cfg(feature = "store")]
+    ProjectionReplaced {
+        seq: i64,
+        at: i64,
+        source_type: String,
+        source_location: String,
+        source_path: String,
+        old_source_revision: Option<i64>,
+        old_projection_revision: Option<i64>,
+        new_source_revision: i64,
+        new_projection_revision: i64,
+        reason: String,
+    },
+    #[cfg(feature = "store")]
+    ChangesSummary {
+        since_seq: i64,
+        last_seq: i64,
+        changes: u64,
+        /// `false` = 被 `--limit` 截断，还有记录没发 —— 消费者必须再拉一轮。
+        caught_up: bool,
+    },
     #[cfg(feature = "store")]
     GcSummary {
         projections: u64,
@@ -287,7 +348,19 @@ fn main() {
             store,
         } => run_sessions_recent(limit, since_ms, store),
         #[cfg(feature = "store")]
+        Command::SessionsRead {
+            sessions,
+            max_events,
+            store,
+        } => run_sessions_read(sessions, max_events, store),
+        #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
+        #[cfg(feature = "store")]
+        Command::Changes {
+            since_seq,
+            limit,
+            store,
+        } => run_changes(since_seq, limit, store),
         #[cfg(feature = "store")]
         Command::Gc { dry_run, store } => run_gc(dry_run, store),
         #[cfg(feature = "store")]
@@ -1040,6 +1113,113 @@ fn run_gc(dry_run: bool, store_arg: Option<PathBuf>) -> i32 {
         }
         Err(e) => {
             log::error!(target: tag::CLI, "gc failed: {e}");
+            1
+        }
+    }
+}
+
+/// `sessions-read`：按会话身份读当前投影的全部事件。
+#[cfg(feature = "store")]
+fn run_sessions_read(specs: Vec<String>, max_events: usize, store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if !store_path.exists() {
+        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
+        return 1;
+    }
+    // `<type>/<location>/<path>/<session>`：path 可能含 `/`，所以从两端切 —— 前两段
+    // 与最后一段取值受限且不含分隔符，中间全归 path。与 EvidenceRef v1 同一个道理。
+    let mut sessions = Vec::new();
+    for spec in &specs {
+        let parts: Vec<&str> = spec.split('/').collect();
+        if parts.len() < 4 {
+            log::error!(target: tag::CLI, "bad --session spec (need type/loc/path/session): {spec}");
+            return 2;
+        }
+        sessions.push((
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2..parts.len() - 1].join("/"),
+            parts[parts.len() - 1].to_string(),
+        ));
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    match store.read_sessions(&sessions, max_events) {
+        Ok(events) => {
+            for (offset, ev) in &events {
+                emit(&Out::Pulled {
+                    offset: *offset,
+                    event: ev,
+                });
+            }
+            emit(&Out::SessionsReadSummary {
+                sessions: sessions.len(),
+                events: events.len() as u64,
+                truncated: events.len() >= max_events,
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "read_sessions failed: {e}");
+            1
+        }
+    }
+}
+
+/// `changes`：投影替换的变更流。
+#[cfg(feature = "store")]
+fn run_changes(since_seq: i64, limit: usize, store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if !store_path.exists() {
+        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
+        return 1;
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    match store.read_projection_changes(since_seq, limit) {
+        Ok(changes) => {
+            let mut last_seq = since_seq;
+            for c in &changes {
+                last_seq = c.seq;
+                emit(&Out::ProjectionReplaced {
+                    seq: c.seq,
+                    at: c.at,
+                    source_type: c.source_type.clone(),
+                    source_location: c.source_location.clone(),
+                    source_path: c.source_path.clone(),
+                    old_source_revision: c.old_source_revision,
+                    old_projection_revision: c.old_projection_revision,
+                    new_source_revision: c.new_source_revision,
+                    new_projection_revision: c.new_projection_revision,
+                    reason: c.reason.clone(),
+                });
+            }
+            emit(&Out::ChangesSummary {
+                since_seq,
+                last_seq,
+                changes: changes.len() as u64,
+                caught_up: changes.len() < limit,
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "read_projection_changes failed: {e}");
             1
         }
     }

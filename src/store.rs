@@ -192,6 +192,27 @@ pub struct ProjectionStats {
     pub loses_events: Option<(u64, u64)>,
 }
 
+/// change-feed 的一条记录：某个源文件的当前投影被换掉了。
+///
+/// 消费者据此按 source **原子替换**自己的物化 —— 而不是逐事件 upsert，那样永远删不掉
+/// 新投影里不再出现的事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionChange {
+    /// change-feed 自己的游标。**与 `raw_events.offset` 无关** —— 后者会被重投影重铸，
+    /// 而这条流记的正是「重投影发生了」。
+    pub seq: i64,
+    pub at: i64,
+    pub source_type: String,
+    pub source_location: String,
+    pub source_path: String,
+    pub old_source_revision: Option<i64>,
+    pub old_projection_revision: Option<i64>,
+    pub new_source_revision: i64,
+    pub new_projection_revision: i64,
+    /// `append` / `rollback` / `reparse` —— 与 `projections.origin` 同口径。
+    pub reason: String,
+}
+
 /// [`TotalStore::gc_superseded_projections`] 的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcStats {
@@ -465,6 +486,32 @@ CREATE TABLE IF NOT EXISTS projections (
 /// 🔴 它取代的是 `read_session` 里那个 `MAX(generation)` 相关子查询。区别不是性能，是
 /// **可表达性**：`MAX` 只能表达「编号最大的那一代」，表达不了「这份投影被替换成了空」
 /// ——而一个新解析器合法地对某文件产出零事件时，正需要表达它（ADR-044 决定 2 / G2）。
+/// 投影替换日志 —— **change-feed 的底座**（ADR-044 决定 6）。
+///
+/// 🔴 为什么「只读当前投影」不够：消费者持久化 offset 游标之后，若一次重投影把旧集合
+/// `{A, B}` 换成 `{A}`，增量流最多重发 A，**没有任何记录要求它删除已物化的 B** ——
+/// 消费者会永久保留一条已经不存在的事件。仅靠 upsert 永远删不掉「不再出现」的东西。
+///
+/// 所以替换本身必须成为一条**可拉取的记录**：消费者读到它，就按 source 原子替换自己
+/// 那一份物化，而不是逐事件比对。
+///
+/// 这张表随 `raw_events` 一起被 erase 清理吗？**不**：它不含正文，只有坐标与计数，
+/// 且删掉它会让落后的消费者永远收不到「该删了」的通知。ADR-027 的墓碑走另一条路。
+const PROJECTION_LOG_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS projection_log (
+    seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    at                  INTEGER NOT NULL,
+    source_type         TEXT    NOT NULL,
+    source_location     TEXT    NOT NULL,
+    source_path         TEXT    NOT NULL,
+    old_source_revision     INTEGER,
+    old_projection_revision INTEGER,
+    new_source_revision     INTEGER NOT NULL,
+    new_projection_revision INTEGER NOT NULL,
+    reason              TEXT    NOT NULL
+);
+"#;
+
 const CURRENT_HEAD_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS current_head (
     source_type         TEXT    NOT NULL,
@@ -591,18 +638,24 @@ impl TotalStore {
             .query_row([], |_| Ok(true))
             .optional()?
             .unwrap_or(false);
-        let column_exists = |name: &str| -> StoreResult<bool> {
-            if !raw_exists {
-                return Ok(false);
-            }
-            Ok(conn
-                .prepare("SELECT 1 FROM pragma_table_info('raw_events') WHERE name = ?1")?
-                .query_row([name], |_| Ok(true))
-                .optional()?
-                .unwrap_or(false))
+        // 一次性把要用的列探测算完 —— 闭包持有 `&conn` 的借用会和后面的
+        // `conn.transaction()`（需要 `&mut`）打架，而事务是这段代码的核心。
+        let (has_generation, has_source_revision, has_occurred_ms) = if raw_exists {
+            let probe = |name: &str| -> StoreResult<bool> {
+                Ok(conn
+                    .prepare("SELECT 1 FROM pragma_table_info('raw_events') WHERE name = ?1")?
+                    .query_row([name], |_| Ok(true))
+                    .optional()?
+                    .unwrap_or(false))
+            };
+            (
+                probe("generation")?,
+                probe("source_revision")?,
+                probe("occurred_at_unix_ms")?,
+            )
+        } else {
+            (false, false, false)
         };
-        let has_generation = column_exists("generation")?;
-        let has_source_revision = column_exists("source_revision")?;
 
         if !raw_exists {
             // 全新库：直接建当前形状的表。
@@ -624,9 +677,25 @@ impl TotalStore {
             //
             // 更早的库（`generation` 之前的五列唯一）在这里一并落到当前形状：它没有
             // `generation` 列，全部归为第 0 版本。
+            //
+            // 🔴 **整个重写包在一个事务里**（评审 [P1]）。`execute_batch` 不自带事务，
+            // 每条语句独立提交 —— 进程在中途被杀、磁盘写满或复制失败时，磁盘上会留下
+            // 一个**空的新 `raw_events`** 加一个藏着全部数据的 `raw_events_pre_srev`。
+            // 下次启动看到 `source_revision` 已存在，于是**跳过迁移**：数据还在，但从此
+            // 不可见。失败必须整体回滚。
+            //
+            // 🔴 **索引要显式重建**（评审 [P2]）。SQLite 里 `ALTER TABLE … RENAME` 会把
+            // 索引一起带到旧表名下、**索引名不变**；随后 `CREATE INDEX IF NOT EXISTS`
+            // 因为同名索引仍存在而**静默跳过**；最后 `DROP TABLE` 把它们一并删掉。
+            // 净效果：迁移后的库一个索引都没有，而这不会报错 —— 只是会话/项目查询与
+            // erase 全部退化成全表扫。实测复现过。
             let generation_expr = if has_generation { "generation" } else { "0" };
-            conn.execute_batch(&format!(
+            let tx = conn.transaction()?;
+            tx.execute_batch(&format!(
                 r#"
+                DROP INDEX IF EXISTS idx_raw_events_session;
+                DROP INDEX IF EXISTS idx_raw_events_project;
+                DROP INDEX IF EXISTS idx_raw_events_occurred;
                 ALTER TABLE raw_events RENAME TO raw_events_pre_srev;
                 {RAW_EVENTS_DDL}
                 INSERT INTO raw_events
@@ -640,10 +709,77 @@ impl TotalStore {
                 DROP TABLE raw_events_pre_srev;
                 "#
             ))?;
+            tx.commit()?;
+        }
+        // 🔴 上一轮迁移半途夭折留下的残骸：新表已建但数据还在临时表里。
+        //
+        // 有了事务这**不该**发生，但「不该发生」不是「不会发生」—— 事务是新加的，
+        // 而磁盘上可能已经存在旧代码留下的残骸。检测到就把数据搬回来，而不是让它
+        // 静默地永远不可见。搬完再删，顺序反了就是真丢数据。
+        let orphan: bool = conn
+            .prepare(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_events_pre_srev'",
+            )?
+            .query_row([], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if orphan {
+            let stranded: i64 =
+                conn.query_row("SELECT COUNT(*) FROM raw_events_pre_srev", [], |r| r.get(0))?;
+            log::warn!(
+                "[total-store] found {stranded} rows stranded in raw_events_pre_srev \
+                 from an interrupted migration; recovering"
+            );
+            // 🔴 按残骸**自己的形状**搬，不能假定。残骸可能来自两种中断：
+            //
+            // - 旧形状（只有 `generation`）→ 映射到 `(generation, 0)`，AAD v1；
+            // - 新形状（已有三列）→ **原样带过来**。
+            //
+            // 硬写 `aad_version = 1` 会让新形状的行解不开（AAD 字节对不上），
+            // 而失败形态是 `read_session` 返回空、不报错 —— 第一版正是这么写的。
+            let orphan_has_srev: bool = conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('raw_events_pre_srev')                      WHERE name = 'source_revision'",
+                )?
+                .query_row([], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+            let orphan_has_gen: bool = conn
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('raw_events_pre_srev')                      WHERE name = 'generation'",
+                )?
+                .query_row([], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+            let coords = if orphan_has_srev {
+                "source_revision, projection_revision, aad_version"
+            } else if orphan_has_gen {
+                "generation, 0, 1"
+            } else {
+                "0, 0, 1"
+            };
+            let tx = conn.transaction()?;
+            let recovered = tx.execute(
+                &format!(
+                    r#"INSERT OR IGNORE INTO raw_events
+                         (offset, ingested_at, schema_version, source_type, source_location,
+                          source_path, source_session_id, seq, source_revision,
+                          projection_revision, aad_version, event_type, occurred_at,
+                          project_root, event_json)
+                       SELECT offset, ingested_at, schema_version, source_type, source_location,
+                              source_path, source_session_id, seq, {coords},
+                              event_type, occurred_at, project_root, event_json
+                         FROM raw_events_pre_srev"#
+                ),
+                [],
+            )?;
+            tx.execute_batch("DROP TABLE raw_events_pre_srev;")?;
+            tx.commit()?;
+            log::info!("[total-store] recovered {recovered} stranded rows");
         }
         // 归一化时间列可能单独缺席（库已是新形状、只是早于决定 5）。ALTER 加列比
         // 重建整表便宜得多，且这一列不参与唯一键，加了不影响既有行的可读性。
-        if raw_exists && !column_exists("occurred_at_unix_ms")? {
+        if raw_exists && !has_occurred_ms && has_source_revision {
             conn.execute_batch(
                 "ALTER TABLE raw_events ADD COLUMN occurred_at_unix_ms INTEGER;
                  CREATE INDEX IF NOT EXISTS idx_raw_events_occurred
@@ -652,6 +788,7 @@ impl TotalStore {
         }
         conn.execute_batch(PROJECTIONS_DDL)?;
         conn.execute_batch(CURRENT_HEAD_DDL)?;
+        conn.execute_batch(PROJECTION_LOG_DDL)?;
         // 台账与头的回填：对既有行是一次性补齐，对新库是空操作。放在建表之后、且用
         // `INSERT OR IGNORE`，所以重复启动幂等。
         //
@@ -1092,6 +1229,29 @@ impl TotalStore {
             }
         }
 
+        // 头真的动了才记 change-feed —— 增量 append 每轮都会走到这里，记下来只是噪声。
+        // 与切头同一事务：消费者绝不会看到「头动了但没有对应记录」，反之亦然。
+        if (source_revision, projection_revision) != head {
+            tx.execute(
+                r#"INSERT INTO projection_log
+                     (at, source_type, source_location, source_path,
+                      old_source_revision, old_projection_revision,
+                      new_source_revision, new_projection_revision, reason)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                params![
+                    now,
+                    source_type,
+                    source_location,
+                    source_path,
+                    head.0,
+                    head.1,
+                    source_revision,
+                    projection_revision,
+                    projection.origin_key(),
+                ],
+            )?;
+        }
+
         // 切头。与事件插入同一事务：插入失败则头原样保留，读侧永远看不到「头指向一份
         // 没写成的投影」这种中间态。
         tx.execute(
@@ -1125,6 +1285,109 @@ impl TotalStore {
             superseded_removed,
             loses_events,
         })
+    }
+
+    /// 按会话身份读它的**当前投影全部事件**（seq 升序）。
+    ///
+    /// 🔴 与「拉前 N 条 offset」的差别不是效率，是**正确性**。消费者先用
+    /// [`recent_sessions`] 选出要处理的会话，然后必须能拿到**那些会话的完整事件**；
+    /// 用 offset 前缀去凑，选中的会话若排在前缀之后就整个不在结果里，而且这不报错
+    /// —— 只是那个会话静默消失。
+    ///
+    /// 与 [`read_session`] 的差别：这个按 `(source, session)` 批量取，一次读事务内
+    /// 完成，避免「列会话」与「逐个读」跨越一次并发 `Reparse` 而拿到不一致的快照。
+    pub fn read_sessions(
+        &self,
+        sessions: &[(String, String, String, String)],
+        max_events: usize,
+    ) -> StoreResult<Vec<(i64, RawEvent)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut out = Vec::new();
+        let mut key_cache = HashMap::new();
+        for (st, loc, path, sid) in sessions {
+            if out.len() >= max_events {
+                break;
+            }
+            let mut stmt = conn.prepare(&format!(
+                r#"SELECT {ENCRYPTED_ROW_COLUMNS}
+                     FROM raw_events r
+                     LEFT JOIN current_head h
+                            ON h.source_type = r.source_type
+                           AND h.source_location = r.source_location
+                           AND h.source_path = r.source_path
+                    WHERE r.source_type = ?1 AND r.source_location = ?2
+                      AND r.source_path = ?3 AND r.source_session_id = ?4
+                      AND r.source_revision = COALESCE(h.source_revision, 0)
+                      AND r.projection_revision = COALESCE(h.projection_revision, 0)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM tombstones t
+                           WHERE (t.scope = 'session'      AND t.key = r.source_session_id)
+                              OR (t.scope = 'source_path'  AND t.key = r.source_path)
+                              OR (t.scope = 'project_root' AND t.key = r.project_root)
+                      )
+                    ORDER BY r.seq ASC, r.offset ASC
+                    LIMIT ?5"#
+            ))?;
+            let remaining = (max_events - out.len()) as i64;
+            let rows = stmt.query_map(
+                params![st, loc, path, sid, remaining],
+                EncryptedRow::from_sql,
+            )?;
+            for row in rows {
+                let row = row?;
+                match self.decode_event_on(&conn, &mut key_cache, &row) {
+                    Ok(ev) => out.push((row.offset, ev)),
+                    // 单行解不开只 skip+warn，不让整个会话失败 —— 与 `read_since_page`
+                    // 同一套韧性策略。
+                    Err(e) => log::warn!(
+                        target: crate::logging::tag::SQLITE,
+                        "raw_events offset={} skipped in read_sessions: {e}", row.offset
+                    ),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 读 `after_seq` 之后的投影替换记录 —— **change-feed**（ADR-044 决定 6）。
+    ///
+    /// 消费者拿到一条就按 `source_key` **原子替换**自己那份物化：先删掉该 source 的
+    /// 全部旧内容，再从当前投影重建。这一步不能用逐事件 upsert 代替 —— upsert 永远
+    /// 删不掉「新投影里不再出现」的那些事件。
+    ///
+    /// `seq` 是这条流自己的游标，与 `raw_events.offset` 无关：后者会被重投影重铸，
+    /// 而这条流记的正是「重投影发生了」。
+    pub fn read_projection_changes(
+        &self,
+        after_seq: i64,
+        limit: usize,
+    ) -> StoreResult<Vec<ProjectionChange>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT seq, at, source_type, source_location, source_path,
+                      old_source_revision, old_projection_revision,
+                      new_source_revision, new_projection_revision, reason
+                 FROM projection_log
+                WHERE seq > ?1
+                ORDER BY seq ASC
+                LIMIT ?2"#,
+        )?;
+        let rows = stmt.query_map(params![after_seq, limit as i64], |r| {
+            Ok(ProjectionChange {
+                seq: r.get(0)?,
+                at: r.get(1)?,
+                source_type: r.get(2)?,
+                source_location: r.get(3)?,
+                source_path: r.get(4)?,
+                old_source_revision: r.get(5)?,
+                old_projection_revision: r.get(6)?,
+                new_source_revision: r.get(7)?,
+                new_projection_revision: r.get(8)?,
+                reason: r.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     /// 回收**已被取代且来源明确**的投影（ADR-044 决定 7）。
@@ -3490,5 +3753,265 @@ mod tests {
             .unwrap();
         assert_eq!(read.events.len(), 1);
         assert_eq!(read.events[0].content.as_deref(), Some("v2"));
+    }
+
+    /// 🔴 **迁移之后索引必须还在**（评审 [P2]）。
+    ///
+    /// SQLite 的陷阱：`ALTER TABLE … RENAME` 把索引一起带到旧表名下、**索引名不变**；
+    /// 随后 `CREATE INDEX IF NOT EXISTS` 因为同名索引仍存在而**静默跳过**；最后
+    /// `DROP TABLE` 把它们一并删掉。净效果是迁移后一个索引都没有 —— 而这不报错，
+    /// 只是会话/项目查询与 erase 全部退化成全表扫。
+    ///
+    /// 断言索引**存在且绑在新表上**，不只是「名字还在」：名字可能还挂在残骸上。
+    #[test]
+    fn migration_keeps_the_indexes_attached_to_the_new_table() {
+        let dir =
+            std::env::temp_dir().join(format!("sv_idx_{}_{}", std::process::id(), now_unix_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+
+        // 造一个「只有 generation」的旧库，带着当时的两个索引。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE raw_events (
+                       offset            INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ingested_at       INTEGER NOT NULL,
+                       schema_version    INTEGER NOT NULL,
+                       source_type       TEXT    NOT NULL,
+                       source_location   TEXT    NOT NULL,
+                       source_path       TEXT    NOT NULL,
+                       source_session_id TEXT    NOT NULL,
+                       seq               INTEGER NOT NULL,
+                       generation        INTEGER NOT NULL DEFAULT 0,
+                       event_type        TEXT    NOT NULL,
+                       occurred_at       TEXT,
+                       project_root      TEXT,
+                       event_json        TEXT    NOT NULL,
+                       UNIQUE (source_type, source_location, source_path,
+                               source_session_id, seq, generation)
+                   );
+                   CREATE INDEX idx_raw_events_session ON raw_events(source_session_id);
+                   CREATE INDEX idx_raw_events_project ON raw_events(project_root);"#,
+            )
+            .unwrap();
+        }
+
+        let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([3u8; 32])).unwrap();
+        let attached: Vec<(String, String)> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, tbl_name FROM sqlite_master
+                      WHERE type = 'index' AND name LIKE 'idx_raw_events_%' ORDER BY name",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        let names: Vec<&str> = attached.iter().map(|(n, _)| n.as_str()).collect();
+        for want in [
+            "idx_raw_events_occurred",
+            "idx_raw_events_project",
+            "idx_raw_events_session",
+        ] {
+            assert!(
+                names.contains(&want),
+                "{want} 在迁移后消失了；相关查询与 erase 会退化成全表扫。实得 {attached:?}"
+            );
+        }
+        assert!(
+            attached.iter().all(|(_, tbl)| tbl == "raw_events"),
+            "索引没绑在新表上：{attached:?}"
+        );
+
+        // 临时表不许留下 —— 留着说明重写没跑完，而数据在它里面就是不可见的。
+        {
+            let conn = store.conn.lock().unwrap();
+            let leftover: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'raw_events_pre_srev'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(leftover, 0, "迁移残骸未清理");
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 上一轮迁移半途夭折留下的残骸必须被**搬回来**，而不是静默地永远不可见。
+    ///
+    /// 有了事务这不该发生，但「不该发生」不是「不会发生」—— 事务是新加的，磁盘上
+    /// 可能已经存在旧代码留下的残骸。检测不到就等于数据丢了：新表是空的、库能正常
+    /// 打开、一个错都不报。
+    #[test]
+    fn an_interrupted_migration_recovers_its_stranded_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_orphan_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([4u8; 32]);
+
+        // 先正常建库写一条，拿到一份真实可解密的行。
+        {
+            let store = TotalStore::open_with_key(&path, key()).unwrap();
+            store
+                .append_events(&[mk_event(0, "s", Some("stranded"))], Projection::Append)
+                .unwrap();
+        }
+        // 手工模拟「重写跑到一半被杀」：数据搬进临时表、新表清空。
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE raw_events RENAME TO raw_events_pre_srev;")
+                .unwrap();
+            conn.execute_batch(RAW_EVENTS_DDL).unwrap();
+        }
+
+        let store = TotalStore::open_with_key(&path, key()).unwrap();
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(
+            read.events.len(),
+            1,
+            "残骸里的行没被搬回来 —— 库能正常打开、一个错不报，而数据从此不可见"
+        );
+        assert_eq!(read.events[0].content.as_deref(), Some("stranded"));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 **change-feed 必须能表达「消失」**（ADR-044 决定 6 / 评审 [P1]）。
+    ///
+    /// 只读「当前投影」不足以让消费者收敛：一次重投影把 `{A, B}` 换成 `{A}` 之后，
+    /// 增量流最多重发 A，**没有任何记录要求删除已物化的 B** —— 消费者会永久保留一条
+    /// 已经不存在的事件。仅靠逐事件 upsert 永远删不掉「不再出现」的东西。
+    ///
+    /// 这条测试正是那个场景：断言重投影产生了一条变更记录，且它带着 source 坐标 ——
+    /// 消费者据此按 source **原子替换**，而不是比对事件。
+    #[test]
+    fn a_reparse_that_drops_an_event_still_tells_consumers_to_replace() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        // 旧投影 {A, B}
+        store
+            .apply_projection(FileProjectionBatch {
+                source: source.clone(),
+                parser_revision: Some(1),
+                mode: Projection::Append,
+                events: vec![mk_event(0, "s", Some("A")), mk_event(1, "s", Some("B"))],
+            })
+            .unwrap();
+        // 新投影只剩 {A}
+        store
+            .apply_projection(FileProjectionBatch {
+                source,
+                parser_revision: Some(2),
+                mode: Projection::Reparse,
+                events: vec![mk_event(0, "s", Some("A"))],
+            })
+            .unwrap();
+
+        let changes = store.read_projection_changes(0, 100).unwrap();
+        let replaced: Vec<&ProjectionChange> =
+            changes.iter().filter(|c| c.reason == "reparse").collect();
+        assert_eq!(
+            replaced.len(),
+            1,
+            "重投影必须产生一条变更记录；没有它，消费者永远不知道 B 该删了"
+        );
+        let c = replaced[0];
+        assert_eq!(c.source_path, "/p/file.jsonl");
+        assert_eq!(
+            (c.old_source_revision, c.old_projection_revision),
+            (Some(0), Some(0)),
+            "记录必须带上被取代的那一份 —— 消费者据此知道自己手里的是哪一版"
+        );
+        assert_eq!((c.new_source_revision, c.new_projection_revision), (0, 1));
+    }
+
+    /// 增量 append **不**产生变更记录 —— 头没动，没有任何东西需要被替换。
+    ///
+    /// 与上一条互为镜像。只测「替换会记」，把「不替换也记」写进去也照样绿，而那会让
+    /// 消费者每一轮都做一次全量重建。
+    #[test]
+    fn plain_appends_do_not_enter_the_change_feed() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        for seq in 0..3u64 {
+            store
+                .apply_projection(FileProjectionBatch {
+                    source: source.clone(),
+                    parser_revision: Some(1),
+                    mode: Projection::Append,
+                    events: vec![mk_event(seq, "s", Some("x"))],
+                })
+                .unwrap();
+        }
+        let changes = store.read_projection_changes(0, 100).unwrap();
+        assert!(
+            changes.is_empty(),
+            "增量不该进变更流。**首次建头也不该** —— 那时没有任何东西被替换，消费者             只需照常收事件；每轮都记会让它每轮做一次全量重建。实得 {changes:?}"
+        );
+    }
+
+    /// 变更流的游标是它**自己的** `seq`，与 `raw_events.offset` 无关。
+    ///
+    /// 这条单独存在，因为「用 offset 当游标」正是这一整轮在修的病 —— 而重投影恰恰会
+    /// 重铸 offset，用它当变更流的游标会让消费者要么重复处理、要么漏掉。
+    #[test]
+    fn the_change_feed_cursor_is_independent_of_event_offsets() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        for (mode, tag) in [
+            (Projection::Append, "v1"),
+            (Projection::Reparse, "v2"),
+            (Projection::Rollback, "v3"),
+        ] {
+            store
+                .apply_projection(FileProjectionBatch {
+                    source: source.clone(),
+                    parser_revision: Some(1),
+                    mode,
+                    events: vec![mk_event(0, "s", Some(tag))],
+                })
+                .unwrap();
+        }
+        let all = store.read_projection_changes(0, 100).unwrap();
+        // Append 不记（头没动），Reparse 与 Rollback 各一条。
+        assert_eq!(all.len(), 2, "实得 {all:?}");
+        let seqs: Vec<i64> = all.iter().map(|c| c.seq).collect();
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq 必须严格递增");
+
+        // 从中间续拉：只拿到之后的那些。
+        let rest = store.read_projection_changes(seqs[0], 100).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].seq, seqs[1]);
     }
 }

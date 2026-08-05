@@ -35,9 +35,9 @@ pub use rawevent::{
 pub use report::ScanReport;
 #[cfg(feature = "store")]
 pub use store::{
-    AppendStats, EraseStats, FileProjectionBatch, GcStats, Projection, ProjectionStats, ReadPage,
-    RecentSession, SessionRead, SnapshotSyncStats, SourceKey, StoreStatus, TombstoneScope,
-    TotalStore,
+    AppendStats, EraseStats, FileProjectionBatch, GcStats, Projection, ProjectionChange,
+    ProjectionStats, ReadPage, RecentSession, SessionRead, SnapshotSyncStats, SourceKey,
+    StoreStatus, TombstoneScope, TotalStore,
 };
 #[cfg(feature = "store")]
 pub use store_crypto::StoreKey;
