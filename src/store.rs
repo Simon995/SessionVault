@@ -41,6 +41,12 @@ pub enum StoreError {
     Serde(#[from] serde_json::Error),
     #[error("crypto: {0}")]
     Crypto(#[from] CryptoError),
+    /// 批里有事件不属于它声明的 [`SourceKey`]。
+    ///
+    /// 从前作用域是从第一条事件反推的，所以这种情况**无法被发现** —— 混进来的事件会被
+    /// 安静地写进另一个文件的投影里。作用域一旦显式，它就变成一个可以拒绝的错误。
+    #[error("batch declares source {declared} but carries an event from {found}")]
+    ForeignEvent { declared: String, found: String },
 }
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
@@ -102,6 +108,65 @@ impl Projection {
             Projection::Reparse => "reparse",
         }
     }
+}
+
+/// 一个源文件的稳定标识：`(类型, 位置, 路径)`。
+///
+/// 🔴 存在的理由是**显式**。此前作用域从批里第一条事件反推，于是空批既拿不到作用域、
+/// 也做不了任何事 —— 而「把当前投影替换为空」正需要一个空批（新解析器合法地对某文件
+/// 产出零事件）。作用域一旦显式，那个语义就自然可表达，不必再为它开特例。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceKey {
+    pub source_type: SourceType,
+    pub source_location: SourceLocation,
+    pub source_path: String,
+}
+
+impl SourceKey {
+    /// 从一条事件取它的作用域。**仅供旧的 `append_events` 兼容层使用** —— 新代码应当
+    /// 从调用点本来就有的 `SourceRef` 构造，而不是从数据里反推。
+    fn from_event(ev: &RawEvent) -> Self {
+        Self {
+            source_type: ev.source_type,
+            source_location: ev.source_location.clone(),
+            source_path: ev.source_path.clone(),
+        }
+    }
+
+    fn parts(&self) -> (&'static str, String, &str) {
+        (
+            source_type_key(self.source_type),
+            self.source_location.as_key(),
+            self.source_path.as_str(),
+        )
+    }
+}
+
+/// 一次投影应用的输入。
+///
+/// `events` **允许为空**：对 `Rollback` / `Reparse` 而言，空批表达的是「这个源文件的
+/// 当前投影就是空的」，不是「无事可做」。区分这两者的是 `mode`，不是批的长度。
+pub struct FileProjectionBatch {
+    pub source: SourceKey,
+    /// 产出这批事件的解析器版本，记进台账供日后判断哪些投影可被取代。
+    pub parser_revision: Option<u32>,
+    pub mode: Projection,
+    pub events: Vec<RawEvent>,
+}
+
+/// 一次 [`TotalStore::apply_projection`] 的结果。比 [`AppendStats`] 多出「落在哪个投影」
+/// 与「头动没动」—— 调用方据此判断重投影是否真的落库（QuotaBar 的
+/// `parser_revision` 就靠这个决定推不推进）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionStats {
+    pub appended: u64,
+    pub skipped_dup: u64,
+    pub skipped_erased: u64,
+    pub max_offset: i64,
+    pub source_revision: i64,
+    pub projection_revision: i64,
+    /// 头是否指向了一个新的 `(source_revision, projection_revision)`。
+    pub head_moved: bool,
 }
 
 /// 某个源文件的当前头；无记录时 `(0, 0)`。
@@ -689,21 +754,67 @@ impl TotalStore {
     ///
     /// ⚠️ **作用域从第一条事件反推，因此空批只能是 no-op** —— 它表达不了「把当前投影替换
     /// 为空」。一个新解析器合法地对某文件产出零事件时正需要那个语义（ADR-044 决定 2）。
-    /// 该缺口由显式携带 `SourceKey` 的 `apply_projection` 补上；本函数保留给作用域推断
-    /// 无害的调用点（测试、固件）。
+    /// 该缺口由显式携带 [`SourceKey`] 的 [`TotalStore::apply_projection`] 补上；本函数是
+    /// 它的兼容层，保留给作用域推断无害的调用点（测试、固件）。
     pub fn append_events(
         &self,
         events: &[RawEvent],
         projection: Projection,
     ) -> StoreResult<AppendStats> {
-        let now = now_unix_secs();
-        let mut conn = self.conn.lock().unwrap();
         let Some(first) = events.first() else {
             return Ok(AppendStats::default());
         };
-        let source_type = source_type_key(first.source_type).to_string();
-        let source_location = first.source_location.as_key();
-        let source_path = first.source_path.clone();
+        let stats = self.apply_projection(FileProjectionBatch {
+            source: SourceKey::from_event(first),
+            parser_revision: None,
+            mode: projection,
+            events: events.to_vec(),
+        })?;
+        Ok(AppendStats {
+            appended: stats.appended,
+            skipped_dup: stats.skipped_dup,
+            skipped_erased: stats.skipped_erased,
+            max_offset: stats.max_offset,
+        })
+    }
+
+    /// 把一份投影应用到一个源文件上 —— 一个显式的文件级事务。
+    ///
+    /// 与 [`TotalStore::append_events`] 的三处差别，每一处都对应一个曾经出过事的形状：
+    ///
+    /// 1. **作用域显式**（`batch.source`），不从第一条事件反推。于是**空批有意义**：
+    ///    `Rollback` / `Reparse` 带空批 = 「这个文件的当前投影就是空的」。区分「替换为空」
+    ///    与「无事可做」的是 `mode`，不是批的长度。
+    /// 2. **校验每条事件都属于 `batch.source`**。此前作用域是猜的，猜错不会报错，只会把
+    ///    事件写进别的文件的投影里。
+    /// 3. **切头与写事件同一事务**。失败则头与旧投影原样保留 —— 与 QuotaBar 那条
+    ///    「`parser_revision` 只在投影真的落库后才推进」的不变式配套：重投影没落库时下一轮
+    ///    仍须是 `Reparse`，否则退化成 `Append`，同 seq 被 dedup 丢弃，新解析永久丢失。
+    ///
+    /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
+    pub fn apply_projection(&self, batch: FileProjectionBatch) -> StoreResult<ProjectionStats> {
+        let now = now_unix_secs();
+        let (type_key, location_key, path_str) = batch.source.parts();
+        let source_type = type_key.to_string();
+        let source_location = location_key;
+        let source_path = path_str.to_string();
+
+        // 🔴 先校验再动库。事件若不属于声明的作用域，写下去不会报错，只会污染另一个文件
+        // 的投影 —— 而那正是「作用域靠猜」时无法察觉的失败。
+        if let Some(bad) = batch.events.iter().find(|ev| {
+            source_type_key(ev.source_type) != type_key
+                || ev.source_location.as_key() != source_location
+                || ev.source_path != source_path
+        }) {
+            return Err(StoreError::ForeignEvent {
+                declared: source_path.clone(),
+                found: bad.source_path.clone(),
+            });
+        }
+
+        let events = &batch.events;
+        let projection = batch.mode;
+        let mut conn = self.conn.lock().unwrap();
         let head = head_of(&conn, &source_type, &source_location, &source_path)?;
         let (source_revision, projection_revision) = projection.target_revisions(head);
         let tx = conn.transaction()?;
@@ -713,13 +824,14 @@ impl TotalStore {
             r#"INSERT OR IGNORE INTO projections
                  (source_type, source_location, source_path, source_revision,
                   projection_revision, parser_revision, origin, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)"#,
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
             params![
                 source_type,
                 source_location,
                 source_path,
                 source_revision,
                 projection_revision,
+                batch.parser_revision,
                 projection.origin_key(),
                 now,
             ],
@@ -811,11 +923,14 @@ impl TotalStore {
         )?;
         tx.commit()?;
         let max_offset = max_offset_on(&conn)?;
-        Ok(AppendStats {
+        Ok(ProjectionStats {
             appended,
             skipped_dup,
             skipped_erased,
             max_offset,
+            source_revision,
+            projection_revision,
+            head_moved: (source_revision, projection_revision) != head,
         })
     }
 
@@ -1481,9 +1596,13 @@ mod tests {
         // 文件 B 的同名 session "s"（--resume replay）+ 文件 A 的另一 session "t"。
         let b0 = mk_event_at(0, "s", "/b.jsonl");
         let t0 = mk_event_at(0, "t", "/a.jsonl");
+        // 🔴 按文件分批。「一批 = 一个文件」早就写在 append_events 的文档里，但从前
+        // 没有任何东西检查，于是这条测试一直混批。作用域显式之后它被当场拒绝
+        // （ForeignEvent），这里改回契约本来的样子。
         store
-            .append_events(&[a1, a0c, b0, t0], Projection::Append)
+            .append_events(&[a1, a0c, t0], Projection::Append)
             .unwrap();
+        store.append_events(&[b0], Projection::Append).unwrap();
 
         let got = store
             .read_session(
@@ -1626,9 +1745,13 @@ mod tests {
         let store = TotalStore::open_in_memory().unwrap();
         let a = mk_event_at(0, "c", "/a|b");
         let b = mk_event_at(0, "b|c", "/a");
-        let stats = store.append_events(&[a, b], Projection::Append).unwrap();
+        // 两条属于**不同文件**（`/a|b` 与 `/a`），所以必须分两批 —— 这正是本条测试要
+        // 说的事：`|` 出现在路径里时，把身份拼成一个串会歧义。
+        let first = store.append_events(&[a], Projection::Append).unwrap();
+        let second = store.append_events(&[b], Projection::Append).unwrap();
         assert_eq!(
-            stats.appended, 2,
+            first.appended + second.appended,
+            2,
             "含 `|` 的两条不同身份必须都入库（不碰撞）"
         );
         assert_eq!(store.status().unwrap().count, 2);
@@ -1879,9 +2002,9 @@ mod tests {
         first.content = Some("first-secret".into());
         let mut second = mk_event_at(0, "second", "/b.jsonl");
         second.content = Some("second-secret".into());
-        store
-            .append_events(&[first, second], Projection::Append)
-            .unwrap();
+        // 两个文件 → 两批（「一批 = 一个文件」，现在由 `apply_projection` 强制）。
+        store.append_events(&[first], Projection::Append).unwrap();
+        store.append_events(&[second], Projection::Append).unwrap();
         {
             let conn = store.conn.lock().unwrap();
             conn.execute_batch(
@@ -2368,5 +2491,183 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 ADR-044 决定 2 / 护栏 G2：**`Reparse` 带空批，当前投影就变成空的。**
+    ///
+    /// 这是 `apply_projection` 存在的首要理由。`append_events` 从第一条事件反推作用域，
+    /// 空批既拿不到作用域也做不了任何事 —— 于是「新解析器合法地对这个文件产出零事件」
+    /// 无法表达。QuotaBar 侧曾因此把空批直接记成「已重投影」并推进 `parser_revision`，
+    /// 旧投影却原样留着，永久残留且不再有重试机会。
+    ///
+    /// 断言用 `read_session` 的返回，不是内部状态：用户看到的是「这个会话现在没有内容」，
+    /// 而不是「头指向了 (0, 1)」。
+    #[test]
+    fn a_reparse_with_no_events_empties_the_current_projection() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        let read = |s: &TotalStore| {
+            s.read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap()
+            .events
+            .len()
+        };
+
+        store
+            .apply_projection(FileProjectionBatch {
+                source: source.clone(),
+                parser_revision: Some(1),
+                mode: Projection::Append,
+                events: vec![mk_event(0, "s", Some("v1"))],
+            })
+            .unwrap();
+        assert_eq!(read(&store), 1);
+
+        let stats = store
+            .apply_projection(FileProjectionBatch {
+                source: source.clone(),
+                parser_revision: Some(2),
+                mode: Projection::Reparse,
+                events: vec![],
+            })
+            .unwrap();
+
+        assert!(stats.head_moved, "空的重投影也必须切头");
+        assert_eq!((stats.source_revision, stats.projection_revision), (0, 1));
+        assert_eq!(
+            read(&store),
+            0,
+            "当前投影是空的；仍返回旧事件说明头退回了上一份非空投影"
+        );
+
+        // 旧投影的行还在（本步不删数据），只是不再是当前的。
+        let total: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "旧投影留存 —— 回收是第 7 步的事，不是这一步");
+    }
+
+    /// `Append` 带空批是**真的无事可做** —— 不切头、不记账。
+    ///
+    /// 区分「替换为空」与「无事可做」的是 `mode`，不是批的长度。增量扫描每一轮都会对
+    /// 几百个未变动的文件产出空批，若它们也切头，头会被无谓地推着走。
+    #[test]
+    fn an_append_with_no_events_changes_nothing() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        store
+            .apply_projection(FileProjectionBatch {
+                source: source.clone(),
+                parser_revision: Some(1),
+                mode: Projection::Append,
+                events: vec![mk_event(0, "s", Some("v1"))],
+            })
+            .unwrap();
+
+        let stats = store
+            .apply_projection(FileProjectionBatch {
+                source,
+                parser_revision: Some(1),
+                mode: Projection::Append,
+                events: vec![],
+            })
+            .unwrap();
+
+        assert!(!stats.head_moved, "空的增量不该切头");
+        assert_eq!((stats.source_revision, stats.projection_revision), (0, 0));
+    }
+
+    /// 🔴 批里混进别的文件的事件 → **拒绝**，且什么都不写。
+    ///
+    /// 从前作用域是从第一条事件反推的，所以这种情况根本无法被发现：混进来的事件会被
+    /// 安静地写进第一条事件那个文件的投影里。作用域显式之后它变成一个可以拒绝的错误。
+    ///
+    /// 同时断言「什么都没写」——校验必须在动库之前，否则会留下半批。
+    #[test]
+    fn a_batch_carrying_another_files_event_is_rejected_whole() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let err = store
+            .apply_projection(FileProjectionBatch {
+                source: SourceKey {
+                    source_type: SourceType::ClaudeCode,
+                    source_location: SourceLocation::Local,
+                    source_path: "/p/a.jsonl".to_string(),
+                },
+                parser_revision: Some(1),
+                mode: Projection::Append,
+                events: vec![
+                    mk_event_at(0, "s", "/p/a.jsonl"),
+                    mk_event_at(1, "s", "/p/b.jsonl"),
+                ],
+            })
+            .unwrap_err();
+
+        assert!(
+            matches!(err, StoreError::ForeignEvent { .. }),
+            "应为 ForeignEvent，实得 {err:?}"
+        );
+        assert_eq!(
+            store.status().unwrap().count,
+            0,
+            "校验必须在动库之前 —— 否则会留下半批"
+        );
+    }
+
+    /// 台账记下产出这份投影的解析器版本。回收的判据是「同一源版本上有更新的投影」，
+    /// 而「更新」得有个可比的东西 —— 那就是这一列（ADR-044 决定 7 的前置）。
+    #[test]
+    fn the_ledger_records_which_parser_produced_the_projection() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        for (parser_revision, mode) in [(1u32, Projection::Append), (2, Projection::Reparse)] {
+            store
+                .apply_projection(FileProjectionBatch {
+                    source: source.clone(),
+                    parser_revision: Some(parser_revision),
+                    mode,
+                    events: vec![mk_event(0, "s", Some("x"))],
+                })
+                .unwrap();
+        }
+
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT projection_revision, parser_revision, origin FROM projections
+                  ORDER BY projection_revision",
+            )
+            .unwrap();
+        let rows: Vec<(i64, Option<i64>, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (0, Some(1), "append".to_string()),
+                (1, Some(2), "reparse".to_string()),
+            ]
+        );
     }
 }
