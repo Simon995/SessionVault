@@ -58,24 +58,71 @@ pub type StoreResult<T> = std::result::Result<T, StoreError>;
 pub enum Projection {
     /// 增量：并入文件当前代，与既有事件一起被 `read_session` 读到。
     Append,
-    /// 扫描器检测到文件变小/被重写，已从 `seq=0` 重建。开新代 —— 新代事件因
-    /// 唯一键含 generation 而不被旧代同 seq 挡掉；旧代留存（append-only）。
+    /// 扫描器检测到文件变小/被重写，已从 `seq=0` 重建。
+    ///
+    /// 开一个**新的源版本** —— 磁盘上那段内容已经不存在了，前一个源版本是它**唯一的
+    /// 副本**，因此永不自动回收（ADR-044 决定 1）。
     Rollback,
     /// **同一份字节，更好的解析器**（`PARSER_REVISION` 提升后的重扫）。
     ///
-    /// 必须开新代，否则 `INSERT OR IGNORE` 会把每一条重发事件当成旧代的重复
-    /// 全部丢弃 —— 文件没变、seq 没变、代没变，唯一键完全相同。结果是解析器
-    /// 修好了而总库纹丝不动，且没有任何错误可查。
+    /// 开一个**新的投影版本**，源版本不动 —— 字节没变，变的是我们。必须开新投影，
+    /// 否则 `INSERT OR IGNORE` 会把每一条重发事件当成重复全部丢弃：文件没变、seq
+    /// 没变、投影也没变，唯一键完全相同。结果是解析器修好了而总库纹丝不动，且没有
+    /// 任何错误可查。
+    ///
+    /// 被它取代的投影是**可再生的**（源字节还在——`Reparse` 按定义就是重读它们），
+    /// 所以可回收，与 `Rollback` 相反。
     Reparse,
 }
 
+/// 一个源文件当前的 `(源版本, 投影版本)`。没有任何记录时是 `(0, 0)`。
+pub type HeadRevisions = (i64, i64);
+
 impl Projection {
-    fn opens_new_generation(self) -> bool {
+    /// 这一批该落在哪个 `(source_revision, projection_revision)`。
+    ///
+    /// 🔴 三个分支各推进**不同的维度**，这正是把 `generation` 拆开的全部意义：
+    /// 「源字节变了」与「解析器变了」留存价值相反，用一个整数表达时无法区分，
+    /// 于是任何回收都只能一刀切。
+    fn target_revisions(self, head: HeadRevisions) -> HeadRevisions {
+        let (source_revision, projection_revision) = head;
         match self {
-            Projection::Append => false,
-            Projection::Rollback | Projection::Reparse => true,
+            Projection::Append => (source_revision, projection_revision),
+            Projection::Rollback => (source_revision + 1, 0),
+            Projection::Reparse => (source_revision, projection_revision + 1),
         }
     }
+
+    /// 写进 `projections.origin` 的理由。**不是** `Debug` 输出：这个串是持久化的，
+    /// 换个 derive 就会悄悄改掉库里的历史含义。
+    fn origin_key(self) -> &'static str {
+        match self {
+            Projection::Append => "append",
+            Projection::Rollback => "rollback",
+            Projection::Reparse => "reparse",
+        }
+    }
+}
+
+/// 某个源文件的当前头；无记录时 `(0, 0)`。
+///
+/// 读 `current_head` 而不是 `MAX(source_revision, projection_revision)`：后者表达不了
+/// 「当前投影是空的」——而一个新解析器合法地对某文件产出零事件时正需要那个语义。
+fn head_of(
+    conn: &Connection,
+    source_type: &str,
+    source_location: &str,
+    source_path: &str,
+) -> StoreResult<HeadRevisions> {
+    Ok(conn
+        .query_row(
+            r#"SELECT source_revision, projection_revision FROM current_head
+                WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3"#,
+            params![source_type, source_location, source_path],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0, 0)))
 }
 
 /// 一次 `append_events` 的结果。`skipped_dup` = 命中 `dedup_key` 唯一约束被忽略的条数
@@ -115,12 +162,15 @@ struct EncryptedRow {
     source_path: String,
     source_session_id: String,
     seq: i64,
-    generation: i64,
+    source_revision: i64,
+    projection_revision: i64,
+    aad_version: i64,
     project_root: String,
     envelope: String,
 }
 
 impl EncryptedRow {
+    /// 列序必须与 [`ENCRYPTED_ROW_COLUMNS`] 一致 —— 两处各写一份是它们分叉的开始。
     fn from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             offset: row.get(0)?,
@@ -129,23 +179,33 @@ impl EncryptedRow {
             source_path: row.get(3)?,
             source_session_id: row.get(4)?,
             seq: row.get(5)?,
-            generation: row.get(6)?,
-            project_root: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-            envelope: row.get(8)?,
+            source_revision: row.get(6)?,
+            projection_revision: row.get(7)?,
+            aad_version: row.get(8)?,
+            project_root: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            envelope: row.get(10)?,
         })
     }
 
     fn aad(&self) -> Vec<u8> {
         event_aad(
+            self.aad_version,
             &self.source_type,
             &self.source_location,
             &self.source_path,
             &self.source_session_id,
             self.seq,
-            self.generation,
+            self.source_revision,
+            self.projection_revision,
         )
     }
 }
+
+/// [`EncryptedRow::from_sql`] 期望的列与顺序。所有 SELECT 都必须用它，否则列序对不上时
+/// 不会报错，只会把 `projection_revision` 读成 `aad_version` 之类 —— 静默且难查。
+const ENCRYPTED_ROW_COLUMNS: &str = "r.offset, r.source_type, r.source_location, r.source_path, \
+     r.source_session_id, r.seq, r.source_revision, r.projection_revision, r.aad_version, \
+     r.project_root, r.event_json";
 
 #[derive(Clone)]
 struct DataKeyGroup {
@@ -212,27 +272,82 @@ pub struct SnapshotSyncStats {
     pub appended: u64,
 }
 
-/// `raw_events` 表 DDL（建库 + 迁移共用）。唯一键含 `generation`：文件回退/重写时新代同 `seq`
-/// 事件不被旧代 dedup 挡掉、照样入库；`read_session` 取当前代，旧代留存（append-only 不可变）。
+/// `raw_events` 表 DDL（建库 + 迁移共用）。
+///
+/// 🔴 **`generation` 已被 `(source_revision, projection_revision)` 取代**（ADR-044 决定 1）。
+/// 那一个整数曾同时表达两件留存价值**相反**的事：
+///
+/// - **源字节被重写/截断** → 旧内容在磁盘上已不存在，那一代是**唯一副本**，永不自动删；
+/// - **换了个解析器** → 源字节没变，旧代只是**更差的、可再生的**解析。
+///
+/// 用一个数表达时，任何「删除非当前代」的回收都会混删前者。拆开之后，留存策略可以跟着
+/// 理由走，而不是一刀切。
+///
+/// `aad_version` 是自描述的加密上下文版本，见 [`event_aad`]。
 const RAW_EVENTS_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS raw_events (
-    offset            INTEGER PRIMARY KEY AUTOINCREMENT,
-    ingested_at       INTEGER NOT NULL,
-    schema_version    INTEGER NOT NULL,
-    source_type       TEXT    NOT NULL,
-    source_location   TEXT    NOT NULL,
-    source_path       TEXT    NOT NULL,
-    source_session_id TEXT    NOT NULL,
-    seq               INTEGER NOT NULL,
-    generation        INTEGER NOT NULL DEFAULT 0,
-    event_type        TEXT    NOT NULL,
-    occurred_at       TEXT,
-    project_root      TEXT,
-    event_json        TEXT    NOT NULL,
-    UNIQUE (source_type, source_location, source_path, source_session_id, seq, generation)
+    offset              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ingested_at         INTEGER NOT NULL,
+    schema_version      INTEGER NOT NULL,
+    source_type         TEXT    NOT NULL,
+    source_location     TEXT    NOT NULL,
+    source_path         TEXT    NOT NULL,
+    source_session_id   TEXT    NOT NULL,
+    seq                 INTEGER NOT NULL,
+    source_revision     INTEGER NOT NULL DEFAULT 0,
+    projection_revision INTEGER NOT NULL DEFAULT 0,
+    aad_version         INTEGER NOT NULL DEFAULT 1,
+    event_type          TEXT    NOT NULL,
+    occurred_at         TEXT,
+    project_root        TEXT,
+    event_json          TEXT    NOT NULL,
+    UNIQUE (source_type, source_location, source_path, source_session_id, seq,
+            source_revision, projection_revision)
 );
 CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
+"#;
+
+/// 投影台账：每一份「某 parser 对某源版本的解析」在这里有一行。
+///
+/// `origin` 记录这份投影**为什么**存在，因为留存策略跟着理由走（ADR-044 决定 7）：
+///
+/// - `rollback` —— 源字节变了，前一个源版本是唯一副本，**永不自动回收**；
+/// - `reparse`  —— 源字节没变，被它取代的投影可回收；
+/// - `append`   —— 并入当前投影，不新开；
+/// - `unknown`  —— 🔴 **ADR-044 之前产生的行**。当时只有 `generation`，无从判断它当初是
+///   回退还是重解析，因此**一律不进通用 GC**，只能由显式、可审计的用户操作清理。
+///   这是「先动手后规范化」的直接代价，明写在这里而不是被悄悄吸收掉。
+const PROJECTIONS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS projections (
+    source_type         TEXT    NOT NULL,
+    source_location     TEXT    NOT NULL,
+    source_path         TEXT    NOT NULL,
+    source_revision     INTEGER NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    parser_revision     INTEGER,
+    origin              TEXT    NOT NULL,
+    created_at          INTEGER NOT NULL,
+    PRIMARY KEY (source_type, source_location, source_path,
+                 source_revision, projection_revision)
+);
+"#;
+
+/// 每个源文件的当前头：哪个源版本、以及该源版本的哪份投影是**当前**的。
+///
+/// 🔴 它取代的是 `read_session` 里那个 `MAX(generation)` 相关子查询。区别不是性能，是
+/// **可表达性**：`MAX` 只能表达「编号最大的那一代」，表达不了「这份投影被替换成了空」
+/// ——而一个新解析器合法地对某文件产出零事件时，正需要表达它（ADR-044 决定 2 / G2）。
+const CURRENT_HEAD_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS current_head (
+    source_type         TEXT    NOT NULL,
+    source_location     TEXT    NOT NULL,
+    source_path         TEXT    NOT NULL,
+    source_revision     INTEGER NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    PRIMARY KEY (source_type, source_location, source_path)
+);
 "#;
 
 const DATA_KEYS_DDL: &str = r#"
@@ -312,7 +427,7 @@ impl TotalStore {
         let conn = self.conn.lock().unwrap();
         let sample: Option<EncryptedRow> = conn
             .query_row(
-                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, project_root, event_json FROM raw_events ORDER BY offset LIMIT 1",
+                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, source_revision, projection_revision, aad_version, project_root, event_json FROM raw_events ORDER BY offset LIMIT 1",
                 [],
                 EncryptedRow::from_sql,
             )
@@ -349,36 +464,95 @@ impl TotalStore {
             .query_row([], |_| Ok(true))
             .optional()?
             .unwrap_or(false);
-        let has_generation: bool = raw_exists
-            && conn
-                .prepare("SELECT 1 FROM pragma_table_info('raw_events') WHERE name='generation'")?
-                .query_row([], |_| Ok(true))
+        let column_exists = |name: &str| -> StoreResult<bool> {
+            if !raw_exists {
+                return Ok(false);
+            }
+            Ok(conn
+                .prepare("SELECT 1 FROM pragma_table_info('raw_events') WHERE name = ?1")?
+                .query_row([name], |_| Ok(true))
                 .optional()?
-                .unwrap_or(false);
+                .unwrap_or(false))
+        };
+        let has_generation = column_exists("generation")?;
+        let has_source_revision = column_exists("source_revision")?;
 
         if !raw_exists {
-            // 全新库：直接建带 generation 的表。
+            // 全新库：直接建当前形状的表。
             conn.execute_batch(RAW_EVENTS_DDL)?;
-        } else if !has_generation {
-            // 既有库（generation 之前的五列唯一）→ **保数据**重建为六列唯一（含 generation）。
-            // 文件回退/重写时，新代同 seq 事件不再被旧代 dedup 挡掉；老事件全归第 0 代。
-            // append-only 不可变性不破（旧代留存，TumeFlow pull 仍见全历史），read_session 取当前代。
+        } else if !has_source_revision {
+            // 🔴 既有库 → 拆 `generation` 为 `(source_revision, projection_revision)`（ADR-044 决定 1）。
+            //
+            // **映射刻意保守**：`source_revision = generation`，`projection_revision = 0`。
+            // 也就是说每一个旧代都被当作**独立的源版本**，而源版本永不自动回收。
+            // 保守是必需的：当时只有一个整数，无从判断某一代当初是「文件被重写」还是
+            // 「换了解析器」，而这两者留存价值相反。猜错一次就是不可逆的数据损坏，
+            // 所以一律按「可能是唯一副本」处理（`origin = 'unknown'`，见 PROJECTIONS_DDL）。
+            //
+            // 🔴 **`aad_version = 1` 是这次迁移能便宜完成的全部原因**：AAD 把 `generation`
+            // 编进了 AES-GCM 的认证数据，而它是长度前缀拼接的，字段一变既有密文全部解不开。
+            // 由于 `source_revision` 取的就是 `generation` 的原值，v1 的 AAD 字节**逐字节
+            // 不变** —— 一行都不用重新加密。新写入的行用 v2（含两个 revision），由这一列
+            // 自描述，不必靠推断。见 [`event_aad`]。
+            //
+            // 更早的库（`generation` 之前的五列唯一）在这里一并落到当前形状：它没有
+            // `generation` 列，全部归为第 0 版本。
+            let generation_expr = if has_generation { "generation" } else { "0" };
             conn.execute_batch(&format!(
                 r#"
-                ALTER TABLE raw_events RENAME TO raw_events_pre_gen;
+                ALTER TABLE raw_events RENAME TO raw_events_pre_srev;
                 {RAW_EVENTS_DDL}
                 INSERT INTO raw_events
                     (offset, ingested_at, schema_version, source_type, source_location,
-                     source_path, source_session_id, seq, generation, event_type, occurred_at,
-                     project_root, event_json)
+                     source_path, source_session_id, seq, source_revision, projection_revision,
+                     aad_version, event_type, occurred_at, project_root, event_json)
                 SELECT offset, ingested_at, schema_version, source_type, source_location,
-                       source_path, source_session_id, seq, 0, event_type, occurred_at,
-                       project_root, event_json
-                  FROM raw_events_pre_gen;
-                DROP TABLE raw_events_pre_gen;
+                       source_path, source_session_id, seq, {generation_expr}, 0,
+                       1, event_type, occurred_at, project_root, event_json
+                  FROM raw_events_pre_srev;
+                DROP TABLE raw_events_pre_srev;
                 "#
             ))?;
         }
+        conn.execute_batch(PROJECTIONS_DDL)?;
+        conn.execute_batch(CURRENT_HEAD_DDL)?;
+        // 台账与头的回填：对既有行是一次性补齐，对新库是空操作。放在建表之后、且用
+        // `INSERT OR IGNORE`，所以重复启动幂等。
+        //
+        // `current_head` 取每个源文件的 `MAX(source_revision, projection_revision)` ——
+        // 与 `read_session` 此前的 `MAX(generation)` 语义**完全一致**，所以这次迁移
+        // 不改变任何一个已有查询的答案。这是刻意的：数据模型分层与行为变更分两步走，
+        // 各自可独立回退。
+        conn.execute_batch(
+            r#"
+            INSERT OR IGNORE INTO projections
+                (source_type, source_location, source_path,
+                 source_revision, projection_revision, parser_revision, origin, created_at)
+            SELECT source_type, source_location, source_path,
+                   source_revision, projection_revision, NULL, 'unknown',
+                   COALESCE(MIN(ingested_at), 0)
+              FROM raw_events
+             GROUP BY source_type, source_location, source_path,
+                      source_revision, projection_revision;
+
+            INSERT OR IGNORE INTO current_head
+                (source_type, source_location, source_path,
+                 source_revision, projection_revision, updated_at)
+            SELECT source_type, source_location, source_path,
+                   source_revision, projection_revision, COALESCE(MAX(ingested_at), 0)
+              FROM raw_events r
+             WHERE (r.source_revision, r.projection_revision) = (
+                       SELECT r2.source_revision, r2.projection_revision
+                         FROM raw_events r2
+                        WHERE r2.source_type = r.source_type
+                          AND r2.source_location = r.source_location
+                          AND r2.source_path = r.source_path
+                        ORDER BY r2.source_revision DESC, r2.projection_revision DESC
+                        LIMIT 1)
+             GROUP BY source_type, source_location, source_path,
+                      source_revision, projection_revision;
+            "#,
+        )?;
         conn.execute_batch(DATA_KEYS_DDL)?;
         drop(conn);
         self.migrate_event_envelopes()?;
@@ -389,7 +563,7 @@ impl TotalStore {
         let mut conn = self.conn.lock().unwrap();
         let legacy_rows = {
             let mut stmt = conn.prepare(
-                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, generation, project_root, event_json FROM raw_events WHERE event_json NOT LIKE 'sv2:%'",
+                "SELECT offset, source_type, source_location, source_path, source_session_id, seq, source_revision, projection_revision, aad_version, project_root, event_json FROM raw_events WHERE event_json NOT LIKE 'sv2:%'",
             )?;
             let rows = stmt.query_map([], EncryptedRow::from_sql)?;
             rows.collect::<Result<Vec<_>, _>>()?
@@ -509,9 +683,14 @@ impl TotalStore {
 
     /// 批量追加事件（一批 = 一个文件，所有事件共享 source_type/location/path）。
     ///
-    /// **代（generation）** 由 [`Projection`] 决定，见其文档。
+    /// 落在哪个 `(source_revision, projection_revision)` 由 [`Projection`] 决定，见其文档。
     ///
-    /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同代旧事件全 skip、增量只落新尾。
+    /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
+    ///
+    /// ⚠️ **作用域从第一条事件反推，因此空批只能是 no-op** —— 它表达不了「把当前投影替换
+    /// 为空」。一个新解析器合法地对某文件产出零事件时正需要那个语义（ADR-044 决定 2）。
+    /// 该缺口由显式携带 `SourceKey` 的 `apply_projection` 补上；本函数保留给作用域推断
+    /// 无害的调用点（测试、固件）。
     pub fn append_events(
         &self,
         events: &[RawEvent],
@@ -519,24 +698,32 @@ impl TotalStore {
     ) -> StoreResult<AppendStats> {
         let now = now_unix_secs();
         let mut conn = self.conn.lock().unwrap();
-        // 文件当前最大代（批内所有事件同文件，取第一条的 source 定位）。
-        let generation = match events.first() {
-            None => return Ok(AppendStats::default()),
-            Some(first) => {
-                let file_max: i64 = conn.query_row(
-                    "SELECT COALESCE(MAX(generation), 0) FROM raw_events
-                       WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3",
-                    params![
-                        source_type_key(first.source_type),
-                        first.source_location.as_key(),
-                        first.source_path,
-                    ],
-                    |r| r.get(0),
-                )?;
-                file_max + i64::from(projection.opens_new_generation())
-            }
+        let Some(first) = events.first() else {
+            return Ok(AppendStats::default());
         };
+        let source_type = source_type_key(first.source_type).to_string();
+        let source_location = first.source_location.as_key();
+        let source_path = first.source_path.clone();
+        let head = head_of(&conn, &source_type, &source_location, &source_path)?;
+        let (source_revision, projection_revision) = projection.target_revisions(head);
         let tx = conn.transaction()?;
+        // 台账：这份投影为什么存在。`INSERT OR IGNORE` 因为增量 append 会反复落在同一
+        // 投影上 —— 第一次记账即可。
+        tx.execute(
+            r#"INSERT OR IGNORE INTO projections
+                 (source_type, source_location, source_path, source_revision,
+                  projection_revision, parser_revision, origin, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)"#,
+            params![
+                source_type,
+                source_location,
+                source_path,
+                source_revision,
+                projection_revision,
+                projection.origin_key(),
+                now,
+            ],
+        )?;
         let mut appended = 0u64;
         let mut skipped_dup = 0u64;
         let mut skipped_erased = 0u64;
@@ -552,9 +739,9 @@ impl TotalStore {
             let mut stmt = tx.prepare(
                 r#"INSERT OR IGNORE INTO raw_events
                      (ingested_at, schema_version, source_type, source_location,
-                      source_path, source_session_id, seq, generation, event_type, occurred_at,
-                      project_root, event_json)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                      source_path, source_session_id, seq, source_revision, projection_revision,
+                      aad_version, event_type, occurred_at, project_root, event_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
             )?;
             for ev in events {
                 let erased: bool = tombstoned.query_row(
@@ -567,12 +754,14 @@ impl TotalStore {
                 }
                 let json = serde_json::to_string(ev)?;
                 let aad = event_aad(
+                    AAD_VERSION_CURRENT,
                     source_type_key(ev.source_type),
                     &ev.source_location.as_key(),
                     &ev.source_path,
                     &ev.source_session_id,
                     ev.seq as i64,
-                    generation,
+                    source_revision,
+                    projection_revision,
                 );
                 let group = DataKeyGroup::from_event(ev);
                 let (key_id, data_cipher) = self.data_cipher_for_group(&tx, &group)?;
@@ -585,7 +774,9 @@ impl TotalStore {
                     ev.source_path,
                     ev.source_session_id,
                     ev.seq as i64,
-                    generation,
+                    source_revision,
+                    projection_revision,
+                    AAD_VERSION_CURRENT,
                     event_type_key(ev.event_type),
                     ev.occurred_at,
                     ev.project_root,
@@ -598,6 +789,26 @@ impl TotalStore {
                 }
             }
         }
+        // 切头。与事件插入同一事务：插入失败则头原样保留，读侧永远看不到「头指向一份
+        // 没写成的投影」这种中间态。
+        tx.execute(
+            r#"INSERT INTO current_head
+                 (source_type, source_location, source_path,
+                  source_revision, projection_revision, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+               ON CONFLICT(source_type, source_location, source_path)
+               DO UPDATE SET source_revision = excluded.source_revision,
+                             projection_revision = excluded.projection_revision,
+                             updated_at = excluded.updated_at"#,
+            params![
+                source_type,
+                source_location,
+                source_path,
+                source_revision,
+                projection_revision,
+                now,
+            ],
+        )?;
         tx.commit()?;
         let max_offset = max_offset_on(&conn)?;
         Ok(AppendStats {
@@ -627,7 +838,8 @@ impl TotalStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
-                      r.source_session_id, r.seq, r.generation, r.project_root, r.event_json
+                      r.source_session_id, r.seq, r.source_revision, r.projection_revision, r.aad_version,
+                      r.project_root, r.event_json
                  FROM raw_events r
                 WHERE r.offset > ?1
                   AND NOT EXISTS (
@@ -668,7 +880,8 @@ impl TotalStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
-                      r.source_session_id, r.seq, r.generation, r.project_root, r.event_json
+                      r.source_session_id, r.seq, r.source_revision, r.projection_revision, r.aad_version,
+                      r.project_root, r.event_json
                  FROM raw_events r
                 WHERE r.event_type = 'config_snapshot'
                   AND r.offset = (
@@ -820,22 +1033,30 @@ impl TotalStore {
         session_id: &str,
     ) -> StoreResult<SessionRead> {
         let conn = self.conn.lock().unwrap();
-        // 只取文件**当前代**（per-file max generation）——回退/重写后旧代被新代取代。按 `seq`
-        // （文件内单调序号 = 气泡顺序）升序，`offset` 作稳定 tiebreak。
+        // 🔴 只取该文件的**当前投影**，且以 `current_head` 为准 —— 不是
+        // `MAX(source_revision, projection_revision)`。
+        //
+        // 差别不是性能，是可表达性：`MAX` 只能指向「存在事件的最大编号」，因此当一份投影
+        // 是**空的**时（新解析器合法地对该文件产出零事件），`MAX` 会退回到上一份非空投影，
+        // 把已被取代的旧解析当成当前答案端出去。头是显式的，空投影就是空。
+        //
+        // `LEFT JOIN` + `IS NULL` 兜住「还没有头」的文件（迁移前的库、或刚建的库）：
+        // 那时按 `(0, 0)` 读，与旧行为一致。
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
-                      r.source_session_id, r.seq, r.generation, r.project_root, r.event_json
+                      r.source_session_id, r.seq, r.source_revision, r.projection_revision, r.aad_version,
+                      r.project_root, r.event_json
                  FROM raw_events r
+                 LEFT JOIN current_head h
+                        ON h.source_type = r.source_type
+                       AND h.source_location = r.source_location
+                       AND h.source_path = r.source_path
                 WHERE r.source_type = ?1
                   AND r.source_location = ?2
                   AND r.source_path = ?3
                   AND r.source_session_id = ?4
-                  AND r.generation = (
-                      SELECT COALESCE(MAX(generation), 0) FROM raw_events r2
-                       WHERE r2.source_type = ?1
-                         AND r2.source_location = ?2
-                         AND r2.source_path = ?3
-                  )
+                  AND r.source_revision = COALESCE(h.source_revision, 0)
+                  AND r.projection_revision = COALESCE(h.projection_revision, 0)
                 ORDER BY r.seq ASC, r.offset ASC"#,
         )?;
         let rows = stmt.query_map(
@@ -1057,25 +1278,57 @@ fn max_offset_on(conn: &Connection) -> StoreResult<i64> {
     )
 }
 
+/// 新写入的行用的 AAD 版本。见 [`event_aad`]。
+const AAD_VERSION_CURRENT: i64 = 2;
+
+/// 事件密文的认证上下文（AES-GCM 的 AAD），把密文钉在它的逻辑位置上，防止行被调换
+/// （ADR-027）。
+///
+/// 🔴 **`version` 必须来自行自己的 `aad_version` 列，不能推断。**
+///
+/// - **v1**（ADR-044 之前写入，以及那次迁移保留的全部既有行）：末位是 `generation`。
+///   迁移把 `source_revision` 取为 `generation` 的原值，所以对这些行传
+///   `source_revision` 得到的字节与当初**逐字节相同** —— 1.66 GB 密文一行都不用重加密。
+/// - **v2**（之后写入）：`source_revision` 与 `projection_revision` 都进 AAD。
+///
+/// 为什么不能只用 v1 了事：v1 下同一事件的两份**不同解析**共享同一个 AAD，于是把旧投影
+/// 的密文换进新投影的行是**不可检测**的 —— 而「旧解析冒充当前」正是 ADR-044 在治的病。
+/// 加一列自描述的版本，比日后反复推理「哪些行是哪种 AAD」便宜得多。
+// 参数多是刻意的：AAD 的每一段都必须是**调用点显式传入的值**。包成结构体会让
+// `RawEvent` 与 `EncryptedRow` 两条路径各自去构造它，而它们对同一行必须产出完全
+// 相同的字节 —— 少一层转换就少一处能悄悄分叉的地方。
+#[allow(clippy::too_many_arguments)]
 fn event_aad(
+    version: i64,
     source_type: &str,
     source_location: &str,
     source_path: &str,
     source_session_id: &str,
     seq: i64,
-    generation: i64,
+    source_revision: i64,
+    projection_revision: i64,
 ) -> Vec<u8> {
-    let mut aad = b"session-vault:event:v1".to_vec();
+    let tag: &[u8] = if version >= AAD_VERSION_CURRENT {
+        b"session-vault:event:v2"
+    } else {
+        b"session-vault:event:v1"
+    };
+    let mut aad = tag.to_vec();
     let seq_bytes = seq.to_be_bytes();
-    let generation_bytes = generation.to_be_bytes();
-    for part in [
+    let source_revision_bytes = source_revision.to_be_bytes();
+    let projection_revision_bytes = projection_revision.to_be_bytes();
+    let mut parts: Vec<&[u8]> = vec![
         source_type.as_bytes(),
         source_location.as_bytes(),
         source_path.as_bytes(),
         source_session_id.as_bytes(),
         &seq_bytes,
-        &generation_bytes,
-    ] {
+        &source_revision_bytes,
+    ];
+    if version >= AAD_VERSION_CURRENT {
+        parts.push(&projection_revision_bytes);
+    }
+    for part in parts {
         aad.extend_from_slice(&(part.len() as u64).to_be_bytes());
         aad.extend_from_slice(part);
     }
@@ -1673,11 +1926,16 @@ mod tests {
         let path = dir.join("total_store.db");
         let event = mk_event(0, "legacy-v1", Some("legacy-v1-private"));
         let aad = event_aad(
+            // 这个 fixture 造的就是一行 **v1 遗留行**：AAD 里没有 projection_revision，
+            // 且 aad_version 列为 1。它同时钉住迁移的核心承诺 —— v1 行的 AAD 字节不变，
+            // 所以 1.66 GB 密文一行都不用重新加密。
+            1,
             source_type_key(event.source_type),
             &event.source_location.as_key(),
             &event.source_path,
             &event.source_session_id,
             event.seq as i64,
+            0,
             0,
         );
         let legacy = StoreCipher::new(StoreKey::from_bytes([9u8; 32]))
@@ -1689,9 +1947,9 @@ mod tests {
             conn.execute(
                 r#"INSERT INTO raw_events
                      (ingested_at, schema_version, source_type, source_location, source_path,
-                      source_session_id, seq, generation, event_type, occurred_at, project_root,
-                      event_json)
-                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 'legacy-v1', 0, 0,
+                      source_session_id, seq, source_revision, projection_revision, aad_version,
+                      event_type, occurred_at, project_root, event_json)
+                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 'legacy-v1', 0, 0, 0, 1,
                            'message', NULL, NULL, ?1)"#,
                 params![legacy],
             )
@@ -1870,7 +2128,7 @@ mod tests {
 
         // 先证明「当成增量」会静默丢弃 —— 没有这一半，下面那一半可能只是碰巧过。
         let as_append = store
-            .append_events(&[reparsed.clone()], Projection::Append)
+            .append_events(std::slice::from_ref(&reparsed), Projection::Append)
             .unwrap();
         assert_eq!(
             as_append.appended, 0,
@@ -1896,5 +2154,219 @@ mod tests {
             Some("parsed-by-rev-2"),
             "读到的应是新解析器的结果"
         );
+    }
+
+    /// 🔴 ADR-044 决定 1：`Rollback` 与 `Reparse` 推进**不同的维度**。
+    ///
+    /// 这是把 `generation` 拆成两个字段的全部意义。用一个整数时两者都只是「+1」，
+    /// 于是任何回收都只能一刀切 —— 而它们的留存价值相反：`Rollback` 的旧版本是磁盘上
+    /// 已消失内容的唯一副本，`Reparse` 的旧投影是同一批字节的更差解析、可再生。
+    ///
+    /// 断言维度而不是断言编号：编号怎么排是实现细节，「哪个维度动了」是契约。
+    #[test]
+    fn rollback_and_reparse_advance_different_dimensions() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let ev = |seq: u64, body: &str| mk_event(seq, "s", Some(body));
+        let head = |s: &TotalStore| {
+            let conn = s.conn.lock().unwrap();
+            head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap()
+        };
+
+        store
+            .append_events(&[ev(0, "v1")], Projection::Append)
+            .unwrap();
+        assert_eq!(head(&store), (0, 0), "首批落在 (0, 0)");
+
+        store
+            .append_events(&[ev(1, "v1")], Projection::Append)
+            .unwrap();
+        assert_eq!(head(&store), (0, 0), "增量不开新版本");
+
+        store
+            .append_events(&[ev(0, "v2")], Projection::Reparse)
+            .unwrap();
+        assert_eq!(
+            head(&store),
+            (0, 1),
+            "Reparse 推进**投影**版本，源版本不动 —— 字节没变，变的是我们"
+        );
+
+        store
+            .append_events(&[ev(0, "v3")], Projection::Rollback)
+            .unwrap();
+        assert_eq!(
+            head(&store),
+            (1, 0),
+            "Rollback 推进**源**版本并把投影归零 —— 磁盘上的内容变了"
+        );
+    }
+
+    /// 台账记下每份投影**为什么**存在。留存策略跟着理由走（ADR-044 决定 7），
+    /// 所以理由必须是持久化的事实，不能事后从编号反推 —— 反推正是本次事故的形状。
+    #[test]
+    fn every_projection_records_why_it_exists() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let ev = |seq: u64| mk_event(seq, "s", Some("x"));
+        store.append_events(&[ev(0)], Projection::Append).unwrap();
+        store.append_events(&[ev(0)], Projection::Reparse).unwrap();
+        store.append_events(&[ev(0)], Projection::Rollback).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_revision, projection_revision, origin FROM projections
+                  ORDER BY source_revision, projection_revision",
+            )
+            .unwrap();
+        let rows: Vec<(i64, i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (0, 0, "append".to_string()),
+                (0, 1, "reparse".to_string()),
+                (1, 0, "rollback".to_string()),
+            ]
+        );
+    }
+
+    /// 🔴 迁移的核心承诺：**既有行照常解得开、`read_session` 的答案不变**。
+    ///
+    /// 数据模型分层与行为变更分两步走，各自可独立回退。这条钉住第一步没有偷偷做第二步。
+    ///
+    /// 它同时钉住 `aad_version = 1` 这个设计的全部理由：`generation` 被编进了 AES-GCM 的
+    /// AAD，而 AAD 是长度前缀拼接的，字段一变既有密文全部解不开。迁移把
+    /// `source_revision` 取为 `generation` 的原值、并把行标成 v1，于是 AAD 字节逐字节
+    /// 相同 —— 实机 1.66 GB 密文一行都不用重加密。若这条前提被破坏，下面的
+    /// `read_session` 会返回**空**（而不是报错），是一个静默的、全库规模的数据损坏。
+    ///
+    /// 🔴 fixture 必须是**真正的迁移前形态**：旧 schema（只有 `generation`）+ **v1 密文**。
+    /// 第一版图省事，用新代码写出 v2 密文再把表「降级」成旧 schema —— 那种库现实中不
+    /// 存在，测出来的 `Crypto(Decrypt)` 只是 fixture 自己造的假象。
+    #[test]
+    fn migration_from_generation_store_keeps_events_readable() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_srev_mig_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([7u8; 32]);
+
+        // 两代同一个 session：gen 0 是旧解析，gen 1 取代它。迁移后 `read_session`
+        // 必须只看到 gen 1 那条 —— 与迁移前 `MAX(generation)` 的语义完全一致。
+        let rows = [(0i64, "old-parse"), (1i64, "new-parse")];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"CREATE TABLE raw_events (
+                       offset            INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ingested_at       INTEGER NOT NULL,
+                       schema_version    INTEGER NOT NULL,
+                       source_type       TEXT    NOT NULL,
+                       source_location   TEXT    NOT NULL,
+                       source_path       TEXT    NOT NULL,
+                       source_session_id TEXT    NOT NULL,
+                       seq               INTEGER NOT NULL,
+                       generation        INTEGER NOT NULL DEFAULT 0,
+                       event_type        TEXT    NOT NULL,
+                       occurred_at       TEXT,
+                       project_root      TEXT,
+                       event_json        TEXT    NOT NULL,
+                       UNIQUE (source_type, source_location, source_path,
+                               source_session_id, seq, generation)
+                   );"#,
+            )
+            .unwrap();
+            for (generation, body) in rows {
+                let event = mk_event(0, "s", Some(body));
+                // v1 AAD：末位是 generation，没有 projection_revision。
+                let aad = event_aad(
+                    1,
+                    source_type_key(event.source_type),
+                    &event.source_location.as_key(),
+                    &event.source_path,
+                    &event.source_session_id,
+                    event.seq as i64,
+                    generation,
+                    0,
+                );
+                let envelope = StoreCipher::new(key())
+                    .encrypt(serde_json::to_string(&event).unwrap().as_bytes(), &aad)
+                    .unwrap();
+                conn.execute(
+                    r#"INSERT INTO raw_events
+                         (ingested_at, schema_version, source_type, source_location, source_path,
+                          source_session_id, seq, generation, event_type, occurred_at,
+                          project_root, event_json)
+                       VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 's', 0, ?1,
+                               'message', NULL, NULL, ?2)"#,
+                    params![generation, envelope],
+                )
+                .unwrap();
+            }
+        }
+
+        let store = TotalStore::open_with_key(&path, key()).unwrap();
+
+        // ① 两行都还在（迁移不删数据）。
+        let total: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "迁移不得删除任何行");
+
+        // ② 答案不变：只看到当前投影那一条，且**解得开**。
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(
+            read.events.len(),
+            1,
+            "read_session 应只返回当前投影；返回 0 通常意味着 AAD 变了、既有密文解不开"
+        );
+        assert_eq!(read.events[0].content.as_deref(), Some("new-parse"));
+
+        // ③ 保守映射：每个旧代成为独立的**源版本**，且理由标为 unknown ——
+        //    当时只有一个整数，无从判断当初是回退还是重解析，一律按「可能是唯一副本」
+        //    处理，永不进通用 GC（ADR-044 决定 7）。
+        {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source_revision, projection_revision, origin FROM projections
+                      ORDER BY source_revision",
+                )
+                .unwrap();
+            let ledger: Vec<(i64, i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                ledger,
+                vec![(0, 0, "unknown".to_string()), (1, 0, "unknown".to_string()),]
+            );
+            assert_eq!(
+                head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap(),
+                (1, 0),
+                "头应指向原 MAX(generation) 那一代"
+            );
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -14,7 +14,18 @@ use session_vault::catalog::Profile;
 use session_vault::cursor::Cursor;
 use session_vault::logging::tag;
 use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
-#[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+// 🔴 门必须是两个使用点的**并集**，一个都不能多、不能少：
+//   - `run_fixture_append`  → `all(feature = "acceptance-fixtures", debug_assertions)`
+//   - `mod tests`           → `all(test, feature = "store")`
+//
+// 只按前者开 ⇒ `--features store` 单独编译时测试模块缺 import（编译失败）；
+// 只按 `feature = "store"` 开 ⇒ 不带 acceptance-fixtures 的 bin 目标里它未被使用
+// （unused import 告警）。两种错法都只在**特定 feature 组合**下现形，与昨天那个漏改的
+// 调用点同源 —— feature 门后的代码不在默认闸的覆盖里，改它必须逐个组合编一遍。
+#[cfg(all(
+    feature = "store",
+    any(all(feature = "acceptance-fixtures", debug_assertions), test)
+))]
 use session_vault::store::Projection;
 use session_vault::SourceRef;
 
