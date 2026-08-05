@@ -94,6 +94,22 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 回收**已被取代且来源明确**的投影（ADR-044 决定 7）。
+    ///
+    /// 只碰台账里 `origin = 'reparse'` 且不是当前头的那些。**不碰** `rollback`
+    /// （磁盘上已消失内容的唯一副本）与 `unknown`（ADR-044 之前产生、无从判断当初
+    /// 是回退还是重解析的行）。
+    ///
+    /// 决定 2 落地后不再产生新的被取代投影，所以这基本是一次性清扫。**不自动执行**
+    /// —— 它删的是历史，该由人按一次按钮。
+    #[cfg(feature = "store")]
+    Gc {
+        /// 只统计不删。
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 用户主动彻底删除：同一事务写不含正文的墓碑并物理删除命中事件（ADR-027）。
     #[cfg(feature = "store")]
     Erase {
@@ -228,6 +244,12 @@ enum Out<'a> {
     #[cfg(feature = "store")]
     SnapshotSummary { snapshots: u64 },
     #[cfg(feature = "store")]
+    GcSummary {
+        projections: u64,
+        events: u64,
+        dry_run: bool,
+    },
+    #[cfg(feature = "store")]
     EraseSummary {
         deleted_events: u64,
         keys_destroyed: u64,
@@ -266,6 +288,8 @@ fn main() {
         } => run_sessions_recent(limit, since_ms, store),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
+        #[cfg(feature = "store")]
+        Command::Gc { dry_run, store } => run_gc(dry_run, store),
         #[cfg(feature = "store")]
         Command::Erase {
             scope,
@@ -985,4 +1009,38 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
         sessions: sessions.len(),
     });
     0
+}
+
+/// `gc`：回收已被取代且来源明确的投影。
+#[cfg(feature = "store")]
+fn run_gc(dry_run: bool, store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if !store_path.exists() {
+        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
+        return 1;
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    match store.gc_superseded_projections(dry_run) {
+        Ok(stats) => {
+            emit(&Out::GcSummary {
+                projections: stats.projections,
+                events: stats.events,
+                dry_run: stats.dry_run,
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "gc failed: {e}");
+            1
+        }
+    }
 }

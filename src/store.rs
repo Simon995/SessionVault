@@ -192,6 +192,16 @@ pub struct ProjectionStats {
     pub loses_events: Option<(u64, u64)>,
 }
 
+/// [`TotalStore::gc_superseded_projections`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcStats {
+    /// 被回收（或将被回收）的投影份数。
+    pub projections: u64,
+    /// 涉及的事件行数。
+    pub events: u64,
+    pub dry_run: bool,
+}
+
 /// [`TotalStore::recent_sessions`] 的一行。
 ///
 /// `last_occurred_at_unix_ms` 为 `None` = 这个会话的事件全都没有可解析的时间。它排在
@@ -1115,6 +1125,79 @@ impl TotalStore {
             superseded_removed,
             loses_events,
         })
+    }
+
+    /// 回收**已被取代且来源明确**的投影（ADR-044 决定 7）。
+    ///
+    /// 🔴 只碰满足两个条件的行：
+    ///
+    /// 1. 它不是该源文件的当前投影（`current_head` 说了算）；
+    /// 2. 它在台账里的 `origin` 是 **`reparse`** —— 也就是「同一批字节的一份更差的
+    ///    解析」，可再生。
+    ///
+    /// **禁止**碰的两类，各有各的理由：
+    ///
+    /// - `origin = 'rollback'`：那是磁盘上**已消失内容的唯一副本**，删了真没了；
+    /// - `origin = 'unknown'`：本 ADR 落地**之前**产生的行。当时只有一个 `generation`
+    ///   整数，无从判断某一代当初是回退还是重解析。实测作者本机 930,056 行里有
+    ///   383,426 行（41.2%，约 1.12 GB）属于这一类。它们**不进通用 GC**，只能由显式的、
+    ///   可审计的用户操作清理 —— 这是「先动手后规范化」的直接代价，明写而不是悄悄吸收。
+    ///
+    /// `dry_run` 时只统计不删，供 CLI 先给人看一眼。
+    pub fn gc_superseded_projections(&self, dry_run: bool) -> StoreResult<GcStats> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        // 候选：台账里 origin='reparse'、且不是当前头指向的那一份。
+        const CANDIDATES: &str = r#"
+            SELECT p.source_type, p.source_location, p.source_path,
+                   p.source_revision, p.projection_revision
+              FROM projections p
+              LEFT JOIN current_head h
+                     ON h.source_type = p.source_type
+                    AND h.source_location = p.source_location
+                    AND h.source_path = p.source_path
+             WHERE p.origin = 'reparse'
+               AND (p.source_revision, p.projection_revision)
+                   IS NOT (COALESCE(h.source_revision, 0), COALESCE(h.projection_revision, 0))
+        "#;
+        let candidates: Vec<(String, String, String, i64, i64)> = {
+            let mut stmt = tx.prepare(CANDIDATES)?;
+            let rows = stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut stats = GcStats {
+            projections: candidates.len() as u64,
+            events: 0,
+            dry_run,
+        };
+        for (st, loc, path, srev, prev) in &candidates {
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM raw_events
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                params![st, loc, path, srev, prev],
+                |r| r.get(0),
+            )?;
+            stats.events += n as u64;
+            if !dry_run {
+                tx.execute(
+                    "DELETE FROM raw_events
+                      WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                        AND source_revision = ?4 AND projection_revision = ?5",
+                    params![st, loc, path, srev, prev],
+                )?;
+                tx.execute(
+                    "DELETE FROM projections
+                      WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                        AND source_revision = ?4 AND projection_revision = ?5",
+                    params![st, loc, path, srev, prev],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(stats)
     }
 
     /// 最近活跃的 N 个会话，按各自最后一条事件的**真实时间**降序。
@@ -3254,5 +3337,158 @@ mod tests {
         assert_eq!(stats.loses_events, Some((1, 0)));
         assert_eq!(stats.superseded_removed, 0);
         assert!(stats.head_moved);
+    }
+
+    /// 🔴 **护栏 G8（ADR-044 决定 7）：GC 只碰「已被取代且来源明确」的投影。**
+    ///
+    /// 三类并存，只有一类该被回收 —— 这条测试的价值全在**另外两类必须活下来**：
+    ///
+    /// - `reparse` 且非当前 → 回收（同一批字节的更差解析，可再生）；
+    /// - `rollback`         → **保留**（磁盘上已消失内容的唯一副本）；
+    /// - `unknown`          → **保留**（ADR-044 之前产生，无从判断当初是哪一种）。
+    ///
+    /// 首稿计划里的「删除每个文件的非当前代」正是会把后两类一并删掉的形状。
+    #[test]
+    fn gc_spares_rollback_history_and_rows_of_unknown_origin() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let at = |path: &str| SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: path.to_string(),
+        };
+        let put = |src: &SourceKey, mode: Projection, tag: &str| {
+            let mut ev = mk_event_at(0, "s", &src.source_path);
+            ev.content = Some(tag.to_string());
+            store
+                .apply_projection(FileProjectionBatch {
+                    source: src.clone(),
+                    parser_revision: Some(1),
+                    mode,
+                    events: vec![ev],
+                })
+                .unwrap()
+        };
+        let count = |s: &TotalStore| -> i64 {
+            s.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // ① 一个走过 rollback 的文件：旧源版本必须留下。
+        let rolled = at("/p/rolled.jsonl");
+        put(&rolled, Projection::Append, "before-rewrite");
+        put(&rolled, Projection::Rollback, "after-rewrite");
+
+        // ② 「来源不明」的旧代 —— 直接造出 ADR-044 之前的形态：有行、台账标 unknown、
+        //    且不是当前头。迁移正是这么标的。
+        // ③ 一份历史遗留的、被取代的 reparse 投影 —— 决定 2 之后不再产生新的，
+        //    GC 存在的意义正是清扫此前攒下的。
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                r#"
+                INSERT INTO projections (source_type, source_location, source_path,
+                    source_revision, projection_revision, parser_revision, origin, created_at)
+                VALUES ('claude_code','local','/p/rolled.jsonl',9,0,NULL,'unknown',0);
+                INSERT INTO raw_events (ingested_at, schema_version, source_type,
+                    source_location, source_path, source_session_id, seq, source_revision,
+                    projection_revision, aad_version, event_type, occurred_at,
+                    occurred_at_unix_ms, project_root, event_json)
+                VALUES (0,1,'claude_code','local','/p/rolled.jsonl','s',0,9,0,1,
+                        'message',NULL,NULL,NULL,'sv2:unknown-origin');
+
+                INSERT INTO projections (source_type, source_location, source_path,
+                    source_revision, projection_revision, parser_revision, origin, created_at)
+                VALUES ('claude_code','local','/p/rolled.jsonl',0,7,1,'reparse',0);
+                INSERT INTO raw_events (ingested_at, schema_version, source_type,
+                    source_location, source_path, source_session_id, seq, source_revision,
+                    projection_revision, aad_version, event_type, occurred_at,
+                    occurred_at_unix_ms, project_root, event_json)
+                VALUES (0,1,'claude_code','local','/p/rolled.jsonl','s',0,0,7,1,
+                        'message',NULL,NULL,NULL,'sv2:superseded');
+                "#,
+            )
+            .unwrap();
+        }
+
+        let before = count(&store);
+
+        // dry-run 先看一眼：只统计，一行不动。
+        let plan = store.gc_superseded_projections(true).unwrap();
+        assert_eq!(plan.projections, 1, "只有那一份 reparse 旧投影是候选");
+        assert_eq!(plan.events, 1);
+        assert!(plan.dry_run);
+        assert_eq!(count(&store), before, "dry-run 不许改任何东西");
+
+        let done = store.gc_superseded_projections(false).unwrap();
+        assert_eq!((done.projections, done.events), (1, 1));
+
+        let survivors: Vec<(String, i64, i64)> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT origin, source_revision, projection_revision FROM projections
+                      ORDER BY source_revision, projection_revision",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        let origins: Vec<&str> = survivors.iter().map(|(o, _, _)| o.as_str()).collect();
+        assert!(
+            origins.contains(&"rollback"),
+            "rollback 历史被删了 —— 那是磁盘上已消失内容的唯一副本。实得 {survivors:?}"
+        );
+        assert!(
+            origins.contains(&"unknown"),
+            "来源不明的旧代被删了 —— 无从判断它当初是回退还是重解析，只能保守保留。实得 {survivors:?}"
+        );
+        assert!(
+            !survivors
+                .iter()
+                .any(|(o, sr, pr)| o == "reparse" && (*sr, *pr) == (0, 7)),
+            "被取代的 reparse 投影应已回收"
+        );
+    }
+
+    /// 当前投影永远不进候选 —— 哪怕它的 origin 是 `reparse`。
+    ///
+    /// 单独一条，因为「只回收非当前的」这个条件最容易在重写 SQL 时丢掉，而丢掉之后的
+    /// 表现是**当前数据被删**，不是报错。
+    #[test]
+    fn gc_never_touches_the_current_projection() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let source = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        };
+        for (mode, tag) in [(Projection::Append, "v1"), (Projection::Reparse, "v2")] {
+            store
+                .apply_projection(FileProjectionBatch {
+                    source: source.clone(),
+                    parser_revision: Some(1),
+                    mode,
+                    events: vec![mk_event(0, "s", Some(tag))],
+                })
+                .unwrap();
+        }
+        // 当前头是那份 reparse。
+        let stats = store.gc_superseded_projections(false).unwrap();
+        assert_eq!(stats.projections, 0, "当前投影不是候选");
+        let read = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap();
+        assert_eq!(read.events.len(), 1);
+        assert_eq!(read.events[0].content.as_deref(), Some("v2"));
     }
 }
