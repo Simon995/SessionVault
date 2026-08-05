@@ -451,10 +451,51 @@ CREATE TABLE IF NOT EXISTS raw_events (
     UNIQUE (source_type, source_location, source_path, source_session_id, seq,
             source_revision, projection_revision)
 );
+"#;
+
+/// 二级索引，**与建表分开**。
+///
+/// 🔴 分开的原因是迁移的代价，不是洁癖。这三条原本就写在 `RAW_EVENTS_DDL` 里，于是
+/// 「先建表再灌 93 万行」这条路上每一次 `INSERT` 都要维护 **4 棵 B 树**（唯一约束的
+/// 隐式索引 + 这三条），而后三条对灌数据本身毫无用处 —— 它们服务的是之后的查询。
+/// 实测 2.8 GB 真库上这让重写阶段多写数 GB 的 WAL。
+///
+/// 建索引放在数据搬完之后、且**无条件执行**（`IF NOT EXISTS` 幂等）。无条件是关键：
+/// 放在迁移分支里的话，一旦进程在「表已改形状、索引还没建」之间被杀，下次启动会因为
+/// `source_revision` 已存在而跳过整个分支 —— 库从此没有索引，而这不报错，只是所有
+/// 会话/项目查询退化成全表扫。
+const RAW_EVENTS_INDEX_DDL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
 CREATE INDEX IF NOT EXISTS idx_raw_events_occurred ON raw_events(occurred_at_unix_ms);
 "#;
+
+/// 把 `rawevent::occurred_at_unix_ms` 暴露成一个 SQL 标量函数 `iso8601_to_unix_ms`。
+///
+/// 🔴 **目的是让归一化在数据搬运的同一趟里完成**，而不是搬完再回来逐行 `UPDATE`。
+/// 后者的代价被行的形状放大得离谱：`raw_events` 的一行装着 `event_json`（真库上平均
+/// 约 3 KB），而 SQLite 更新任意一列都要**重写整条记录** —— 93 万次 UPDATE ≈ 又一遍
+/// 2.8 GB 的整表重写，还是随机顺序，外加 `secure_delete` 把每个旧页清零。实测这让迁移
+/// 从「一趟」变成「三趟」。
+///
+/// 🔴 **解析仍然只有 Rust 那一处实现**。这里注册的是同一个函数的 SQL 门面，不是第二份
+/// 规则 —— 用 SQL 表达式去切时间串必然与 Rust 分叉，而分叉的表现是**排序悄悄不对**，
+/// 不报错。归一化规则（时区偏移、小数秒位数、闰年）见 [`crate::rawevent::occurred_at_unix_ms`]。
+fn register_sql_functions(conn: &Connection) -> StoreResult<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "iso8601_to_unix_ms",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let raw: Option<String> = ctx.get(0)?;
+            Ok(raw
+                .as_deref()
+                .and_then(crate::rawevent::occurred_at_unix_ms))
+        },
+    )?;
+    Ok(())
+}
 
 /// 投影台账：每一份「某 parser 对某源版本的解析」在这里有一行。
 ///
@@ -588,6 +629,7 @@ impl TotalStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
+        register_sql_functions(&conn)?;
         let store = Self {
             conn: Mutex::new(conn),
             cipher: StoreCipher::new(key),
@@ -689,6 +731,14 @@ impl TotalStore {
             // 因为同名索引仍存在而**静默跳过**；最后 `DROP TABLE` 把它们一并删掉。
             // 净效果：迁移后的库一个索引都没有，而这不会报错 —— 只是会话/项目查询与
             // erase 全部退化成全表扫。实测复现过。
+            //
+            // 🔴 **索引不在这里建**（见 [`RAW_EVENTS_INDEX_DDL`]）。它们原本写在
+            // `RAW_EVENTS_DDL` 里，于是这条路上每灌一行都要维护 4 棵 B 树，而其中三棵
+            // 对灌数据本身毫无用处。现在只剩唯一约束那棵（它由表定义带来，躲不掉）。
+            //
+            // 🔴 **`occurred_at_unix_ms` 在这一趟里就算好**（`iso8601_to_unix_ms`）。
+            // 搬完再逐行 `UPDATE` 是又一遍整表重写 —— 这一列不参与唯一键、也不参与
+            // 排序以外的任何判断，放进 SELECT 是纯粹的白拿。
             let generation_expr = if has_generation { "generation" } else { "0" };
             let tx = conn.transaction()?;
             tx.execute_batch(&format!(
@@ -701,10 +751,12 @@ impl TotalStore {
                 INSERT INTO raw_events
                     (offset, ingested_at, schema_version, source_type, source_location,
                      source_path, source_session_id, seq, source_revision, projection_revision,
-                     aad_version, event_type, occurred_at, project_root, event_json)
+                     aad_version, event_type, occurred_at, occurred_at_unix_ms,
+                     project_root, event_json)
                 SELECT offset, ingested_at, schema_version, source_type, source_location,
                        source_path, source_session_id, seq, {generation_expr}, 0,
-                       1, event_type, occurred_at, project_root, event_json
+                       1, event_type, occurred_at, iso8601_to_unix_ms(occurred_at),
+                       project_root, event_json
                   FROM raw_events_pre_srev;
                 DROP TABLE raw_events_pre_srev;
                 "#
@@ -765,10 +817,11 @@ impl TotalStore {
                          (offset, ingested_at, schema_version, source_type, source_location,
                           source_path, source_session_id, seq, source_revision,
                           projection_revision, aad_version, event_type, occurred_at,
-                          project_root, event_json)
+                          occurred_at_unix_ms, project_root, event_json)
                        SELECT offset, ingested_at, schema_version, source_type, source_location,
                               source_path, source_session_id, seq, {coords},
-                              event_type, occurred_at, project_root, event_json
+                              event_type, occurred_at, iso8601_to_unix_ms(occurred_at),
+                              project_root, event_json
                          FROM raw_events_pre_srev"#
                 ),
                 [],
@@ -779,25 +832,41 @@ impl TotalStore {
         }
         // 归一化时间列可能单独缺席（库已是新形状、只是早于决定 5）。ALTER 加列比
         // 重建整表便宜得多，且这一列不参与唯一键，加了不影响既有行的可读性。
+        // 索引不在这里建 —— 统一由末尾的 `RAW_EVENTS_INDEX_DDL` 无条件补，否则这个
+        // 分支跑过一次之后索引就再没有第二次机会被建出来。
         if raw_exists && !has_occurred_ms && has_source_revision {
-            conn.execute_batch(
-                "ALTER TABLE raw_events ADD COLUMN occurred_at_unix_ms INTEGER;
-                 CREATE INDEX IF NOT EXISTS idx_raw_events_occurred
-                     ON raw_events(occurred_at_unix_ms);",
-            )?;
+            conn.execute_batch("ALTER TABLE raw_events ADD COLUMN occurred_at_unix_ms INTEGER;")?;
         }
         conn.execute_batch(PROJECTIONS_DDL)?;
         conn.execute_batch(CURRENT_HEAD_DDL)?;
         conn.execute_batch(PROJECTION_LOG_DDL)?;
-        // 台账与头的回填：对既有行是一次性补齐，对新库是空操作。放在建表之后、且用
-        // `INSERT OR IGNORE`，所以重复启动幂等。
+        // 🔴 **回填是一次性的，用标记闸住，别靠 `INSERT OR IGNORE` 幂等来兜。**
         //
-        // `current_head` 取每个源文件的 `MAX(source_revision, projection_revision)` ——
-        // 与 `read_session` 此前的 `MAX(generation)` 语义**完全一致**，所以这次迁移
-        // 不改变任何一个已有查询的答案。这是刻意的：数据模型分层与行为变更分两步走，
-        // 各自可独立回退。
-        conn.execute_batch(
-            r#"
+        // 幂等只保证结果不错，不保证不做功：下面两条都要在 93 万行上 `GROUP BY`
+        // 七列（实测 4.3s，冷缓存更久），而这在**每次启动**都会重来一遍，只为算出一份
+        // 与上次逐字相同的答案。`apply_projection` 之后自己维护这两张表，所以这段只服务
+        // ADR-044 之前的旧行 —— 一次做完就再也不需要。
+        //
+        // 判据用显式标记而不是「`current_head` 是不是空的」：一个合法为空的库（还没有
+        // 任何事件）每次启动都会重跑，而它恰恰是最不需要回填的那种。
+        let coords_backfilled: bool = conn
+            .query_row(
+                "SELECT 1 FROM store_meta WHERE k = 'adr044_coords_backfilled'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !coords_backfilled {
+            // 台账与头的回填：对既有行是一次性补齐，对新库是空操作。放在建表之后、且用
+            // `INSERT OR IGNORE`，所以重复启动幂等。
+            //
+            // `current_head` 取每个源文件的 `MAX(source_revision, projection_revision)` ——
+            // 与 `read_session` 此前的 `MAX(generation)` 语义**完全一致**，所以这次迁移
+            // 不改变任何一个已有查询的答案。这是刻意的：数据模型分层与行为变更分两步走，
+            // 各自可独立回退。
+            conn.execute_batch(
+                r#"
             INSERT OR IGNORE INTO projections
                 (source_type, source_location, source_path,
                  source_revision, projection_revision, parser_revision, origin, created_at)
@@ -808,60 +877,63 @@ impl TotalStore {
              GROUP BY source_type, source_location, source_path,
                       source_revision, projection_revision;
 
+            -- 🔴 头从**分组结果**里选，不要在 `raw_events` 上写关联子查询。
+            --
+            -- 原先那版对外层的每一行都跑一次「按该 source_path 取最大 (srev, prev)」的
+            -- 子查询。唯一索引是 `(type, loc, path, session, seq, srev, prev)` —— 过滤列
+            -- 是前缀，但要取的两列被 `session, seq` 隔在后面，所以每次子查询都得把该路径
+            -- 下的行全扫一遍再排序。93 万行 × 每路径上千行 ≈ 十亿级，实测在 2.8 GB 真库
+            -- 上跑了 90 秒还没出结果，而这发生在同步的 `open()` 里 —— 界面全程不出来。
+            --
+            -- 分组本身上面那条语句已经做过一次（1445 组），头只是「每个 path 里 (srev,
+            -- prev) 最大的那一组」。窗口函数在**那 1445 行**上选，是常数级的。
             INSERT OR IGNORE INTO current_head
                 (source_type, source_location, source_path,
                  source_revision, projection_revision, updated_at)
             SELECT source_type, source_location, source_path,
-                   source_revision, projection_revision, COALESCE(MAX(ingested_at), 0)
-              FROM raw_events r
-             WHERE (r.source_revision, r.projection_revision) = (
-                       SELECT r2.source_revision, r2.projection_revision
-                         FROM raw_events r2
-                        WHERE r2.source_type = r.source_type
-                          AND r2.source_location = r.source_location
-                          AND r2.source_path = r.source_path
-                        ORDER BY r2.source_revision DESC, r2.projection_revision DESC
-                        LIMIT 1)
-             GROUP BY source_type, source_location, source_path,
-                      source_revision, projection_revision;
+                   source_revision, projection_revision, updated_at
+              FROM (
+                SELECT source_type, source_location, source_path,
+                       source_revision, projection_revision,
+                       COALESCE(MAX(ingested_at), 0) AS updated_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY source_type, source_location, source_path
+                           ORDER BY source_revision DESC, projection_revision DESC) AS rn
+                  FROM raw_events
+                 GROUP BY source_type, source_location, source_path,
+                          source_revision, projection_revision)
+             WHERE rn = 1;
             "#,
-        )?;
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('adr044_coords_backfilled', '1')",
+                [],
+            )?;
+        }
         // 回填归一化时间：只补 NULL 的行，所以重复启动幂等，且一次全库回填之后
         // 常态启动是一次索引扫、零写入。
         //
-        // 🔴 在 Rust 里解析、逐行 UPDATE，而不是写一段 SQL 表达式去切串 —— 归一化
-        // 规则（时区偏移、小数秒位数、闰年）只有一处实现，SQL 里再写一份必然分叉，
-        // 而分叉的表现是**排序悄悄不对**，不是报错。
-        {
-            let pending: Vec<(i64, String)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT offset, occurred_at FROM raw_events
-                      WHERE occurred_at IS NOT NULL AND occurred_at_unix_ms IS NULL",
-                )?;
-                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-                rows.collect::<Result<Vec<_>, _>>()?
-            };
-            if !pending.is_empty() {
-                let tx = conn.transaction()?;
-                {
-                    let mut up = tx.prepare(
-                        "UPDATE raw_events SET occurred_at_unix_ms = ?1 WHERE offset = ?2",
-                    )?;
-                    let mut filled = 0u64;
-                    for (offset, raw) in &pending {
-                        if let Some(ms) = crate::rawevent::occurred_at_unix_ms(raw) {
-                            up.execute(params![ms, offset])?;
-                            filled += 1;
-                        }
-                    }
-                    log::info!(
-                        "[total-store] normalized occurred_at for {filled}/{} rows",
-                        pending.len()
-                    );
-                }
-                tx.commit()?;
-            }
+        // 解析规则仍然只有 Rust 那一处 —— `iso8601_to_unix_ms` 是它的 SQL 门面
+        // （见 [`register_sql_functions`]），不是第二份实现。用 SQL 表达式去切时间串
+        // 必然与 Rust 分叉，而分叉的表现是**排序悄悄不对**，不报错。
+        //
+        // 🔴 走**一条 UPDATE**，不是「读进 Vec 再逐行 execute」。后者在真库上是 93 万
+        // 次往返 + 93 万条记录重写（行里装着 `event_json`，改任意一列都要重写整条），
+        // 而重写路径在上面已经把这一列在搬运那一趟里算好了 —— 到这里通常一行都不剩。
+        // 这条只服务「库已是新形状、只差这一列」那个分支。
+        let filled = conn.execute(
+            "UPDATE raw_events SET occurred_at_unix_ms = iso8601_to_unix_ms(occurred_at)
+              WHERE occurred_at IS NOT NULL AND occurred_at_unix_ms IS NULL",
+            [],
+        )?;
+        if filled > 0 {
+            log::info!("[total-store] normalized occurred_at for {filled} rows");
         }
+        // 🔴 二级索引**无条件**在这里建（`IF NOT EXISTS` 幂等，已存在时是零成本的
+        // 元数据查询）。放在数据搬完之后，灌数据时就不必维护它们；放在所有分支之外，
+        // 「表已改形状但索引没建成」的中断就还有第二次机会被补上 —— 放进迁移分支里的话
+        // 下次启动会因为 `source_revision` 已存在而整段跳过，库从此没有索引且不报错。
+        conn.execute_batch(RAW_EVENTS_INDEX_DDL)?;
         conn.execute_batch(DATA_KEYS_DDL)?;
         drop(conn);
         self.migrate_event_envelopes()?;
@@ -870,6 +942,29 @@ impl TotalStore {
 
     fn migrate_event_envelopes(&self) -> StoreResult<()> {
         let mut conn = self.conn.lock().unwrap();
+        // 🔴 **完成标记要被当闸读，不然它只是个装饰。**
+        //
+        // 下面那条 `WHERE event_json NOT LIKE 'sv2:%'` 用不上任何索引，且 SELECT 出的是
+        // 整行（含 `event_json`）—— 在 2.8 GB 真库上是一次 93 万行、数 GB 的扫描，**每次
+        // 启动都跑一遍**，为的是得到「零行待迁移」这个上一次启动就已经知道的答案。而
+        // `encryption_version = '2'` 早就在写了，只是从来没有人读它：实测每次 `open()`
+        // 白白花掉十几秒，而 `open()` 在 QuotaBar 里是同步的 setup hook，界面就卡在这。
+        //
+        // 跳过是安全的，因为**读路径本来就认两种信封**（[`Self::decode_event_on`]：带
+        // `sv2:` 前缀走每组密钥，否则走 store 主密钥）。所以即便有哪条路径在标记落地后
+        // 又写进了 v1 行（比如用户降级跑了一次旧版），那些行仍然读得出来 —— 代价只是没被
+        // 重新封装，不是数据不可用。
+        let done: bool = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'encryption_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some_and(|v| v == "2");
+        if done {
+            return Ok(());
+        }
         let legacy_rows = {
             let mut stmt = conn.prepare(
                 "SELECT offset, source_type, source_location, source_path, source_session_id, seq, source_revision, projection_revision, aad_version, project_root, event_json FROM raw_events WHERE event_json NOT LIKE 'sv2:%'",
@@ -4013,5 +4108,306 @@ mod tests {
         let rest = store.read_projection_changes(seqs[0], 100).unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].seq, seqs[1]);
+    }
+
+    // ------------------------------------------------------------------
+    // 迁移代价（2026-08-05 实测：2.8 GB / 93 万行真库）
+    //
+    // 这一组钉的不是「结果对不对」，而是「有没有在每次启动时把同一份答案重算一遍」。
+    // 起因：`TotalStore::open` 在 QuotaBar 里是**同步的 setup hook**，首次迁移实测
+    // 103 秒、此后每次启动仍白花 12–13 秒 —— 而这三处代价都不会报错，只会表现为
+    // 「双击图标后很久什么都不出来」。
+    // ------------------------------------------------------------------
+
+    /// 造一个只有 `generation` 的旧库，带 `n` 条真实加密行（同一 session，逐代递增）。
+    #[cfg(feature = "store")]
+    fn legacy_generation_store(path: &std::path::Path, key: StoreKey, gens: &[(i64, &str)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE raw_events (
+                   offset            INTEGER PRIMARY KEY AUTOINCREMENT,
+                   ingested_at       INTEGER NOT NULL,
+                   schema_version    INTEGER NOT NULL,
+                   source_type       TEXT    NOT NULL,
+                   source_location   TEXT    NOT NULL,
+                   source_path       TEXT    NOT NULL,
+                   source_session_id TEXT    NOT NULL,
+                   seq               INTEGER NOT NULL,
+                   generation        INTEGER NOT NULL DEFAULT 0,
+                   event_type        TEXT    NOT NULL,
+                   occurred_at       TEXT,
+                   project_root      TEXT,
+                   event_json        TEXT    NOT NULL,
+                   UNIQUE (source_type, source_location, source_path,
+                           source_session_id, seq, generation)
+               );"#,
+        )
+        .unwrap();
+        let cipher = StoreCipher::new(key);
+        for (generation, occurred_at) in gens {
+            let event = mk_event(0, "s", Some("body"));
+            let aad = event_aad(
+                1,
+                source_type_key(event.source_type),
+                &event.source_location.as_key(),
+                &event.source_path,
+                &event.source_session_id,
+                event.seq as i64,
+                *generation,
+                0,
+            );
+            let envelope = cipher
+                .encrypt(serde_json::to_string(&event).unwrap().as_bytes(), &aad)
+                .unwrap();
+            conn.execute(
+                r#"INSERT INTO raw_events
+                     (ingested_at, schema_version, source_type, source_location, source_path,
+                      source_session_id, seq, generation, event_type, occurred_at,
+                      project_root, event_json)
+                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 's', 0, ?1,
+                           'message', ?2, NULL, ?3)"#,
+                params![generation, occurred_at, envelope],
+            )
+            .unwrap();
+        }
+    }
+
+    /// 迁移之后每一行都必须带上归一化时间戳 —— 缺了它，「最近」的排序会整段落空，
+    /// 而 `recent_sessions` 只会返回空，不报错。
+    ///
+    /// 🔴 **覆盖边界明写：这条测不到「在哪一趟里算的」。** 把 `iso8601_to_unix_ms(...)`
+    /// 从搬运那趟的 SELECT 里拿掉，后面那条兜底 `UPDATE` 会把同样的值补上 —— 结果逐字
+    /// 相同，这条照样绿（实测变异 M1 如此）。它锁的是**结果在场**，不是代价。
+    ///
+    /// 而代价那一半是真的：`raw_events` 一行装着 `event_json`（真库平均约 3 KB），SQLite
+    /// 改任意一列都要重写整条记录，93 万次 UPDATE ≈ 又一遍 2.8 GB 的随机顺序整表重写。
+    /// 支撑它的是**测量**（2026-08-05：一趟 103s；分两趟时连 `current_head` 回填都跑不完），
+    /// 不是这条测试。要把它也钉住，得让「兜底 UPDATE 改了几行」变成可观测量。
+    #[test]
+    #[cfg(feature = "store")]
+    fn migration_leaves_every_row_with_a_normalized_timestamp() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_occ_mig_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([11u8; 32]);
+        legacy_generation_store(&path, key(), &[(0, "2026-06-01T10:00:00Z")]);
+
+        let store = TotalStore::open_with_key(&path, key()).unwrap();
+        let ms: Option<i64> = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT occurred_at_unix_ms FROM raw_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            ms,
+            crate::rawevent::occurred_at_unix_ms("2026-06-01T10:00:00Z"),
+            "迁移后 occurred_at_unix_ms 还是空的 —— 「最近」的排序会整段落空，而这不报错"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 `current_head` 必须是每个源文件里 `(source_revision, projection_revision)`
+    /// **最大**的那一组 —— 与迁移前 `MAX(generation)` 的语义一致。
+    ///
+    /// 这条在窗口函数重写之后单独立起来：原先那版对外层每一行都跑一次关联子查询，
+    /// 实测在真库上跑了 90 秒仍未出结果。改写只有在**答案不变**的前提下才算优化，
+    /// 而「答案变了」的表现是读到一份被取代的旧解析，不是报错。
+    #[test]
+    #[cfg(feature = "store")]
+    fn the_backfilled_head_is_the_highest_revision_of_each_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_head_bf_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([12u8; 32]);
+        // 三代：迁移把 generation 映射成 source_revision，projection_revision 恒 0。
+        legacy_generation_store(
+            &path,
+            key(),
+            &[
+                (0, "2026-06-01T10:00:00Z"),
+                (2, "2026-06-01T10:00:02Z"),
+                (1, "2026-06-01T10:00:01Z"),
+            ],
+        );
+
+        let store = TotalStore::open_with_key(&path, key()).unwrap();
+        let head: (i64, i64) = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT source_revision, projection_revision FROM current_head",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            head,
+            (2, 0),
+            "头没取到最高代 —— 读到的会是一份已被取代的旧解析，且不报错"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 回填是一次性的：标记落地之后，重开**不得**再重算一遍。
+    ///
+    /// 与上一条互为镜像。只测「结果对」的话，一个每次启动都重算的实现照样全绿 ——
+    /// 而那正是被修掉的东西（93 万行上 `GROUP BY` 七列，实测 4.3s，每次启动）。
+    /// 判据用「手动删掉一行头之后它不会被补回来」：能补回来就说明闸没起作用。
+    #[test]
+    #[cfg(feature = "store")]
+    fn the_coordinate_backfill_does_not_run_again_once_marked() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_bf_once_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([13u8; 32]);
+        legacy_generation_store(&path, key(), &[(0, "2026-06-01T10:00:00Z")]);
+
+        {
+            let store = TotalStore::open_with_key(&path, key()).unwrap();
+            let conn = store.conn.lock().unwrap();
+            let marked: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM store_meta WHERE k = 'adr044_coords_backfilled'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(marked, 1, "第一次迁移必须留下完成标记，否则闸永远关不上");
+            conn.execute("DELETE FROM current_head", []).unwrap();
+        }
+
+        let store = TotalStore::open_with_key(&path, key()).unwrap();
+        let heads: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM current_head", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            heads, 0,
+            "头被重新算了一遍 —— 说明标记没被当闸读，每次启动都在 93 万行上重跑 GROUP BY"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 🔴 信封迁移的完成标记同样必须被当闸读。
+    ///
+    /// 那条 `WHERE event_json NOT LIKE 'sv2:%'` 用不上索引且 SELECT 整行，在真库上是
+    /// 每次启动数 GB 的扫描，只为得到「零行待迁移」这个上次就已经知道的答案。
+    ///
+    /// 跳过安全的前提是**读路径本来就认两种信封**（[`TotalStore::decode_event_on`]），
+    /// 所以这条同时断言那条 v1 行仍然读得出来 —— 只测「没被重新封装」而不测「还能读」，
+    /// 会把一个真正的数据不可用当成优化放过去。
+    #[test]
+    #[cfg(feature = "store")]
+    fn a_marked_store_skips_the_envelope_rescan_but_still_reads_v1_rows() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv_env_gate_{}_{}",
+            std::process::id(),
+            now_unix_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([14u8; 32]);
+        legacy_generation_store(&path, key(), &[(0, "2026-06-01T10:00:00Z")]);
+
+        // 第一次开：没有标记 ⇒ 必须真的迁移（sv1 → sv2）。
+        {
+            let store = TotalStore::open_with_key(&path, key()).unwrap();
+            let conn = store.conn.lock().unwrap();
+            let sv2: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM raw_events WHERE event_json LIKE 'sv2:%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(sv2, 1, "没有标记时必须迁移 —— 闸不能反过来把该做的事跳掉");
+        }
+
+        // 再塞一条 v1 信封进去（模拟用户降级跑过一次旧版），标记仍在。
+        {
+            let conn = Connection::open(&path).unwrap();
+            let event = mk_event(1, "s", Some("v1-again"));
+            let aad = event_aad(
+                2,
+                source_type_key(event.source_type),
+                &event.source_location.as_key(),
+                &event.source_path,
+                &event.source_session_id,
+                event.seq as i64,
+                0,
+                0,
+            );
+            let envelope = StoreCipher::new(key())
+                .encrypt(serde_json::to_string(&event).unwrap().as_bytes(), &aad)
+                .unwrap();
+            conn.execute(
+                r#"INSERT INTO raw_events
+                     (ingested_at, schema_version, source_type, source_location, source_path,
+                      source_session_id, seq, source_revision, projection_revision, aad_version,
+                      event_type, occurred_at, occurred_at_unix_ms, project_root, event_json)
+                   VALUES (0, 1, 'claude_code', 'local', '/p/file.jsonl', 's', 1, 0, 0, 2,
+                           'message', NULL, NULL, NULL, ?1)"#,
+                params![envelope],
+            )
+            .unwrap();
+        }
+
+        let store = TotalStore::open_with_key(&path, key()).unwrap();
+        let still_v1: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE event_json NOT LIKE 'sv2:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_v1, 1,
+            "那条 v1 行被重新封装了 —— 说明整库又被扫了一遍，标记形同虚设"
+        );
+        // 而它仍然读得出来：这才是跳过安全的依据。
+        let events = store
+            .read_session(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                "/p/file.jsonl",
+                "s",
+            )
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), 2, "跳过重封装不该让任何一行变得读不出来");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

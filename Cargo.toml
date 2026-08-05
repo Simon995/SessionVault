@@ -55,7 +55,10 @@ clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 
 # `store` feature only — 不可变 RawEvent 总库的持久化后端（与 QuotaBar 同版本）。
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# `functions`：把 `rawevent::occurred_at_unix_ms` 注册成 SQL 标量函数，让归一化在
+# 数据搬运的同一趟里完成。没有它，迁移要为这一列再整表重写一遍（行里装着
+# `event_json`，改任意一列都要重写整条记录）。解析规则仍只有 Rust 那一处实现。
+rusqlite = { version = "0.32", features = ["bundled", "functions"], optional = true }
 aes-gcm = { version = "0.10", features = ["std"], optional = true }
 base64 = { version = "0.22", optional = true }
 keyring = { version = "2.3", optional = true }
