@@ -60,10 +60,31 @@ enum Command {
         /// 只拉 offset 严格大于此值的事件；首次全量同步传 `0`（默认）。
         #[arg(long, default_value_t = 0)]
         since: i64,
+        /// 发哪一份投影。**默认 `all` 是刻意的**：给一个已发布 CLI 静默换掉返回内容，
+        /// 按旧语义写的消费者不会报错，只会悄悄拿到不同的数据（ADR-044 决定 6 的
+        /// 兼容性铁律）。想要「只发当前解析」必须显式选 `current`。
+        #[arg(long, value_enum, default_value = "all")]
+        projection: ProjectionArg,
         /// 本轮最多吐多少条事件（`0` = 不限，一次拉到追平总库尾）。用于把大回填切成有界批次。
         #[arg(long, default_value_t = 0)]
         limit: u64,
         /// 总库路径（覆盖默认 `<data_local_dir>/svault/total_store.db`，与 QuotaBar 写者同址）。
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
+    /// 最近活跃的 N 个会话（按**事件真实时间**降序，不是按写入顺序）。
+    ///
+    /// 消费者此前用 `[max_offset - N, max_offset]` 当「最近窗口」，而 `offset` 是写入
+    /// 顺序 —— 一次全量重扫之后，那个窗口实测横跨九个多月、当天的会话被挤了出去。
+    /// 这个子命令的存在就是让正确的做法比错误的做法更好用。
+    #[cfg(feature = "store")]
+    SessionsRecent {
+        /// 最多返回多少个会话。
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// 只看这个 UTC 毫秒之后活跃过的会话。
+        #[arg(long)]
+        since_ms: Option<i64>,
         #[arg(long)]
         store: Option<PathBuf>,
     },
@@ -95,6 +116,18 @@ enum Command {
         #[arg(long)]
         store: PathBuf,
     },
+}
+
+/// `pull --projection` 的取值。
+///
+/// `all` = 历史上所有投影（旧语义，默认）；`current` = 只发每个源文件的当前投影。
+/// 一次重投影之后两者差别巨大：`all` 会把同一批会话发两遍（旧解析 + 新解析），
+/// 消费者若不自己按身份去重就会把同一段历史物化两次。
+#[cfg(feature = "store")]
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProjectionArg {
+    All,
+    Current,
 }
 
 #[cfg(feature = "store")]
@@ -175,6 +208,21 @@ enum Out<'a> {
         /// 是否已读尽 `since` 之后的可读事件（`false` = 被 `--limit` 截断，需再拉）。
         caught_up: bool,
     },
+    /// `sessions-recent` 的一行。`last_occurred_at_unix_ms = null` = 这个会话的事件
+    /// 全都没有可解析的时间 —— 它排在最后但**照常返回**，因为「不知道什么时候发生」
+    /// 是需要被看见的事实，不是「很久以前」。
+    #[cfg(feature = "store")]
+    RecentSession {
+        source_type: String,
+        source_location: String,
+        source_path: String,
+        session_id: String,
+        last_occurred_at_unix_ms: Option<i64>,
+        first_occurred_at_unix_ms: Option<i64>,
+        events: u64,
+    },
+    #[cfg(feature = "store")]
+    RecentSessionsSummary { sessions: usize },
     #[cfg(feature = "store")]
     Snapshot { offset: i64, event: &'a RawEvent },
     #[cfg(feature = "store")]
@@ -206,9 +254,16 @@ fn main() {
         #[cfg(feature = "store")]
         Command::Pull {
             since,
+            projection,
             limit,
             store,
-        } => run_pull(since, limit, store),
+        } => run_pull(since, projection, limit, store),
+        #[cfg(feature = "store")]
+        Command::SessionsRecent {
+            limit,
+            since_ms,
+            store,
+        } => run_sessions_recent(limit, since_ms, store),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
@@ -376,7 +431,7 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
 /// 退出码：`0` 正常（含「无新事件」）；`1` 定位/打开/读取失败。游标推进是**调用方**的事
 /// （持久化 `last_offset` 作下次 `--since`）——本命令无状态、只读，符合 §8「内核不落盘游标」。
 #[cfg(feature = "store")]
-fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
+fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option<PathBuf>) -> i32 {
     let store_path = match resolve_store_path(store_arg) {
         Some(p) => p,
         None => {
@@ -414,7 +469,11 @@ fn run_pull(since: i64, limit: u64, store_arg: Option<PathBuf>) -> i32 {
     let mut events = 0u64;
     let mut last_offset = since;
     let pulled = pull_stream(
-        |cursor, want| store.read_since_page(cursor, want),
+        |cursor, want| match projection {
+            // 默认路径原样不动 —— 见 `ProjectionArg` 的文档。
+            ProjectionArg::All => store.read_since_page(cursor, want),
+            ProjectionArg::Current => store.read_current_since_page(cursor, want),
+        },
         since,
         limit,
         |offset, ev| {
@@ -710,6 +769,8 @@ mod tests {
     /// 收集 `pull_stream` 的回调到 `(offset, RawEvent)` 列表，便于断言。
     fn collect(store: &TotalStore, since: i64, limit: u64) -> (Vec<(i64, RawEvent)>, bool) {
         let mut out = Vec::new();
+        // 这个 helper 测的是 `pull_stream` 的翻页/追平语义，与选哪份投影无关，
+        // 所以固定走默认（`all`）那一路。
         let hit_limit = pull_stream(
             |cursor, want| store.read_since_page(cursor, want),
             since,
@@ -882,4 +943,46 @@ mod tests {
         assert_eq!(erased["keys_destroyed"], 2);
         assert_eq!(erased["tombstone_written"], true);
     }
+}
+
+/// `sessions-recent`：按事件真实时间列出最近活跃的会话。
+#[cfg(feature = "store")]
+fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if !store_path.exists() {
+        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
+        return 1;
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    let sessions = match store.recent_sessions(limit, since_ms) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!(target: tag::CLI, "recent_sessions failed: {e}");
+            return 1;
+        }
+    };
+    for s in &sessions {
+        emit(&Out::RecentSession {
+            source_type: s.source_type.clone(),
+            source_location: s.source_location.clone(),
+            source_path: s.source_path.clone(),
+            session_id: s.session_id.clone(),
+            last_occurred_at_unix_ms: s.last_occurred_at_unix_ms,
+            first_occurred_at_unix_ms: s.first_occurred_at_unix_ms,
+            events: s.event_count,
+        });
+    }
+    emit(&Out::RecentSessionsSummary {
+        sessions: sessions.len(),
+    });
+    0
 }

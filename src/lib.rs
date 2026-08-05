@@ -36,7 +36,8 @@ pub use report::ScanReport;
 #[cfg(feature = "store")]
 pub use store::{
     AppendStats, EraseStats, FileProjectionBatch, Projection, ProjectionStats, ReadPage,
-    SessionRead, SnapshotSyncStats, SourceKey, StoreStatus, TombstoneScope, TotalStore,
+    RecentSession, SessionRead, SnapshotSyncStats, SourceKey, StoreStatus, TombstoneScope,
+    TotalStore,
 };
 #[cfg(feature = "store")]
 pub use store_crypto::StoreKey;

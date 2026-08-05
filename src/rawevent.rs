@@ -163,6 +163,96 @@ pub struct TokenUsage {
     pub cache_read: u64,
 }
 
+/// 把 `occurred_at` 的原始串归一成 **UTC 毫秒**。无法解析 → `None`。
+///
+/// 🔴 为什么必须归一，而不是直接给原始串建索引排序：
+///
+/// - `2026-08-05T01:00:00Z` 与 `2026-08-05T09:00:00+08:00` 是**同一时刻**，字典序却
+///   相差八小时；
+/// - 小数秒位数不同（`.1` / `.123` / 无）会让同一秒内的顺序按位数而非按时间排；
+/// - ADR-020 早就写明「`occurred_at` 统一 UTC unix 秒」——这不是新决定，是把一个
+///   写下了却没实现的决定补上（本字段的注释自己都写着「归一到 UTC unix 秒是后续细化」）。
+///
+/// 支持 `YYYY-MM-DD` + `T`/空格 + `HH:MM[:SS[.frac]]` + 可选时区（`Z` / `±HH:MM` /
+/// `±HHMM` / `±HH`）。无时区视为 UTC —— 来源都是 agent 自己写的日志，实测全是 `Z`。
+///
+/// 不引 chrono：这是一个有界的、可穷举测试的转换，而本仓一贯 stdlib 优先。
+pub fn occurred_at_unix_ms(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() < 16 {
+        return None;
+    }
+    let num = |a: usize, b: usize| -> Option<i64> { s.get(a..b)?.parse::<i64>().ok() };
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    if !matches!(bytes[10], b'T' | b't' | b' ') || bytes[13] != b':' {
+        return None;
+    }
+    let (hour, minute) = (num(11, 13)?, num(14, 16)?);
+    let mut idx = 16;
+    let mut second = 0i64;
+    if bytes.get(idx) == Some(&b':') {
+        second = num(idx + 1, idx + 3)?;
+        idx += 3;
+    }
+    let mut millis = 0i64;
+    if bytes.get(idx) == Some(&b'.') || bytes.get(idx) == Some(&b',') {
+        idx += 1;
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        // 只取前三位，不足补零 —— 纳秒精度的输入不该因为多几位就解析失败。
+        let frac = s.get(start..idx)?;
+        let head: String = frac.chars().chain("000".chars()).take(3).collect();
+        millis = head.parse().ok()?;
+    }
+    let offset_minutes = match bytes.get(idx) {
+        None => 0,
+        Some(b'Z') | Some(b'z') => 0,
+        Some(sign @ (b'+' | b'-')) => {
+            let rest = s.get(idx + 1..)?;
+            let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
+            let (oh, om) = match digits.len() {
+                2 => (digits.parse::<i64>().ok()?, 0),
+                4 => (digits[..2].parse().ok()?, digits[2..].parse().ok()?),
+                _ => return None,
+            };
+            let magnitude = oh * 60 + om;
+            if *sign == b'+' {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+        Some(_) => return None,
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_minutes * 60;
+    Some(secs * 1_000 + millis)
+}
+
+/// 民用日历 → 自 1970-01-01 起的天数（Howard Hinnant 的 `days_from_civil`）。
+/// 纯整数算术，闰年/世纪规则全在里面，不需要日期库。
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// 归一化事件。去重唯一键见 `dedup_key()`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawEvent {
@@ -245,5 +335,78 @@ impl RawEvent {
             self.source_session_id,
             self.seq
         )
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::occurred_at_unix_ms as ms;
+
+    /// 🔴 同一时刻的两种写法必须归到同一个数 —— 而它们的**字典序相差八小时**。
+    /// 这正是「直接给原始串建索引排序」会静默排错的地方。
+    #[test]
+    fn the_same_instant_in_two_zones_normalizes_to_one_number() {
+        assert_eq!(ms("2026-08-05T01:00:00Z"), ms("2026-08-05T09:00:00+08:00"));
+        assert_eq!(ms("2026-08-05T01:00:00Z"), ms("2026-08-04T20:00:00-05:00"));
+        // 而字典序会把它们排反：
+        assert!("2026-08-04T20:00:00-05:00" < "2026-08-05T01:00:00Z");
+    }
+
+    /// 小数秒位数不同不该改变同一秒内的先后。
+    #[test]
+    fn fractional_second_width_does_not_reorder() {
+        let a = ms("2026-08-05T01:00:00.9Z").unwrap();
+        let b = ms("2026-08-05T01:00:00.123Z").unwrap();
+        assert!(b < a, "0.123s 早于 0.9s");
+        // 字典序反过来："0.123" < "0.9" 成立纯属巧合；位数一变就翻车：
+        assert!("2026-08-05T01:00:00.9Z" > "2026-08-05T01:00:00.123Z");
+        assert_eq!(
+            ms("2026-08-05T01:00:00.123456789Z"),
+            Some(1_785_891_600_123)
+        );
+    }
+
+    #[test]
+    fn epoch_and_civil_calendar_edges() {
+        assert_eq!(ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(ms("1969-12-31T23:59:59Z"), Some(-1_000));
+        // 闰年与世纪规则（2000 是闰年，1900 不是）由 days_from_civil 保证。
+        assert_eq!(
+            ms("2000-03-01T00:00:00Z").unwrap() - ms("2000-02-28T00:00:00Z").unwrap(),
+            2 * 86_400_000
+        );
+        assert_eq!(
+            ms("2026-03-01T00:00:00Z").unwrap() - ms("2026-02-28T00:00:00Z").unwrap(),
+            86_400_000
+        );
+    }
+
+    #[test]
+    fn accepts_the_shapes_real_logs_emit() {
+        // 实测真库 4 万条采样全是这一种。
+        assert!(ms("2026-06-01T10:00:02.123Z").is_some());
+        assert!(ms("2026-06-01T10:00:02Z").is_some());
+        assert!(ms("2026-06-01T10:00Z").is_some());
+        assert!(ms("2026-06-01 10:00:02+0800").is_some());
+        assert!(ms("  2026-06-01T10:00:02Z  ").is_some(), "两端空白应被容忍");
+    }
+
+    /// 🔴 解析不了就返回 None，**不猜**。一个猜出来的时间戳会让事件排到错误的位置，
+    /// 而排序本身不会报错 —— 那正是本轮在修的那类缺陷。
+    #[test]
+    fn unparseable_input_is_none_not_a_guess() {
+        for bad in [
+            "",
+            "not a time",
+            "2026-13-01T00:00:00Z",
+            "2026-01-32T00:00:00Z",
+            "2026-01-01T25:00:00Z",
+            "2026-01-01T00:61:00Z",
+            "2026-01-01",
+            "2026-01-01T00:00:00+9",
+            "2026/01/01T00:00:00Z",
+        ] {
+            assert_eq!(ms(bad), None, "{bad:?} 不该被解析出时间");
+        }
     }
 }

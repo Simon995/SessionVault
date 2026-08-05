@@ -169,6 +169,30 @@ pub struct ProjectionStats {
     pub head_moved: bool,
 }
 
+/// [`TotalStore::recent_sessions`] 的一行。
+///
+/// `last_occurred_at_unix_ms` 为 `None` = 这个会话的事件全都没有可解析的时间。它排在
+/// 最后并**照常返回** —— 消费者需要知道「有这么个会话但不知道它什么时候发生」，
+/// 而不是发现它凭空消失了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentSession {
+    pub source_type: String,
+    pub source_location: String,
+    pub source_path: String,
+    pub session_id: String,
+    pub last_occurred_at_unix_ms: Option<i64>,
+    pub first_occurred_at_unix_ms: Option<i64>,
+    pub event_count: u64,
+}
+
+impl RecentSession {
+    /// 这个会话有没有可用的时间。`false` 时它排在末尾，且任何按时间做的判断都不该
+    /// 把它当作「很久以前」——那是**未知**，不是**旧**。
+    pub fn has_time(&self) -> bool {
+        self.last_occurred_at_unix_ms.is_some()
+    }
+}
+
 /// 某个源文件的当前头；无记录时 `(0, 0)`。
 ///
 /// 读 `current_head` 而不是 `MAX(source_revision, projection_revision)`：后者表达不了
@@ -364,6 +388,10 @@ CREATE TABLE IF NOT EXISTS raw_events (
     aad_version         INTEGER NOT NULL DEFAULT 1,
     event_type          TEXT    NOT NULL,
     occurred_at         TEXT,
+    -- 归一化的 UTC 毫秒。排序与索引**只认这一列**；`occurred_at` 保留原始串供溯源。
+    -- 直接给原始串排序会出两种错：不同时区偏移的字典序与时刻序不一致，小数秒位数
+    -- 不同会打乱同一秒内的先后。见 `rawevent::occurred_at_unix_ms`。
+    occurred_at_unix_ms INTEGER,
     project_root        TEXT,
     event_json          TEXT    NOT NULL,
     UNIQUE (source_type, source_location, source_path, source_session_id, seq,
@@ -371,6 +399,7 @@ CREATE TABLE IF NOT EXISTS raw_events (
 );
 CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
+CREATE INDEX IF NOT EXISTS idx_raw_events_occurred ON raw_events(occurred_at_unix_ms);
 "#;
 
 /// 投影台账：每一份「某 parser 对某源版本的解析」在这里有一行。
@@ -505,7 +534,7 @@ impl TotalStore {
     }
 
     fn migrate(&self) -> StoreResult<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
             -- 墓碑带作用域：同一字符串值在不同维度（会话 vs 路径 vs 项目根）含义不同，
@@ -579,6 +608,15 @@ impl TotalStore {
                 "#
             ))?;
         }
+        // 归一化时间列可能单独缺席（库已是新形状、只是早于决定 5）。ALTER 加列比
+        // 重建整表便宜得多，且这一列不参与唯一键，加了不影响既有行的可读性。
+        if raw_exists && !column_exists("occurred_at_unix_ms")? {
+            conn.execute_batch(
+                "ALTER TABLE raw_events ADD COLUMN occurred_at_unix_ms INTEGER;
+                 CREATE INDEX IF NOT EXISTS idx_raw_events_occurred
+                     ON raw_events(occurred_at_unix_ms);",
+            )?;
+        }
         conn.execute_batch(PROJECTIONS_DDL)?;
         conn.execute_batch(CURRENT_HEAD_DDL)?;
         // 台账与头的回填：对既有行是一次性补齐，对新库是空操作。放在建表之后、且用
@@ -618,6 +656,42 @@ impl TotalStore {
                       source_revision, projection_revision;
             "#,
         )?;
+        // 回填归一化时间：只补 NULL 的行，所以重复启动幂等，且一次全库回填之后
+        // 常态启动是一次索引扫、零写入。
+        //
+        // 🔴 在 Rust 里解析、逐行 UPDATE，而不是写一段 SQL 表达式去切串 —— 归一化
+        // 规则（时区偏移、小数秒位数、闰年）只有一处实现，SQL 里再写一份必然分叉，
+        // 而分叉的表现是**排序悄悄不对**，不是报错。
+        {
+            let pending: Vec<(i64, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT offset, occurred_at FROM raw_events
+                      WHERE occurred_at IS NOT NULL AND occurred_at_unix_ms IS NULL",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if !pending.is_empty() {
+                let tx = conn.transaction()?;
+                {
+                    let mut up = tx.prepare(
+                        "UPDATE raw_events SET occurred_at_unix_ms = ?1 WHERE offset = ?2",
+                    )?;
+                    let mut filled = 0u64;
+                    for (offset, raw) in &pending {
+                        if let Some(ms) = crate::rawevent::occurred_at_unix_ms(raw) {
+                            up.execute(params![ms, offset])?;
+                            filled += 1;
+                        }
+                    }
+                    log::info!(
+                        "[total-store] normalized occurred_at for {filled}/{} rows",
+                        pending.len()
+                    );
+                }
+                tx.commit()?;
+            }
+        }
         conn.execute_batch(DATA_KEYS_DDL)?;
         drop(conn);
         self.migrate_event_envelopes()?;
@@ -852,8 +926,9 @@ impl TotalStore {
                 r#"INSERT OR IGNORE INTO raw_events
                      (ingested_at, schema_version, source_type, source_location,
                       source_path, source_session_id, seq, source_revision, projection_revision,
-                      aad_version, event_type, occurred_at, project_root, event_json)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
+                      aad_version, event_type, occurred_at, occurred_at_unix_ms,
+                      project_root, event_json)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
             )?;
             for ev in events {
                 let erased: bool = tombstoned.query_row(
@@ -891,6 +966,9 @@ impl TotalStore {
                     AAD_VERSION_CURRENT,
                     event_type_key(ev.event_type),
                     ev.occurred_at,
+                    ev.occurred_at
+                        .as_deref()
+                        .and_then(crate::rawevent::occurred_at_unix_ms),
                     ev.project_root,
                     envelope,
                 ])?;
@@ -934,6 +1012,66 @@ impl TotalStore {
         })
     }
 
+    /// 最近活跃的 N 个会话，按各自最后一条事件的**真实时间**降序。
+    ///
+    /// 🔴 存在的理由：消费者此前用 `[max_offset - N, max_offset]` 当「最近窗口」，而
+    /// `offset` 是**写入顺序** —— 全量重扫时等于文件遍历顺序，与时间无关。实测一次
+    /// 重投影之后，那个「最近 5 万条」的窗口横跨九个多月，而当天的会话被挤了出去。
+    ///
+    /// `INGEST_KERNEL.md` §13.1 早就写着「`offset` 仅作同步游标，**不代表**时间先后」。
+    /// 规则写对了、写下了、然后被违反了，而没有任何东西会报错 —— 这个 API 的作用是让
+    /// 正确的做法比错误的做法更好用。
+    ///
+    /// 排序键是 `(last_occurred_at_unix_ms, source_path, session_id)`：**稳定键**，
+    /// 同时间戳不会在翻页时抖动。无时间的会话排在最后并标 `has_time = false`，
+    /// 而不是被静默丢弃 —— 「没有时间」是一个需要被看见的事实。
+    ///
+    /// 只看**当前投影**（复用 `current_head`）：已被取代的旧解析不该参与「最近」。
+    pub fn recent_sessions(
+        &self,
+        limit: usize,
+        since_unix_ms: Option<i64>,
+    ) -> StoreResult<Vec<RecentSession>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT r.source_type, r.source_location, r.source_path, r.source_session_id,
+                      MAX(r.occurred_at_unix_ms) AS last_ms,
+                      MIN(r.occurred_at_unix_ms) AS first_ms,
+                      COUNT(*) AS events
+                 FROM raw_events r
+                 LEFT JOIN current_head h
+                        ON h.source_type = r.source_type
+                       AND h.source_location = r.source_location
+                       AND h.source_path = r.source_path
+                WHERE r.source_revision = COALESCE(h.source_revision, 0)
+                  AND r.projection_revision = COALESCE(h.projection_revision, 0)
+                  AND (?1 IS NULL OR r.occurred_at_unix_ms >= ?1)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM tombstones t
+                       WHERE (t.scope = 'session'      AND t.key = r.source_session_id)
+                          OR (t.scope = 'source_path'  AND t.key = r.source_path)
+                          OR (t.scope = 'project_root' AND t.key = r.project_root)
+                  )
+                GROUP BY r.source_type, r.source_location, r.source_path, r.source_session_id
+                ORDER BY last_ms IS NULL, last_ms DESC, r.source_path DESC,
+                         r.source_session_id DESC
+                LIMIT ?2"#,
+        )?;
+        let rows = stmt.query_map(params![since_unix_ms, limit as i64], |row| {
+            Ok(RecentSession {
+                source_type: row.get(0)?,
+                source_location: row.get(1)?,
+                source_path: row.get(2)?,
+                session_id: row.get(3)?,
+                last_occurred_at_unix_ms: row.get(4)?,
+                first_occurred_at_unix_ms: row.get(5)?,
+                event_count: row.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     /// 读 `offset` 之后的事件（升序、最多 `limit` 条），跳过被**按作用域**墓碑标记的来源。
     /// 这是最小读 API——验证总库可读。**返回成功反序列化的事件**；需要「SQL 扫描进度」
     /// （翻页越过坏行窗口）的 pull 流走 [`read_since_page`]。保持此签名向后兼容，QuotaBar
@@ -949,14 +1087,47 @@ impl TotalStore {
     /// **韧性**：单行 `event_json` 反序列化失败（损坏 / 未来不兼容 `schema_version`）只 **skip+warn**，
     /// 不让整批失败。跨版本升级 DTO（把旧 `schema_version` 行 up-convert 到当前）是首次破坏性 schema
     /// 升级前的前置工作（届时按 `schema_version` 分派解析），当前 v1 单版本不需要。
+    /// [`read_since_page`] 的**当前投影版**（ADR-044 决定 6 / D1）。
+    ///
+    /// 🔴 与旧接口的唯一差别：只发**当前投影**的行。`read_session` 一直是这么做的，
+    /// 而 `read_since_page` 不是 —— 两个读 API 对「什么算数」给出不同答案，而 pull
+    /// 走的是不过滤的那个。一次重投影之后，pull 流里同一批会话各有两份。
+    ///
+    /// 🔴 **旧接口保持原样**，不是懒。给一个已发布 CLI 静默换掉返回内容，按旧语义
+    /// 写的消费者不会报错，只会悄悄拿到不同的数据 —— 那是最难查的一类回归。新语义
+    /// 走新入口，由调用方显式选择（`pull --projection current`）。
+    pub fn read_current_since_page(
+        &self,
+        after_offset: i64,
+        limit: usize,
+    ) -> StoreResult<ReadPage> {
+        self.read_page_impl(after_offset, limit, true)
+    }
+
     pub fn read_since_page(&self, after_offset: i64, limit: usize) -> StoreResult<ReadPage> {
+        self.read_page_impl(after_offset, limit, false)
+    }
+
+    fn read_page_impl(
+        &self,
+        after_offset: i64,
+        limit: usize,
+        current_only: bool,
+    ) -> StoreResult<ReadPage> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
                       r.source_session_id, r.seq, r.source_revision, r.projection_revision, r.aad_version,
                       r.project_root, r.event_json
                  FROM raw_events r
+                 LEFT JOIN current_head h
+                        ON h.source_type = r.source_type
+                       AND h.source_location = r.source_location
+                       AND h.source_path = r.source_path
                 WHERE r.offset > ?1
+                  AND (NOT ?3
+                       OR (r.source_revision = COALESCE(h.source_revision, 0)
+                           AND r.projection_revision = COALESCE(h.projection_revision, 0)))
                   AND NOT EXISTS (
                       SELECT 1 FROM tombstones t
                        WHERE (t.scope = 'session'      AND t.key = r.source_session_id)
@@ -966,7 +1137,10 @@ impl TotalStore {
                 ORDER BY r.offset ASC
                 LIMIT ?2"#,
         )?;
-        let rows = stmt.query_map(params![after_offset, limit as i64], EncryptedRow::from_sql)?;
+        let rows = stmt.query_map(
+            params![after_offset, limit as i64, current_only],
+            EncryptedRow::from_sql,
+        )?;
         let mut out = Vec::new();
         let mut key_cache = HashMap::new();
         // 记录 SQL 实际扫描到的最大 offset（含坏行）——行按 offset ASC，故最后一行即最大。
@@ -2669,6 +2843,126 @@ mod tests {
                 (0, Some(1), "append".to_string()),
                 (1, Some(2), "reparse".to_string()),
             ]
+        );
+    }
+
+    /// 🔴 **护栏 G6（ADR-044 决定 5）：全量重扫之后，最近的会话仍在「最近 N」里。**
+    ///
+    /// fixture 刻意让 **offset 顺序与时间顺序相反** —— 先写「新会话」再写「旧会话」，
+    /// 于是按 offset 取最近 N 会取到旧的那个。不这么造，两种实现给出同样答案、测试恒绿
+    /// （这是本仓反复踩过的形状）。
+    ///
+    /// 这正是实机上发生过的事：一次重投影按文件遍历顺序重写全库，「最近 5 万条」的
+    /// offset 窗口因此横跨九个多月，而当天的会话被挤了出去。
+    #[test]
+    fn recency_follows_event_time_not_write_order() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let at = |path: &str, sid: &str, ts: &str| {
+            let mut ev = mk_event_at(0, sid, path);
+            ev.occurred_at = Some(ts.to_string());
+            store.append_events(&[ev], Projection::Append).unwrap();
+        };
+        // 写入顺序：新 → 旧。offset 因此与时间**相反**。
+        at("/p/new.jsonl", "recent", "2026-08-05T10:00:00Z");
+        at("/p/old.jsonl", "ancient", "2025-01-01T00:00:00Z");
+
+        let by_offset_last: String = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT source_session_id FROM raw_events ORDER BY offset DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            by_offset_last, "ancient",
+            "fixture 前提：按 offset 取「最近」会取到最旧的那个；否则本条恒真"
+        );
+
+        let recent = store.recent_sessions(1, None).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].session_id, "recent",
+            "最近 N 必须按 occurred_at 排；取到 ancient 说明又用回了写入顺序"
+        );
+    }
+
+    /// 同一时刻的两种时区写法排在一起 —— 字典序会把它们排开八小时。
+    #[test]
+    fn recency_compares_instants_not_strings() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let at = |path: &str, sid: &str, ts: &str| {
+            let mut ev = mk_event_at(0, sid, path);
+            ev.occurred_at = Some(ts.to_string());
+            store.append_events(&[ev], Projection::Append).unwrap();
+        };
+        // b 比 a 晚一小时，但它的**字符串**更小。
+        at("/p/a.jsonl", "a", "2026-08-05T09:00:00+08:00"); // = 01:00Z
+        at("/p/b.jsonl", "b", "2026-08-05T02:00:00Z");
+        assert!(
+            "2026-08-05T02:00:00Z" < "2026-08-05T09:00:00+08:00",
+            "fixture 前提：晚发生的那个字符串更小 —— 字典序会把它们排反"
+        );
+
+        let recent = store.recent_sessions(2, None).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|r| r.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"],
+            "b（02:00Z）晚于 a（01:00Z）；顺序反了说明在比字符串而不是比时刻"
+        );
+    }
+
+    /// 没有可解析时间的会话**排在末尾并照常返回** —— 不是被静默丢掉。
+    ///
+    /// 「没有时间」是一个需要被看见的事实：消费者得知道有这么个会话、但不知道它什么
+    /// 时候发生，而不是发现它凭空消失。
+    #[test]
+    fn sessions_without_time_sort_last_but_are_not_dropped() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut timed = mk_event_at(0, "timed", "/p/a.jsonl");
+        timed.occurred_at = Some("2020-01-01T00:00:00Z".into());
+        store.append_events(&[timed], Projection::Append).unwrap();
+        let mut untimed = mk_event_at(0, "untimed", "/p/b.jsonl");
+        untimed.occurred_at = None;
+        store.append_events(&[untimed], Projection::Append).unwrap();
+
+        let recent = store.recent_sessions(10, None).unwrap();
+        let ids: Vec<&str> = recent.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["timed", "untimed"], "无时间的排最后");
+        assert!(recent[0].has_time());
+        assert!(
+            !recent[1].has_time(),
+            "无时间必须能被识别 —— 它是**未知**，不是**很旧**"
+        );
+    }
+
+    /// 🔴 **D1：`read_current_since_page` 只发当前投影；旧的 `read_since_page` 保持原样。**
+    ///
+    /// 两条一起断言。只测新接口过滤对了，证明不了旧接口没被静默改掉 —— 而给一个已发布
+    /// CLI 换掉返回内容，按旧语义写的消费者不会报错，只会悄悄拿到不同的数据。
+    #[test]
+    fn the_current_projection_read_filters_superseded_rows_while_the_legacy_one_does_not() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(&[mk_event(0, "s", Some("old-parse"))], Projection::Append)
+            .unwrap();
+        store
+            .append_events(&[mk_event(0, "s", Some("new-parse"))], Projection::Reparse)
+            .unwrap();
+
+        let current = store.read_current_since_page(0, 100).unwrap();
+        assert_eq!(current.events.len(), 1, "当前投影只有一条");
+        assert_eq!(current.events[0].1.content.as_deref(), Some("new-parse"));
+
+        let legacy = store.read_since_page(0, 100).unwrap();
+        assert_eq!(
+            legacy.events.len(),
+            2,
+            "旧接口必须原样返回两代 —— 静默改变它的语义比不修 D1 更糟"
         );
     }
 }
