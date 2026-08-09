@@ -1800,40 +1800,48 @@ impl TotalStore {
             .collect())
     }
 
-    fn snapshot_cursor(&self, source: &SourceRef) -> StoreResult<Cursor> {
-        let latest = self
-            .read_latest_snapshots()?
-            .into_iter()
-            .map(|(_, event)| event)
-            .find(|event| {
-                event.source_type == source.source_type
-                    && event.source_location == source.source_location
-                    && event.source_path == source.path.to_string_lossy()
-            });
+    /// 在**已读好的**「每来源最新快照」集合里定位 `source`，据此算增量游标。
+    ///
+    /// 🔴 **`latest` 由调用方读一次、循环内复用。** 这里曾是 `self.read_latest_snapshots()?`，
+    /// 而 [`Self::sync_snapshots`] 每个 source 调它一次 —— 那条查询是 `MAX(offset)` 相关
+    /// 子查询 + tombstone `NOT EXISTS`，`raw_events` 上没有可用索引，于是每次都是全表扫。
+    /// 实测 2026-08-09（3.08 GB / 968,029 行 / 176 个 source）：单次 **5.6 s** × 176
+    /// ⇒ **16 分 06 秒**，其间 QuotaBar 的「蒸馏」满核空转、界面只显示「蒸馏中…」。
+    /// 一次读之后是 176 条的线性匹配，量级从 O(source × 全表) 落到 O(全表 + source²)。
+    ///
+    /// 纯函数（不借 `&self`），所以下面的单测能直接钉住三条分支。
+    fn snapshot_cursor(latest: &[(i64, RawEvent)], source: &SourceRef) -> Cursor {
+        let found = latest.iter().map(|(_, event)| event).find(|event| {
+            event.source_type == source.source_type
+                && event.source_location == source.source_location
+                && event.source_path == source.path.to_string_lossy()
+        });
         let mut cursor = Cursor::new_fingerprint();
-        if let Some(event) = latest {
+        if let Some(event) = found {
             // 内容未变但宿主补齐/修正了项目身份或 artifact kind 时也要发新版本；
             // 否则早期无身份快照会永久挡住后续规范化元数据。
             if event.project_root == source.project_root
                 && event.artifact_kind == source.artifact_kind
             {
-                cursor.content_hash = event.content_hash;
+                cursor.content_hash = event.content_hash.clone();
             }
             cursor.next_seq = event.seq.saturating_add(1);
         }
-        Ok(cursor)
+        cursor
     }
 
     /// 用 SessionVault 的 snapshot scanner 同步一组已授权来源到总库。宿主只负责
     /// 触发与提供项目身份；发现、读取、指纹、增量和持久化都在本仓完成。
     pub fn sync_snapshots(&self, sources: &[SourceRef]) -> StoreResult<SnapshotSyncStats> {
         let mut stats = SnapshotSyncStats::default();
+        // 🔴 一次读、循环内复用 —— 理由与实测数字见 `snapshot_cursor` 的注释。
+        let mut latest = self.read_latest_snapshots()?;
         for source in sources {
             if source.source_mode != SourceMode::SnapshotFile {
                 continue;
             }
             stats.sources += 1;
-            let cursor = self.snapshot_cursor(source)?;
+            let cursor = Self::snapshot_cursor(&latest, source);
             let result = crate::scan::scan_source(source, Some(cursor), Profile::Full);
             if result.status == ScanStatus::Error {
                 stats.failed += 1;
@@ -1851,6 +1859,22 @@ impl TotalStore {
             let appended = self.append_events(&result.events, Projection::Append)?;
             stats.changed += 1;
             stats.appended += appended.appended;
+            // 同一个 source 在 `sources` 里出现两次时，第二次必须看到刚写进去的那一版 ——
+            // 否则它会拿旧游标重扫一遍。append 本身幂等（`skipped_dup` 走唯一约束），所以
+            // 漏掉这一步不会写重，只会白扫一次并让 `changed` 虚高。缓存既然提到了循环外，
+            // 就得由循环负责让它保持新鲜。
+            if let Some(newest) = result.events.last() {
+                let hit = latest.iter().position(|(_, event)| {
+                    event.source_type == source.source_type
+                        && event.source_location == source.source_location
+                        && event.source_path == source.path.to_string_lossy()
+                });
+                let fresh = (appended.max_offset, newest.clone());
+                match hit {
+                    Some(i) => latest[i] = fresh,
+                    None => latest.push(fresh),
+                }
+            }
         }
         log::info!(
             target: crate::logging::tag::SNAPSHOT,
@@ -2312,6 +2336,45 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(store.read_active_latest_snapshots().unwrap().is_empty());
         assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
+    }
+
+    /// 🔴 同一个 source 在**一次** `sync_snapshots` 里出现两次。
+    ///
+    /// 上面那条测试每次 `sync_snapshots` 只给一个 source，所以「每来源最新快照」这份
+    /// 缓存在每次调用开头都是新读的 —— 它**测不到**缓存提到循环外之后新增的那个风险：
+    /// 循环内写了库，缓存却还是进来时的样子。第二次于是拿旧游标重扫。
+    ///
+    /// `append_events` 幂等（撞 `dedup_key` 唯一约束走 `skipped_dup`），所以症状不是写重，
+    /// 而是**白扫一遍 + `changed` 虚高** —— 一个只看事件条数的断言会放它过去。
+    #[test]
+    fn a_source_listed_twice_in_one_sync_is_scanned_once() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("svault-store-snapshot-dup-{nanos}.md"));
+        std::fs::write(&path, "# memory\nv1\n").unwrap();
+        let source = SourceRef {
+            source_type: SourceType::Codex,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::SnapshotFile,
+            path: path.clone(),
+            project_root: None,
+            artifact_kind: Some("memory".into()),
+        };
+        let store = TotalStore::open_in_memory().unwrap();
+        let stats = store
+            .sync_snapshots(&[source.clone(), source.clone()])
+            .unwrap();
+
+        assert_eq!(stats.sources, 2, "两个条目都该被处理");
+        assert_eq!(
+            (stats.changed, stats.unchanged, stats.appended),
+            (1, 1, 1),
+            "第二个条目必须命中循环内刷新过的缓存 → unchanged，而不是再扫一次"
+        );
+        assert_eq!(store.status().unwrap().count, 1, "总库里只该有一条快照事件");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
