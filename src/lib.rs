@@ -10,6 +10,7 @@
 pub mod catalog;
 pub mod cursor;
 pub mod discover;
+pub mod identity;
 pub mod logging;
 pub mod parser;
 pub mod pathnorm;
