@@ -585,6 +585,16 @@ CREATE INDEX IF NOT EXISTS idx_data_keys_project ON data_keys(project_root);
 pub struct TotalStore {
     conn: Mutex<Connection>,
     cipher: StoreCipher,
+    /// 本进程已为哪些 `(source_type, source_location, project_root)` 记过身份。
+    ///
+    /// 🔴 **它省掉的是文件 IO，不是正确性**：算身份要读 `.git/config`，而
+    /// `apply_projection` 是**每个文件一次**的热路径 —— 一个大仓的几百个会话文件会把
+    /// 同一个 `.git/config` 读几百遍。写入本身是 upsert（幂等），缓存只是别再问一遍。
+    ///
+    /// ⚠️ 代价写在这里：**同一进程内身份变更不会被发现**（改了 remote 要重启才看得到）。
+    /// 可接受 —— 身份变更极罕见，而 upsert 保证下一个进程立刻纠正；反过来，
+    /// 为了捕捉一件几乎不发生的事而每个文件读一次盘，是明确的坏交易。
+    identity_seen: Mutex<std::collections::HashSet<(String, String, String)>>,
 }
 
 impl TotalStore {
@@ -642,6 +652,7 @@ impl TotalStore {
         let store = Self {
             conn: Mutex::new(conn),
             cipher: StoreCipher::new(key),
+            identity_seen: Mutex::new(std::collections::HashSet::new()),
         };
         store.migrate()?;
         store.validate_cipher()?;
@@ -681,6 +692,34 @@ impl TotalStore {
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
             );
+
+            -- 项目的规范身份（`identity::canonical_repo_id`），**在扫描时记下来**。
+            --
+            -- 🔴 存在的理由：身份靠读磁盘上的 `.git/config` 现算，而 checkout 一旦被
+            -- 删除就再也算不出来 —— 实测有一个项目留着 161,256 条历史事件，却没有任何
+            -- 东西能说出它属于哪个仓库。扫描时 `.git` 还在，那是唯一能记下它的时刻。
+            --
+            -- 🔴 **主键带 `canonical_id`，不做 latest-wins。** 同一个 `project_root`
+            -- 先后观察到两个身份有两种可能，看起来一模一样而后果相反：
+            --   ① 同一个仓改了 remote / 迁移了 ⇒ 指同一个项目，可合并
+            --   ② **路径被另一个仓复用**（删掉重新 clone 别的）⇒ 是两个项目，绝不能合
+            -- ② 一点也不罕见，而 latest-wins 会把前一个仓的整段历史划到后一个名下。
+            -- 区分两者要仓库自身的连续性证据（首次提交 hash），代价远超「只读
+            -- `.git/config`」这个定位 ⇒ 不区分，改为**不丢信息**：两个身份就是两行，
+            -- 默认取 `last_seen` 最大的那条（行为等同 latest-wins），历史需要时可查。
+            CREATE TABLE IF NOT EXISTS project_identity (
+                source_type     TEXT    NOT NULL,
+                source_location TEXT    NOT NULL,
+                project_root    TEXT    NOT NULL,
+                canonical_id    TEXT    NOT NULL,
+                -- 🔴 毫秒，不是秒：`last_seen_ms` 是**排序键**（默认查询取最新的那条），
+                -- 而秒级精度下同一秒内的两个身份会平局、退化成按 id 字母序。
+                first_seen_ms   INTEGER NOT NULL,
+                last_seen_ms    INTEGER NOT NULL,
+                PRIMARY KEY (source_type, source_location, project_root, canonical_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_identity_root ON project_identity(project_root);
+            CREATE INDEX IF NOT EXISTS idx_identity_cid ON project_identity(canonical_id);
             "#,
         )?;
 
@@ -1140,7 +1179,121 @@ impl TotalStore {
     ///    仍须是 `Reparse`，否则退化成 `Append`，同 seq 被 dedup 丢弃，新解析永久丢失。
     ///
     /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
+    /// 记下这批事件所属项目的规范身份 —— **趁 `.git` 还在**。
+    ///
+    /// 见 `migrate()` 里 `project_identity` 的注释与 `docs/project-identity.md`。
+    /// 三条约束，都在下面的代码里：
+    ///
+    /// 1. **算不出身份就什么都不写**，尤其不写 `path:` 兜底行 —— 那种 id 不跨 checkout
+    ///    稳定，记下来只会让「查得到身份」变成一句不能信的话。
+    /// 2. 每个 `(来源, project_root)` **本进程至多问一次盘**（`identity_seen`）。
+    /// 3. 🔴 **失败绝不影响摄取**：身份是**加法**能力，它坏了不该让事件写不进总库。
+    ///    所以本函数不返回 `Result` —— 调用点连忽略错误的机会都不需要有。
+    fn record_project_identity(&self, events: &[RawEvent]) {
+        let Some(ev) = events.first() else { return };
+        let Some(root) = ev.project_root.as_deref().filter(|r| !r.is_empty()) else {
+            return;
+        };
+        let key = (
+            source_type_key(ev.source_type).to_string(),
+            ev.source_location.as_key(),
+            root.to_string(),
+        );
+        {
+            let Ok(mut seen) = self.identity_seen.lock() else {
+                return;
+            };
+            // 🔴 **先记后算**：算不出来的（无 `.git`、UNC 回环读不到）也算「问过了」，
+            // 否则一个读不到的项目会让它名下每个文件都去试一次盘。
+            if !seen.insert(key.clone()) {
+                return;
+            }
+        }
+
+        // `project_root` 可能是 `wsl:<distro>:/abs` 这类规范形 —— 那不是本机可打开的
+        // 路径，`find_git_root` 会（正确地）拒绝。这里不做任何路径改写：改写等于猜，
+        // 而猜错会把身份安到别的项目上。
+        let Some(git_root) = crate::identity::find_git_root(std::path::Path::new(root)) else {
+            return;
+        };
+        let cid = crate::identity::canonical_repo_id(&git_root);
+        if !cid.starts_with("git:") {
+            return; // 约束 1：不写 `path:` 兜底行
+        }
+
+        let now = now_unix_millis();
+        let Ok(conn) = self.conn.lock() else { return };
+        let _ = conn.execute(
+            "INSERT INTO project_identity
+                 (source_type, source_location, project_root, canonical_id, first_seen_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(source_type, source_location, project_root, canonical_id)
+             DO UPDATE SET last_seen_ms = ?5",
+            rusqlite::params![key.0, key.1, key.2, cid, now],
+        );
+    }
+
+    /// 这个项目当前的规范身份 —— `last_seen` 最大的那条。
+    ///
+    /// 🔴 **即使 checkout 已经从磁盘上消失，这里依然答得出来**，只要它被扫描过一次。
+    /// 那正是 `project_identity` 表存在的全部理由。
+    ///
+    /// 返回 `None` 有两种含义，**调用方通常不需要区分**：没扫到过，或扫到时就没有
+    /// git remote（后者不写行，见 `record_project_identity` 的约束 1）。两种都表示
+    /// 「说不出这个项目的跨系统身份」，而那是诚实的答案。
+    pub fn project_identity(
+        &self,
+        source_type: &str,
+        source_location: &str,
+        project_root: &str,
+    ) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT canonical_id FROM project_identity
+              WHERE source_type = ?1 AND source_location = ?2 AND project_root = ?3
+              ORDER BY last_seen_ms DESC, canonical_id ASC
+              LIMIT 1",
+            rusqlite::params![source_type, source_location, project_root],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// 一个项目**观察到过的全部**身份，新到旧。多于一条即意味着这个路径的身份变过 ——
+    /// 可能是改了 remote，也可能是路径被另一个仓复用，**本层不替调用方判断**
+    /// （见 `migrate()` 里那段注释）。
+    pub fn project_identity_history(
+        &self,
+        source_type: &str,
+        source_location: &str,
+        project_root: &str,
+    ) -> Vec<(String, i64, i64)> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT canonical_id, first_seen_ms, last_seen_ms FROM project_identity
+              WHERE source_type = ?1 AND source_location = ?2 AND project_root = ?3
+              ORDER BY last_seen_ms DESC",
+        ) else {
+            return Vec::new();
+        };
+        let rows = stmt.query_map(
+            rusqlite::params![source_type, source_location, project_root],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        );
+        match rows {
+            Ok(it) => it.flatten().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn apply_projection(&self, batch: FileProjectionBatch) -> StoreResult<ProjectionStats> {
+        // 趁 `.git` 还在把身份记下来。**放在校验之前**是有意的：身份与这批事件写不写得
+        // 进去无关，而一次 `ForeignEvent` 提前返回不该让这个项目的身份永远记不上。
+        self.record_project_identity(&batch.events);
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();
         let source_type = type_key.to_string();
@@ -2222,6 +2375,19 @@ fn now_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 毫秒时间戳 —— **给需要排序的时间用**。
+///
+/// 🔴 `project_identity.last_seen_ms` 用它而不是秒，因为那一列是**排序键**：秒级精度下
+/// 同一秒内观察到的两个身份会平局，于是「取最新」实际退化成「取字母序靠前的」。
+/// 这不是假想 —— 一条测试当场撞上了它（同一路径先后两个 remote，查询返回了旧的那个）。
+/// 排序键不该依赖时钟精度。
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
@@ -4503,5 +4669,204 @@ mod tests {
             limit > 0,
             "journal_size_limit = {limit}（-1 = 不限）—— WAL 会停在历史最高水位，             一次全表迁移之后就是几 GB 纯占盘，且没有任何迹象提示"
         );
+    }
+}
+
+#[cfg(test)]
+mod project_identity_tests {
+    use super::*;
+    use crate::rawevent::{
+        Actor, EventType, SourceLocation, SourceMode, TimeConfidence, TokenUsage, SCHEMA_VERSION,
+    };
+
+    /// 造一个真实的 git 工作目录（只要 `.git/config` —— 身份从不 spawn git）。
+    fn seed_repo(root: &std::path::Path, origin: Option<&str>) {
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let body = match origin {
+            Some(url) => format!("[remote \"origin\"]\n\turl = {url}\n"),
+            None => "[core]\n\tbare = false\n".to_string(),
+        };
+        std::fs::write(root.join(".git").join("config"), body).unwrap();
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sv-pident-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn event_in(project_root: &std::path::Path, seq: u64) -> RawEvent {
+        RawEvent {
+            schema_version: SCHEMA_VERSION,
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/p/f.jsonl".to_string(),
+            source_session_id: "s1".to_string(),
+            seq,
+            event_key: None,
+            source_mode: SourceMode::AppendLog,
+            cwd: Some(project_root.to_string_lossy().into_owned()),
+            project_root: Some(project_root.to_string_lossy().into_owned()),
+            project_root_source: Some("git".to_string()),
+            workspace_location: Some("local".to_string()),
+            event_type: EventType::Message,
+            actor: Some(Actor::User),
+            occurred_at: Some("2026-06-01T10:00:00Z".to_string()),
+            time_confidence: TimeConfidence::High,
+            model: None,
+            effort: None,
+            usage: Some(TokenUsage::default()),
+            content: None,
+            parent_ref: None,
+            content_hash: None,
+            artifact_kind: None,
+            observed_at: None,
+            message_id: None,
+            request_id: None,
+        }
+    }
+
+    /// 走**生产的那条路**（`apply_projection`），不是直接调 `record_project_identity`
+    /// —— 后者只能证明我理解得对，证明不了它在真实写入路径上被调到。
+    fn ingest(store: &TotalStore, root: &std::path::Path, seq: u64) {
+        let ev = event_in(root, seq);
+        store
+            .apply_projection(FileProjectionBatch {
+                source: SourceKey::from_event(&ev),
+                parser_revision: None,
+                mode: Projection::Append,
+                events: vec![ev],
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn identity_survives_the_checkout_being_deleted() {
+        // 🔴 **这条就是 project_identity 表存在的全部理由。** 实测有个项目留着 16 万条
+        // 历史事件，却因为 checkout 已删而没有任何东西能说出它属于哪个仓库。
+        let root = scratch("survives");
+        let proj = root.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, Some("git@github.com:o/Proj.git"));
+
+        let store = TotalStore::open_in_memory().unwrap();
+        ingest(&store, &proj, 0);
+        let root_str = proj.to_string_lossy().into_owned();
+        assert_eq!(
+            store.project_identity("claude_code", "local", &root_str),
+            Some("git:github.com/o/proj".to_string())
+        );
+
+        // checkout 消失 —— 现算的那条路（identity::canonical_repo_id）从此答不出来。
+        std::fs::remove_dir_all(&proj).unwrap();
+        assert_eq!(
+            crate::identity::find_git_root(&proj),
+            None,
+            "前提：磁盘上真的没了"
+        );
+        assert_eq!(
+            store.project_identity("claude_code", "local", &root_str),
+            Some("git:github.com/o/proj".to_string()),
+            "记下来的身份必须活过 checkout 的删除"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_reused_path_keeps_both_identities_instead_of_silently_overwriting() {
+        // 🔴 latest-wins 会把前一个仓的整段历史划到后一个仓名下。这里两行都在，
+        // 默认查询给最新的那个，历史查得到。
+        let root = scratch("reused");
+        let proj = root.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, Some("git@github.com:o/first.git"));
+
+        let store = TotalStore::open_in_memory().unwrap();
+        ingest(&store, &proj, 0);
+
+        // 路径被另一个仓复用：删掉重新 clone 别的东西。
+        std::fs::remove_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, Some("git@github.com:o/second.git"));
+        // 缓存按进程记，换个 store 模拟「下次启动」——upsert 幂等，历史累积。
+        store.identity_seen.lock().unwrap().clear();
+        ingest(&store, &proj, 1);
+
+        let root_str = proj.to_string_lossy().into_owned();
+        let hist = store.project_identity_history("claude_code", "local", &root_str);
+        let ids: Vec<&str> = hist.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert!(
+            ids.contains(&"git:github.com/o/first") && ids.contains(&"git:github.com/o/second"),
+            "两个身份都得留着，不能被覆盖：{ids:?}"
+        );
+        assert_eq!(
+            store.project_identity("claude_code", "local", &root_str),
+            Some("git:github.com/o/second".to_string()),
+            "默认查询取 last_seen 最新的那条"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_repo_without_a_remote_writes_no_row_at_all() {
+        // `path:` 身份不跨 checkout 稳定，记下来会让「查得到身份」变成一句不能信的话。
+        let root = scratch("no-remote");
+        let proj = root.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, None);
+
+        let store = TotalStore::open_in_memory().unwrap();
+        ingest(&store, &proj, 0);
+        assert_eq!(
+            store.project_identity("claude_code", "local", &proj.to_string_lossy()),
+            None,
+            "没有 remote 时不得写 path: 兜底行"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unreadable_project_root_never_blocks_ingestion() {
+        // 🔴 身份是**加法**能力。`wsl:<distro>:/abs` 这类规范形不是本机可打开的路径
+        // （UNC 回环那一族同理）—— 记不下身份，但事件必须照常入库。
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut ev = event_in(std::path::Path::new("/nonexistent"), 0);
+        ev.project_root = Some("wsl:Ubuntu-22.04:/home/u/Proj".to_string());
+        let stats = store
+            .apply_projection(FileProjectionBatch {
+                source: SourceKey::from_event(&ev),
+                parser_revision: None,
+                mode: Projection::Append,
+                events: vec![ev],
+            })
+            .expect("身份记不下来时，摄取必须照常成功");
+        assert!(stats.appended > 0, "事件没进库：{stats:?}");
+        assert_eq!(
+            store.project_identity("claude_code", "local", "wsl:Ubuntu-22.04:/home/u/Proj"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_same_project_is_only_probed_once_per_process() {
+        // 省的是文件 IO：一个大仓的几百个会话文件不该把同一个 .git/config 读几百遍。
+        let root = scratch("cached");
+        let proj = root.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, Some("git@github.com:o/Proj.git"));
+
+        let store = TotalStore::open_in_memory().unwrap();
+        ingest(&store, &proj, 0);
+        // 把 .git 拿掉：若第二次仍去读盘，缓存就没生效。
+        std::fs::remove_dir_all(proj.join(".git")).unwrap();
+        ingest(&store, &proj, 1);
+
+        assert_eq!(
+            store.project_identity("claude_code", "local", &proj.to_string_lossy()),
+            Some("git:github.com/o/proj".to_string()),
+            "第二次不该再问盘，身份应保持"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }

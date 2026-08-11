@@ -1,6 +1,6 @@
 # 项目身份：从「现算」到「记下来」（ADR-032 的 P2）
 
-> 状态：**设计，未实现**（2026-08-11）
+> 状态：**已实现**（2026-08-11，store.rs `project_identity` 表 + 5 条验收测试）
 > 前置：P1 已落地——`src/identity.rs`（`canonical_repo_id` 等四个纯函数 + 8 条测试）
 
 ## P1 解决了什么，没解决什么
@@ -33,8 +33,10 @@ CREATE TABLE IF NOT EXISTS project_identity (
     project_root    TEXT    NOT NULL,
     -- `git:<host>/<owner>/<repo>` 或 `path:<git root>`，见 identity.rs
     canonical_id    TEXT    NOT NULL,
-    first_seen      INTEGER NOT NULL,
-    last_seen       INTEGER NOT NULL,
+    -- 🔴 毫秒，不是秒：last_seen_ms 是**排序键**，而秒级精度下同一秒内观察到的
+    -- 两个身份会平局、"取最新" 退化成 "取字母序靠前的"。实现时一条测试当场撞上了它。
+    first_seen_ms   INTEGER NOT NULL,
+    last_seen_ms    INTEGER NOT NULL,
     PRIMARY KEY (source_type, source_location, project_root, canonical_id)
 );
 CREATE INDEX IF NOT EXISTS idx_identity_root ON project_identity(project_root);
@@ -60,9 +62,9 @@ CREATE INDEX IF NOT EXISTS idx_identity_cid  ON project_identity(canonical_id);
 packfile，**代价远超本模块「只读 `.git/config`」的定位**。
 
 所以不区分，**改为不丢信息**：主键带上 `canonical_id` ⇒ 同一个 `project_root` 先后
-观察到不同身份就是**两行**，各自带 `first_seen` / `last_seen`。
+观察到不同身份就是**两行**，各自带 `first_seen_ms` / `last_seen_ms`。
 
-- **默认消费**：取 `last_seen` 最大的那行 —— 行为等同 latest-wins，调用方不必懂历史
+- **默认消费**：取 `last_seen_ms` 最大的那行 —— 行为等同 latest-wins，调用方不必懂历史
 - **需要时可查**：「这个路径的身份变过吗、什么时候」有答案，而不是被覆盖掉
 
 判据是本仓反复用的那条：**降级要降到「说得出来」**。分不清两种变更时，把两条都记下、
@@ -103,7 +105,7 @@ packfile，**代价远超本模块「只读 `.git/config`」的定位**。
 1. 扫描一次含 git remote 的项目 ⇒ `project_identity` 有对应行，`canonical_id` 与
    `identity::canonical_repo_id` 一致。
 2. **删掉那个 checkout 再扫** ⇒ 行还在、内容不变（这条就是 P2 存在的理由）。
-3. 同一 `project_root` 换一个 remote 再扫 ⇒ **两行**，`last_seen` 区分新旧；
+3. 同一 `project_root` 换一个 remote 再扫 ⇒ **两行**，`last_seen_ms` 区分新旧；
    默认查询返回新的那条。
 4. 无 remote 的仓 ⇒ **不写任何行**（不写 `path:` 兜底）。
 5. `.git/config` 不可读（UNC 回环等）⇒ 不写行、不报错、计数可见。
