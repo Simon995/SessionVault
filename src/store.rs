@@ -1261,6 +1261,36 @@ impl TotalStore {
         .flatten()
     }
 
+    /// 全部已知的 `(project_root → 当前 canonical_id)`。
+    ///
+    /// 消费侧（QuotaBar 的别名表）要的就是这一张表：目录扫描只看得见现在还在磁盘上的
+    /// checkout，而这里回答的是**扫描时记下来的**那一半。同一 `project_root` 有多个
+    /// 身份时取 `last_seen_ms` 最新的（与 [`project_identity`] 同口径）。
+    ///
+    /// ⚠️ key 只用 `project_root`：调用方按路径查，而同一个路径在两个 source_type 下
+    /// 指的是同一个目录。**真出现分歧时后写的赢** —— 那与单点查询的「取最新」一致。
+    pub fn all_project_identities(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Ok(conn) = self.conn.lock() else {
+            return out;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT project_root, canonical_id FROM project_identity
+              ORDER BY last_seen_ms ASC",
+        ) else {
+            return out;
+        };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        else {
+            return out;
+        };
+        // ASC + 覆盖插入 ⇒ 最后写进 map 的是 last_seen_ms 最大的那条。
+        for (root, cid) in rows.flatten() {
+            out.insert(root, cid);
+        }
+        out
+    }
+
     /// 一个项目**观察到过的全部**身份，新到旧。多于一条即意味着这个路径的身份变过 ——
     /// 可能是改了 remote，也可能是路径被另一个仓复用，**本层不替调用方判断**
     /// （见 `migrate()` 里那段注释）。
