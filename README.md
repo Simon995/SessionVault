@@ -82,7 +82,7 @@ CLI（NDJSON）与 lib 等价（PyO3 wheel 后置）：
 | `discover()` | 发现来源清单（本地 + WSL），首次只发现不读内容 |
 | `discover_transcripts()` / `discover_snapshots()` | 分离会话与状态制品，防止 snapshot 污染会话投影 |
 | `discover_project_snapshots()` | 在宿主已确认的项目根内发现 CLAUDE.md / AGENTS.md；身份由宿主提供 |
-| `scan(source_ref, cursor_in, profile)` | 单来源增量摄取主接口（无状态：游标进、游标出） |
+| `scan(source_ref, cursor_in, profile, roots)` | 单来源增量摄取主接口（无状态：游标进、游标出）。`roots` 是已知项目根注册表 —— 归属的唯一输入，**空表 = 一个根都不知道 ⇒ 每条路径 `Unattributed`**，不是退回 cwd 兜底 |
 | `TotalStore::sync_snapshots()` | 快照增量扫描并加密写入总库 |
 | `TotalStore::read_active_latest_snapshots()` | 每个来源的当前最新快照，删除文件不再返回 |
 

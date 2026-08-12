@@ -746,6 +746,21 @@ impl TotalStore {
                 first_seen_ms   INTEGER NOT NULL,
                 last_seen_ms    INTEGER NOT NULL
             );
+
+            -- 探测过的候选路径及其结果（ADR-050，评审 [P2]）。
+            --
+            -- 🔴 **`None` 与 `Failed` 也要落**。发现只过滤「已归属」的候选，于是
+            -- 「确认没有根」的那些每一轮后台刷新都会被重新探测一遍 —— 实测 36 条，
+            -- 其中 WSL 形式的每条一次跨 VM 往返。候选集因此永远降不到零。
+            --
+            -- 三态分开记，因为它们的**有效期不同**：`none` 是一个稳定的事实
+            -- （那个目录确实没有根），`unreachable` 是一个暂时的故障（WSL 卡住了）。
+            -- 拿同一个 TTL 套两者，要么让故障闷太久，要么让稳定事实白探。
+            CREATE TABLE IF NOT EXISTS project_root_probe (
+                path          TEXT PRIMARY KEY,
+                outcome       TEXT NOT NULL,   -- 'none' | 'unreachable'
+                last_probe_ms INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -1374,6 +1389,46 @@ impl TotalStore {
             return Vec::new();
         };
         rows.flatten().collect()
+    }
+
+    /// 记下一次「没探到根」的结果（`none` = 确认没有，`unreachable` = 没问成）。
+    ///
+    /// **失败静默**：与 [`Self::register_project_root`] 同一条 —— 这是加法能力，
+    /// 它坏了该多探几次，不该让摄取停下。
+    pub fn record_probe_miss(&self, path: &str, outcome: &str) {
+        let now = now_unix_millis();
+        let Ok(conn) = self.conn.lock() else { return };
+        let _ = conn.execute(
+            "INSERT INTO project_root_probe (path, outcome, last_probe_ms) VALUES (?1, ?2, ?3)              ON CONFLICT(path) DO UPDATE SET outcome = ?2, last_probe_ms = ?3",
+            rusqlite::params![path, outcome, now],
+        );
+    }
+
+    /// 读出探测记录：`path → (outcome, last_probe_ms)`。读不出来返回空 —— 那只意味着
+    /// 这一轮把所有候选都重探一遍，是**慢**，不是错。
+    pub fn probe_misses(&self) -> std::collections::HashMap<String, (String, i64)> {
+        let mut out = std::collections::HashMap::new();
+        let Ok(conn) = self.conn.lock() else {
+            return out;
+        };
+        let Ok(mut stmt) =
+            conn.prepare("SELECT path, outcome, last_probe_ms FROM project_root_probe")
+        else {
+            return out;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }) else {
+            return out;
+        };
+        for (path, outcome, ms) in rows.flatten() {
+            out.insert(path, (outcome, ms));
+        }
+        out
     }
 
     /// 读出整份注册表，供 [`attribution::attribute`] 使用。

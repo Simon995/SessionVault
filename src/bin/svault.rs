@@ -479,7 +479,7 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
     // 归属的唯一输入。读不出来就是空注册表 ⇒ 一致地 `Unattributed`，**不退回 cwd**。
     // 🔴 空表要说出来：一份静默为空的注册表会让整轮扫描的 `project_root` 全成兜底值，
     // 而那与「本机确实一个项目根都没发现」在输出里长得一模一样。
-    let roots = std::sync::Arc::new(project_roots(store_arg_for_roots()));
+    let roots = std::sync::Arc::new(project_roots());
     if roots.is_empty() {
         log::warn!(
             target: tag::CLI,
@@ -765,20 +765,14 @@ where
     }
 }
 
-/// 解析总库路径：`--store` 优先，否则 `<data_local_dir>/svault/total_store.db`
-/// （与 QuotaBar 写者 `main.rs` 同址）。无法确定数据目录时返回 `None`。
+/// 打开总库读项目根注册表；**任何一步拿不到就是空注册表**（一致地说不出来）。
+///
+/// `scan-all` 没有 `--store` 参数（它是流式的、不写库），所以走默认路径。
 #[cfg(feature = "store")]
-/// `scan-all` 没有 `--store` 参数（它是流式的，不写库），但归属要读注册表 ——
-/// 所以走默认路径。给不出来时返回 `None`，由 [`project_roots`] 落到空注册表。
-fn store_arg_for_roots() -> Option<PathBuf> {
-    resolve_store_path(None).filter(|p| p.exists())
-}
-
-/// 打开总库读注册表；任何一步失败都落到**空注册表**（一致地说不出来）。
-#[cfg(feature = "store")]
-fn project_roots(path: Option<PathBuf>) -> session_vault::attribution::RootRegistry {
-    let Some(p) = path else {
-        return session_vault::attribution::RootRegistry::new();
+fn project_roots() -> session_vault::attribution::RootRegistry {
+    let empty = session_vault::attribution::RootRegistry::new;
+    let Some(p) = resolve_store_path(None).filter(|p| p.exists()) else {
+        return empty();
     };
     match open_total_store(&p) {
         Ok(store) => {
@@ -786,17 +780,24 @@ fn project_roots(path: Option<PathBuf>) -> session_vault::attribution::RootRegis
         }
         Err(e) => {
             log::warn!(target: tag::CLI, "open total store for roots failed: {e}");
-            session_vault::attribution::RootRegistry::new()
+            empty()
         }
     }
 }
 
-/// 无 `store` feature 时没有注册表可读 —— 归属一致地说不出来。
+/// 无 `store` feature 时**没有注册表可读** —— 归属一致地说不出来。
+///
+/// 🔴 这不是「补个空桩让它编译过」：默认 feature 下 `scan-all` 会把每条路径记成
+/// `unattributed`，那是**真话**（这个构建确实无从知道项目根），但它对消费方几乎没用。
+/// 所以调用点会 `warn` 一行说出来 —— 见 `run_scan_all`。**要有归属就带 `--features store`。**
 #[cfg(not(feature = "store"))]
-fn project_roots(_path: Option<PathBuf>) -> session_vault::attribution::RootRegistry {
+fn project_roots() -> session_vault::attribution::RootRegistry {
     session_vault::attribution::RootRegistry::new()
 }
 
+/// 解析总库路径：`--store` 优先，否则 `<data_local_dir>/svault/total_store.db`
+/// （与 QuotaBar 写者 `main.rs` 同址）。无法确定数据目录时返回 `None`。
+#[cfg(feature = "store")]
 fn resolve_store_path(arg: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = arg {
         return Some(p);

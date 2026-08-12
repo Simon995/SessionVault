@@ -279,15 +279,53 @@ fn covers(root: &str, path: &str) -> bool {
 /// 🔴 **只用于比较，不用于存储** —— 注册表同时留着原始路径，归属结果返回的是
 /// 原始形式。归一化是这一层的内部细节，不该泄漏到 `project_root` 列里去。
 fn normalize(p: &str) -> Cow<'_, str> {
-    let needs = p.contains('\\') || p.ends_with('/') || p.chars().any(char::is_uppercase);
+    let fold = folds_case(p);
+    let needs = p.contains('\\') || p.ends_with('/') || (fold && p.chars().any(char::is_uppercase));
     if !needs {
         return Cow::Borrowed(p);
     }
-    let mut s = p.replace('\\', "/").to_lowercase();
+    let mut s = p.replace('\\', "/");
+    if fold {
+        s = s.to_lowercase();
+    }
     while s.len() > 1 && s.ends_with('/') {
         s.pop();
     }
     Cow::Owned(s)
+}
+
+/// 这条路径所在的文件系统**是否**大小写不敏感。
+///
+/// 🔴 **不能一律小写。** Linux 上 `/home/u/Foo` 与 `/home/u/foo` 是**两个真实目录**，
+/// 可以各自是一个仓库；全部折叠会让它们在注册表里撞成一个键，归属跟着归到后写入的
+/// 那个 —— 症状是**跨项目的会话与记忆被混在一起**，而且不报任何错。
+///
+/// 判据按**路径命名空间**，不按当前宿主：一条 `wsl:<distro>:/home/…` 在 Windows 上
+/// 被处理时，它描述的仍然是 Linux 文件系统。
+///
+/// | 形式 | 折叠 |
+/// | --- | --- |
+/// | `C:\…` / `c:/…`（Windows 盘符） | ✅ |
+/// | `/mnt/<drive>/…`（WSL 里挂的 Windows 盘，底下是 NTFS） | ✅ |
+/// | `wsl:<distro>:/…`、`//wsl$/…`、裸 `/home/…` | ❌ |
+/// | 其余（相对路径等） | ❌ 保守：宁可少收敛，不可错并 |
+fn folds_case(p: &str) -> bool {
+    // `wsl:<distro>:/path` —— 冒号前是 `wsl` 时那是规范形前缀，不是盘符。
+    // 里面的 Linux 路径除非本身是 `/mnt/<drive>`，否则不折叠。
+    if let Some(rest) = p.strip_prefix("wsl:").or_else(|| p.strip_prefix("WSL:")) {
+        let linux = rest.split_once(':').map_or(rest, |(_, tail)| tail);
+        return crate::pathnorm::is_windows_drive_mount(linux);
+    }
+    // UNC 形式的 WSL 路径同理（`\\wsl$\Ubuntu\home\…`）。
+    if crate::pathnorm::canonical_wsl_unc(p).is_some() {
+        return false;
+    }
+    // 单字母 + 冒号 = Windows 盘符。
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return true;
+    }
+    crate::pathnorm::is_windows_drive_mount(p)
 }
 
 #[cfg(test)]
@@ -296,6 +334,69 @@ mod tests {
 
     fn reg(paths: &[(&str, RootSource)]) -> RootRegistry {
         RootRegistry::from_roots(paths.iter().copied())
+    }
+
+    // ── 大小写：按路径命名空间，不按宿主 ──────────────────────────────
+    //
+    // 🔴 这一组是评审 [P1] 逼出来的：`normalize` 原先**无条件小写**，于是 Linux 上
+    // 两个仅大小写不同的真实仓库在注册表里撞成一个键，归属归到后写入的那个 ——
+    // 跨项目的会话与记忆被混在一起，且不报任何错。
+
+    #[test]
+    fn two_linux_projects_differing_only_in_case_stay_apart() {
+        let r = reg(&[
+            ("/home/u/Foo", RootSource::Git),
+            ("/home/u/foo", RootSource::Git),
+        ]);
+        assert_eq!(r.len(), 2, "Linux 上这是两个目录，不能撞成一个键");
+        assert_eq!(
+            attribute(Some("/home/u/Foo/src"), &r).root(),
+            Some("/home/u/Foo")
+        );
+        assert_eq!(
+            attribute(Some("/home/u/foo/src"), &r).root(),
+            Some("/home/u/foo")
+        );
+    }
+
+    #[test]
+    fn wsl_canonical_paths_keep_case_too() {
+        // 规范形描述的仍是 Linux 文件系统 —— 即便这段代码跑在 Windows 上。
+        let r = reg(&[
+            ("wsl:Ubuntu:/home/u/Foo", RootSource::Git),
+            ("wsl:Ubuntu:/home/u/foo", RootSource::Git),
+        ]);
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            attribute(Some("wsl:Ubuntu:/home/u/foo/deep"), &r).root(),
+            Some("wsl:Ubuntu:/home/u/foo")
+        );
+    }
+
+    #[test]
+    fn windows_paths_still_fold_case() {
+        // 反向也要钉住：NTFS 大小写不敏感，折叠是**必要**的，不是可选的。
+        let r = reg(&[(r"C:\Users\u\Proj", RootSource::Git)]);
+        assert_eq!(
+            attribute(Some(r"c:\users\u\proj\src"), &r).root(),
+            Some(r"C:\Users\u\Proj")
+        );
+    }
+
+    #[test]
+    fn a_windows_drive_mounted_into_wsl_folds_case() {
+        // `/mnt/c/…` 底下就是 NTFS —— 虽然写成 Linux 形式，规则跟着**文件系统**走。
+        let r = reg(&[("/mnt/c/Users/u/Proj", RootSource::Git)]);
+        assert_eq!(
+            attribute(Some("/mnt/c/users/u/proj/src"), &r).root(),
+            Some("/mnt/c/Users/u/Proj")
+        );
+        // 而 wsl 规范形里的 /mnt/c 同样折叠。
+        let r2 = reg(&[("wsl:Ubuntu:/mnt/d/Work", RootSource::Git)]);
+        assert_eq!(
+            attribute(Some("wsl:Ubuntu:/mnt/d/work/x"), &r2).root(),
+            Some("wsl:Ubuntu:/mnt/d/Work")
+        );
     }
 
     #[test]

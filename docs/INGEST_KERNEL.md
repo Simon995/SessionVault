@@ -280,7 +280,7 @@ parser_version            # 解析器版本，绑定字段语义
 ## 8. 无状态游标 API
 
 ```text
-scan(source_ref, cursor_in, profile) -> ScanResult {
+scan(source_ref, cursor_in, profile, roots) -> ScanResult {
   events:     [RawEvent],
   cursor_out: Cursor,
   status:     ok | partial | error,
@@ -333,7 +333,7 @@ Cursor {
 |---|---|---|---|
 | `catalog()` | （可选 user_config） | 生效后的 provider 描述符列表 | 宿主据此渲染"将扫哪些 provider/路径"与设置页 |
 | `discover(user_config)` | 用户配置 + 平台 | 发现到的来源清单（path、location、kind、provider、是否已授权） | 首次只发现不读，供用户授权 |
-| `scan(source_ref, cursor_in, profile)` | 单来源 + 游标 + 档位 | `ScanResult`（事件 + 新游标 + 状态） | 增量摄取主接口 |
+| `scan(source_ref, cursor_in, profile, roots)` | 单来源 + 游标 + 档位 + 项目根注册表 | `ScanResult`（事件 + 新游标 + 状态） | 增量摄取主接口。`roots` 空 ⇒ 一致地 `Unattributed`（ADR-050） |
 | `scan_all(user_config, cursors, profile)` | 全量来源 + 游标表 | 事件流 + 游标表 + **扫描报告**（§10） | 一轮全量增量扫描 |
 
 - CLI 形态（`svault`）：`svault discover`、`svault scan --source ... --cursor ...`、`svault scan-all --profile metadata|full`，事件走 stdout NDJSON，报告走单独 JSON。

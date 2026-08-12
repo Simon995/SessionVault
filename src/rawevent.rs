@@ -279,9 +279,17 @@ pub struct RawEvent {
     // --- 工程定位 ---
     /// 对话记录里的原始 cwd（provenance）。
     pub cwd: Option<String>,
-    /// 解析出的工程根路径（`resolve_project_root`）。
+    /// 归属到的工程根（`attribution::attribute`，ADR-050）。
+    ///
+    /// 归不到根时**仍然是那条原始路径**（`Attribution::storage_path`）—— 下游要能按它
+    /// 做粗粒度查询。所以「归到了」与「没归到」只能靠下面那个字段分辨。
     pub project_root: Option<String>,
-    /// 工程根判定依据：git / marker:<file> / cwd / wsl_cwd / missing_cwd。
+    /// 归属判定依据：`git` / `marker` / `scan` / `configured` / `unattributed` /
+    /// `missing_cwd`。
+    ///
+    /// 🔴 ADR-050 换过一次取值集合：旧的 `cwd` / `wsl_cwd` 表示「stat 不了这条路径，
+    /// 所以拿 cwd 当答案」，现在那种情况一律是 `unattributed` —— **说不出来要说出来**。
+    /// `marker:<file>` 那种带后缀的形式也随之退役（发现层只记「是 marker」，不记哪一个）。
     pub project_root_source: Option<String>,
     /// 工程物理位置（`local` | `wsl:<distro>`）与 transcript 存储位置的二分。
     /// 由 `pathnorm::workspace_location` 据规范化后的 project_root + 宿主平台判定

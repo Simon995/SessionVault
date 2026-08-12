@@ -51,12 +51,22 @@ pub fn default_distro(distros: &[String]) -> Option<String> {
 pub fn list_distros() -> Result<Vec<String>, String> {
     use std::process::Command;
 
+    use std::process::Stdio;
+
     let mut cmd = Command::new("wsl.exe");
-    cmd.args(["-l", "-q"]);
+    cmd.args(["-l", "-q"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_no_window(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|e| format!("spawn wsl.exe failed: {e}"))?;
+    // 🔴 **枚举发行版同样要有上限。** 它是每一轮发现的第一步，`output()` 没有超时 ——
+    // 一个卡住的 WSL 会让整轮刷新停在这一行，比后面任何一次探测都更早、更彻底。
+    // 修 `run_bash_stdin` 时漏掉它，实测让一次单元测试跑了 10 分钟没结束。
+    let output = wait_with_deadline(
+        cmd.spawn()
+            .map_err(|e| format!("spawn wsl.exe failed: {e}"))?,
+        WSL_LIST_TIMEOUT,
+    )?;
 
     if !output.status.success() {
         let err = decode_utf16le(&output.stderr)
@@ -106,9 +116,77 @@ fn run_bash_stdin(distro: &str, script: &str) -> Result<std::process::Output, St
             .write_all(script.as_bytes())
             .map_err(|e| format!("write to wsl.exe stdin failed: {e}"))?;
     }
-    child
-        .wait_with_output()
-        .map_err(|e| format!("wsl.exe wait failed: {e}"))
+    wait_with_deadline(child, WSL_CALL_TIMEOUT)
+}
+
+/// 一次 `wsl.exe` 调用的上限。
+///
+/// 🔴 **不是为了「慢」，是为了「永远」。** 原先用 `wait_with_output()`：一个卡住的
+/// WSL（内存耗尽、VM 半死、`E_UNEXPECTED`）会让调用方**无限期挂住** —— 而调用方是
+/// 后台刷新循环，于是整轮扫描停在那里，连「有多少个候选探测失败」都写不进日志。
+/// 实测判例：一次 WSL 卡死让 Codex 卡片红了 19 分钟（v0.8.0-beta.23）。
+///
+/// 值取得宽：`find` 遍历一棵大目录树本来就可能几十秒，超时不该把正常的慢判成故障。
+const WSL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 枚举发行版的上限。比 [`WSL_CALL_TIMEOUT`] 短得多：`wsl -l -q` 只读注册表，
+/// 正常在 100ms 内返回；它慢就说明 WSL 服务本身有问题，等下去没有意义。
+const WSL_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 等子进程结束，超时就杀掉并报错。
+///
+/// 手写而不用 `wait_with_output()`：后者没有超时。管道必须**在等待期间**被读走，
+/// 否则子进程写满管道缓冲区就阻塞，形成一个我们自己造的死锁 —— 所以两个流各起一个
+/// 读线程，主线程只轮询退出状态。
+#[cfg(windows)]
+fn wait_with_deadline(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = out_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = err_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "wsl.exe timed out after {}s (distro wedged?)",
+                        timeout.as_secs()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(e) => return Err(format!("wsl.exe wait failed: {e}")),
+        }
+    };
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// 列出发行版内 `$HOME/<rel_subpath>` 下的全部 `*.jsonl` 绝对路径（仅发现、不读内容）。
