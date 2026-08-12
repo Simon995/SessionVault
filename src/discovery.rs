@@ -238,12 +238,24 @@ pub fn probe_path(path: &str, default_distro: Option<&str>, mounts: &DriveMounts
     // 重启、以及 `/mnt/data` 这类普通 Linux 挂载三种情况下都是错的，而猜错的后果
     // 是把事件归到**别的项目**（甚至不存在的盘）名下。
     //
-    // 表为空（没读到 / 没 WSL）⇒ 落到 `probe_local`，那里 `Path::new("/mnt/d/…")`
-    // 在 Windows 上是当前盘根的相对路径、必然探不到 ⇒ 报 `None`（说不出来）。
+    // 🔴 **换算不出来是「没问成」，不是「没有根」**（评审 [P2]）。
+    //
+    // 原先落到 `probe_local`：`Path::new("/mnt/d/…")` 在 Windows 上是**当前盘根的
+    // 相对路径**，于是要么探不到（报 `None`）、要么更糟 —— 误中当前盘上真实存在的
+    // `\mnt\…`。而 `None` 会被调用方按「确认无根」缓存 24 小时，
+    // 一次 WSL 超时就让这一族路径整天归不到根。
+    //
+    // 与本 ADR 的主线同一条：`Probe::None`（问了、没有）与 `Probe::Failed`（没问成）
+    // 必须分开 —— 这里属于后者，退避该按「暂时故障」的那档走。
     if cfg!(windows) && pathnorm::is_windows_drive_mount(path) {
-        if let Some(p) = probe_mnt_with(path, mounts, probe_local) {
-            return p;
-        }
+        return match probe_mnt_with(path, mounts, probe_local) {
+            Some(p) => p,
+            None => Probe::Failed {
+                reason: format!(
+                    "no drive mount covers {path} (mount table unavailable or this is a plain Linux mount)"
+                ),
+            },
+        };
     }
     probe_local(path)
 }
@@ -497,6 +509,40 @@ mod tests {
         });
         assert!(got.is_none());
         assert!(!called.get(), "映射不出来时不该调探测器");
+    }
+
+    #[test]
+    fn an_unmappable_mnt_path_is_failed_not_rootless() {
+        // 🔴 换算不出来是「没问成」，不是「没有根」（评审 [P2]）。
+        //
+        // 原先落到 `probe_local`：`/mnt/d/…` 在 Windows 上是**当前盘根的相对路径**，
+        // 于是要么探不到（报 `None`）、要么更糟 —— 误中当前盘上真实存在的 `\mnt\…`。
+        // 而 `None` 会被调用方按「确认无根」缓存 24 小时，一次 WSL 超时就让这一族路径
+        // 整天归不到根。
+        //
+        // ⚠️ 只在 Windows 上成立：非 Windows 宿主上 `/mnt/d/…` 是真实本机路径，
+        // 该走 `probe_local`。
+        if !cfg!(windows) {
+            return;
+        }
+        match probe_path("/mnt/d/work/proj", None, &Vec::new()) {
+            Probe::Failed { reason } => {
+                assert!(
+                    reason.contains("/mnt/d/work/proj"),
+                    "要说出是哪条路径：{reason}"
+                )
+            }
+            other => panic!("空挂载表下必须报 Failed（暂时故障档退避），得到 {other:?}"),
+        }
+        // 表里有它就正常走探测，不该恒 Failed。
+        let m = mounts();
+        assert!(
+            !matches!(
+                probe_path("/mnt/d/work/proj", None, &m),
+                Probe::Failed { .. }
+            ),
+            "映射得出来时不该报失败"
+        );
     }
 
     #[test]

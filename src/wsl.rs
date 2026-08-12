@@ -503,9 +503,15 @@ pub fn read_file_at(distro: &str, abs_path: &str) -> Result<Option<String>, Stri
         .stderr(Stdio::piped());
     configure_no_window(&mut cmd);
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("spawn wsl.exe failed: {e}"))?;
+    // 🔴 与 `run_bash_stdin` / `list_distros` 同一条：**`.output()` 没有上限**。
+    // 快照全文读走这里（`scan_snapshot`），一个卡死的 WSL 会让 `svault scan-all`
+    // 无限期挂住。评审 [P2] 指出前两处改了、这处漏了 —— 加超时这件事必须**逐个
+    // 出站调用**核，不能核到「主要那条路径」为止。
+    let output = wait_with_deadline(
+        cmd.spawn()
+            .map_err(|e| format!("spawn wsl.exe failed: {e}"))?,
+        WSL_CALL_TIMEOUT,
+    )?;
 
     match output.status.code() {
         Some(0) => String::from_utf8(output.stdout)

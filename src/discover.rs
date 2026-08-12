@@ -135,6 +135,9 @@ fn discover(local_only: bool) -> Result<Vec<SourceRef>> {
 /// 「所有 WSL 位置都没问成」的哨兵（连 `wsl -l -q` 都失败时）。
 pub const UNREACHABLE_ALL_WSL: &str = "wsl:*";
 
+/// 本机位置键（与 QuotaBar `SourceLocation::as_key()` 一致）。
+pub const LOCAL_LOCATION: &str = "local";
+
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryOutcome {
     pub sources: Vec<SourceRef>,
@@ -178,7 +181,11 @@ fn discover_by_mode(local_only: bool, wanted: SourceMode) -> Result<DiscoveryOut
             if !dir.is_dir() {
                 continue;
             }
-            let files = collect_artifact_files(&dir, &art.glob, art.recursive);
+            let (files, walk_failed) =
+                collect_artifact_files_reported(&dir, &art.glob, art.recursive);
+            if walk_failed && !unreachable.contains(&LOCAL_LOCATION.to_string()) {
+                unreachable.push(LOCAL_LOCATION.to_string());
+            }
             log::debug!(
                 target: tag::DISCOVER,
                 "scanned subdir: provider={} subdir={} files={}",
@@ -338,11 +345,29 @@ fn artifact_suffix(glob: &str) -> Option<&str> {
 }
 
 pub fn collect_artifact_files(dir: &Path, glob: &str, recursive: bool) -> Vec<PathBuf> {
+    collect_artifact_files_reported(dir, glob, recursive).0
+}
+
+/// 同上，外加**这次遍历有没有失败过**。
+///
+/// 🔴 `read_dir` / 目录项 / `file_type` 的错误从前一律被当成「这里没有文件」——
+/// 与本仓刚修的 WSL 那条一模一样，而 `local` 位置的 prune 同样会据此删存量：
+/// 一次权限拒绝或瞬时 FS 错误就能删掉某个 provider 的全部会话与 `usage_facts`
+/// （评审 [P2]）。**「问了、没有」与「没问成」必须分开** —— 这里是第三次。
+///
+/// ⚠️ `NotFound` **不算失败**：目录不存在就是「这里确实没有」，调用方本来就先
+/// `is_dir()` 过一道。
+pub fn collect_artifact_files_reported(
+    dir: &Path,
+    glob: &str,
+    recursive: bool,
+) -> (Vec<PathBuf>, bool) {
     let mut out = Vec::new();
+    let mut failed = false;
     let Some(suffix) = artifact_suffix(glob) else {
-        return out;
+        return (out, false);
     };
-    collect_files_into(dir, recursive, suffix, &mut out);
+    collect_files_into(dir, recursive, suffix, &mut out, &mut failed);
     if glob == "**/memory/*.md" {
         out.retain(|p| {
             p.parent()
@@ -352,7 +377,7 @@ pub fn collect_artifact_files(dir: &Path, glob: &str, recursive: bool) -> Vec<Pa
         });
     }
     out.sort();
-    out
+    (out, failed)
 }
 
 /// 递归（或单层）收集目录下的 `*.jsonl`。骨架用 std 遍历，不引第三方 glob。
@@ -360,16 +385,44 @@ pub fn collect_jsonl(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     collect_artifact_files(dir, "**/*.jsonl", recursive)
 }
 
-fn collect_files_into(dir: &Path, recursive: bool, suffix: &str, out: &mut Vec<PathBuf>) {
+fn collect_files_into(
+    dir: &Path,
+    recursive: bool,
+    suffix: &str,
+    out: &mut Vec<PathBuf>,
+    failed: &mut bool,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(e) => {
+            // NotFound = 「这里确实没有」；其余（权限、IO、句柄耗尽）= 「没问成」。
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!(target: tag::DISCOVER, "read_dir failed: {} err={e}", dir.display());
+                *failed = true;
+            }
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            log::warn!(target: tag::DISCOVER, "dir entry failed under {}", dir.display());
+            *failed = true;
+            continue;
+        };
+        // `path.is_dir()` 把错误吞成 false —— 用 `file_type()` 才分得开
+        // 「不是目录」和「问不到它是什么」。
+        let is_dir = match entry.file_type() {
+            Ok(t) => t.is_dir(),
+            Err(e) => {
+                log::warn!(target: tag::DISCOVER, "file_type failed: {:?} err={e}", entry.path());
+                *failed = true;
+                continue;
+            }
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if is_dir {
             if recursive {
-                collect_files_into(&path, recursive, suffix, out);
+                collect_files_into(&path, recursive, suffix, out, failed);
             }
         } else if path.to_string_lossy().ends_with(suffix) {
             out.push(path);
@@ -379,6 +432,35 @@ fn collect_files_into(dir: &Path, recursive: bool, suffix: &str, out: &mut Vec<P
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 本地遍历失败也必须报出来（评审 [P2]）—— `read_dir` / 目录项 / `file_type`
+    /// 的错误从前一律被当成「这里没有文件」，而 `local` 位置的 prune 据此删存量：
+    /// 一次权限拒绝或瞬时 FS 错误就能删掉某个 provider 的全部会话与 usage_facts。
+    ///
+    /// 用**一个真实的失败**驱动：把一个普通文件当目录传进去 —— `read_dir` 会报
+    /// `NotADirectory`（非 `NotFound`），正是「问了但没问成」那一档。
+    #[test]
+    fn a_local_walk_failure_is_reported_not_treated_as_empty() {
+        use super::collect_artifact_files_reported;
+
+        let base = std::env::temp_dir().join(format!("sv-walk-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let not_a_dir = base.join("plain.txt");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        let (files, failed) = collect_artifact_files_reported(&not_a_dir, "**/*.jsonl", true);
+        assert!(files.is_empty());
+        assert!(failed, "把文件当目录遍历是「没问成」，不是「这里是空的」");
+
+        // 反向：目录不存在就是**真的没有** —— 那不该被报成不可达，
+        // 否则每一个没装某个 CLI 的用户都会永久带着一个「不可达」位置、prune 全被禁掉。
+        let (files, failed) =
+            collect_artifact_files_reported(&base.join("no-such-dir"), "**/*.jsonl", true);
+        assert!(files.is_empty());
+        assert!(!failed, "NotFound 是事实，不是故障");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// 🔴 「问了、没有」与「没问成」在返回值上必须分得开。
     ///
