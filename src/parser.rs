@@ -9,12 +9,15 @@
 //! 与 QuotaBar 的有意差异：无时间戳的事件**不丢弃**，照发但 `time_confidence=low`
 //! （reconciliation §3 的设计意图）。Codex 累计 token 的 delta 数学与 QuotaBar 完全一致。
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
+use crate::attribution::{attribute, Attribution, RootRegistry};
 use crate::catalog::Profile;
 use crate::cursor::{CodexState, CodexUsage};
 use crate::pathnorm::{self, HostPlatform};
-use crate::project_root::{resolve_project_root, ProjectRoot};
+use crate::project_root::ProjectRoot;
 use crate::rawevent::{
     Actor, EventKey, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
     TokenUsage, EVENT_KEY_VERSION, SCHEMA_VERSION,
@@ -50,7 +53,7 @@ use crate::rawevent::{
 ///
 /// 判据就是本常量文档第一句：**从同一份字节里能提取出什么发生了变化** —— 加一个新
 /// 字段正是这种变化。
-pub const PARSER_REVISION: u32 = 3;
+pub const PARSER_REVISION: u32 = 4;
 
 /// 解析产物：本批事件 + 更新后的 Codex 状态 + 跳过计数 + 告警。
 #[derive(Debug, Clone, Default)]
@@ -74,6 +77,16 @@ pub struct ParseCtx {
     /// Linux cwd 打成 `wsl:<distro>:..` 而非泛 `wsl`。WSL 来源取自身发行版；本地来源
     /// 一般为 None（除非宿主只有一个用户发行版，见 `wsl::default_distro`）。
     pub default_distro: Option<String>,
+    /// 已知项目根的注册表 —— **归属的唯一输入**（ADR-050 步 3）。
+    ///
+    /// 🔴 **空注册表是合法输入，含义是「一个根都不知道」** ⇒ 每条路径归 `Unattributed`。
+    /// 它**不是**「退回旧的 `resolve_project_root`」：那条路会在发现失效时静默给出
+    /// 另一个答案（把 cwd 当根），而这一层的契约是「说不出来就说不出来」。
+    /// 所以本字段无 `Option`，也没有任何回退分支。
+    ///
+    /// 用 `Arc` 而不是引用：`ParseCtx` 每文件构造一次并在 `parse_lines` 里长期借出，
+    /// 加生命周期参数会污染整条调用链；克隆一个 `Arc` 是一次原子自增。
+    pub roots: Arc<RootRegistry>,
 }
 
 impl ParseCtx {
@@ -241,6 +254,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             cwd.as_deref(),
             ctx.host,
             ctx.default_distro.as_deref(),
+            &ctx.roots,
         );
 
         // 1) thinking（Claude `message.content[].type=thinking`）。
@@ -514,6 +528,7 @@ fn parse_codex(
             cwd.as_deref(),
             ctx.host,
             ctx.default_distro.as_deref(),
+            &ctx.roots,
         );
 
         // response_item：reasoning→thinking / message / tool_use / tool_result。
@@ -801,9 +816,14 @@ fn session_id_from_path(path: &str) -> String {
         .to_string()
 }
 
-/// 解析工程根（带按原始 cwd 缓存，避免逐行重复 find_upward 文件系统遍历）。
-/// 先把原始 cwd 过 [`pathnorm::normalize_cwd`] 归一到规范形，再上溯 marker——
-/// 这样产出的 `project_root` 是规范化路径，供 `workspace_location` 正确判定 local/wsl。
+/// 归属工程根（带按原始 cwd 缓存）。先把原始 cwd 过 [`pathnorm::normalize_cwd`]
+/// 归一到规范形，再交给 [`attribute`] 对着注册表做**纯字符串**最长匹配。
+///
+/// 🔴 **ADR-050 步 3：这里不再做 I/O。** 从前是 `project_root::resolve_project_root`
+/// —— 它用「我此刻能不能 stat 这个路径」决定「要不要回答归属问题」，stat 不了就把
+/// cwd 原样当答案交出去。实测后果：71.4% 的事件（`wsl_cwd`）从没做过项目根解析，
+/// 同一个项目被记成 11 个 `project_root`。现在**发现**（慢、可 I/O、允许失败）在别处
+/// 先跑完，这里只做归属（快、纯函数、必然有答案 —— 含「说不出来」那一种）。
 ///
 /// `default_distro` 由调用方注入（WSL 来源取其自身发行版，见 `scan`）：有值时裸 Linux
 /// cwd 在 Windows 宿主上被打成精确 `wsl:<distro>`，无值则回落泛 `wsl`；UNC 路径恒能精确还原。
@@ -812,6 +832,7 @@ fn resolve_cached(
     cwd: Option<&str>,
     host: HostPlatform,
     default_distro: Option<&str>,
+    roots: &RootRegistry,
 ) -> Option<ProjectRoot> {
     let cwd = cwd?;
     if let Some((c, pr)) = cache.as_ref() {
@@ -820,9 +841,27 @@ fn resolve_cached(
         }
     }
     let normalized = pathnorm::normalize_cwd(Some(cwd), host, default_distro);
-    let pr = resolve_project_root(normalized.as_deref(), host);
+    let pr = project_root_of(attribute(normalized.as_deref(), roots));
     *cache = Some((cwd.to_string(), pr.clone()));
     Some(pr)
+}
+
+/// [`Attribution`] → [`ProjectRoot`]（落库形态）。
+///
+/// 🔴 **`Unattributed` 必须在 `source` 上留下痕迹。** 它的 `path` 走
+/// [`Attribution::storage_path`]（总得往 `project_root` 列里写点什么，粗粒度查询要它），
+/// 但 `source` 记成 `unattributed` —— 否则「归到了一个根」与「没归到、拿原路径顶上」
+/// 在库里长得一模一样，而那正是本 ADR 要消灭的东西。
+fn project_root_of(a: Attribution) -> ProjectRoot {
+    let source = match &a {
+        Attribution::Root { source, .. } => source.as_str().to_string(),
+        Attribution::Unattributed { .. } => "unattributed".to_string(),
+        Attribution::NoPath => "missing_cwd".to_string(),
+    };
+    ProjectRoot {
+        path: a.storage_path().map(std::path::PathBuf::from),
+        source,
+    }
 }
 
 fn record_skip(out: &mut ParseOut, path: &str, idx: usize, e: &serde_json::Error) {
@@ -845,6 +884,7 @@ mod tests {
             profile,
             host: HostPlatform::current(),
             default_distro: None,
+            roots: Arc::new(RootRegistry::new()),
         }
     }
 
@@ -861,6 +901,7 @@ mod tests {
             profile: Profile::Metadata,
             host,
             default_distro: default_distro.map(str::to_string),
+            roots: Arc::new(RootRegistry::new()),
         }
     }
 
@@ -990,8 +1031,12 @@ mod tests {
 
     #[test]
     fn workspace_location_populated_from_cwd() {
-        // UNC cwd → 规范化 → project_root 标 wsl_cwd、workspace_location = wsl:<distro>。
-        // 这条断言锁住 cwd → normalize_cwd → resolve_project_root → workspace_location 全链路。
+        // UNC cwd → 规范化 → 归属 → workspace_location = wsl:<distro>。
+        // 这条断言锁住 cwd → normalize_cwd → attribute → workspace_location 全链路。
+        //
+        // 🔴 ADR-050 步 3 起 source 是 `unattributed` 而不是旧的 `wsl_cwd`：
+        // 后者的含义正是「我 stat 不了这个路径，所以拒绝回答、拿 cwd 顶上」，
+        // 而那个「拒绝」从前在库里与「归到了一个根」长得一模一样。
         let unc = serde_json::json!({
             "type": "user",
             "sessionId": "s",
@@ -1006,8 +1051,10 @@ mod tests {
             None,
         );
         let ev = &out.events[0];
-        assert_eq!(ev.project_root_source.as_deref(), Some("wsl_cwd"));
+        assert_eq!(ev.project_root_source.as_deref(), Some("unattributed"));
         assert_eq!(ev.workspace_location.as_deref(), Some("wsl:Ubuntu"));
+        // 归不到根**不丢路径** —— 粗粒度查询还要它。
+        assert_eq!(ev.project_root.as_deref(), Some("wsl:Ubuntu:/home/me/proj"));
 
         // /mnt/<drive> 是挂载的 Windows 盘 → local（不被误标 wsl）。
         let mnt = serde_json::json!({
@@ -1054,7 +1101,8 @@ mod tests {
         );
         assert_eq!(
             with.events[0].project_root_source.as_deref(),
-            Some("wsl_cwd")
+            Some("unattributed"),
+            "注册表为空 ⇒ 说不出来，而不是拿 cwd 冒充项目根"
         );
 
         // 无 default_distro：回落泛 wsl（仍不做错盘本地上溯，P2 修复仍生效）。
@@ -1067,8 +1115,49 @@ mod tests {
         assert_eq!(without.events[0].workspace_location.as_deref(), Some("wsl"));
         assert_eq!(
             without.events[0].project_root_source.as_deref(),
-            Some("wsl_cwd")
+            Some("unattributed")
         );
+    }
+
+    /// 🔴 上面两条都是「空注册表 ⇒ 说不出来」。这条是**另一半**：注册表里有根时
+    /// 必须真的归上去 —— 否则把 `attribute` 换成一个恒返回 `Unattributed` 的桩，
+    /// 那两条照样全绿，而整个步 3 等于没做。
+    #[test]
+    fn a_known_root_actually_attributes_and_collapses_subdirs() {
+        let mut reg = RootRegistry::new();
+        reg.insert(
+            "wsl:Ubuntu:/home/me/proj",
+            crate::attribution::RootSource::Git,
+        );
+        let roots = Arc::new(reg);
+
+        let mut seen = Vec::new();
+        for cwd in [
+            r"\\wsl$\Ubuntu\home\me\proj",
+            r"\\wsl$\Ubuntu\home\me\proj\docs",
+            r"\\wsl$\Ubuntu\home\me\proj\src\deep\er",
+        ] {
+            let line = serde_json::json!({
+                "type": "user",
+                "sessionId": "s",
+                "cwd": cwd,
+                "message": {"role": "user", "content": "hi"}
+            })
+            .to_string();
+            let mut c = ctx(SourceType::ClaudeCode, Profile::Full);
+            c.roots = roots.clone();
+            let out = parse_lines(&c, &[line.as_str()], 0, None);
+            let ev = &out.events[0];
+            assert_eq!(ev.project_root_source.as_deref(), Some("git"), "cwd={cwd}");
+            seen.push(ev.project_root.clone().unwrap_or_default());
+        }
+        // 三个子目录塌成**同一个** project_root —— 这正是 ADR 要治的
+        // 「同一个项目被记成 11 个 root」。
+        assert_eq!(
+            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            1
+        );
+        assert_eq!(seen[0], "wsl:Ubuntu:/home/me/proj");
     }
 
     #[test]

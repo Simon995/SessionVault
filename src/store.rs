@@ -1351,6 +1351,31 @@ impl TotalStore {
         );
     }
 
+    /// 库里出现过的所有 `project_root` 取值 —— **发现的候选清单**。
+    ///
+    /// 归属只认注册表，而注册表要有东西才认得出来；这些历史取值就是「人在哪些目录
+    /// 里工作过」的全部记录，是发现的天然起点。
+    ///
+    /// ⚠️ 它们**不是**项目根 —— 恰恰相反，其中大多是子目录（同一个项目被记成 11 个
+    /// `project_root` 正是本 ADR 的症状）。发现侧要对每一条上溯到真正的根。
+    ///
+    /// 🔴 **读不出来返回空，不报错**：发现是加法能力，它坏了该少发现几个根，
+    /// 不该让摄取停下（与 [`Self::register_project_root`] 同一条）。
+    pub fn distinct_project_roots(&self) -> Vec<String> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT project_root FROM raw_events              WHERE project_root IS NOT NULL AND project_root <> ''",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
+    }
+
     /// 读出整份注册表，供 [`attribution::attribute`] 使用。
     ///
     /// 🔴 **读不到就返回空注册表，不是报错。** 空注册表下每个路径都归到
@@ -2128,7 +2153,15 @@ impl TotalStore {
             }
             stats.sources += 1;
             let cursor = Self::snapshot_cursor(&latest, source);
-            let result = crate::scan::scan_source(source, Some(cursor), Profile::Full);
+            // 空注册表在这条路上是**惰性**的，不是降级：快照（Class-B）的
+            // `project_root` 由宿主直接填在 `SourceRef` 上，不从 cwd 归属而来 ——
+            // `scan_snapshot_file` 压根不碰 `roots`。给非空的反而会让人以为它参与了判定。
+            let result = crate::scan::scan_source(
+                source,
+                Some(cursor),
+                Profile::Full,
+                std::sync::Arc::new(crate::attribution::RootRegistry::new()),
+            );
             if result.status == ScanStatus::Error {
                 stats.failed += 1;
                 log::warn!(

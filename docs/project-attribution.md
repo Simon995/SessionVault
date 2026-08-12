@@ -2,7 +2,8 @@
 
 > 状态：**实现中**（2026-08-12）——
 > **步 1 已落地**（`attribution.rs` 归属纯函数 + `project_root_registry` 表，
-> 17 条测试 / 7 个变异精确变红）；**步 2 已完成**，步 3 待人确认，见下方「落地步骤」。
+> 17 条测试 / 7 个变异精确变红）；**步 2 已完成**；**步 3 代码已实现并在真库副本上跑通，
+> 但尚未在真库执行**（不可逆，等人确认），见下方「落地步骤」。
 > 跨仓：SessionVault（解析器 + 注册表）· QuotaBar（发现的一个来源）· TumeFlow（消费）
 > 前置：ADR-032 P1/P2（`identity.rs` + `project_identity` 表）已落地
 > 触发：`PARSER_REVISION` 3 → 4，全库重投影（ADR-044 决定 6 的第③触发条件）
@@ -372,7 +373,7 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 | --- | --- | --- |
 | 1 | `attribution.rs`（归属纯函数 + `RootRegistry`）+ `project_root_registry` 表与读写 API | ✅ 2026-08-12 |
 | 2 | 发现的多个来源接上（本地 `.git`/marker、**WSL 访问桥**、`/mnt/<drive>` 换算），写进注册表 | ✅ 2026-08-12 |
-| 3 | `PARSER_REVISION` 3→4，`parser.rs` 改用 `attribute()`；全库重投影 | ⬜ **不可逆，动手前人确认** |
+| 3 | `PARSER_REVISION` 3→4，`parser.rs` 改用 `attribute()`；全库重投影 | 🟡 代码已实现 + 副本实测；**真库未执行，等人确认** |
 
 ### 步 2 实现记录（2026-08-12）
 
@@ -524,6 +525,73 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 小幅出入，我据此「解释」成更具体的根抢走了子路径 —— 而真实原因主要是**总库是活的**
 （两轮之间 992,802 → 993,038，本会话自己的事件在写入）。跨轮比各根数字本就不成立；
 守恒是**轮内**不变量，只有它能把「挪」和「丢」分开。
+
+### 步 3 实现记录（2026-08-12，代码已实现，真库未执行）
+
+**改了什么**
+
+| 位置 | 改动 |
+| --- | --- |
+| `parser.rs::resolve_cached` | `resolve_project_root`（会 I/O、失败就拿 cwd 顶上）→ `attribute()`（纯函数、对着注册表最长匹配） |
+| `parser.rs::ParseCtx` | 新增 `roots: Arc<RootRegistry>`，**无 `Option`、无回退分支** —— 空注册表就是「一个根都不知道」 |
+| `parser.rs::project_root_of` | `Attribution` → `ProjectRoot`：`Unattributed` 的 `source` 记成 `unattributed`，`path` 走 `storage_path()` |
+| `PARSER_REVISION` | 3 → 4（决定 6） |
+| `lib.rs` | `host_drive_mounts()` + `project_root_registry(store, mounts)` —— **两个 client 的唯一入口** |
+| `store.rs` | `distinct_project_roots()`（发现的候选清单） |
+| QuotaBar `session_index.rs` | `discover_project_roots()`：扫描**之前**先发现，只探还归不上的候选 |
+
+🔴 **`project_root_source` 上必须留下痕迹。** `Unattributed` 的 `path` 仍是那条路径（粗粒度
+查询要它），但 `source` 记 `unattributed` —— 否则「归到了一个根」与「没归到、拿原路径顶上」
+在库里长得**一模一样**，而那正是本 ADR 要消灭的东西（旧的 `cwd` / `wsl_cwd` 就是这样）。
+
+🔴 **发现只探还归不上的候选。** 第一轮要探全库历史取值（111 条 / 12.5s，WSL 那些每条一次
+`wsl.exe` 往返）；之后绝大多数已被某个根覆盖 ⇒ 候选集塌到近乎空 ⇒ 代价回到零。
+没有这条过滤，**每次刷新都要付一次 12 秒**。
+
+**变异验证**（三条各自精确变红）：`attribute` 换成恒 `Unattributed` 的桩 /
+归不到根却谎称 `cwd` / `Unattributed` 丢掉路径。第一条是关键 —— 没有它，
+「空注册表 ⇒ 说不出来」那两条测试在整个步 3 被架空的情况下照样全绿。
+
+#### 🔴 真库副本实测：干跑的 83% 是乐观数字
+
+`examples/reprojection_timing.rs`（在 QuotaBar 仓）在两个库的一致快照上跑完整步 3，
+真库全程只读：
+
+```
+重投影   227.5s · 646 个文件 · 总库 3146 → 3349 MB（+202 MB，上界）
+当代（查询实际看到的那一代）
+  project_root  111 → 94 个（−15%）
+  改了归属       7,605 条事件
+  归到已知根 87.6% · 说不出来 12.4%
+```
+
+迁移正是本 ADR 承诺的三类：
+
+```
+8692  …\QuotaBar\src-tauri          →  …\QuotaBar     ← 原 P3 的收益
+2524  /mnt/c/…/QuotaBar             →  C:\…\QuotaBar  ← 决定 7 的 /mnt 收敛
+ 952  wsl:…/<proj>/experimental_…  →  wsl:…/<proj>   ┐
+ 532  wsl:…/<proj>/docs             →  wsl:…/<proj>   ├ 「同一个项目被记成 11 个」
+共 20 个旧取值 → 4 个新取值                            ┘
+```
+
+**为什么不是干跑说的 111 → 19**：干跑对每个 `project_root` **取值**算归属，而实际重投影
+只能覆盖**源文件还在磁盘上**的那些 —— 总库 881 个会话文件现存 **646**，另外 235 个的事件
+占 **55%**，没有字节就无法重解析，`project_root` 永远停在旧值。而且被重投影的 40.7 万条里
+**98% 本来就归对了**（人多数时间就在仓库根目录工作）。
+
+> **一般化：一个「如果全部重算会怎样」的干跑，回答不了「实际能重算多少」。**
+> 两者的差是**不可重算的存量**，而它在干跑里完全不可见。凡是要按干跑结果做不可逆决定的，
+> 都要先问一句「这些输入里有多少是这次动不了的」。
+
+⚠️ 历史那 55% 不必靠重投影补：`attribute` 是纯函数，**查询时**重新归属算得起。
+那是另一件事，不在步 3 里。
+
+⚠️ **两次量错才拿到上面的数**（都记在探针注释里）：① 第一版数了**全部代**，
+其中含从未重投影的旧地层，于是把「55% 不可重投影」读成「归属没生效」；
+② 逐行比对的 join 漏了 UNIQUE 索引第 4 列 `source_session_id`，索引只用得上前 3 列前缀、
+`seq` 退化成扫描，还拆成四条查询各跑一遍 —— 十分钟没跑完。现改为**一份对照副本 +
+单条全前缀查询**（42.9s）。
 
 ### 步 1 实现记录（2026-08-12）
 

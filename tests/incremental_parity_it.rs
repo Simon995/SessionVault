@@ -87,6 +87,7 @@ fn incremental_parse_equals_whole_on_real_local_data() {
             profile: Profile::Full,
             host: HostPlatform::current(),
             default_distro: None,
+            roots: std::sync::Arc::new(session_vault::attribution::RootRegistry::new()),
         };
 
         let whole = parse_lines(&ctx, &lines, 0, None);

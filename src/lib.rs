@@ -90,7 +90,55 @@ pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRe
     discover::discover_project_snapshots(roots)
 }
 
+/// 本机 WSL 里 Windows 盘的挂载表 —— **发现与归属共用的一项运行期事实**。
+///
+/// best-effort：没 WSL / `wsl.exe` 卡住 ⇒ 空表 ⇒ `/mnt/…` 那族不与宿主形式收敛，
+/// **不是**退回按盘符猜（那会把事件归到别的项目名下）。
+pub fn host_drive_mounts() -> pathnorm::DriveMounts {
+    wsl::list_distros()
+        .ok()
+        .and_then(|d| wsl::default_distro(&d))
+        .and_then(|d| match wsl::drive_mounts(&d) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log::debug!(
+                    target: logging::tag::SCAN,
+                    "drive mounts unavailable: {e} — /mnt paths will not converge with their host form"
+                );
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// 读出项目根注册表 —— **归属的唯一输入**（ADR-050）。
+///
+/// 🔴 **收口在这里，因为它有两个客户端**（QuotaBar 的 session index、`svault scan-all`），
+/// 而「注册表 = 表里的行 + 本机挂载表」这条规则若各写一遍，两边会对「哪些路径算同一个
+/// 根」给出不同答案 —— 而 `project_root` 本该是事件的客观属性，不是「取决于谁跑」。
+/// 本仓已有判例：会话枚举曾有两条路径，对「有哪些文件」给出 201 vs 23 两个答案。
+///
+/// `mounts` 显式传入（而不是在函数里读）：发现侧也要用同一份表，读两次会拿到两份
+/// 运行期事实，而它们**可以不同**（中途 `wsl --shutdown`）。
+#[cfg(feature = "store")]
+pub fn project_root_registry(
+    store: &TotalStore,
+    mounts: &pathnorm::DriveMounts,
+) -> attribution::RootRegistry {
+    store.project_root_registry(mounts)
+}
+
 /// §9 `scan()`：单来源增量扫描（按 source_mode 分派）。
-pub fn scan(source: &SourceRef, cursor_in: Option<Cursor>, profile: Profile) -> ScanResult {
-    scan::scan_source(source, cursor_in, profile)
+///
+/// `roots` 是已知项目根的注册表 —— 归属的**唯一**输入（ADR-050 步 3）。
+/// 🔴 **空注册表合法**，含义是「一个根都不知道」⇒ 每条路径归 `Unattributed`。
+/// 它不是「退回旧的 cwd 兜底」：调用方**必须**显式决定给什么，而给不出来时
+/// 得到的是「说不出来」，不是另一个答案。
+pub fn scan(
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    profile: Profile,
+    roots: std::sync::Arc<crate::attribution::RootRegistry>,
+) -> ScanResult {
+    scan::scan_source(source, cursor_in, profile, roots)
 }
