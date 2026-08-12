@@ -178,8 +178,21 @@ fn discover_by_mode(local_only: bool, wanted: SourceMode) -> Result<DiscoveryOut
                 continue;
             }
             let dir = root.join(&art.subdir);
-            if !dir.is_dir() {
-                continue;
+            // 🔴 `is_dir()` 把**所有**错误折叠成 false（评审 [P2]）—— 权限拒绝、
+            // 元数据读失败，全都长得像「这个目录不存在」。而下面那个错误感知的遍历
+            // 压根走不到，于是 `local` 不会进 `unreachable`，prune 照样删存量。
+            // 判据必须显式区分 `NotFound`（事实）与其余（没问成）。
+            match std::fs::metadata(&dir) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => continue, // 存在但不是目录 —— 那是事实，不是故障
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    log::warn!(target: tag::DISCOVER, "stat failed: {} err={e}", dir.display());
+                    if !unreachable.contains(&LOCAL_LOCATION.to_string()) {
+                        unreachable.push(LOCAL_LOCATION.to_string());
+                    }
+                    continue;
+                }
             }
             let (files, walk_failed) =
                 collect_artifact_files_reported(&dir, &art.glob, art.recursive);
