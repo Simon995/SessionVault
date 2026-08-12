@@ -169,6 +169,8 @@ pub fn probe_wsl(distro: &str, linux_path: &str, canonical_form: bool) -> Probe 
     }
 }
 
+pub use crate::pathnorm::{mnt_to_windows, DriveMounts};
+
 /// 对一批候选路径做发现，按路径形式自动分派探测器。
 ///
 /// 候选通常就是**总库里已有的 `project_root` 值** —— 那些是人真的工作过的目录，
@@ -176,7 +178,11 @@ pub fn probe_wsl(distro: &str, linux_path: &str, canonical_form: bool) -> Probe 
 ///
 /// `default_distro` 是访问桥注入的运行期事实（Windows 上「唯一用户发行版」时才有值）；
 /// 缺席时 WSL 形式的路径**探测不了**，计入 `failed` 而不是当作「没有根」。
-pub fn discover<I, S>(candidates: I, default_distro: Option<&str>) -> DiscoveryReport
+pub fn discover<I, S>(
+    candidates: I,
+    default_distro: Option<&str>,
+    mounts: &DriveMounts,
+) -> DiscoveryReport
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -188,7 +194,7 @@ where
         if path.is_empty() || !seen.insert(path.to_string()) {
             continue;
         }
-        report.record(probe_path(path, default_distro));
+        report.record(probe_path(path, default_distro, mounts));
     }
     report
 }
@@ -203,7 +209,7 @@ where
 /// 归属是纯字符串匹配，**登记什么形式就只认什么形式**；无条件转规范形会让裸形式
 /// 的路径全部归不到根（干跑实测：一条 `/home/simon/workspace/EyeVLM` 就是 106,814
 /// 条事件）。
-pub fn probe_path(path: &str, default_distro: Option<&str>) -> Probe {
+pub fn probe_path(path: &str, default_distro: Option<&str>, mounts: &DriveMounts) -> Probe {
     if let Some((distro, linux)) = pathnorm::split_canonical_wsl(path) {
         return probe_wsl(distro, linux, true);
     }
@@ -224,7 +230,45 @@ pub fn probe_path(path: &str, default_distro: Option<&str>) -> Probe {
             },
         };
     }
+    // 🔴 `/mnt/<drive>/…`：WSL 里访问 Windows 盘。**本机能 stat 它对应的盘符路径**，
+    // 所以换算过去探测，比走访问桥便宜得多（零 `wsl.exe` 调用）。
+    //
+    // ⚠️ 换算必须靠**实测的挂载表**（`wsl::drive_mounts` 读 `mount`），不能按
+    // 「`/mnt/<单字母>` 就是盘符」猜 —— 那在 `automount.root` 被改过、配置改了没
+    // 重启、以及 `/mnt/data` 这类普通 Linux 挂载三种情况下都是错的，而猜错的后果
+    // 是把事件归到**别的项目**（甚至不存在的盘）名下。
+    //
+    // 表为空（没读到 / 没 WSL）⇒ 落到 `probe_local`，那里 `Path::new("/mnt/d/…")`
+    // 在 Windows 上是当前盘根的相对路径、必然探不到 ⇒ 报 `None`（说不出来）。
+    if cfg!(windows) && pathnorm::is_windows_drive_mount(path) {
+        if let Some(p) = probe_mnt_with(path, mounts, probe_local) {
+            return p;
+        }
+    }
     probe_local(path)
+}
+
+/// `/mnt/…` 分支的可测形态 —— **探测器显式注入**。
+///
+/// `None` = 「这条路径不在实测挂载表里」，由调用者落回 [`probe_local`]。
+///
+/// 🔴 **探到的根按宿主形式（`D:\…`）返回，不转回 `/mnt/…`。** `/mnt/c/X` 与
+/// `C:\X` 在本机是同一个目录、同一个项目，收敛由注册表的比较键负责
+/// （[`crate::attribution::RootRegistry::with_mounts`]）—— 发现侧转回去只会让
+/// `/mnt` 那一族自成一个根，干跑实测过：`/mnt/c/…/QuotaBar` 与 `C:\…\QuotaBar`
+/// 分成两条，且前者在 Windows 上 stat 不到 `.git/config`，`canonical_repo_id`
+/// 只能落 `path:` id，身份层跟着分家。
+///
+/// 拆出来（而不是内联在 `probe_path` 里）的理由和 [`probe_local_with_home`] 一样：
+/// **探测器注入了才测得到调用点**。变异验证当场证明它是必要的 —— 改坏这里的接线，
+/// 直接调两个映射函数的那几条测试一条都不红。
+fn probe_mnt_with(
+    path: &str,
+    mounts: &DriveMounts,
+    probe: impl Fn(&str) -> Probe,
+) -> Option<Probe> {
+    let win = mnt_to_windows(path, mounts)?;
+    Some(probe(&win))
 }
 
 #[cfg(test)]
@@ -306,7 +350,7 @@ mod tests {
         if !cfg!(windows) {
             return; // 非 Windows 上裸 Linux 路径是本机路径，走 probe_local
         }
-        match probe_path("/home/simon/workspace/EyeVLM/docs", None) {
+        match probe_path("/home/u/workspace/proj/docs", None, &Vec::new()) {
             Probe::Failed { reason } => assert!(reason.contains("no known distro")),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -362,6 +406,110 @@ mod tests {
         assert!(pathnorm::is_bare_linux_path("/home/u/P"));
     }
 
+    // ── /mnt/… 那一族：挂载表驱动的映射 ──────────────────────────────
+    fn mounts() -> DriveMounts {
+        vec![
+            ("/mnt/c".to_string(), r"C:\".to_string()),
+            ("/mnt/d".to_string(), r"D:\".to_string()),
+        ]
+    }
+
+    #[test]
+    fn mnt_maps_to_windows_using_the_measured_table() {
+        let m = mounts();
+        assert_eq!(
+            mnt_to_windows("/mnt/d/work/code/proj", &m).as_deref(),
+            Some(r"D:\work\code\proj")
+        );
+        assert_eq!(mnt_to_windows("/mnt/c", &m).as_deref(), Some(r"C:\"));
+    }
+
+    #[test]
+    fn an_unmapped_mount_point_is_none_not_a_guess() {
+        // 🔴 `/mnt/data` 可以是普通 Linux 挂载 —— 按「单字母就是盘符」猜会把它
+        // 当成某个盘，而猜错的后果是把事件归到**别的项目**名下。
+        let m = mounts();
+        assert_eq!(mnt_to_windows("/mnt/data/stuff", &m), None);
+        assert_eq!(
+            mnt_to_windows("/mnt/e/x", &m),
+            None,
+            "表里没有 e 盘就不该编一个"
+        );
+    }
+
+    #[test]
+    fn an_empty_mount_table_maps_nothing() {
+        // 读不到 mount ⇒ 不映射，而不是退回猜。
+        assert_eq!(mnt_to_windows("/mnt/d/proj", &Vec::new()), None);
+    }
+
+    #[test]
+    fn the_mnt_branch_probes_the_host_form_and_keeps_it() {
+        // 🔴 这条打的是**调用点**，不是映射函数本身：探测器必须收到 Windows 形式，
+        // 而探到的根**原样返回**（不转回 `/mnt`）—— 收敛由注册表的比较键做，
+        // 见 `RootRegistry::with_mounts`。断言纯函数各自对，证明不了接线对。
+        let m = mounts();
+        let probed = std::cell::RefCell::new(String::new());
+        let got = probe_mnt_with("/mnt/d/work/code/proj/sub", &m, |p| {
+            *probed.borrow_mut() = p.to_string();
+            Probe::Found {
+                root: r"D:\work\code\proj".to_string(),
+                source: RootSource::Git,
+            }
+        });
+        assert_eq!(
+            probed.borrow().as_str(),
+            r"D:\work\code\proj\sub",
+            "探测器该收到 Windows 形式"
+        );
+        match got {
+            Some(Probe::Found { root, source }) => {
+                assert_eq!(root, r"D:\work\code\proj", "根按宿主形式登记");
+                assert_eq!(source, RootSource::Git);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_mnt_branch_passes_through_none_and_failed() {
+        // 「没有根」和「探不动」都要原样穿过去 —— 不能被转换环节改写成别的答案。
+        let m = mounts();
+        assert!(matches!(
+            probe_mnt_with("/mnt/d/x", &m, |_| Probe::None),
+            Some(Probe::None)
+        ));
+        assert!(matches!(
+            probe_mnt_with("/mnt/d/x", &m, |_| Probe::Failed {
+                reason: "boom".into()
+            }),
+            Some(Probe::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unmapped_mount_falls_through_instead_of_probing() {
+        // 表里没有 ⇒ `None`（交回调用者），**不是**拿原路径去探。
+        let called = std::cell::Cell::new(false);
+        let got = probe_mnt_with("/mnt/data/x", &mounts(), |_| {
+            called.set(true);
+            Probe::None
+        });
+        assert!(got.is_none());
+        assert!(!called.get(), "映射不出来时不该调探测器");
+    }
+
+    #[test]
+    fn is_windows_drive_device_accepts_only_drive_roots() {
+        use crate::wsl::is_windows_drive_device;
+        assert!(is_windows_drive_device(r"C:\"));
+        assert!(is_windows_drive_device("D:/"));
+        assert!(is_windows_drive_device("E:"));
+        assert!(!is_windows_drive_device("/dev/sda1"));
+        assert!(!is_windows_drive_device("tmpfs"));
+        assert!(!is_windows_drive_device(r"C:\Users"));
+    }
+
     #[test]
     fn report_dedupes_roots_and_counts_the_rest() {
         let mut r = DiscoveryReport::default();
@@ -393,7 +541,7 @@ mod tests {
         std::fs::create_dir_all(tmp.join("r").join("s")).unwrap();
         std::fs::create_dir_all(tmp.join("r").join(".git")).unwrap();
         let p = tmp.join("r").join("s").to_string_lossy().into_owned();
-        let rep = discover([p.clone(), p.clone(), p], None);
+        let rep = discover([p.clone(), p.clone(), p], None, &Vec::new());
         assert_eq!(rep.roots.len(), 1);
         std::fs::remove_dir_all(&tmp).ok();
     }

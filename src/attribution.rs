@@ -38,6 +38,8 @@
 
 use std::borrow::Cow;
 
+use crate::pathnorm::{mnt_to_windows, DriveMounts};
+
 /// 一个已知项目根是**怎么发现的**。写进注册表供排查，不参与归属判定。
 ///
 /// 归属只关心「这是个根」，不关心它怎么来的 —— 但排查时「为什么这个目录被当成
@@ -133,11 +135,38 @@ impl Attribution {
 pub struct RootRegistry {
     /// `(归一化路径, 原始路径, 来源)`，按归一化路径排序，便于最长前缀匹配。
     roots: Vec<(String, String, RootSource)>,
+    /// WSL 挂载表 —— 让 `/mnt/c/X` 与 `C:\X` 认成同一个根。空表 = 不收敛。
+    ///
+    /// 🔴 **住在注册表里，而不是当参数传给 `attribute`**：写入键与查询键必须由
+    /// **同一份**表算出来，否则一个已登记的根会查不到，而那**不报错** ——
+    /// 只表现成「归属突然失效」。放进结构体，两侧就没有拿不同表的机会。
+    mounts: DriveMounts,
 }
 
 impl RootRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 带挂载表的注册表 —— `/mnt/<drive>/…` 与它对应的 `<drive>:\…` 收敛成一个根。
+    ///
+    /// 🔴 为什么收敛在**这一层**：`/mnt/c/X` 与 `C:\X` 在本机是同一个目录，
+    /// 不是两个项目。曾经的做法是在发现侧把探到的 Windows 根转回 `/mnt` 形式，
+    /// 那让 `/mnt` 那一族**自成一个根** —— 干跑实测 `/mnt/c/…/QuotaBar` 与
+    /// `C:\…\QuotaBar` 是两条，且前者 `canonical_repo_id` 读不到 `.git/config`
+    /// （Windows 上 stat 不了 `/mnt/…`），只能落 `path:` id，于是身份层也分家。
+    /// 根因是**注册表按比较键判覆盖，而同一目录在本机有多种形式** ——
+    /// 所以形式收敛属于比较规则，不是某个发现分支的补丁。
+    pub fn with_mounts(mounts: DriveMounts) -> Self {
+        Self {
+            mounts,
+            ..Self::default()
+        }
+    }
+
+    /// 本注册表的比较键 —— **归一化规则的唯一出口**（见 [`registry_key`]）。
+    pub fn key(&self, path: &str) -> String {
+        registry_key(path, &self.mounts)
     }
 
     /// 从 `(路径, 来源)` 构建。重复路径按**后来者覆盖**，与注册表写入语义一致。
@@ -161,7 +190,7 @@ impl RootRegistry {
         if path.is_empty() {
             return;
         }
-        let key = normalize(path).into_owned();
+        let key = self.key(path);
         match self
             .roots
             .binary_search_by(|(k, _, _)| k.as_str().cmp(key.as_str()))
@@ -200,7 +229,7 @@ pub fn attribute(path: Option<&str>, registry: &RootRegistry) -> Attribution {
     let Some(raw) = path.map(str::trim).filter(|p| !p.is_empty()) else {
         return Attribution::NoPath;
     };
-    let key = normalize(raw);
+    let key = registry.key(raw);
     // 从最长往回找：注册表按归一化路径排序，比 key 大的不可能是它的前缀。
     let key_ref: &str = &key;
     let upper = registry
@@ -225,8 +254,16 @@ pub fn attribute(path: Option<&str>, registry: &RootRegistry) -> Attribution {
 /// 两份归一化规则各自演化时，写进去的键和查出来的键会对不上，而那**不会报错** ——
 /// 只会让一个已登记的根查不到，表现成「归属突然失效」。本仓已有判例：
 /// 规范形拼串曾散在多处，收口到 `pathnorm::canonical_wsl_unc` 一处。
-pub fn registry_key(path: &str) -> String {
-    normalize(path.trim()).into_owned()
+///
+/// `mounts` 非空时先把 `/mnt/<drive>/…` 换算成宿主形式 —— **同一个目录只能有
+/// 一个键**。读写两侧必须传同一份表，所以正常路径都经 [`RootRegistry::key`]，
+/// 它持有那份表；本函数直接调用只用于存储层算行键。
+pub fn registry_key(path: &str, mounts: &DriveMounts) -> String {
+    let p = path.trim();
+    match mnt_to_windows(p, mounts) {
+        Some(host) => normalize(&host).into_owned(),
+        None => normalize(p).into_owned(),
+    }
 }
 
 /// `root` 是否覆盖 `path`（相等，或 `path` 在它之下）。**按路径段比，不按字符**。

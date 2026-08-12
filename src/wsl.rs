@@ -179,6 +179,84 @@ pub fn list_files_under_home(
 /// `$HOME` 本身**：把 home 当项目根，会让它名下每个散落目录都归到同一个「项目」。
 ///
 /// `-e` 而不是 `-d`：子模块的 `.git` 是**文件**（`gitdir: …`），不是目录。
+/// 发行版里 **Windows 盘的实际挂载表**：`(Linux 挂载点, Windows 路径)`。
+///
+/// 例：`[("/mnt/c", "C:\\"), ("/mnt/d", "D:\\")]`
+///
+/// ## 🔴 读 `mount`，不读 `wsl.conf`
+///
+/// 想把 `/mnt/d/proj` 换算成 `D:\proj`，需要知道「挂载点 ↔ 盘」的对应。
+/// 一个自然的做法是读 `/etc/wsl.conf` 的 `[automount] root`，**而那有三个漏洞**：
+///
+/// 1. **配置可以不存在** —— 实测本机 `wsl.conf` 只有 `[boot] systemd=true`，
+///    没有 `[automount]` 段。那时得靠「默认是 `/mnt/`」这个知识去推，而默认值
+///    不是保证；
+/// 2. **意图 ≠ 生效** —— 改了 `wsl.conf` 不 `wsl --shutdown` 就不生效，
+///    于是配置说的和实际挂的不是一回事；
+/// 3. **并非所有 `/mnt/x` 都是 Windows 盘** —— `/mnt/data` 可以是普通 Linux 挂载，
+///    按盘符猜会把它误当成 `D:\`（而那个盘可能根本不存在）。
+///
+/// `mount` 是**运行期事实**，三个漏洞一起没有：
+///
+/// ```text
+/// C:\ on /mnt/c type 9p (rw,noatime,aname=drvfs;path=C:\;uid=1000;…)
+/// ```
+///
+/// 判据用 **device 形如 `<盘符>:\`**：那是 drvfs 挂载最稳的标记，且天然排除了
+/// 非 Windows 挂载。`aname=drvfs` 也能用，但 WSL1/WSL2 的 fstype 不同
+/// （`drvfs` vs `9p`），device 那一列两代一致。
+///
+/// 失败 ⇒ `Err`。调用方据此**不做映射**（那些路径照旧「说不出来」），
+/// 而不是退回「猜 `/mnt/<字母>` 就是盘」。
+#[cfg(windows)]
+pub fn drive_mounts(distro: &str) -> Result<Vec<(String, String)>, String> {
+    let out = run_bash_stdin(distro, "set -eu\nmount\n")?;
+    if out.status.code() != Some(0) {
+        return Err(format!(
+            "wsl mount {distro} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut mounts = Vec::new();
+    for line in text.lines() {
+        // `<device> on <mountpoint> type <fstype> (<options>)`
+        let Some((device, rest)) = line.split_once(" on ") else {
+            continue;
+        };
+        let Some((mountpoint, _)) = rest.split_once(" type ") else {
+            continue;
+        };
+        let device = device.trim();
+        let mountpoint = mountpoint.trim();
+        if !is_windows_drive_device(device) || mountpoint.is_empty() {
+            continue;
+        }
+        mounts.push((mountpoint.to_string(), device.to_string()));
+    }
+    // 最长挂载点优先 —— `/mnt/c/sub` 若也是个挂载点，它比 `/mnt/c` 更精确。
+    mounts.sort_by_key(|m| std::cmp::Reverse(m.0.len()));
+    Ok(mounts)
+}
+
+#[cfg(not(windows))]
+pub fn drive_mounts(_distro: &str) -> Result<Vec<(String, String)>, String> {
+    Err("wsl.exe access is only available on Windows builds".to_string())
+}
+
+/// device 是不是 Windows 盘根（`C:\` / `D:\` / 少数场景下无尾斜杠的 `C:`）。
+///
+/// 纯函数，好让上面那个解析在没有 WSL 的机器上也能测。
+pub fn is_windows_drive_device(device: &str) -> bool {
+    let b = device.as_bytes();
+    match b.len() {
+        2 => b[0].is_ascii_alphabetic() && b[1] == b':',
+        3 => b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'),
+        _ => false,
+    }
+}
+
 #[cfg(windows)]
 pub fn find_project_root(distro: &str, abs_path: &str) -> Result<Option<(String, String)>, String> {
     let esc = shell_escape(abs_path);

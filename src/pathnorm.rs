@@ -98,6 +98,47 @@ pub fn is_windows_drive_mount(path: &str) -> bool {
     bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1).map_or(true, |b| *b == b'/')
 }
 
+/// WSL 里 Windows 盘的挂载表 —— **发现的一项运行期事实**（`(挂载点, Windows 路径)`）。
+///
+/// 由 [`crate::wsl::drive_mounts`] 读 `mount` 得到，见那里的「为什么不读 `wsl.conf`」。
+/// 空表 = 不做 `/mnt/…` 映射（那些路径照旧「说不出来」），**不是**退回按盘符猜。
+pub type DriveMounts = Vec<(String, String)>;
+
+/// 把 WSL 里的 `/mnt/<x>/…` 换算成 Windows 路径。**纯函数**，挂载表由外面给。
+///
+/// 🔴 **表为空或没匹配 ⇒ `None`，不猜。** 「`/mnt/<单字母>` 就是盘符」这个猜法
+/// 在三种情况下是错的：`automount.root` 被改过、配置改了没重启、以及
+/// `/mnt/data` 这类普通 Linux 挂载。而猜错的后果不是「少归一个」——
+/// 是把事件归到一个**别的项目**（甚至一个不存在的盘）名下。
+///
+/// 住在 `pathnorm` 而不是 `discovery`，是因为它有**两个**用户：发现侧要拿它挑
+/// 「本机 stat 哪条路径」，归属侧要拿它把 `/mnt/c/X` 与 `C:\X` 认成同一个根。
+/// 谁先要它就放在谁那儿，另一个就得反向依赖 —— 本仓已有判例（`TRANSIENT_ERR`
+/// 曾住在某一个 provider 里，于是四个 provider 里三个漏掉了它）。
+pub fn mnt_to_windows(path: &str, mounts: &DriveMounts) -> Option<String> {
+    let p = path.replace('\\', "/");
+    for (mount_point, win_root) in mounts {
+        let mp = mount_point.trim_end_matches('/');
+        if mp.is_empty() {
+            continue;
+        }
+        let rest = if p == mp {
+            ""
+        } else if let Some(r) = p.strip_prefix(&format!("{mp}/")) {
+            r
+        } else {
+            continue;
+        };
+        let root = win_root.trim_end_matches(['\\', '/']);
+        return Some(if rest.is_empty() {
+            format!("{root}\\")
+        } else {
+            format!("{root}\\{}", rest.replace('/', "\\"))
+        });
+    }
+    None
+}
+
 /// 裸 Linux 绝对路径（`/home`、`/root`…），且不是挂载的 Windows 盘。
 ///
 /// 「归属」由 [`HostPlatform`] 决定，本函数只判「形状」，不判归属。

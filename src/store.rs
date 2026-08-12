@@ -1333,7 +1333,12 @@ impl TotalStore {
         if path.is_empty() {
             return;
         }
-        let key = crate::attribution::registry_key(path);
+        // 🔴 **不做 `/mnt/…` 收敛**（传空表）：这个键只用于本表去重，
+        // **归属不读它** —— `project_root_registry()` 是拿 `root_path` 重算键的，
+        // 用的是那份带挂载表的注册表。所以即便有人登记了一条 `/mnt/…` 形式的根，
+        // 它顶多在本表多占一行，归属结果照样与宿主形式那条收敛到一起。
+        // 这不是靠推理保证的，见 `a_mnt_root_still_attributes_after_a_round_trip`。
+        let key = crate::attribution::registry_key(path, &Vec::new());
         let now = now_unix_millis();
         let Ok(conn) = self.conn.lock() else { return };
         let _ = conn.execute(
@@ -1350,8 +1355,15 @@ impl TotalStore {
     ///
     /// 🔴 **读不到就返回空注册表，不是报错。** 空注册表下每个路径都归到
     /// `Unattributed` —— 一致地说不出来，而不是退回「用 cwd 当根」那个老答案。
-    pub fn project_root_registry(&self) -> crate::attribution::RootRegistry {
-        let mut reg = crate::attribution::RootRegistry::new();
+    ///
+    /// `mounts` 是 WSL 里 Windows 盘的挂载表（[`crate::wsl::drive_mounts`]）——
+    /// 给了就让 `/mnt/c/X` 与 `C:\X` 归到同一个根，空表就不收敛。**每条根的比较键
+    /// 在这里由 `root_path` 重算**，所以本表里存的那个 `root_key` 不参与归属。
+    pub fn project_root_registry(
+        &self,
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> crate::attribution::RootRegistry {
+        let mut reg = crate::attribution::RootRegistry::with_mounts(mounts.clone());
         let Ok(conn) = self.conn.lock() else {
             return reg;
         };
@@ -4995,11 +5007,51 @@ mod project_identity_tests {
     use crate::attribution::{attribute, RootSource};
 
     #[test]
+    fn a_mnt_root_still_attributes_after_a_round_trip() {
+        // 🔴 这条钉的是一个**架构断言的后果**，不是断言本身。
+        // `register_project_root` 算行键时不做 `/mnt` 收敛（传空表），理由是
+        // 「归属不读那个键 —— 它由 `root_path` 在读出时重算」。那句话是对周边结构的
+        // 断言，而结构一变它不会报错（本仓判例：安全性注释会悄悄失效）。
+        // 所以不靠它，直接钉后果：一条 `/mnt` 形式的根落库、读回来，仍与宿主形式收敛。
+        let st = TotalStore::open_in_memory().unwrap();
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+
+        st.register_project_root("/mnt/c/w/QuotaBar", RootSource::Git);
+        let reg = st.project_root_registry(&mounts);
+
+        // 两种形式的路径都归到同一个根。
+        assert_eq!(
+            attribute(Some(r"C:\w\QuotaBar\src"), &reg).root(),
+            Some("/mnt/c/w/QuotaBar"),
+            "宿主形式的路径要认出这个根"
+        );
+        assert_eq!(
+            attribute(Some("/mnt/c/w/QuotaBar/src"), &reg).root(),
+            Some("/mnt/c/w/QuotaBar")
+        );
+        // 且它们是**同一个**根，不是两条。
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn without_a_mount_table_the_two_forms_stay_apart() {
+        // 收敛不能凭空发生：没读到挂载表就不该猜 `/mnt/c` 是哪个盘。
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/mnt/c/w/QuotaBar", RootSource::Git);
+        let reg = st.project_root_registry(&Vec::new());
+        assert_eq!(
+            attribute(Some(r"C:\w\QuotaBar\src"), &reg).root(),
+            None,
+            r"空表下不该把 C:\ 认成 /mnt/c"
+        );
+    }
+
+    #[test]
     fn registry_round_trips_through_the_store() {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("/w/QuotaBar", RootSource::Git);
         st.register_project_root("/w/QuotaBar/third_party/TumeFlow", RootSource::Git);
-        let reg = st.project_root_registry();
+        let reg = st.project_root_registry(&Vec::new());
         assert_eq!(reg.len(), 2);
         assert_eq!(
             attribute(Some("/w/QuotaBar/src-tauri/src"), &reg).root(),
@@ -5017,7 +5069,7 @@ mod project_identity_tests {
         // 出现一堆小写正斜杠路径，而那不是任何一个系统里真实存在的写法。
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root(r"C:\Users\u\QuotaBar", RootSource::Git);
-        let reg = st.project_root_registry();
+        let reg = st.project_root_registry(&Vec::new());
         let a = attribute(Some(r"c:\users\u\quotabar\src-tauri"), &reg);
         assert_eq!(a.root(), Some(r"C:\Users\u\QuotaBar"));
     }
@@ -5028,7 +5080,7 @@ mod project_identity_tests {
         st.register_project_root("/w/P", RootSource::Marker);
         st.register_project_root("/w/P/", RootSource::Git); // 尾斜杠 = 同一个根
         assert_eq!(st.project_root_count(), 1);
-        let reg = st.project_root_registry();
+        let reg = st.project_root_registry(&Vec::new());
         match attribute(Some("/w/P/x"), &reg) {
             crate::attribution::Attribution::Root { source, .. } => {
                 assert_eq!(source, RootSource::Git, "后来者应覆盖来源")
@@ -5051,7 +5103,7 @@ mod project_identity_tests {
         assert_eq!(
             attribute(
                 Some("/w/no-remote-project/src"),
-                &st.project_root_registry()
+                &st.project_root_registry(&Vec::new())
             )
             .root(),
             Some("/w/no-remote-project"),
@@ -5063,7 +5115,7 @@ mod project_identity_tests {
     fn an_empty_registry_attributes_nothing_rather_than_falling_back() {
         // 发现整个没跑过时，归属该一致地说不出来 —— 而不是退回「用 cwd 当根」。
         let st = TotalStore::open_in_memory().unwrap();
-        let reg = st.project_root_registry();
+        let reg = st.project_root_registry(&Vec::new());
         assert!(reg.is_empty());
         assert!(!attribute(Some("/w/anything"), &reg).is_attributed());
     }
@@ -5084,7 +5136,7 @@ mod project_identity_tests {
             .unwrap();
         }
         assert_eq!(
-            attribute(Some("/w/future/x"), &st.project_root_registry()).root(),
+            attribute(Some("/w/future/x"), &st.project_root_registry(&Vec::new())).root(),
             Some("/w/future")
         );
     }
