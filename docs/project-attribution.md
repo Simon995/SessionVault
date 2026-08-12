@@ -1,6 +1,8 @@
 # ADR-050：项目归属分成「发现」与「归属」两层 —— I/O 能力不该决定语义
 
-> 状态：**设计**（2026-08-12）
+> 状态：**实现中**（2026-08-12）——
+> **步 1 已落地**（`attribution.rs` 归属纯函数 + `project_root_registry` 表，
+> 17 条测试 / 7 个变异精确变红）；**步 2/3 待做**，见下方「落地步骤」。
 > 跨仓：SessionVault（解析器 + 注册表）· QuotaBar（发现的一个来源）· TumeFlow（消费）
 > 前置：ADR-032 P1/P2（`identity.rs` + `project_identity` 表）已落地
 > 触发：`PARSER_REVISION` 3 → 4，全库重投影（ADR-044 决定 6 的第③触发条件）
@@ -277,6 +279,49 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 射程内。唯一有效的办法是**在 TumeChat 目录下单独开会话**（那时它有自己的
 `~/.claude/projects/` 目录）。原 #20 提的「主题切到哪个仓就 cd 过去」对同级仓库
 **结构性无效**，已实测否定。
+
+## 落地步骤
+
+**前两步不改变任何现有行为** —— `parser.rs` 仍走老的 `resolve_project_root`，
+所以可以随时停在任何一步而不留下半拉状态。
+
+| 步 | 内容 | 状态 |
+| --- | --- | --- |
+| 1 | `attribution.rs`（归属纯函数 + `RootRegistry`）+ `project_root_registry` 表与读写 API | ✅ 2026-08-12 |
+| 2 | 发现的多个来源接上（本地 `.git`/marker、**WSL 访问桥**、宿主扫描、显式配置），写进注册表 | ⬜ |
+| 3 | `PARSER_REVISION` 3→4，`parser.rs` 改用 `attribute()`；全库重投影 | ⬜ **不可逆，动手前人确认** |
+
+### 步 1 实现记录（2026-08-12）
+
+- `src/attribution.rs`：`RootSource` / `Attribution` / `RootRegistry` / `attribute()` /
+  `registry_key()`。11 条测试。
+- `src/store.rs`：`project_root_registry` 表 + `register_project_root()` /
+  `project_root_registry()` / `project_root_count()`。6 条测试。
+- **7 个变异精确变红**：取最短匹配 · 字符串前缀而非路径段 · `root()` 也返回
+  `Unattributed` 的路径 · 空注册表退回老答案 · 存储侧自己写一遍归一化 ·
+  未知来源标签丢掉那个根 · 注册表存归一化路径丢掉原始形式。
+
+⚠️ **一处自陈**：头三个变异第一轮全绿，是因为 `perl` 的多行替换没匹配上 ——
+**变异根本没应用**。改成「替换前先断言锚点存在」之后，三个全部变红。
+同一天在 `project_root_scope.rs` 的探针上刚栽过一次同样的坑（手写 JSON 解析器
+一条都没匹配上，探针照常打表头、算出 `NaN%`、退出码 0）。
+**判据：变异验证的第一步是证明变异真的发生了。**
+
+### 为什么注册表是**独立的表**，不与 `project_identity` 合并
+
+两者回答不同的问题，而且有**冲突的约束**：
+
+| 表 | 回答 | 关键约束 |
+| --- | --- | --- |
+| `project_identity` | 这个项目在别的系统里叫什么 | 🔴 **不写 `path:` 兜底行** —— 那种 id 不跨 checkout 稳定 |
+| `project_root_registry` | 这个路径**是不是**一个项目根 | 🔴 **必须收没有 remote 的根** —— 「是个根」不要求跨 checkout 稳定 |
+
+合表就得在「写不写没有 remote 的根」上二选一，而两边都需要自己的答案。
+`a_root_without_a_git_remote_is_still_a_root` 这条测试钉的正是它。
+
+⚠️ 注册表**不带 `source_type` / `source_location`**：一个路径是不是项目根，与
+「谁在什么位置扫到它」无关。带上它们会让同一个根按发现者分裂成多行，而归属时
+又得决定听谁的 —— 那是凭空造出来的分歧（与决定 3.5「结果与执行者无关」同源）。
 
 ## 验收
 

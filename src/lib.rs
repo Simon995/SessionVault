@@ -7,6 +7,7 @@
 //! （ADR-026），由宿主（QuotaBar / `svault`）决定输出。
 #![allow(dead_code)]
 
+pub mod attribution;
 pub mod catalog;
 pub mod cursor;
 pub mod discover;

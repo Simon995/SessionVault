@@ -720,6 +720,32 @@ impl TotalStore {
             );
             CREATE INDEX IF NOT EXISTS idx_identity_root ON project_identity(project_root);
             CREATE INDEX IF NOT EXISTS idx_identity_cid ON project_identity(canonical_id);
+
+            -- 🔴 **项目根注册表（ADR-050 决定 3）—— 与 `project_identity` 分开，
+            -- 因为两者回答的是不同的问题。**
+            --
+            --   project_identity  这个项目在**别的系统里**叫什么（跨 checkout 的身份）
+            --   project_root_registry  这个路径**是不是**一个项目根（归属的输入）
+            --
+            -- 合成一张表看起来省事，但 `project_identity` 有一条刻意的约束：
+            -- **不写 `path:` 兜底行**（那种 id 不跨 checkout 稳定，记下来会让「查得到
+            -- 身份」变成一句不能信的话）。而归属恰恰需要那些没有 remote 的项目根 ——
+            -- 「这是个根」不要求它跨 checkout 稳定。约束冲突 ⇒ 两张表。
+            --
+            -- 🔴 **不带 source_type / source_location**：一个路径是不是项目根，与
+            -- 「谁在什么位置扫到它」无关。带上它们会让同一个根按发现者分裂成多行，
+            -- 而归属时又得决定听谁的 —— 那是凭空造出来的分歧。
+            CREATE TABLE IF NOT EXISTS project_root_registry (
+                -- 归一化后的比较键（小写、正斜杠、无尾斜杠）。主键用它，
+                -- 于是同一个根的不同写法不会重复入表。
+                root_key        TEXT PRIMARY KEY,
+                -- 原始形式 —— 归属结果返回它，归一化只是本层的内部细节。
+                root_path       TEXT NOT NULL,
+                -- 怎么发现的：git / marker / scan / configured（`attribution::RootSource`）。
+                root_source     TEXT NOT NULL,
+                first_seen_ms   INTEGER NOT NULL,
+                last_seen_ms    INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -1289,6 +1315,71 @@ impl TotalStore {
             out.insert(root, cid);
         }
         out
+    }
+
+    // ── 项目根注册表（ADR-050）───────────────────────────────────────────
+    //
+    // 🔴 **写盘，不只在内存里。** QuotaBar 与 TumeFlow 各自摄取，而它们能发现的根
+    // 不一样（前者有 WSL 访问桥）。一个只在本进程内存里生效的「已发现根」会让另一个
+    // 进程看不见它 —— 那正是 ADR-050 根因二（同一知识分散多处、互相看不见）在**进程
+    // 之间**的重演。共享靠这张表。
+
+    /// 登记一个已知项目根。同一个根重复登记只更新 `last_seen_ms` 与来源。
+    ///
+    /// **失败静默**：注册表是**加法**能力 —— 它坏了该少发现几个根，不该让摄取停下。
+    /// 与 `record_project_identity` 同一条。
+    pub fn register_project_root(&self, path: &str, source: crate::attribution::RootSource) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let key = crate::attribution::registry_key(path);
+        let now = now_unix_millis();
+        let Ok(conn) = self.conn.lock() else { return };
+        let _ = conn.execute(
+            "INSERT INTO project_root_registry
+                 (root_key, root_path, root_source, first_seen_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(root_key) DO UPDATE SET
+                 root_path = ?2, root_source = ?3, last_seen_ms = ?4",
+            rusqlite::params![key, path, source.as_str(), now],
+        );
+    }
+
+    /// 读出整份注册表，供 [`attribution::attribute`] 使用。
+    ///
+    /// 🔴 **读不到就返回空注册表，不是报错。** 空注册表下每个路径都归到
+    /// `Unattributed` —— 一致地说不出来，而不是退回「用 cwd 当根」那个老答案。
+    pub fn project_root_registry(&self) -> crate::attribution::RootRegistry {
+        let mut reg = crate::attribution::RootRegistry::new();
+        let Ok(conn) = self.conn.lock() else {
+            return reg;
+        };
+        let Ok(mut stmt) = conn.prepare("SELECT root_path, root_source FROM project_root_registry")
+        else {
+            return reg;
+        };
+        let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        else {
+            return reg;
+        };
+        for row in rows.flatten() {
+            // 来源解析不出来时用 `Scan` —— 一个不认识的来源标签不该让这个根整个消失。
+            let src = crate::attribution::RootSource::parse(&row.1)
+                .unwrap_or(crate::attribution::RootSource::Scan);
+            reg.insert(&row.0, src);
+        }
+        reg
+    }
+
+    /// 注册表里有多少个根。诊断用（验收第 3 条：`Unattributed` 的数量要报得出来）。
+    pub fn project_root_count(&self) -> usize {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row("SELECT COUNT(*) FROM project_root_registry", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n as usize)
+        .unwrap_or(0)
     }
 
     /// 一个项目**观察到过的全部**身份，新到旧。多于一条即意味着这个路径的身份变过 ——
@@ -4898,5 +4989,103 @@ mod project_identity_tests {
             "第二次不该再问盘，身份应保持"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 项目根注册表（ADR-050 决定 3 / 3.5）──────────────────────────────
+    use crate::attribution::{attribute, RootSource};
+
+    #[test]
+    fn registry_round_trips_through_the_store() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/w/QuotaBar", RootSource::Git);
+        st.register_project_root("/w/QuotaBar/third_party/TumeFlow", RootSource::Git);
+        let reg = st.project_root_registry();
+        assert_eq!(reg.len(), 2);
+        assert_eq!(
+            attribute(Some("/w/QuotaBar/src-tauri/src"), &reg).root(),
+            Some("/w/QuotaBar")
+        );
+        assert_eq!(
+            attribute(Some("/w/QuotaBar/third_party/TumeFlow/x.py"), &reg).root(),
+            Some("/w/QuotaBar/third_party/TumeFlow")
+        );
+    }
+
+    #[test]
+    fn registry_stores_the_original_form_and_matches_case_insensitively() {
+        // 🔴 归一化只用于比较；查出来的必须是原始形式，否则 `project_root` 列里会
+        // 出现一堆小写正斜杠路径，而那不是任何一个系统里真实存在的写法。
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(r"C:\Users\u\QuotaBar", RootSource::Git);
+        let reg = st.project_root_registry();
+        let a = attribute(Some(r"c:\users\u\quotabar\src-tauri"), &reg);
+        assert_eq!(a.root(), Some(r"C:\Users\u\QuotaBar"));
+    }
+
+    #[test]
+    fn registering_the_same_root_twice_does_not_duplicate_it() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/w/P", RootSource::Marker);
+        st.register_project_root("/w/P/", RootSource::Git); // 尾斜杠 = 同一个根
+        assert_eq!(st.project_root_count(), 1);
+        let reg = st.project_root_registry();
+        match attribute(Some("/w/P/x"), &reg) {
+            crate::attribution::Attribution::Root { source, .. } => {
+                assert_eq!(source, RootSource::Git, "后来者应覆盖来源")
+            }
+            other => panic!("expected Root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_root_without_a_git_remote_is_still_a_root() {
+        // 🔴 这条正是「为什么不与 project_identity 合表」：那张表刻意**不写** `path:`
+        // 兜底行（身份要跨 checkout 稳定），而归属恰恰需要这些没有 remote 的根。
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/w/no-remote-project", RootSource::Marker);
+        assert_eq!(
+            st.project_identity("claude_code", "local", "/w/no-remote-project"),
+            None,
+            "身份表不该有它"
+        );
+        assert_eq!(
+            attribute(
+                Some("/w/no-remote-project/src"),
+                &st.project_root_registry()
+            )
+            .root(),
+            Some("/w/no-remote-project"),
+            "但归属必须认得它"
+        );
+    }
+
+    #[test]
+    fn an_empty_registry_attributes_nothing_rather_than_falling_back() {
+        // 发现整个没跑过时，归属该一致地说不出来 —— 而不是退回「用 cwd 当根」。
+        let st = TotalStore::open_in_memory().unwrap();
+        let reg = st.project_root_registry();
+        assert!(reg.is_empty());
+        assert!(!attribute(Some("/w/anything"), &reg).is_attributed());
+    }
+
+    #[test]
+    fn an_unknown_root_source_label_does_not_drop_the_root() {
+        // 未来版本写进一个本版不认识的来源标签时，那个根**仍然要参与归属** ——
+        // 少一个根会让它名下所有事件静默变成 Unattributed。
+        let st = TotalStore::open_in_memory().unwrap();
+        {
+            let conn = st.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO project_root_registry
+                     (root_key, root_path, root_source, first_seen_ms, last_seen_ms)
+                 VALUES ('/w/future', '/w/future', 'some_future_source', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            attribute(Some("/w/future/x"), &st.project_root_registry()).root(),
+            Some("/w/future")
+        );
     }
 }
