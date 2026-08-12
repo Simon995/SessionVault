@@ -371,6 +371,59 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 2. 修法不是补测试，是**改代码让规则可测**（home 显式注入）。补一条依赖「本机 home
    恰好是 git 仓」的测试，等于把护栏建在一个环境事实上。
 
+### 🔴 干跑实测（2026-08-12，`examples/attribution_dryrun.rs`）
+
+**发现 + 归属跑一遍真实数据，一个字节都不写。** 步 3 不可逆，所以在那之前必须先
+回答「新规则会把全库变成什么样」。
+
+```
+总库现状：111 个 project_root，992,460 条事件
+发现：72 条探到根 · 39 条确认无根 · 0 条探测失败 —— 12.2s
+归属：111 → 18 个项目根（收敛 84%）
+      Unattributed：43 条路径 / 约 12% 事件
+```
+
+判据（ADR「验收」）：✅ 收敛到 ≤43（实际 18）· ✅ `Unattributed` 数量可报 ·
+✅ 失败与「无根」分开计数（failed=0 / no_root=39）。
+
+⚠️ **不写盘是判据的一部分**，不只是谨慎：一次会改状态的「干跑」跑第二遍时输入已经
+变了，量到的数字和第一遍不同 —— 而那正是要拿来做决策的数。
+
+#### 干跑当场抓出一个真 bug：结果的形式必须跟随输入
+
+第一版把 WSL 探测结果**无条件**转成规范形（`wsl:<distro>:/home/u/P`），于是注册表
+里只有规范形的根。而归属是**纯字符串匹配** —— 裸 Linux 形式的 `project_root`
+匹配不上任何根：
+
+```
+修复前   /home/simon/workspace/EyeVLM              106,814 条 → Unattributed
+         wsl:Ubuntu-22.04:/home/simon/…/EyeVLM     344,217 条 → 归到了
+```
+
+**同一个项目的两种形式，一种归到一种没有。** 修法：`probe_wsl` 的结果形式跟随
+输入形式（规范形/UNC 输入拿规范形，裸 Linux 输入拿裸形式）。
+
+> **登记什么形式，就只认什么形式** —— 这是归属层「零 I/O、纯字符串」的直接推论，
+> 而它在单元测试里看不出来（测试只用一种形式）。**只有对着真实数据的多种形式跑
+> 一遍才暴露。**
+
+#### 已知剩余：`/mnt/…` 那一族（43 条 Unattributed 的全部）
+
+```
+26,572  /mnt/d/mwf/code/corneal-staining-grading
+22,256  /mnt/d/mwf/code/fbut-video-classifier
+ …
+```
+
+`/mnt/<drive>/…` 不是裸 Linux 路径（`is_windows_drive_mount` 为真），所以走
+`probe_local`；而在 Windows 上 `Path::new("/mnt/d/…")` 被当成当前盘根的相对路径
+⇒ 不存在 ⇒ 报 `Probe::None`。
+
+**解法明确但不在本步**：把 `/mnt/<drive>/…` 映射到 `<drive>:\…` 再本机探测。
+⚠️ **不能直接猜** —— 映射成立的前提是 `wsl.conf` 的 `automount.root` 没被改过，
+而默认值不是保证。正确做法是经访问桥读一次 `wsl.conf` 确认，读不到就**不映射**
+（那时它们照旧 `Unattributed`，诚实地说不出来）。
+
 ### 步 1 实现记录（2026-08-12）
 
 - `src/attribution.rs`：`RootSource` / `Attribution` / `RootRegistry` / `attribute()` /

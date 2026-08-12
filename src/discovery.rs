@@ -136,14 +136,25 @@ pub(crate) fn probe_local_with_home(path: &str, home: Option<&Path>) -> Probe {
 ///
 /// 逐级从 Windows 侧 stat 要 N 次跨 VM 往返（每次约 0.1–0.3s），所以循环写在
 /// 脚本里 —— 见 [`crate::wsl::find_project_root`]。
-pub fn probe_wsl(distro: &str, linux_path: &str) -> Probe {
+pub fn probe_wsl(distro: &str, linux_path: &str, canonical_form: bool) -> Probe {
     match crate::wsl::find_project_root(distro, linux_path) {
         Ok(Some((dir, kind))) => {
-            // 探测结果里的路径是 WSL 内的 Linux 路径，要还原成规范形才与
-            // `project_root` 同形 —— 否则注册表里的根匹配不上任何事件。
-            let root =
+            // 🔴 **结果的形式必须跟随输入的形式。**
+            //
+            // WSL 里返回的永远是 Linux 路径（`/home/u/P`），而同一个项目在总库里
+            // 有多种写法。第一版无条件转成规范形（`wsl:<distro>:/home/u/P`），于是
+            // 注册表里**只有规范形的根**，而裸 Linux 形式的 `project_root`
+            // （实测 `/home/simon/workspace/EyeVLM` 一条就有 106,814 条事件）
+            // 匹配不上任何根 —— 归属把它们全报成 `Unattributed`。
+            //
+            // 干跑当场抓到：同一个项目的两种形式，规范形归到了、裸形式没有。
+            // 归属是纯字符串匹配，所以**登记什么形式，就只认什么形式**。
+            let root = if canonical_form {
                 pathnorm::normalize_cwd(Some(&dir), pathnorm::HostPlatform::Windows, Some(distro))
-                    .unwrap_or(dir);
+                    .unwrap_or(dir)
+            } else {
+                dir
+            };
             Probe::Found {
                 root,
                 source: if kind == "git" {
@@ -187,20 +198,27 @@ where
 /// 分派判据与 `project_root::resolve_project_root` 的守卫**同源**（都问「本机能不能
 /// stat 它」），但**结论相反**：那里 stat 不了就放弃并拿 cwd 冒充答案，这里
 /// stat 不了就**换一条能问的路**（访问桥）。这正是 ADR-050 根因一说的那个区别。
+/// 🔴 **第三个参数 `canonical_form` 决定探测结果用哪种形式表达** —— 它跟随输入。
+/// 规范形 / UNC 的输入拿规范形的根，裸 Linux 输入拿裸 Linux 的根。
+/// 归属是纯字符串匹配，**登记什么形式就只认什么形式**；无条件转规范形会让裸形式
+/// 的路径全部归不到根（干跑实测：一条 `/home/simon/workspace/EyeVLM` 就是 106,814
+/// 条事件）。
 pub fn probe_path(path: &str, default_distro: Option<&str>) -> Probe {
     if let Some((distro, linux)) = pathnorm::split_canonical_wsl(path) {
-        return probe_wsl(distro, linux);
+        return probe_wsl(distro, linux, true);
     }
     if let Some(canonical) = pathnorm::canonical_wsl_unc(path) {
         if let Some((distro, linux)) = pathnorm::split_canonical_wsl(&canonical) {
-            return probe_wsl(distro, linux);
+            // UNC 输入：总库里 UNC 与规范形是同一族（`canonical_wsl_unc` 已经把
+            // 前者归一到后者），所以用规范形登记。
+            return probe_wsl(distro, linux, true);
         }
     }
     // Windows 宿主上的裸 Linux 路径（`/home/…`）：本机 stat 会去错盘，
-    // 只有知道 distro 才问得动。
+    // 只有知道 distro 才问得动 —— 但**结果要保持裸形式**。
     if cfg!(windows) && pathnorm::is_bare_linux_path(path) {
         return match default_distro {
-            Some(d) => probe_wsl(d, path),
+            Some(d) => probe_wsl(d, path, false),
             None => Probe::Failed {
                 reason: format!("bare linux path with no known distro: {path}"),
             },
@@ -324,6 +342,24 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         }
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn the_probe_result_keeps_the_form_of_its_input() {
+        // 🔴 这条是**干跑抓出来的真 bug**：第一版无条件把 WSL 探测结果转成规范形，
+        // 于是注册表里只有规范形的根，而裸 Linux 形式的 project_root 匹配不上任何
+        // 根 —— 实测一条 `/home/simon/workspace/EyeVLM` 就是 106,814 条事件被报成
+        // Unattributed，而同一个项目的规范形 `wsl:Ubuntu-22.04:/home/…` 归到了。
+        //
+        // 归属是纯字符串匹配：**登记什么形式，就只认什么形式**。
+        //
+        // 这里不跑真 WSL（CI 没有），只钉住 `probe_path` 的分派意图：两种形式
+        // 走的是同一个 distro、同一条链，区别只在结果的表达形式。
+        use crate::pathnorm;
+        // 规范形能被拆出 (distro, linux)，裸形式不能 —— 分派据此走两条路。
+        assert!(pathnorm::split_canonical_wsl("wsl:U:/home/u/P").is_some());
+        assert!(pathnorm::split_canonical_wsl("/home/u/P").is_none());
+        assert!(pathnorm::is_bare_linux_path("/home/u/P"));
     }
 
     #[test]
