@@ -126,14 +126,19 @@ marker 的目录**」来回答 —— 而 marker 只说明「这里有个构建�
 
 ```rust
 pub enum Attribution {
-    /// 归属到一个已知项目根。`registry_source` 记下这个根是怎么发现的。
-    Root { path: String, registry_source: RootSource },
-    /// 🔴 没有任何已知根覆盖它 —— **说出来，不拿 cwd 冒充**。
-    Unattributed { cwd: String },
+    /// 归属到一个已知项目根。`source` 记下这个根是怎么发现的。
+    Root { path: String, source: RootSource },
+    /// 🔴 没有任何已知根覆盖它 —— **说出来，不拿它冒充项目根**。
+    Unattributed { path: String },
+    /// 连路径都没有（如 TumeChat 的一次纯闲聊）—— 见决定 3.6。
+    NoPath,
 }
 ```
 
-⚠️ **`Unattributed` 仍然携带 cwd**（下游要能按它做粗粒度查询），但它是**另一个变体**：
+> ⚠️ 实现时比原设计多了 `NoPath`：原文把「没有路径」和「有路径但归不到根」压在
+> 同一个变体里，而两者的下游动作不同（前者连粗粒度查询都做不了）。
+
+⚠️ **`Unattributed` 仍然携带那个路径**（下游要能按它做粗粒度查询），但它是**另一个变体**：
 下游想当 project_root 用就必须 `match`，于是「这是兜底」这件事没法被静默忽略。
 
 > 与账号身份那条同源：`IdentityResolution::Pending` **不携带值**，于是
@@ -143,20 +148,55 @@ pub enum Attribution {
 判据：最长前缀。一个 root 是另一个的真后代时，**取更长的那个** —— `QuotaBar/third_party/TumeFlow`
 是独立仓（有自己的 `.git`），它比 `QuotaBar` 更准确。
 
-### 决定 3：注册表存在总库里，与 ADR-032 P2 的 `project_identity` 合并
+### 决定 3：注册表存在总库里，但是**独立的一张表**
 
-P2 那张表已经在存 `(source_type, source_location, project_root, canonical_id)`。
-本 ADR 扩展它：
+> 🔴 **本条 2026-08-12 实现时订正过。** 原文写的是「与 ADR-032 P2 的
+> `project_identity` **合并**」——动手时发现两者的约束**互相冲突**，合表就得在
+> 关键的一条上二选一。原文保留在下方 details 里，因为「为什么当初以为能合」
+> 本身是这条决定的一半理由。
 
-- 现在只记「**算得出 `canonical_id`** 的」（有 origin remote）—— 改为**也记没有 remote
-  的项目根**（`canonical_id` 为 `path:<root>`，P2 原本刻意不写的那种）；
-- 加一列 `root_source`：`git` / `marker:<file>` / `scan` / `configured`，
-  让「这个根是怎么来的」可查。
+`project_root_registry`：
 
-⚠️ P2 当初「不写 `path:` 兜底行」的理由是「那种 id 不跨 checkout 稳定，记下来只会让
-『查得到身份』变成一句不能信的话」—— **那条理由针对的是身份（identity），不是归属
-（attribution）**。归属只需要知道「这是一个项目根」，不需要它跨 checkout 稳定。
-两者现在分开了，所以那条约束不再适用于本表的归属用途。
+```sql
+CREATE TABLE IF NOT EXISTS project_root_registry (
+    root_key      TEXT PRIMARY KEY,  -- 归一化比较键（attribution::registry_key）
+    root_path     TEXT NOT NULL,     -- 原始形式；归属结果返回它
+    root_source   TEXT NOT NULL,     -- git / marker / scan / configured
+    first_seen_ms INTEGER NOT NULL,
+    last_seen_ms  INTEGER NOT NULL
+);
+```
+
+**为什么不能与 `project_identity` 合表** —— 两者回答不同的问题，而约束冲突：
+
+| 表 | 回答 | 关键约束 |
+| --- | --- | --- |
+| `project_identity` | 这个项目**在别的系统里叫什么** | 🔴 **不写 `path:` 兜底行** —— 那种 id 不跨 checkout 稳定，记下来会让「查得到身份」变成一句不能信的话 |
+| `project_root_registry` | 这个路径**是不是**一个项目根 | 🔴 **必须收没有 remote 的根** —— 「是个根」不要求跨 checkout 稳定 |
+
+原文以为「那条约束针对身份、不针对归属，所以合表后放宽即可」。**但一张表只能有
+一套写入规则**：放宽之后 `project_identity` 的查询就会读到它当初刻意排除的那些行，
+而那正是 P2 明确不要的。测试 `a_root_without_a_git_remote_is_still_a_root` 钉住了
+这个区分。
+
+⚠️ **注册表不带 `source_type` / `source_location`**：一个路径是不是项目根，与
+「谁在什么位置扫到它」无关。带上它们会让同一个根按发现者分裂成多行，而归属时又得
+决定听谁的 —— 那是凭空造出来的分歧，与决定 3.5「结果与执行者无关」直接冲突。
+
+<details><summary>原文（保留见证：为什么当初以为能合）</summary>
+
+> P2 那张表已经在存 `(source_type, source_location, project_root, canonical_id)`。
+> 本 ADR 扩展它：现在只记「算得出 `canonical_id` 的」（有 origin remote）—— 改为
+> 也记没有 remote 的项目根（`canonical_id` 为 `path:<root>`）；加一列 `root_source`。
+>
+> ⚠️ P2 当初「不写 `path:` 兜底行」的理由是「那种 id 不跨 checkout 稳定」—— 那条
+> 理由针对的是身份（identity），不是归属（attribution）。归属只需要知道「这是一个
+> 项目根」，不需要它跨 checkout 稳定。
+
+**漏掉的一步**：约束是写在**表**上的，不是写在**读法**上的。即使「归属不需要稳定
+身份」成立，放宽写入规则也会同时改变身份查询看到的东西。
+
+</details>
 
 ### 🔴 决定 3.5：注册表是**共享状态**，不是各进程各自的缓存
 
@@ -306,22 +346,6 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 同一天在 `project_root_scope.rs` 的探针上刚栽过一次同样的坑（手写 JSON 解析器
 一条都没匹配上，探针照常打表头、算出 `NaN%`、退出码 0）。
 **判据：变异验证的第一步是证明变异真的发生了。**
-
-### 为什么注册表是**独立的表**，不与 `project_identity` 合并
-
-两者回答不同的问题，而且有**冲突的约束**：
-
-| 表 | 回答 | 关键约束 |
-| --- | --- | --- |
-| `project_identity` | 这个项目在别的系统里叫什么 | 🔴 **不写 `path:` 兜底行** —— 那种 id 不跨 checkout 稳定 |
-| `project_root_registry` | 这个路径**是不是**一个项目根 | 🔴 **必须收没有 remote 的根** —— 「是个根」不要求跨 checkout 稳定 |
-
-合表就得在「写不写没有 remote 的根」上二选一，而两边都需要自己的答案。
-`a_root_without_a_git_remote_is_still_a_root` 这条测试钉的正是它。
-
-⚠️ 注册表**不带 `source_type` / `source_location`**：一个路径是不是项目根，与
-「谁在什么位置扫到它」无关。带上它们会让同一个根按发现者分裂成多行，而归属时
-又得决定听谁的 —— 那是凭空造出来的分歧（与决定 3.5「结果与执行者无关」同源）。
 
 ## 验收
 
