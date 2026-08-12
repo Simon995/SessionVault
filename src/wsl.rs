@@ -159,6 +159,77 @@ pub fn list_files_under_home(
 /// 取发行版内**绝对路径**文件的 `(size, mtime_secs)`；`Ok(None)` = 文件不存在（exit 7）。
 /// 供增量扫描的 `(size,mtime)` 回退检测用（对应本地 `fs::metadata`）。
 #[cfg(windows)]
+/// 沿 `abs_path` 的祖先链找项目根 —— **一次 `wsl.exe` 调用走完整条链**。
+///
+/// 返回 `Some((目录, "git" | "marker:<file>"))`，一路没找到则 `None`。
+///
+/// ## 🔴 为什么把循环放进 WSL 里
+///
+/// 从 Windows 侧逐级 `stat` 要 N 次 `wsl.exe` 调用（每次都是一次进程启动 + 跨 VM
+/// 往返，实测单次约 0.1–0.3s）。一条 8 层深的路径就是 8 次 —— 而全库有 68 个
+/// WSL 形式的 `project_root`。把 `while` 写进脚本，**一次调用解决一条链**。
+///
+/// ## 🔴 `.git` 优先，但只找**最近的那个**
+///
+/// 先整条链找 `.git`；找不到才回退到最近的构建 marker。这实现了 ADR-050 决定 5
+/// （`.git` 优先于构建 marker），而**不引入**原 P3 那个「一路走到根会命中
+/// `~/.git`（dotfiles 仓）」的风险 —— 因为路径上任何更近的 `.git` 都会先命中。
+///
+/// 唯一还能走到 home 的情况是「这条链上一个 `.git` 都没有」，所以脚本**显式排除
+/// `$HOME` 本身**：把 home 当项目根，会让它名下每个散落目录都归到同一个「项目」。
+///
+/// `-e` 而不是 `-d`：子模块的 `.git` 是**文件**（`gitdir: …`），不是目录。
+#[cfg(windows)]
+pub fn find_project_root(distro: &str, abs_path: &str) -> Result<Option<(String, String)>, String> {
+    let esc = shell_escape(abs_path);
+    let script = format!(
+        r#"set -eu
+D="{esc}"
+[ -n "$D" ] || exit 7
+# 第一遍：最近的 .git（-e：子模块的 .git 是文件）
+P="$D"
+while [ "$P" != "/" ] && [ -n "$P" ]; do
+  if [ "$P" != "$HOME" ] && [ -e "$P/.git" ]; then
+    printf 'git	%s
+' "$P"
+    exit 0
+  fi
+  P=$(dirname "$P")
+done
+# 第二遍：最近的构建 marker（顺序即优先级）
+P="$D"
+while [ "$P" != "/" ] && [ -n "$P" ]; do
+  for M in Cargo.toml package.json pyproject.toml go.mod .hg; do
+    if [ "$P" != "$HOME" ] && [ -e "$P/$M" ]; then
+      printf 'marker:%s	%s
+' "$M" "$P"
+      exit 0
+    fi
+  done
+  P=$(dirname "$P")
+done
+exit 7
+"#
+    );
+    let out = run_bash_stdin(distro, &script)?;
+    match out.status.code() {
+        Some(0) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let line = text.trim();
+            let (kind, dir) = line.split_once('\t').ok_or_else(|| {
+                format!("wsl find_project_root {distro}:{abs_path} bad output: {line:?}")
+            })?;
+            Ok(Some((dir.to_string(), kind.to_string())))
+        }
+        // 7 = 这条链上没有项目根。**不是错误** —— 归属会据此报 Unattributed。
+        Some(7) => Ok(None),
+        other => Err(format!(
+            "wsl find_project_root {distro}:{abs_path} exited {other:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
 pub fn stat(distro: &str, abs_path: &str) -> Result<Option<(u64, i64)>, String> {
     let esc = shell_escape(abs_path);
     let script = format!(
@@ -193,6 +264,14 @@ pub fn stat(distro: &str, abs_path: &str) -> Result<Option<(u64, i64)>, String> 
 
 #[cfg(not(windows))]
 pub fn stat(_distro: &str, _abs_path: &str) -> Result<Option<(u64, i64)>, String> {
+    Err("wsl.exe access is only available on Windows builds".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn find_project_root(
+    _distro: &str,
+    _abs_path: &str,
+) -> Result<Option<(String, String)>, String> {
     Err("wsl.exe access is only available on Windows builds".to_string())
 }
 

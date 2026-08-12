@@ -11,6 +11,7 @@ pub mod attribution;
 pub mod catalog;
 pub mod cursor;
 pub mod discover;
+pub mod discovery;
 pub mod identity;
 pub mod logging;
 pub mod parser;
