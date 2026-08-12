@@ -29,7 +29,7 @@ pub mod wsl;
 
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
 pub use cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
-pub use discover::{ProjectSnapshotRoot, SourceRef};
+pub use discover::{DiscoveryOutcome, ProjectSnapshotRoot, SourceRef, UNREACHABLE_ALL_WSL};
 pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
@@ -76,6 +76,12 @@ pub fn discover_local() -> Result<Vec<SourceRef>> {
 
 pub fn discover_transcripts() -> Result<Vec<SourceRef>> {
     discover::discover_transcripts()
+}
+
+/// 同 [`discover_transcripts`]，但报出哪些位置没问成 —— 要据发现结果删存量的调用方
+/// **必须**用这个（见 [`DiscoveryOutcome`]）。
+pub fn discover_transcripts_reported() -> Result<DiscoveryOutcome> {
+    discover::discover_transcripts_reported()
 }
 
 pub fn discover_transcripts_local() -> Result<Vec<SourceRef>> {

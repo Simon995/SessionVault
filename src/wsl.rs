@@ -145,6 +145,16 @@ fn wait_with_deadline(
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
 
+    // 🔴 **先关 stdin。** 标准库的 `wait_with_output()` 第一件事就是
+    // `drop(self.stdin.take())` —— 我手写替代它时漏了，于是 `bash` 一直等 stdin 的 EOF、
+    // 等不到，**每一次调用都撞满 60 秒超时**。症状极具误导性：日志说
+    // 「timed out (distro wedged?)」，而同一条 `find` 手工跑只要 0.6 秒 ——
+    // 我差点据此断定 WSL 坏了、超时值太紧。
+    //
+    // 一般化：**替换一个标准库辅助函数时，先读它到底替你做了什么。**
+    // 它的名字（"wait with output"）说不出「顺带关了 stdin」这件事。
+    drop(child.stdin.take());
+
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
     let out_handle = std::thread::spawn(move || {
