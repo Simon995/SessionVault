@@ -22,7 +22,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
 use crate::cursor::{Cursor, ScanStatus};
+use crate::deadline::Deadline;
 use crate::discover::SourceRef;
+use crate::probe::ProbeBackend;
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
 use crate::store_crypto::{
     create_os_key, data_key_id, is_envelope, load_os_key, new_data_key_id, CryptoError,
@@ -1380,8 +1382,23 @@ impl TotalStore {
         // `project_root` 可能是 `wsl:<distro>:/abs` 这类规范形 —— 那不是本机可打开的
         // 路径，`find_git_root` 会（正确地）拒绝。这里不做任何路径改写：改写等于猜，
         // 而猜错会把身份安到别的项目上。
-        let Some(git_root) = crate::identity::find_git_root(std::path::Path::new(root)) else {
-            return;
+        // 🔴 三态各有各的处置：`Absent` 是事实（这个根确实没有 `.git`），
+        // `Unknown` 是「本轮没问成」—— 它**已经**被上面的 `identity_seen` 记成
+        // 「问过了」，所以这里要把它从缓存里撤回，否则一次权限错误 / UNC 不通会让
+        // 这个项目在本进程生命周期内永远算不出身份。
+        let git_root = match crate::identity::find_git_root(std::path::Path::new(root)) {
+            crate::identity::GitRoot::Found(p) => p,
+            crate::identity::GitRoot::Absent => return,
+            crate::identity::GitRoot::Unknown(e) => {
+                log::debug!(
+                    target: crate::logging::tag::SQLITE,
+                    "project identity probe failed, will retry: {e}"
+                );
+                if let Ok(mut seen) = self.identity_seen.lock() {
+                    seen.remove(&key);
+                }
+                return;
+            }
         };
         let cid = crate::identity::canonical_repo_id(&git_root);
         if !cid.starts_with("git:") {
@@ -2472,9 +2489,36 @@ impl TotalStore {
         Ok(out)
     }
 
-    /// `read_latest_snapshots` 的当前可见视图：已明确删除的源文件不返回；WSL
-    /// 探测暂时失败时保守保留，避免短暂离线被误判成删除。
+    /// `read_latest_snapshots` 的当前可见视图：已明确删除的源文件不返回；探测**失败**
+    /// 时保守保留，避免一次问不成被误判成删除。
+    ///
+    /// 🔴 **这条规矩从前只有 WSL 那一支守着。** 本机支是
+    /// `Path::new(&event.source_path).is_file()` —— 权限拒绝、句柄耗尽、外接盘没挂上、
+    /// 网络盘断开全都折叠成 `false` ⇒ 那条快照**被读作「用户删了这个文件」**，
+    /// 于是该项目的 `CLAUDE.md` / `AGENTS.md` 规则静默退出视图（`svault snapshots`
+    /// → TumeFlow Class-B）。而**同一个函数里**、隔四行的 WSL 支写着
+    /// 「keeping last versions」，连日志文案都把判据说对了。
+    ///
+    /// 两支的差别不是谁更细心，是本机那支的判定**内联在调用点**、没有类型逼它表态。
+    /// 现在两支都经 [`crate::probe`]：三态里只有 `Absent` 才是删除。
     pub fn read_active_latest_snapshots(&self) -> StoreResult<Vec<(i64, RawEvent)>> {
+        self.read_active_latest_snapshots_with(&crate::probe::LocalBackend)
+    }
+
+    /// [`Self::read_active_latest_snapshots`] 的可测形态 —— **本机 backend 注入**。
+    ///
+    /// 🔴 拆出来是因为「探测失败 ⇒ 保留」这条**在本机造不出来**：要让一次
+    /// `std::fs::metadata` 返回 `NotFound` 以外的错误，得靠权限、句柄耗尽或
+    /// 断开的网络盘，三者都不可在单测里确定性构造。判定作参数，逻辑才可单测 ——
+    /// 与 `probe_local_with` 的探测器注入、`probe_local_with_home` 的 home 注入同一个惯例。
+    ///
+    /// ⚠️ 注入的是 backend **而不是** `bool`：测试驱动的必须是生产那段 `match`
+    /// 本身，否则钉住的只是我自己造的映射（AGENTS.md：「纯函数的测试钉的是映射，
+    /// 永远说不了输入的来路」）。
+    pub(crate) fn read_active_latest_snapshots_with(
+        &self,
+        local: &dyn ProbeBackend,
+    ) -> StoreResult<Vec<(i64, RawEvent)>> {
         let rows = self.read_latest_snapshots()?;
         let mut by_distro: HashMap<String, Vec<String>> = HashMap::new();
         for (_, event) in &rows {
@@ -2505,7 +2549,22 @@ impl TotalStore {
         Ok(rows
             .into_iter()
             .filter(|(_, event)| match &event.source_location {
-                SourceLocation::Local => Path::new(&event.source_path).is_file(),
+                SourceLocation::Local => {
+                    match local.probe(Path::new(&event.source_path), Deadline::unbounded()) {
+                        // 存在但不是普通文件（被换成目录/符号链）—— 也是**事实**，
+                        // 那个快照的源确实不在了。
+                        crate::probe::Probed::Found(crate::probe::FileKind::File) => true,
+                        crate::probe::Probed::Found(_) | crate::probe::Probed::Absent => false,
+                        // 🔴 没问成 ⇒ **保留**，与 WSL 支同一判据。
+                        crate::probe::Probed::Unknown(e) => {
+                            log::warn!(
+                                target: crate::logging::tag::SNAPSHOT,
+                                "local snapshot existence probe failed; keeping last version: {e}"
+                            );
+                            true
+                        }
+                    }
+                }
                 SourceLocation::Wsl(distro) => existing
                     .get(distro)
                     .and_then(Option::as_ref)
@@ -2823,8 +2882,16 @@ impl TombstoneScope {
 }
 
 fn store_has_encrypted_rows(path: &Path) -> StoreResult<bool> {
-    if !path.exists() {
-        return Ok(false);
+    // 🔴 本函数返回 `Result`，所以「没问成」有地方可去 —— 从前的 `!path.exists()`
+    // 把它折成 `Ok(false)`＝「这个库没有加密行」，而调用方据此决定要不要按明文处理。
+    match crate::probe::LocalBackend.probe(path, Deadline::unbounded()) {
+        crate::probe::Probed::Found(_) => {}
+        crate::probe::Probed::Absent => return Ok(false),
+        crate::probe::Probed::Unknown(e) => {
+            return Err(StoreError::Io(std::io::Error::other(format!(
+                "cannot tell whether the store exists: {e}"
+            ))))
+        }
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let raw_exists: bool = conn
@@ -3073,6 +3140,73 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(store.read_active_latest_snapshots().unwrap().is_empty());
         assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
+    }
+
+    /// 🔴 **本机快照的「没问成」必须保留，与 WSL 支同一判据。**
+    ///
+    /// 从前本机支是 `Path::new(&event.source_path).is_file()` —— 权限拒绝、句柄耗尽、
+    /// 外接盘没挂上全折叠成「文件没了」，那条快照就此退出 `svault snapshots` 的输出，
+    /// 该项目的 `CLAUDE.md` 规则静默不再进记忆。而**同一个函数里**隔四行的 WSL 支
+    /// 早就写对了（`existing.insert(distro, None)` + `is_none_or`）。
+    ///
+    /// ⚠️ **两端都断言。** 只钉「没问成要保留」的话，一个恒 `true` 的实现照样绿
+    /// （本轮评审里这个形状出现过两次）；只钉「确认没了要删」则恒 `false` 照样绿。
+    /// 两条一起，任何与探测结果无关的实现都至少红一条。
+    #[test]
+    fn an_unprobeable_local_snapshot_is_kept_not_treated_as_deleted() {
+        struct Fixed(fn(&Path) -> crate::probe::Probed<crate::probe::FileKind>);
+        impl ProbeBackend for Fixed {
+            fn probe(
+                &self,
+                p: &Path,
+                _d: Deadline,
+            ) -> crate::probe::Probed<crate::probe::FileKind> {
+                (self.0)(p)
+            }
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("svault-store-unprobeable-{nanos}.md"));
+        std::fs::write(&path, "# rules\n").unwrap();
+        let source = SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::SnapshotFile,
+            path: path.clone(),
+            project_root: Some("C:/work/project".into()),
+            artifact_kind: Some("memory".into()),
+        };
+        let store = TotalStore::open_in_memory().unwrap();
+        store.sync_snapshots(std::slice::from_ref(&source)).unwrap();
+        assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
+
+        // 文件真的还在，但探测「没问成」⇒ 必须保留。
+        let unknown = Fixed(|p| {
+            crate::probe::Probed::Unknown(crate::probe::ProbeError::new(p, "permission denied"))
+        });
+        assert_eq!(
+            store
+                .read_active_latest_snapshots_with(&unknown)
+                .unwrap()
+                .len(),
+            1,
+            "探测失败被当成删除 —— 这个项目的指令文件会静默退出视图"
+        );
+
+        // 反向：探明白了没有 ⇒ 才是删除。少了这条，恒 `true` 的实现也能绿。
+        let absent = Fixed(|_| crate::probe::Probed::Absent);
+        assert!(
+            store
+                .read_active_latest_snapshots_with(&absent)
+                .unwrap()
+                .is_empty(),
+            "确认不存在的源文件仍被返回 —— 已删除的项目规则会一直挂在视图里"
+        );
+
+        std::fs::remove_file(path).unwrap();
     }
 
     /// 🔴 同一个 source 在**一次** `sync_snapshots` 里出现两次。
@@ -5560,7 +5694,7 @@ mod project_identity_tests {
         std::fs::remove_dir_all(&proj).unwrap();
         assert_eq!(
             crate::identity::find_git_root(&proj),
-            None,
+            crate::identity::GitRoot::Absent,
             "前提：磁盘上真的没了"
         );
         assert_eq!(
