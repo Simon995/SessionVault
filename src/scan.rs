@@ -18,6 +18,10 @@ use crate::report::SourceReport;
 use std::sync::Arc;
 
 use crate::attribution::RootRegistry;
+use crate::observation::{
+    AppendLogObservation, ParseDiagnostics, ParseQuality, ScanFailure, SourceChange,
+    SourceFingerprint,
+};
 use crate::Profile;
 
 /// scan 主入口：按形态分派。append_log 的字节来源（本地 `File` vs WSL `wsl.exe`）
@@ -29,48 +33,70 @@ pub fn scan_source(
     roots: Arc<RootRegistry>,
 ) -> ScanResult {
     match source.source_mode {
-        SourceMode::AppendLog => match &source.source_location {
-            SourceLocation::Local => scan_append_log(
-                &LocalSource { path: &source.path },
+        SourceMode::AppendLog => {
+            let (obs, report) = scan_append_log_observed(source, cursor_in, profile, roots);
+            obs.into_scan_result(report)
+        }
+        SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile),
+        SourceMode::SqliteStore | SourceMode::OpaqueFamily => scan_unimplemented(source, cursor_in),
+    }
+}
+
+/// append-log 扫描的**权威返回** —— 完整观察（ADR-051 §1）。
+///
+/// [`scan_source`] 是它的有损投影：`ScanStatus` 三个变体压掉了四种含义，于是消费方
+/// 只能靠 `items_skipped` 与 warning 文案前缀猜回来（实测 QuotaBar 的 `svault_bridge`
+/// 正是这么做的 —— **一条日志文案的前缀决定要不要写库**）。新消费方走这个入口。
+pub fn scan_append_log_observed(
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    profile: Profile,
+    roots: Arc<RootRegistry>,
+) -> (AppendLogObservation, SourceReport) {
+    match &source.source_location {
+        SourceLocation::Local => scan_append_log(
+            &LocalSource { path: &source.path },
+            source,
+            cursor_in,
+            profile,
+            roots,
+        ),
+        SourceLocation::Wsl(distro) => {
+            let abs = source.path.to_string_lossy().into_owned();
+            scan_append_log(
+                &WslSource { distro, abs: &abs },
                 source,
                 cursor_in,
                 profile,
                 roots,
-            ),
-            SourceLocation::Wsl(distro) => {
-                let abs = source.path.to_string_lossy().into_owned();
-                scan_append_log(
-                    &WslSource { distro, abs: &abs },
-                    source,
-                    cursor_in,
-                    profile,
-                    roots,
-                )
-            }
-        },
-        SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile),
-        // 其余形态骨架未实装：返回 NoCursor，事件空。
-        SourceMode::SqliteStore | SourceMode::OpaqueFamily => {
-            let mut report = SourceReport {
-                source_path: source.path.display().to_string(),
-                source_mode: Some(source.source_mode),
-                cursor_kind: Some(CursorKind::NoCursor),
-                ..Default::default()
-            };
-            report.warnings.push(format!(
-                "source_mode {:?} not implemented",
-                source.source_mode
-            ));
-            ScanResult {
-                status: ScanStatus::Ok,
-                events: Vec::new(),
-                cursor_out: Cursor {
-                    kind: CursorKind::NoCursor,
-                    ..Cursor::new_byte_offset()
-                },
-                report,
-            }
+            )
         }
+    }
+}
+
+/// 其余形态骨架未实装：返回 NoCursor，事件空。
+///
+/// ⚠️ **不塞进 `ParseQuality::Unavailable`**：那表示「读不成」，而这里是「这种来源
+/// 我们还不会读」—— 重试一万次也不会变，与一次瞬时 IO 失败的处置完全不同。
+fn scan_unimplemented(source: &SourceRef, _cursor_in: Option<Cursor>) -> ScanResult {
+    let mut report = SourceReport {
+        source_path: source.path.display().to_string(),
+        source_mode: Some(source.source_mode),
+        cursor_kind: Some(CursorKind::NoCursor),
+        ..Default::default()
+    };
+    report.warnings.push(format!(
+        "source_mode {:?} not implemented",
+        source.source_mode
+    ));
+    ScanResult {
+        status: ScanStatus::Ok,
+        events: Vec::new(),
+        cursor_out: Cursor {
+            kind: CursorKind::NoCursor,
+            ..Cursor::new_byte_offset()
+        },
+        report,
     }
 }
 
@@ -253,7 +279,7 @@ fn scan_append_log<S: ByteSource>(
     cursor_in: Option<Cursor>,
     profile: Profile,
     roots: Arc<RootRegistry>,
-) -> ScanResult {
+) -> (AppendLogObservation, SourceReport) {
     let mut report = SourceReport {
         source_path: source.path.display().to_string(),
         source_mode: Some(SourceMode::AppendLog),
@@ -271,12 +297,17 @@ fn scan_append_log<S: ByteSource>(
         Ok(v) => v,
         Err(e) => {
             report.warnings.push(format!("stat failed: {e}"));
-            return ScanResult {
-                status: ScanStatus::Error,
-                events: Vec::new(),
-                cursor_out: cursor,
+            // `Stat` 而非 `Read`：调用方据此**跳过本文件、不写库**。此前两者
+            // 同为 `ScanStatus::Error`，消费方靠 warning 文案前缀区分。
+            return (
+                observe(
+                    SourceChange::Appended,
+                    ParseQuality::Unavailable(ScanFailure::Stat(e)),
+                    cursor,
+                    None,
+                ),
                 report,
-            };
+            );
         }
     };
 
@@ -294,17 +325,30 @@ fn scan_append_log<S: ByteSource>(
         start = 0;
         cursor = Cursor::new_byte_offset();
     }
+    // 🔴 **源变化是观察，不是意图** —— 由 stat 结果检出，调用方事先不知道。
+    // ⚠️ 这里只认「变短 / mtime 倒退」；**同尺寸原地重写在这一层检不出来**，
+    // 要靠下方全读时算出的指纹与上次比对（见 `source_fingerprint`）。
+    let mut change = if rollback {
+        SourceChange::RollbackOrRewrite
+    } else {
+        SourceChange::Appended
+    };
 
     if start >= size {
         // 无新增。
         cursor.size = size;
         cursor.mtime = mtime;
-        return ScanResult {
-            status: ScanStatus::Ok,
-            events: Vec::new(),
-            cursor_out: cursor,
+        return (
+            observe(
+                change,
+                ParseQuality::Clean {
+                    deferred_tail_bytes: 0,
+                },
+                cursor,
+                None,
+            ),
             report,
-        };
+        );
     }
 
     // 读 [start, size) 尾部。
@@ -312,15 +356,43 @@ fn scan_append_log<S: ByteSource>(
         Ok(b) => b,
         Err(e) => {
             report.warnings.push(format!("read failed: {e}"));
-            return ScanResult {
-                status: ScanStatus::Error,
-                events: Vec::new(),
-                cursor_out: cursor,
+            // `Read` 而非 `Stat`：文件在，只是读不出来 ⇒ 落一行 error 状态 + 冻游标，
+            // 而不是当没发生。两者此前同为 `ScanStatus::Error`。
+            return (
+                observe(
+                    change,
+                    ParseQuality::Unavailable(ScanFailure::Read(e)),
+                    cursor,
+                    None,
+                ),
                 report,
-            };
+            );
         }
     };
     report.bytes_read = tail.len() as u64;
+
+    // 全读（`start == 0`）才算得出整份内容的指纹；增量手上只有尾巴，**算不出**。
+    // `None` 因此表示「这一轮没读全文」，不是「内容没变」。
+    let fingerprint = if start == 0 {
+        let fp = SourceFingerprint::of(&tail);
+        // 🔴 同尺寸原地重写：size 与 mtime 都可能一字不变，只有内容变了。
+        // 不在这里认出来，UI 索引会 `ReplaceFile` 而总库走 `Append` 把新 seq 当重复
+        // 丢弃 —— 两层从此不一致，且没有任何东西会说出来。
+        if let Some(prev) = cursor.content_hash.as_deref() {
+            if prev != fp.as_str() {
+                change = SourceChange::RollbackOrRewrite;
+                log::warn!(
+                    target: tag::CURSOR,
+                    "in-place rewrite detected by fingerprint: path={}",
+                    report.source_path
+                );
+            }
+        }
+        cursor.content_hash = Some(fp.as_str().to_string());
+        Some(fp)
+    } else {
+        None
+    };
 
     let text = String::from_utf8_lossy(&tail);
     let (complete, pending) = split_complete_jsonl(&text);
@@ -377,12 +449,18 @@ fn scan_append_log<S: ByteSource>(
                 "append_log one-shot kept good events despite bad json: path={} skipped={} events={}",
                 report.source_path, parsed.skipped, parsed.events.len()
             );
-            return ScanResult {
-                status: ScanStatus::Partial,
-                events: parsed.events,
-                cursor_out: cursor,
-                report,
+            let diagnostics = ParseDiagnostics {
+                skipped_lines: parsed.skipped,
+                first_warning: report.warnings.first().cloned(),
             };
+            let mut obs = observe(
+                change,
+                ParseQuality::Degraded(diagnostics),
+                cursor,
+                fingerprint,
+            );
+            obs.events = parsed.events;
+            return (obs, report);
         }
         cursor.safe_offset = start; // 不前进
         cursor.codex_state = codex_state_before; // 不吃进坏批的状态推进
@@ -392,12 +470,21 @@ fn scan_append_log<S: ByteSource>(
             "append_log batch frozen (bad json): path={} skipped={} kept_offset={}",
             report.source_path, parsed.skipped, start
         );
-        return ScanResult {
-            status: ScanStatus::Error,
-            events: Vec::new(),
-            cursor_out: cursor,
-            report,
+        let diagnostics = ParseDiagnostics {
+            skipped_lines: parsed.skipped,
+            first_warning: report.warnings.first().cloned(),
         };
+        // `RejectedPoisonLine` 而非 `Unavailable`：**字节读到了**，是我们主动丢了
+        // 这一批。处置也不同 —— 游标冻在原处等下轮重读，而不是跳过本文件。
+        return (
+            observe(
+                change,
+                ParseQuality::RejectedPoisonLine(diagnostics),
+                cursor,
+                fingerprint,
+            ),
+            report,
+        );
     }
 
     // 全部好行：推进 safe_offset 到「完整行」边界（size - pending），半行留下轮。
@@ -406,23 +493,41 @@ fn scan_append_log<S: ByteSource>(
     cursor.codex_state = parsed.codex_state;
     report.events_emitted = parsed.events.len() as u64;
 
-    let status = if pending > 0 {
-        ScanStatus::Partial
-    } else {
-        ScanStatus::Ok
-    };
-
     log::info!(
         target: tag::SCAN,
         "append_log done: path={} events={} examined={} bytes={} pending={} rollback={}",
         report.source_path, report.events_emitted, report.items_examined, report.bytes_read, pending, report.rollback_detected
     );
 
-    ScanResult {
-        status,
-        events: parsed.events,
-        cursor_out: cursor,
-        report,
+    // 半截尾行是 append-log 的**常态**（写入方正写到一半），属于 `Clean` ——
+    // 旧的 `Partial` 把它与「全读遇坏行」归成一档，于是消费方分不出「一切正常」
+    // 与「有数据坏了但保住了好行」。
+    let mut obs = observe(
+        change,
+        ParseQuality::Clean {
+            deferred_tail_bytes: pending as u64,
+        },
+        cursor,
+        fingerprint,
+    );
+    obs.events = parsed.events;
+    (obs, report)
+}
+
+/// 构造一次观察。events 由调用点在需要时补上 —— 大多数失败路径本来就没有事件，
+/// 让它们各自写一遍 `events: Vec::new()` 只会多几个可以写错的地方。
+fn observe(
+    source_change: SourceChange,
+    quality: ParseQuality,
+    cursor: Cursor,
+    source_fingerprint: Option<SourceFingerprint>,
+) -> AppendLogObservation {
+    AppendLogObservation {
+        source_change,
+        quality,
+        events: Vec::new(),
+        cursor,
+        source_fingerprint,
     }
 }
 
@@ -786,5 +891,161 @@ mod tests {
         let (c, p) = split_complete_jsonl("");
         assert_eq!(c, "");
         assert_eq!(p, 0);
+    }
+
+    /// ADR-051 §1 的判据 —— 观察四态 + 同尺寸原地重写。
+    ///
+    /// 嵌在 `tests` 内而非做兄弟模块：`temp_source` / `claude_line` 这些 fixture 是
+    /// 私有的，另起一个模块就得把它们逐个 `pub(super)` —— 为测试放宽可见性，是
+    /// 让生产代码给测试让路。
+    mod observation {
+        use super::super::*; // scan 模块本体（`super` 只是 `tests`）
+        use super::*; // tests 的 fixture：temp_source / claude_line / append / no_roots
+        use crate::observation::{ParseQuality, ScanFailure, SourceChange};
+
+        fn scan_obs(
+            src: &SourceRef,
+            cursor: Option<Cursor>,
+        ) -> (crate::observation::AppendLogObservation, SourceReport) {
+            scan_append_log_observed(src, cursor, Profile::Full, no_roots())
+        }
+
+        /// 🔴 **本步的判据：同尺寸原地重写要被识别出来。**
+        ///
+        /// 回退检测只看 `size` 与 `mtime`，一次保留大小的原地重写**两样都不变**。
+        /// 认不出来的后果：UI 索引走 `ReplaceFile`，总库走 `Append` 把新 seq 当重复
+        /// 丢弃 —— 两层从此不一致，而没有任何东西会说出来。
+        #[test]
+        fn a_same_sized_in_place_rewrite_is_detected() {
+            let (path, src) = temp_source("rewrite", &format!("{}\n", claude_line("s1", "aaa")));
+            let (first, _) = scan_obs(&src, None);
+            assert_eq!(first.source_change, SourceChange::Appended);
+            let fp1 = first.source_fingerprint.clone().expect("全读必须算出指纹");
+
+            // 同尺寸原地重写：内容变了，字节数一模一样。
+            let rewritten = format!("{}\n", claude_line("s1", "bbb"));
+            let before = std::fs::metadata(&path).unwrap().len();
+            std::fs::write(&path, &rewritten).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                before,
+                "前提：这次重写确实没改变文件大小"
+            );
+
+            // 再次全读（`cursor_in=None`，但带上上次的指纹）——
+            // 这正是 `ForceVerify` 的形状：强制全读，且不能预先宣称「字节未变」。
+            let mut carry = first.cursor.clone();
+            carry.safe_offset = 0;
+            carry.next_seq = 0;
+            let (second, _) = scan_obs(&src, Some(carry));
+            assert_ne!(
+                second.source_fingerprint.as_ref().unwrap(),
+                &fp1,
+                "内容变了，指纹必须变"
+            );
+            assert_eq!(
+                second.source_change,
+                SourceChange::RollbackOrRewrite,
+                "同尺寸重写要被认出来 —— size/mtime 都指望不上"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// 增量读**算不出**整份指纹 —— `None` 是「没读全文」，不是「内容没变」。
+        #[test]
+        fn an_incremental_scan_has_no_fingerprint() {
+            let (path, src) = temp_source("incr-fp", &format!("{}\n", claude_line("s1", "one")));
+            let (first, _) = scan_obs(&src, None);
+            assert!(first.source_fingerprint.is_some(), "全读有指纹");
+
+            append(&path, &format!("{}\n", claude_line("s1", "two")));
+            let (second, _) = scan_obs(&src, Some(first.cursor.clone()));
+            assert!(
+                second.source_fingerprint.is_none(),
+                "增量只读了尾巴，算不出整份指纹 —— 不得拿尾巴的哈希冒充"
+            );
+            assert_eq!(second.source_change, SourceChange::Appended);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// 半截尾行是 `Clean`，不是降级 —— 它是 append-log 的常态。
+        #[test]
+        fn a_half_written_tail_is_clean_with_deferred_bytes() {
+            let body = format!("{}\n{{\"type\":\"user\"", claude_line("s1", "done"));
+            let (path, src) = temp_source("halftail", &body);
+            let (obs, _) = scan_obs(&src, None);
+            match obs.quality {
+                ParseQuality::Clean {
+                    deferred_tail_bytes,
+                } => assert!(deferred_tail_bytes > 0, "半行的字节数要报出来"),
+                other => panic!("半截尾行必须是 Clean，实际 {other:?}"),
+            }
+            assert!(obs.events_are_usable() && obs.should_record());
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// 全读遇坏行 = **降级**：好行保留，数据可用。
+        #[test]
+        fn a_one_shot_scan_with_a_bad_line_degrades_but_keeps_events() {
+            let body = format!("{}\nnot json at all\n", claude_line("s1", "good"));
+            let (path, src) = temp_source("degraded", &body);
+            let (obs, _) = scan_obs(&src, None);
+            match &obs.quality {
+                ParseQuality::Degraded(d) => {
+                    assert_eq!(d.skipped_lines, 1);
+                    assert!(d.first_warning.is_some(), "要说得出第一条坏在哪");
+                }
+                other => panic!("全读遇坏行应降级，实际 {other:?}"),
+            }
+            assert!(!obs.events.is_empty(), "好行必须保留 —— 丢弃只会平白少数据");
+            assert!(obs.events_are_usable());
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// 🔴 增量遇坏行 = **主动拒绝整批**，与「没读成」是两件事。
+        ///
+        /// 保留事件又冻结游标会让下轮把同一批好行再发一遍，所以整批丢弃。
+        /// 处置也不同：游标冻在原处等下轮重读，而不是跳过本文件。
+        #[test]
+        fn an_incremental_bad_line_is_rejected_not_unavailable() {
+            let (path, src) = temp_source("poison", &format!("{}\n", claude_line("s1", "one")));
+            let (first, _) = scan_obs(&src, None);
+            append(&path, "garbage\n");
+            let (second, _) = scan_obs(&src, Some(first.cursor.clone()));
+
+            assert!(
+                matches!(second.quality, ParseQuality::RejectedPoisonLine(_)),
+                "增量坏行是主动拒绝，不是 Unavailable：{:?}",
+                second.quality
+            );
+            assert!(second.events.is_empty(), "整批丢弃");
+            assert!(!second.events_are_usable());
+            assert!(second.should_record(), "要落状态，否则下轮复用旧游标当成功");
+            assert_eq!(
+                second.cursor.safe_offset, first.cursor.safe_offset,
+                "游标冻在原处"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// 🔴 文件不在 ⇒ `Stat`，调用方**跳过本文件、不写库**。
+        ///
+        /// 与读失败分开，是因为处置相反：写一行 error 会把一次瞬时失败变成持久的坏记录。
+        /// 此前两者同为 `ScanStatus::Error`，消费方靠 warning 文案前缀区分。
+        #[test]
+        fn a_vanished_file_reports_stat_failure_not_read_failure() {
+            let (path, src) = temp_source("vanish", &format!("{}\n", claude_line("s1", "x")));
+            std::fs::remove_file(&path).unwrap();
+            let (obs, _) = scan_obs(&src, None);
+            assert!(
+                matches!(obs.quality, ParseQuality::Unavailable(ScanFailure::Stat(_))),
+                "文件消失是 stat 失败：{:?}",
+                obs.quality
+            );
+            assert!(
+                !obs.should_record(),
+                "跳过本文件，别把瞬时失败写成持久坏记录"
+            );
+        }
     }
 }
