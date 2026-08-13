@@ -97,36 +97,76 @@ pub fn probe_local(path: &str) -> Probe {
 /// 与本仓一贯的做法同源（`currency.anchor_fn` 注入、`resolve_project_root` 的
 /// `HostPlatform` 注入）：**平台事实作参数，逻辑才可单测**。
 pub(crate) fn probe_local_with_home(path: &str, home: Option<&Path>) -> Probe {
+    probe_local_with(path, home, |p| p.try_exists())
+}
+
+/// [`probe_local_with_home`] 的可测形态 —— **存在性判定注入**。
+///
+/// 🔴 拆出来是因为「权限错误 ≠ 不存在」这条**在本机测不到**：造一个 `try_exists`
+/// 会失败的路径要么要管理员权限、要么依赖平台细节。判定作参数，逻辑才可单测 ——
+/// 与 `home` 注入、`probe_mnt_with` 的探测器注入同一个惯例。
+pub(crate) fn probe_local_with(
+    path: &str,
+    home: Option<&Path>,
+    exists: impl Fn(&Path) -> std::io::Result<bool>,
+) -> Probe {
+    // 🔴 **`Path::exists()` 把访问失败折叠成 `false`**（评审 [P2]）。权限拒绝、
+    // 句柄耗尽、瞬时 IO 错误全都长得像「这里没有 `.git`」，于是探测要么错误地
+    // 落到**外层仓库**（把子项目的事件归到父仓名下），要么报 `Probe::None` 并被
+    // 按「确认没有根」写进 6 小时负缓存 —— 而那正是本 ADR 立的 `None` / `Failed`
+    // 契约要防的：**「问了、没有」与「没问成」必须分开**。
+    // 用 `try_exists()`：只有 `NotFound` 才是「没有」。
+    let mut failure: Option<String> = None;
+    let mut hit = |dir: &Path, name: &str| -> bool {
+        match exists(&dir.join(name)) {
+            Ok(v) => v,
+            Err(e) => {
+                failure.get_or_insert_with(|| format!("{}: {e}", dir.join(name).display()));
+                false
+            }
+        }
+    };
+
+    let mut found = None;
     let mut cur = Some(Path::new(path));
-    // 第一遍：最近的 `.git`（`exists()` 对子模块的 `.git` **文件**同样为真）。
+    // 第一遍：最近的 `.git`（对子模块的 `.git` **文件**同样为真）。
     while let Some(dir) = cur {
-        if Some(dir) != home && dir.join(".git").exists() {
-            return Probe::Found {
-                root: dir.to_string_lossy().into_owned(),
-                source: RootSource::Git,
-            };
+        if Some(dir) != home && hit(dir, ".git") {
+            found = Some((dir.to_string_lossy().into_owned(), RootSource::Git));
+            break;
         }
         cur = dir.parent();
     }
     // 第二遍：最近的构建 marker。
-    let mut cur = Some(Path::new(path));
-    while let Some(dir) = cur {
-        if Some(dir) != home {
-            for m in crate::project_root::MARKERS
-                .iter()
-                .filter(|m| **m != ".git")
-            {
-                if dir.join(m).exists() {
-                    return Probe::Found {
-                        root: dir.to_string_lossy().into_owned(),
-                        source: RootSource::Marker,
-                    };
+    if found.is_none() {
+        let mut cur = Some(Path::new(path));
+        'outer: while let Some(dir) = cur {
+            if Some(dir) != home {
+                for m in crate::project_root::MARKERS
+                    .iter()
+                    .filter(|m| **m != ".git")
+                {
+                    if hit(dir, m) {
+                        found = Some((dir.to_string_lossy().into_owned(), RootSource::Marker));
+                        break 'outer;
+                    }
                 }
             }
+            cur = dir.parent();
         }
-        cur = dir.parent();
     }
-    Probe::None
+
+    match found {
+        Some((root, source)) => Probe::Found { root, source },
+        // 🔴 探到了才算数；**一路没探到但中途有访问失败 ⇒ 说不出来**，
+        // 不能报 `None`（那会被当成「确认没有根」缓存 6 小时）。
+        None => match failure {
+            Some(why) => Probe::Failed {
+                reason: format!("cannot tell whether a root exists ({why})"),
+            },
+            None => Probe::None,
+        },
+    }
 }
 
 /// 经访问桥在 WSL 内探测 —— **一次 `wsl.exe` 调用走完整条祖先链**。
@@ -509,6 +549,47 @@ mod tests {
         });
         assert!(got.is_none());
         assert!(!called.get(), "映射不出来时不该调探测器");
+    }
+
+    /// 🔴 访问失败 ≠ 「这里没有根」（评审 [P2]）。
+    ///
+    /// `Path::exists()` 把权限拒绝折叠成 `false`，于是探测要么错误地落到**外层仓库**，
+    /// 要么报 `None` 并被按「确认没有根」写进 6 小时负缓存 —— 违反的正是本 ADR 立的
+    /// `None` / `Failed` 契约。
+    #[test]
+    fn a_permission_error_while_probing_is_failed_not_rootless() {
+        use std::io::{Error, ErrorKind};
+
+        let deny = |_: &Path| -> std::io::Result<bool> {
+            Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+        };
+        match probe_local_with("/w/proj/sub", None, deny) {
+            Probe::Failed { reason } => assert!(reason.contains("cannot tell"), "got {reason}"),
+            other => panic!("权限失败必须报 Failed，得到 {other:?}"),
+        }
+
+        // 🔴 **中途失败但最终探到了根 ⇒ 仍是 Found**。失败只在「一路没探到」时才决定
+        // 结论 —— 否则一个无关目录的权限问题会把一次成功的归属打成失败。
+        let flaky = |p: &Path| -> std::io::Result<bool> {
+            if p.to_string_lossy().contains("sub") {
+                Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+            } else {
+                Ok(p.file_name().is_some_and(|n| n == ".git"))
+            }
+        };
+        match probe_local_with("/w/proj/sub", None, flaky) {
+            Probe::Found { root, source } => {
+                assert_eq!(source, RootSource::Git);
+                assert!(root.ends_with("proj"), "got {root}");
+            }
+            other => panic!("探到了根就该是 Found，得到 {other:?}"),
+        }
+
+        // 反向：一路都答得上来、就是没有 ⇒ `None`（那才是「问了、没有」）。
+        assert!(matches!(
+            probe_local_with("/w/proj/sub", None, |_: &Path| Ok(false)),
+            Probe::None
+        ));
     }
 
     #[test]
