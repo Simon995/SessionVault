@@ -2543,6 +2543,8 @@ impl TotalStore {
                 Some(cursor),
                 Profile::Full,
                 std::sync::Arc::new(crate::attribution::RootRegistry::new()),
+                // 快照同步是一次性维护动作，不属于宿主任何一轮刷新的预算。
+                crate::deadline::Deadline::unbounded(),
             );
             if result.status == ScanStatus::Error {
                 stats.failed += 1;

@@ -31,10 +31,12 @@ pub fn scan_source(
     cursor_in: Option<Cursor>,
     profile: Profile,
     roots: Arc<RootRegistry>,
+    deadline: crate::deadline::Deadline,
 ) -> ScanResult {
     match source.source_mode {
         SourceMode::AppendLog => {
-            let (obs, report) = scan_append_log_observed(source, cursor_in, profile, roots);
+            let (obs, report) =
+                scan_append_log_observed(source, cursor_in, profile, roots, deadline);
             obs.into_scan_result(report)
         }
         SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile),
@@ -52,6 +54,7 @@ pub fn scan_append_log_observed(
     cursor_in: Option<Cursor>,
     profile: Profile,
     roots: Arc<RootRegistry>,
+    deadline: crate::deadline::Deadline,
 ) -> (AppendLogObservation, SourceReport) {
     match &source.source_location {
         SourceLocation::Local => scan_append_log(
@@ -64,7 +67,11 @@ pub fn scan_append_log_observed(
         SourceLocation::Wsl(distro) => {
             let abs = source.path.to_string_lossy().into_owned();
             scan_append_log(
-                &WslSource { distro, abs: &abs },
+                &WslSource {
+                    distro,
+                    abs: &abs,
+                    deadline,
+                },
                 source,
                 cursor_in,
                 profile,
@@ -117,11 +124,13 @@ fn scan_snapshot_file(
     };
     let read = match &source.source_location {
         SourceLocation::Local => std::fs::read(&source.path).map_err(|e| e.to_string()),
-        SourceLocation::Wsl(distro) => {
-            crate::wsl::read_file_at(distro, &source.path.to_string_lossy())
-                .and_then(|v| v.ok_or_else(|| "snapshot file disappeared".to_string()))
-                .map(String::into_bytes)
-        }
+        SourceLocation::Wsl(distro) => crate::wsl::read_file_at(
+            distro,
+            &source.path.to_string_lossy(),
+            crate::deadline::Deadline::unbounded(),
+        )
+        .and_then(|v| v.ok_or_else(|| "snapshot file disappeared".to_string()))
+        .map(String::into_bytes),
     };
     let bytes = match read {
         Ok(v) => v,
@@ -257,18 +266,21 @@ impl ByteSource for LocalSource<'_> {
 struct WslSource<'a> {
     distro: &'a str,
     abs: &'a str,
+    /// 🔴 **持有整轮 deadline**，不各自新建 —— `ByteSource` 的 `stat`/`read_range`
+    /// 没有参数位，而「每次调用重新拿 60 秒」正是这次要修的（ADR-051 §4）。
+    deadline: crate::deadline::Deadline,
 }
 
 impl ByteSource for WslSource<'_> {
     fn stat(&self) -> Result<(u64, Option<i64>), String> {
-        match crate::wsl::stat(self.distro, self.abs)? {
+        match crate::wsl::stat(self.distro, self.abs, self.deadline)? {
             Some((size, mtime)) => Ok((size, Some(mtime))),
             None => Err(format!("wsl file missing: {}:{}", self.distro, self.abs)),
         }
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
-        crate::wsl::read_range(self.distro, self.abs, start, end)
+        crate::wsl::read_range(self.distro, self.abs, start, end, self.deadline)
     }
 }
 
@@ -658,7 +670,13 @@ mod tests {
     #[test]
     fn snapshot_emits_only_on_hash_change_and_keeps_versions() {
         let (path, src) = temp_snapshot("changed", "# preference\nuse uv\n");
-        let first = scan_source(&src, None, Profile::Full, no_roots());
+        let first = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(first.status, ScanStatus::Ok);
         assert_eq!(first.events.len(), 1);
         assert!(first.report.fingerprint_changed);
@@ -673,12 +691,24 @@ mod tests {
             .as_deref()
             .is_some_and(|hash| hash.starts_with("sha256:")));
 
-        let unchanged = scan_source(&src, Some(first.cursor_out), Profile::Full, no_roots());
+        let unchanged = scan_source(
+            &src,
+            Some(first.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert!(unchanged.events.is_empty());
         assert!(!unchanged.report.fingerprint_changed);
 
         std::fs::write(&path, "# preference\nuse uv only\n").unwrap();
-        let changed = scan_source(&src, Some(unchanged.cursor_out), Profile::Full, no_roots());
+        let changed = scan_source(
+            &src,
+            Some(unchanged.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(changed.events.len(), 1);
         assert_eq!(changed.events[0].seq, 1);
         assert_ne!(changed.events[0].content_hash, first.events[0].content_hash);
@@ -696,7 +726,13 @@ mod tests {
             claude_line("s1", "beta")
         );
         let (path, src) = temp_source("badoneshot", &body);
-        let res = scan_source(&src, None, Profile::Full, no_roots());
+        let res = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(res.status, ScanStatus::Partial);
         assert_eq!(res.events.len(), 2, "两条好行事件应保留");
         assert_eq!(res.report.items_skipped, 1);
@@ -709,7 +745,13 @@ mod tests {
         // 增量（带游标续扫）：坏行整批冻结 —— offset 不前进、status=error、不发事件。
         // 保留事件 + 冻结游标会让下轮把同一批好行再发一遍（事件流重复），故增量必须丢弃。
         let (path, src) = temp_source("badincr", &format!("{}\n", claude_line("s", "alpha")));
-        let r1 = scan_source(&src, None, Profile::Full, no_roots());
+        let r1 = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r1.status, ScanStatus::Ok);
         let prev_offset = r1.cursor_out.safe_offset;
 
@@ -717,7 +759,13 @@ mod tests {
             &path,
             &format!("{}\nnot-json-here\n", claude_line("s", "beta")),
         );
-        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full, no_roots());
+        let r2 = scan_source(
+            &src,
+            Some(r1.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r2.status, ScanStatus::Error);
         assert!(r2.events.is_empty(), "增量坏行批不发事件");
         assert_eq!(
@@ -732,7 +780,13 @@ mod tests {
         // 全好行 → status=ok、offset 推进到完整行边界、无跳过。
         let body = "{\"a\":1}\n{\"b\":2}\n";
         let (path, src) = temp_source("good", body);
-        let res = scan_source(&src, None, Profile::Metadata, no_roots());
+        let res = scan_source(
+            &src,
+            None,
+            Profile::Metadata,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(res.status, ScanStatus::Ok);
         assert_eq!(res.cursor_out.safe_offset, body.len() as u64);
         assert_eq!(res.report.items_skipped, 0);
@@ -751,14 +805,26 @@ mod tests {
                 claude_line("s", "beta")
             ),
         );
-        let r1 = scan_source(&src, None, Profile::Full, no_roots());
+        let r1 = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r1.status, ScanStatus::Ok);
         let n1 = r1.events.len();
         assert_eq!(n1, 2, "两条 user 行 → 两个 message 事件");
         let off1 = r1.cursor_out.safe_offset;
 
         append(&path, &format!("{}\n", claude_line("s", "gamma")));
-        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full, no_roots());
+        let r2 = scan_source(
+            &src,
+            Some(r1.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r2.status, ScanStatus::Ok);
         assert_eq!(r2.events.len(), 1, "只出新增那一行");
         assert_eq!(r2.events[0].seq, n1 as u64, "seq 跨批续接（不重不漏）");
@@ -781,14 +847,26 @@ mod tests {
         let l2 = claude_line("s", "second");
         let cut = l2.len() / 2;
         let (path, src) = temp_source("pending", &format!("{l1}\n{}", &l2[..cut]));
-        let r1 = scan_source(&src, None, Profile::Full, no_roots());
+        let r1 = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r1.status, ScanStatus::Partial);
         assert!(r1.report.pending_tail_bytes > 0, "半行应 pending");
         assert_eq!(r1.events.len(), 1);
         assert_eq!(r1.events[0].content.as_deref(), Some("first"));
 
         append(&path, &format!("{}\n", &l2[cut..]));
-        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full, no_roots());
+        let r2 = scan_source(
+            &src,
+            Some(r1.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r2.report.pending_tail_bytes, 0);
         assert_eq!(r2.events.len(), 1);
         assert_eq!(r2.events[0].content.as_deref(), Some("second"));
@@ -799,9 +877,21 @@ mod tests {
     #[test]
     fn rescan_unchanged_emits_nothing() {
         let (path, src) = temp_source("nochange", &format!("{}\n", claude_line("s", "x")));
-        let r1 = scan_source(&src, None, Profile::Full, no_roots());
+        let r1 = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         let off = r1.cursor_out.safe_offset;
-        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full, no_roots());
+        let r2 = scan_source(
+            &src,
+            Some(r1.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(r2.status, ScanStatus::Ok);
         assert!(r2.events.is_empty(), "未变文件不重发事件");
         assert_eq!(r2.cursor_out.safe_offset, off);
@@ -814,13 +904,25 @@ mod tests {
             "trunc",
             &format!("{}\n{}\n", claude_line("s", "one"), claude_line("s", "two")),
         );
-        let r1 = scan_source(&src, None, Profile::Full, no_roots());
+        let r1 = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert!(r1.cursor_out.safe_offset > 0);
         assert!(r1.cursor_out.next_seq > 0);
 
         // 重写为更短内容（截断/重写）→ size 回退。
         std::fs::write(&path, format!("{}\n", claude_line("s", "fresh"))).unwrap();
-        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full, no_roots());
+        let r2 = scan_source(
+            &src,
+            Some(r1.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert!(r2.report.rollback_detected, "size 变小应触发回退");
         assert_eq!(r2.events.len(), 1);
         assert_eq!(r2.events[0].seq, 0, "回退后 seq 归零重读");
@@ -835,7 +937,13 @@ mod tests {
             "codexincr",
             &format!("{}\n{}\n", codex_meta("cdx"), codex_token(100, 20, 50)),
         );
-        let r1 = scan_source(&src, None, Profile::Full, no_roots());
+        let r1 = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         let u1: Vec<_> = r1
             .events
             .iter()
@@ -847,7 +955,13 @@ mod tests {
 
         // 追加第二条累计 token（仅这一行进第二批，session_meta 不重复）。
         append(&path, &format!("{}\n", codex_token(150, 30, 80)));
-        let r2 = scan_source(&src, Some(r1.cursor_out), Profile::Full, no_roots());
+        let r2 = scan_source(
+            &src,
+            Some(r1.cursor_out),
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
         let u2: Vec<_> = r2
             .events
             .iter()
@@ -907,7 +1021,13 @@ mod tests {
             src: &SourceRef,
             cursor: Option<Cursor>,
         ) -> (crate::observation::AppendLogObservation, SourceReport) {
-            scan_append_log_observed(src, cursor, Profile::Full, no_roots())
+            scan_append_log_observed(
+                src,
+                cursor,
+                Profile::Full,
+                no_roots(),
+                crate::deadline::Deadline::unbounded(),
+            )
         }
 
         /// 🔴 **本步的判据：同尺寸原地重写要被识别出来。**

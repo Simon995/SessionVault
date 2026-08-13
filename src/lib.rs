@@ -10,6 +10,7 @@
 pub mod attribution;
 pub mod catalog;
 pub mod cursor;
+pub mod deadline;
 pub mod discover;
 pub mod discovery;
 pub mod identity;
@@ -70,30 +71,30 @@ pub fn catalog() -> Vec<ProviderDescriptor> {
 
 /// §9 `discover()`：发现 transcript + snapshot 来源（本地 + WSL）。
 pub fn discover() -> Result<Vec<SourceRef>> {
-    discover::discover_all()
+    discover::discover_all(crate::deadline::Deadline::unbounded())
 }
 
 /// 仅发现宿主系统本机来源，不调用 WSL。用于需要确定性和文件系统隔离的宿主测试。
 pub fn discover_local() -> Result<Vec<SourceRef>> {
-    discover::discover_local()
+    discover::discover_local(crate::deadline::Deadline::unbounded())
 }
 
 pub fn discover_transcripts() -> Result<Vec<SourceRef>> {
-    discover::discover_transcripts()
+    discover::discover_transcripts(crate::deadline::Deadline::unbounded())
 }
 
 /// 同 [`discover_transcripts`]，但报出哪些位置没问成 —— 要据发现结果删存量的调用方
 /// **必须**用这个（见 [`DiscoveryOutcome`]）。
 pub fn discover_transcripts_reported() -> Result<DiscoveryOutcome> {
-    discover::discover_transcripts_reported()
+    discover::discover_transcripts_reported(crate::deadline::Deadline::unbounded())
 }
 
 pub fn discover_transcripts_local() -> Result<Vec<SourceRef>> {
-    discover::discover_transcripts_local()
+    discover::discover_transcripts_local(crate::deadline::Deadline::unbounded())
 }
 
 pub fn discover_snapshots() -> Result<Vec<SourceRef>> {
-    discover::discover_snapshots()
+    discover::discover_snapshots(crate::deadline::Deadline::unbounded())
 }
 
 pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRef> {
@@ -105,10 +106,10 @@ pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRe
 /// best-effort：没 WSL / `wsl.exe` 卡住 ⇒ 空表 ⇒ `/mnt/…` 那族不与宿主形式收敛，
 /// **不是**退回按盘符猜（那会把事件归到别的项目名下）。
 pub fn host_drive_mounts() -> pathnorm::DriveMounts {
-    wsl::list_distros()
+    wsl::list_distros(crate::deadline::Deadline::unbounded())
         .ok()
         .and_then(|d| wsl::default_distro(&d))
-        .and_then(|d| match wsl::drive_mounts(&d) {
+        .and_then(|d| match wsl::drive_mounts(&d, crate::deadline::Deadline::unbounded()) {
             Ok(m) => Some(m),
             Err(e) => {
                 log::debug!(
@@ -150,5 +151,11 @@ pub fn scan(
     profile: Profile,
     roots: std::sync::Arc<crate::attribution::RootRegistry>,
 ) -> ScanResult {
-    scan::scan_source(source, cursor_in, profile, roots)
+    scan::scan_source(
+        source,
+        cursor_in,
+        profile,
+        roots,
+        crate::deadline::Deadline::unbounded(),
+    )
 }

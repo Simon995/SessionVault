@@ -48,7 +48,7 @@ pub fn default_distro(distros: &[String]) -> Option<String> {
 /// 非 Windows 构建返回 `Ok(vec![])`（静默——这是个发现调用，不该在 Linux/macOS dev 上
 /// 用错误污染日志）。
 #[cfg(windows)]
-pub fn list_distros() -> Result<Vec<String>, String> {
+pub fn list_distros(deadline: crate::deadline::Deadline) -> Result<Vec<String>, String> {
     use std::process::Command;
 
     use std::process::Stdio;
@@ -62,10 +62,13 @@ pub fn list_distros() -> Result<Vec<String>, String> {
     // 🔴 **枚举发行版同样要有上限。** 它是每一轮发现的第一步，`output()` 没有超时 ——
     // 一个卡住的 WSL 会让整轮刷新停在这一行，比后面任何一次探测都更早、更彻底。
     // 修 `run_bash_stdin` 时漏掉它，实测让一次单元测试跑了 10 分钟没结束。
+    let budget = deadline
+        .budget_for(WSL_LIST_TIMEOUT)
+        .ok_or_else(|| "wsl -l -q: round budget exhausted before the call".to_string())?;
     let output = wait_with_deadline(
         cmd.spawn()
             .map_err(|e| format!("spawn wsl.exe failed: {e}"))?,
-        WSL_LIST_TIMEOUT,
+        budget,
     )?;
 
     if !output.status.success() {
@@ -93,8 +96,17 @@ pub fn list_distros() -> Result<Vec<String>, String> {
 /// `find|while` 在 `bash -c` 下 drain 不到 fd0——脚本走 stdin 两者皆避。含 `$` 的脚本
 /// 一律走这里。退出码由调用方判（含 exit-7 哨兵）。
 #[cfg(windows)]
-fn run_bash_stdin(distro: &str, script: &str) -> Result<std::process::Output, String> {
+fn run_bash_stdin(
+    distro: &str,
+    script: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<std::process::Output, String> {
     use std::io::Write;
+    // 🔴 **预算耗尽就根本别 spawn**（ADR-051 §4）。传一个零上限进去只会白付一次
+    // 进程创建的代价，还会在日志里留下一条看起来像「超时」的失败。
+    let budget = deadline
+        .budget_for(WSL_CALL_TIMEOUT)
+        .ok_or_else(|| format!("wsl {distro}: round budget exhausted before the call"))?;
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("wsl.exe");
@@ -116,7 +128,7 @@ fn run_bash_stdin(distro: &str, script: &str) -> Result<std::process::Output, St
             .write_all(script.as_bytes())
             .map_err(|e| format!("write to wsl.exe stdin failed: {e}"))?;
     }
-    wait_with_deadline(child, WSL_CALL_TIMEOUT)
+    wait_with_deadline(child, budget)
 }
 
 /// 一次 `wsl.exe` 调用的上限。
@@ -202,8 +214,12 @@ fn wait_with_deadline(
 /// 列出发行版内 `$HOME/<rel_subpath>` 下的全部 `*.jsonl` 绝对路径（仅发现、不读内容）。
 /// 目录不存在 → `Ok(vec![])`（脚本 `exit 0`）。
 #[cfg(windows)]
-pub fn list_jsonl_under_home(distro: &str, rel_subpath: &str) -> Result<Vec<String>, String> {
-    list_files_under_home(distro, rel_subpath, ".jsonl")
+pub fn list_jsonl_under_home(
+    distro: &str,
+    rel_subpath: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Vec<String>, String> {
+    list_files_under_home(distro, rel_subpath, ".jsonl", deadline)
 }
 
 /// 递归列出 `$HOME/<rel_subpath>` 下指定后缀的普通文件。后缀来自内置 catalog，
@@ -213,13 +229,14 @@ pub fn list_files_under_home(
     distro: &str,
     rel_subpath: &str,
     suffix: &str,
+    deadline: crate::deadline::Deadline,
 ) -> Result<Vec<String>, String> {
     let script = format!(
         "set -eu\nDIR=\"$HOME/{rel}\"\n[ -d \"$DIR\" ] || exit 0\nfind \"$DIR\" -type f -name \"{pattern}\" -print0\n",
         rel = shell_escape(rel_subpath),
         pattern = shell_escape(&format!("*{suffix}")),
     );
-    let output = run_bash_stdin(distro, &script)?;
+    let output = run_bash_stdin(distro, &script, deadline)?;
     if !output.status.success() {
         return Err(format!(
             "wsl.exe -d {distro} find exited {:?}: {}",
@@ -231,7 +248,11 @@ pub fn list_files_under_home(
 }
 
 #[cfg(not(windows))]
-pub fn list_jsonl_under_home(_distro: &str, _rel_subpath: &str) -> Result<Vec<String>, String> {
+pub fn list_jsonl_under_home(
+    _distro: &str,
+    _rel_subpath: &str,
+    _deadline: crate::deadline::Deadline,
+) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }
 
@@ -297,8 +318,11 @@ pub fn list_files_under_home(
 /// 失败 ⇒ `Err`。调用方据此**不做映射**（那些路径照旧「说不出来」），
 /// 而不是退回「猜 `/mnt/<字母>` 就是盘」。
 #[cfg(windows)]
-pub fn drive_mounts(distro: &str) -> Result<Vec<(String, String)>, String> {
-    let out = run_bash_stdin(distro, "set -eu\nmount\n")?;
+pub fn drive_mounts(
+    distro: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Vec<(String, String)>, String> {
+    let out = run_bash_stdin(distro, "set -eu\nmount\n", deadline)?;
     if out.status.code() != Some(0) {
         return Err(format!(
             "wsl mount {distro} exited {:?}: {}",
@@ -329,7 +353,10 @@ pub fn drive_mounts(distro: &str) -> Result<Vec<(String, String)>, String> {
 }
 
 #[cfg(not(windows))]
-pub fn drive_mounts(_distro: &str) -> Result<Vec<(String, String)>, String> {
+pub fn drive_mounts(
+    _distro: &str,
+    _deadline: crate::deadline::Deadline,
+) -> Result<Vec<(String, String)>, String> {
     Err("wsl.exe access is only available on Windows builds".to_string())
 }
 
@@ -346,7 +373,11 @@ pub fn is_windows_drive_device(device: &str) -> bool {
 }
 
 #[cfg(windows)]
-pub fn find_project_root(distro: &str, abs_path: &str) -> Result<Option<(String, String)>, String> {
+pub fn find_project_root(
+    distro: &str,
+    abs_path: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Option<(String, String)>, String> {
     let esc = shell_escape(abs_path);
     let script = format!(
         r#"set -eu
@@ -377,7 +408,7 @@ done
 exit 7
 "#
     );
-    let out = run_bash_stdin(distro, &script)?;
+    let out = run_bash_stdin(distro, &script, deadline)?;
     match out.status.code() {
         Some(0) => {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -396,12 +427,16 @@ exit 7
     }
 }
 
-pub fn stat(distro: &str, abs_path: &str) -> Result<Option<(u64, i64)>, String> {
+pub fn stat(
+    distro: &str,
+    abs_path: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Option<(u64, i64)>, String> {
     let esc = shell_escape(abs_path);
     let script = format!(
         "set -eu\nF=\"{esc}\"\n[ -f \"$F\" ] || exit 7\nprintf '%s\\t%s\\n' \"$(stat -c %Y \"$F\")\" \"$(stat -c %s \"$F\")\"\n"
     );
-    let out = run_bash_stdin(distro, &script)?;
+    let out = run_bash_stdin(distro, &script, deadline)?;
     match out.status.code() {
         Some(0) => {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -446,7 +481,13 @@ pub fn find_project_root(
 /// `tail -c +K`（1-indexed）取 `[start, EOF)`，再 `head -c (end-start)` 截到 `end`——
 /// append-only 文件下即精确 `[start, end)`。`end <= start` 直接空。
 #[cfg(windows)]
-pub fn read_range(distro: &str, abs_path: &str, start: u64, end: u64) -> Result<Vec<u8>, String> {
+pub fn read_range(
+    distro: &str,
+    abs_path: &str,
+    start: u64,
+    end: u64,
+    deadline: crate::deadline::Deadline,
+) -> Result<Vec<u8>, String> {
     if end <= start {
         return Ok(Vec::new());
     }
@@ -454,7 +495,7 @@ pub fn read_range(distro: &str, abs_path: &str, start: u64, end: u64) -> Result<
     let from = start + 1; // tail -c + 是 1-indexed
     let take = end - start;
     let script = format!("set -eu\ntail -c +{from} \"{esc}\" | head -c {take}\n");
-    let out = run_bash_stdin(distro, &script)?;
+    let out = run_bash_stdin(distro, &script, deadline)?;
     if !out.status.success() {
         return Err(format!(
             "wsl read_range {distro}:{abs_path} exited {:?}: {}",
@@ -490,7 +531,11 @@ pub fn read_range(
 ///
 /// 绝对路径不含 `$`，故安全走 `bash -c`（无 stdin-pipe 需求）。
 #[cfg(windows)]
-pub fn read_file_at(distro: &str, abs_path: &str) -> Result<Option<String>, String> {
+pub fn read_file_at(
+    distro: &str,
+    abs_path: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Option<String>, String> {
     use std::process::{Command, Stdio};
 
     let escaped = shell_escape(abs_path);
@@ -507,10 +552,13 @@ pub fn read_file_at(distro: &str, abs_path: &str) -> Result<Option<String>, Stri
     // 快照全文读走这里（`scan_snapshot`），一个卡死的 WSL 会让 `svault scan-all`
     // 无限期挂住。评审 [P2] 指出前两处改了、这处漏了 —— 加超时这件事必须**逐个
     // 出站调用**核，不能核到「主要那条路径」为止。
+    let budget = deadline
+        .budget_for(WSL_CALL_TIMEOUT)
+        .ok_or_else(|| format!("wsl read {distro}: round budget exhausted before the call"))?;
     let output = wait_with_deadline(
         cmd.spawn()
             .map_err(|e| format!("spawn wsl.exe failed: {e}"))?,
-        WSL_CALL_TIMEOUT,
+        budget,
     )?;
 
     match output.status.code() {
@@ -527,7 +575,11 @@ pub fn read_file_at(distro: &str, abs_path: &str) -> Result<Option<String>, Stri
 }
 
 #[cfg(not(windows))]
-pub fn read_file_at(_distro: &str, _abs_path: &str) -> Result<Option<String>, String> {
+pub fn read_file_at(
+    _distro: &str,
+    _abs_path: &str,
+    _deadline: crate::deadline::Deadline,
+) -> Result<Option<String>, String> {
     Err("wsl.exe access is only available on Windows builds".to_string())
 }
 
@@ -545,7 +597,7 @@ pub fn existing_files(
             "[ ! -f \"{escaped}\" ] || printf '%s\\0' \"{escaped}\"\n"
         ));
     }
-    let output = run_bash_stdin(distro, &script)?;
+    let output = run_bash_stdin(distro, &script, crate::deadline::Deadline::unbounded())?;
     if !output.status.success() {
         return Err(format!(
             "wsl batch exists {distro} exited {:?}: {}",
@@ -749,7 +801,7 @@ mod tests {
         if std::env::var("SVAULT_WSL_IT").is_err() {
             return;
         }
-        let distros = list_distros().expect("list_distros");
+        let distros = list_distros(crate::deadline::Deadline::unbounded()).expect("list_distros");
         let distro = distros
             .iter()
             .find(|d| is_user_distro(d))
@@ -760,28 +812,52 @@ mod tests {
         run_bash_stdin(
             distro,
             &format!("set -eu\nprintf 'line1\\nline2\\nline3\\n' > {path}\n"),
+            crate::deadline::Deadline::unbounded(),
         )
         .expect("write throwaway file");
 
-        let (size, mtime) = stat(distro, path).expect("stat ok").expect("file exists");
+        let (size, mtime) = stat(distro, path, crate::deadline::Deadline::unbounded())
+            .expect("stat ok")
+            .expect("file exists");
         assert_eq!(size, 18, "size mismatch");
         assert!(mtime > 0, "mtime should be a real epoch second");
 
         // 全读 [0, size)。
-        let full = read_range(distro, path, 0, size).expect("full read");
+        let full = read_range(
+            distro,
+            path,
+            0,
+            size,
+            crate::deadline::Deadline::unbounded(),
+        )
+        .expect("full read");
         assert_eq!(full, b"line1\nline2\nline3\n");
 
         // 增量 tail [6, size)：跳过 "line1\n"，得 "line2\nline3\n"（12 字节）。
-        let tail = read_range(distro, path, 6, size).expect("tail read");
+        let tail = read_range(
+            distro,
+            path,
+            6,
+            size,
+            crate::deadline::Deadline::unbounded(),
+        )
+        .expect("tail read");
         assert_eq!(tail, b"line2\nline3\n", "read_range(start>0) wrong");
 
         // 区间到中段 [6, 12)：恰 "line2\n"。
-        let mid = read_range(distro, path, 6, 12).expect("mid read");
+        let mid = read_range(distro, path, 6, 12, crate::deadline::Deadline::unbounded())
+            .expect("mid read");
         assert_eq!(mid, b"line2\n", "bounded read_range wrong");
 
         // 短读必须报错（P1 修复）：请求超出文件实际字节（截断/轮转/越过 EOF 的模拟）→ Err，
         // 与本地 read_exact 同语义，绝不静默返回少于 take 的字节。
-        let short = read_range(distro, path, 0, 1000);
+        let short = read_range(
+            distro,
+            path,
+            0,
+            1000,
+            crate::deadline::Deadline::unbounded(),
+        );
         assert!(
             short.is_err(),
             "read_range asking 1000B from an 18B file must Err (short read), got {short:?}"
@@ -789,12 +865,20 @@ mod tests {
 
         // 不存在文件 → stat 返回 None（exit-7 哨兵）。
         assert!(
-            stat(distro, "/tmp/svault-it-does-not-exist-xyz.txt")
-                .expect("stat missing ok")
-                .is_none(),
+            stat(
+                distro,
+                "/tmp/svault-it-does-not-exist-xyz.txt",
+                crate::deadline::Deadline::unbounded()
+            )
+            .expect("stat missing ok")
+            .is_none(),
             "missing file should stat to None"
         );
 
-        let _ = run_bash_stdin(distro, &format!("rm -f {path}\n"));
+        let _ = run_bash_stdin(
+            distro,
+            &format!("rm -f {path}\n"),
+            crate::deadline::Deadline::unbounded(),
+        );
     }
 }

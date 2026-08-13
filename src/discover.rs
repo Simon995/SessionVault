@@ -29,36 +29,38 @@ pub struct SourceRef {
 }
 
 /// 发现全部内置 provider 的本地来源。
-pub fn discover_all() -> Result<Vec<SourceRef>> {
-    discover(false)
+pub fn discover_all(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    discover(false, deadline)
 }
 
-pub fn discover_local() -> Result<Vec<SourceRef>> {
-    discover(true)
+pub fn discover_local(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    discover(true, deadline)
 }
 
 /// 只发现会话 append_log。QuotaBar 会话索引必须使用本接口，避免 snapshot
 /// 状态制品污染 `agent_sessions` 投影。
-pub fn discover_transcripts() -> Result<Vec<SourceRef>> {
-    Ok(discover_by_mode(false, SourceMode::AppendLog)?.sources)
+pub fn discover_transcripts(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    Ok(discover_by_mode(false, SourceMode::AppendLog, deadline)?.sources)
 }
 
 /// 同上，但**同时报出哪些位置没问成**。
 ///
 /// 🔴 会话索引必须用这个，不能用上面那个：调用方要据发现结果 prune 存量行，
 /// 而「这个位置零文件」与「这个位置问不到」在 `sources` 里长得一模一样。
-pub fn discover_transcripts_reported() -> Result<DiscoveryOutcome> {
-    discover_by_mode(false, SourceMode::AppendLog)
+pub fn discover_transcripts_reported(
+    deadline: crate::deadline::Deadline,
+) -> Result<DiscoveryOutcome> {
+    discover_by_mode(false, SourceMode::AppendLog, deadline)
 }
 
-pub fn discover_transcripts_local() -> Result<Vec<SourceRef>> {
-    Ok(discover_by_mode(true, SourceMode::AppendLog)?.sources)
+pub fn discover_transcripts_local(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    Ok(discover_by_mode(true, SourceMode::AppendLog, deadline)?.sources)
 }
 
 /// 只发现工具配置根内的 Class-B 状态快照。项目 instruction 由
 /// [`discover_project_snapshots`] 接收宿主已经算好的项目身份后发现。
-pub fn discover_snapshots() -> Result<Vec<SourceRef>> {
-    Ok(discover_by_mode(false, SourceMode::SnapshotFile)?.sources)
+pub fn discover_snapshots(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    Ok(discover_by_mode(false, SourceMode::SnapshotFile, deadline)?.sources)
 }
 
 #[derive(Debug, Clone)]
@@ -95,12 +97,14 @@ pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRe
             let exists = match (&root.source_location, probe) {
                 (_, Some(path)) => path.is_file(),
                 (SourceLocation::Local, None) => path.is_file(),
-                (SourceLocation::Wsl(distro), None) => {
-                    crate::wsl::stat(distro, &path.to_string_lossy())
-                        .ok()
-                        .flatten()
-                        .is_some()
-                }
+                (SourceLocation::Wsl(distro), None) => crate::wsl::stat(
+                    distro,
+                    &path.to_string_lossy(),
+                    crate::deadline::Deadline::unbounded(),
+                )
+                .ok()
+                .flatten()
+                .is_some(),
             };
             if exists {
                 out.push(SourceRef {
@@ -118,8 +122,8 @@ pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRe
     out
 }
 
-fn discover(local_only: bool) -> Result<Vec<SourceRef>> {
-    Ok(discover_reported(local_only)?.sources)
+fn discover(local_only: bool, deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    Ok(discover_reported(local_only, deadline)?.sources)
 }
 
 /// 一次发现的完整结果：**找到了什么** + **哪些位置没问成**。
@@ -145,9 +149,12 @@ pub struct DiscoveryOutcome {
     pub unreachable: Vec<String>,
 }
 
-fn discover_reported(local_only: bool) -> Result<DiscoveryOutcome> {
-    let mut first = discover_by_mode(local_only, SourceMode::AppendLog)?;
-    let second = discover_by_mode(local_only, SourceMode::SnapshotFile)?;
+fn discover_reported(
+    local_only: bool,
+    deadline: crate::deadline::Deadline,
+) -> Result<DiscoveryOutcome> {
+    let mut first = discover_by_mode(local_only, SourceMode::AppendLog, deadline)?;
+    let second = discover_by_mode(local_only, SourceMode::SnapshotFile, deadline)?;
     first.sources.extend(second.sources);
     for u in second.unreachable {
         if !first.unreachable.contains(&u) {
@@ -158,7 +165,11 @@ fn discover_reported(local_only: bool) -> Result<DiscoveryOutcome> {
     Ok(first)
 }
 
-fn discover_by_mode(local_only: bool, wanted: SourceMode) -> Result<DiscoveryOutcome> {
+fn discover_by_mode(
+    local_only: bool,
+    wanted: SourceMode,
+    deadline: crate::deadline::Deadline,
+) -> Result<DiscoveryOutcome> {
     let mut out = Vec::new();
     let mut unreachable = Vec::new();
     for desc in catalog::builtin_descriptors() {
@@ -221,7 +232,7 @@ fn discover_by_mode(local_only: bool, wanted: SourceMode) -> Result<DiscoveryOut
     if local_only {
         log::debug!(target: tag::DISCOVER, "skip WSL discovery: local-only mode");
     } else {
-        discover_wsl(&mut out, &mut unreachable, wanted);
+        discover_wsl(&mut out, &mut unreachable, wanted, deadline);
     }
     log::info!(
         target: tag::DISCOVER,
@@ -251,8 +262,13 @@ fn home_rel_base(source_type: SourceType) -> Option<&'static str> {
 /// 在发行版内 `find *.jsonl`。非 Windows 构建为 no-op（见 `wsl` 的桩）。
 /// append_log 与 snapshot_file 均经 WSL bridge 读取；sqlite_store 仍未实现。
 #[cfg(windows)]
-fn discover_wsl(out: &mut Vec<SourceRef>, unreachable: &mut Vec<String>, wanted: SourceMode) {
-    let distros = match crate::wsl::list_distros() {
+fn discover_wsl(
+    out: &mut Vec<SourceRef>,
+    unreachable: &mut Vec<String>,
+    wanted: SourceMode,
+    deadline: crate::deadline::Deadline,
+) {
+    let distros = match crate::wsl::list_distros(deadline) {
         Ok(d) => d,
         Err(e) => {
             // 🔴 连发行版都列不出来 ⇒ **每一个** WSL 位置都算没问成。
@@ -280,22 +296,23 @@ fn discover_wsl(out: &mut Vec<SourceRef>, unreachable: &mut Vec<String>, wanted:
                     log::warn!(target: tag::DISCOVER, "unsupported artifact glob: {}", art.glob);
                     continue;
                 };
-                let mut files = match crate::wsl::list_files_under_home(distro, &rel, suffix) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        // 这个发行版的这一族没问成 ⇒ 整个位置都不能据本轮结果删存量。
-                        // 「这一族空」与「这一族问不到」在返回值上一模一样。
-                        log::warn!(
-                            target: tag::DISCOVER,
-                            "wsl find failed: distro={distro} rel={rel} err={e}"
-                        );
-                        let key = format!("wsl:{distro}");
-                        if !unreachable.contains(&key) {
-                            unreachable.push(key);
+                let mut files =
+                    match crate::wsl::list_files_under_home(distro, &rel, suffix, deadline) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            // 这个发行版的这一族没问成 ⇒ 整个位置都不能据本轮结果删存量。
+                            // 「这一族空」与「这一族问不到」在返回值上一模一样。
+                            log::warn!(
+                                target: tag::DISCOVER,
+                                "wsl find failed: distro={distro} rel={rel} err={e}"
+                            );
+                            let key = format!("wsl:{distro}");
+                            if !unreachable.contains(&key) {
+                                unreachable.push(key);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                };
+                    };
                 if !art.recursive {
                     files.retain(|p| {
                         p.rsplit_once('/')
@@ -329,7 +346,13 @@ fn discover_wsl(out: &mut Vec<SourceRef>, unreachable: &mut Vec<String>, wanted:
 }
 
 #[cfg(not(windows))]
-fn discover_wsl(_out: &mut Vec<SourceRef>, _unreachable: &mut Vec<String>, _wanted: SourceMode) {}
+fn discover_wsl(
+    _out: &mut Vec<SourceRef>,
+    _unreachable: &mut Vec<String>,
+    _wanted: SourceMode,
+    _deadline: crate::deadline::Deadline,
+) {
+}
 
 fn artifact_kind(mode: SourceMode, glob: &str) -> Option<String> {
     if mode != SourceMode::SnapshotFile {
@@ -488,7 +511,12 @@ mod tests {
         let mut unreachable = Vec::new();
         // 非 Windows 构建下 discover_wsl 是空实现，这里只钉「签名带得出这个信息」
         // 以及哨兵的含义 —— 真实失败路径由 Windows 侧的 `list_distros` 覆盖。
-        discover_wsl(&mut out, &mut unreachable, SourceMode::AppendLog);
+        discover_wsl(
+            &mut out,
+            &mut unreachable,
+            SourceMode::AppendLog,
+            crate::deadline::Deadline::unbounded(),
+        );
         assert!(
             unreachable.iter().all(|u| u.starts_with("wsl:")),
             "位置键必须是 wsl:<distro> 或全量哨兵 wsl:*，调用方按它匹配"

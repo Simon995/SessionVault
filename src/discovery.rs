@@ -190,8 +190,13 @@ pub(crate) fn probe_local_with(
 ///
 /// 逐级从 Windows 侧 stat 要 N 次跨 VM 往返（每次约 0.1–0.3s），所以循环写在
 /// 脚本里 —— 见 [`crate::wsl::find_project_root`]。
-pub fn probe_wsl(distro: &str, linux_path: &str, canonical_form: bool) -> Probe {
-    match crate::wsl::find_project_root(distro, linux_path) {
+pub fn probe_wsl(
+    distro: &str,
+    linux_path: &str,
+    canonical_form: bool,
+    deadline: crate::deadline::Deadline,
+) -> Probe {
+    match crate::wsl::find_project_root(distro, linux_path, deadline) {
         Ok(Some((dir, kind))) => {
             // 🔴 **结果的形式必须跟随输入的形式。**
             //
@@ -236,6 +241,7 @@ pub fn discover<I, S>(
     candidates: I,
     default_distro: Option<&str>,
     mounts: &DriveMounts,
+    deadline: crate::deadline::Deadline,
 ) -> DiscoveryReport
 where
     I: IntoIterator<Item = S>,
@@ -248,7 +254,7 @@ where
         if path.is_empty() || !seen.insert(path.to_string()) {
             continue;
         }
-        report.record(probe_path(path, default_distro, mounts));
+        report.record(probe_path(path, default_distro, mounts, deadline));
     }
     report
 }
@@ -263,22 +269,27 @@ where
 /// 归属是纯字符串匹配，**登记什么形式就只认什么形式**；无条件转规范形会让裸形式
 /// 的路径全部归不到根（干跑实测：一条 `/home/simon/workspace/EyeVLM` 就是 106,814
 /// 条事件）。
-pub fn probe_path(path: &str, default_distro: Option<&str>, mounts: &DriveMounts) -> Probe {
+pub fn probe_path(
+    path: &str,
+    default_distro: Option<&str>,
+    mounts: &DriveMounts,
+    deadline: crate::deadline::Deadline,
+) -> Probe {
     if let Some((distro, linux)) = pathnorm::split_canonical_wsl(path) {
-        return probe_wsl(distro, linux, true);
+        return probe_wsl(distro, linux, true, deadline);
     }
     if let Some(canonical) = pathnorm::canonical_wsl_unc(path) {
         if let Some((distro, linux)) = pathnorm::split_canonical_wsl(&canonical) {
             // UNC 输入：总库里 UNC 与规范形是同一族（`canonical_wsl_unc` 已经把
             // 前者归一到后者），所以用规范形登记。
-            return probe_wsl(distro, linux, true);
+            return probe_wsl(distro, linux, true, deadline);
         }
     }
     // Windows 宿主上的裸 Linux 路径（`/home/…`）：本机 stat 会去错盘，
     // 只有知道 distro 才问得动 —— 但**结果要保持裸形式**。
     if cfg!(windows) && pathnorm::is_bare_linux_path(path) {
         return match default_distro {
-            Some(d) => probe_wsl(d, path, false),
+            Some(d) => probe_wsl(d, path, false, deadline),
             None => Probe::Failed {
                 reason: format!("bare linux path with no known distro: {path}"),
             },
@@ -416,7 +427,12 @@ mod tests {
         if !cfg!(windows) {
             return; // 非 Windows 上裸 Linux 路径是本机路径，走 probe_local
         }
-        match probe_path("/home/u/workspace/proj/docs", None, &Vec::new()) {
+        match probe_path(
+            "/home/u/workspace/proj/docs",
+            None,
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        ) {
             Probe::Failed { reason } => assert!(reason.contains("no known distro")),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -664,7 +680,12 @@ mod tests {
         if !cfg!(windows) {
             return;
         }
-        match probe_path("/mnt/d/work/proj", None, &Vec::new()) {
+        match probe_path(
+            "/mnt/d/work/proj",
+            None,
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        ) {
             Probe::Failed { reason } => {
                 assert!(
                     reason.contains("/mnt/d/work/proj"),
@@ -677,7 +698,12 @@ mod tests {
         let m = mounts();
         assert!(
             !matches!(
-                probe_path("/mnt/d/work/proj", None, &m),
+                probe_path(
+                    "/mnt/d/work/proj",
+                    None,
+                    &m,
+                    crate::deadline::Deadline::unbounded()
+                ),
                 Probe::Failed { .. }
             ),
             "映射得出来时不该报失败"
@@ -726,7 +752,12 @@ mod tests {
         std::fs::create_dir_all(tmp.join("r").join("s")).unwrap();
         std::fs::create_dir_all(tmp.join("r").join(".git")).unwrap();
         let p = tmp.join("r").join("s").to_string_lossy().into_owned();
-        let rep = discover([p.clone(), p.clone(), p], None, &Vec::new());
+        let rep = discover(
+            [p.clone(), p.clone(), p],
+            None,
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        );
         assert_eq!(rep.roots.len(), 1);
         std::fs::remove_dir_all(&tmp).ok();
     }
