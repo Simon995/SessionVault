@@ -97,18 +97,22 @@ pub fn probe_local(path: &str) -> Probe {
 /// 与本仓一贯的做法同源（`currency.anchor_fn` 注入、`resolve_project_root` 的
 /// `HostPlatform` 注入）：**平台事实作参数，逻辑才可单测**。
 pub(crate) fn probe_local_with_home(path: &str, home: Option<&Path>) -> Probe {
-    probe_local_with(path, home, |p| p.try_exists())
+    probe_local_with(path, home, &crate::probe::LocalBackend)
 }
 
-/// [`probe_local_with_home`] 的可测形态 —— **存在性判定注入**。
+/// [`probe_local_with_home`] 的可测形态 —— **backend 注入**。
 ///
-/// 🔴 拆出来是因为「权限错误 ≠ 不存在」这条**在本机测不到**：造一个 `try_exists`
-/// 会失败的路径要么要管理员权限、要么依赖平台细节。判定作参数，逻辑才可单测 ——
+/// 🔴 拆出来是因为「权限错误 ≠ 不存在」这条**在本机测不到**：造一个探测会失败的
+/// 路径要么要管理员权限、要么依赖平台细节。判定作参数，逻辑才可单测 ——
 /// 与 `home` 注入、`probe_mnt_with` 的探测器注入同一个惯例。
+///
+/// ⚠️ 这里从前收的是一个 `Fn(&Path) -> io::Result<bool>` 闭包，于是「`NotFound` 是
+/// 事实、其余是没问成」这条判据在本文件里**又抄了一遍**。现在收 [`ProbeBackend`]，
+/// 判据只在 `probe::classify` 里存在一次。
 pub(crate) fn probe_local_with(
     path: &str,
     home: Option<&Path>,
-    exists: impl Fn(&Path) -> std::io::Result<bool>,
+    backend: &dyn crate::probe::ProbeBackend,
 ) -> Probe {
     // 🔴 **`Path::exists()` 把访问失败折叠成 `false`**（评审 [P2]）。权限拒绝、
     // 句柄耗尽、瞬时 IO 错误全都长得像「这里没有 `.git`」，于是探测要么错误地
@@ -129,7 +133,12 @@ pub(crate) fn probe_local_with(
     // ⚠️ 命中之后的失败不算：命中即返回，根本不会去探更外层（有测试钉这条 ——
     // 否则「更严格」会变成「一路探到底」，一个无关的外层权限问题又能推翻结论）。
     let probe_layer = |dir: &Path, name: &str| -> Result<bool, String> {
-        exists(&dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()))
+        match backend.probe(&dir.join(name), crate::deadline::Deadline::unbounded()) {
+            // `.git` 是文件（子模块 / worktree）时同样算命中。
+            crate::probe::Probed::Found(_) => Ok(true),
+            crate::probe::Probed::Absent => Ok(false),
+            crate::probe::Probed::Unknown(e) => Err(e.to_string()),
+        }
     };
     let cannot_tell = |why: String| Probe::Failed {
         reason: format!("cannot tell whether a root exists ({why})"),
@@ -351,6 +360,23 @@ fn probe_mnt_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 把一个闭包当 backend 用。**闭包直接产 `Probed`** —— 见
+    /// `a_permission_error_while_probing_is_failed_not_rootless` 里的说明：
+    /// 让 fixture 自己把 `io::Error` 翻成三态，等于在测试侧再写一份判据。
+    struct FnBackend<F>(F);
+    impl<F> crate::probe::ProbeBackend for FnBackend<F>
+    where
+        F: Fn(&Path) -> crate::probe::Probed<crate::probe::FileKind>,
+    {
+        fn probe(
+            &self,
+            path: &Path,
+            _deadline: crate::deadline::Deadline,
+        ) -> crate::probe::Probed<crate::probe::FileKind> {
+            (self.0)(path)
+        }
+    }
 
     #[test]
     fn finds_the_nearest_git_not_the_farthest() {
@@ -588,12 +614,13 @@ mod tests {
     /// `None` / `Failed` 契约。
     #[test]
     fn a_permission_error_while_probing_is_failed_not_rootless() {
-        use std::io::{Error, ErrorKind};
+        use crate::probe::{FileKind, ProbeError, Probed};
 
-        let deny = |_: &Path| -> std::io::Result<bool> {
-            Err(Error::new(ErrorKind::PermissionDenied, "denied"))
-        };
-        match probe_local_with("/w/proj/sub", None, deny) {
+        // ⚠️ 探测器直接产 `Probed` —— **不是**产 `io::Result<bool>` 再由一个测试用的
+        // 适配器翻译。适配器会另写一遍「`NotFound` 是事实、其余是没问成」，那时
+        // fixture 与生产各有一份判据，变异掉生产那份的测试照样绿（本仓 mock 契约那条）。
+        let deny = FnBackend(|p: &Path| Probed::Unknown(ProbeError::new(p, "denied")));
+        match probe_local_with("/w/proj/sub", None, &deny) {
             Probe::Failed { reason } => assert!(reason.contains("cannot tell"), "got {reason}"),
             other => panic!("权限失败必须报 Failed，得到 {other:?}"),
         }
@@ -606,14 +633,16 @@ mod tests {
         // —— 归到 `/w/proj` 就是把子仓库的会话记到父仓库名下，**而且静默**。
         //
         // 一条把错误行为钉死的测试比没有测试更糟：它让后来者以为这是想要的。
-        let inner_denied = |p: &Path| -> std::io::Result<bool> {
+        let inner_denied = FnBackend(|p: &Path| {
             if p.to_string_lossy().contains("sub") {
-                Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+                Probed::Unknown(ProbeError::new(p, "denied"))
+            } else if p.file_name().is_some_and(|n| n == ".git") {
+                Probed::Found(FileKind::Dir)
             } else {
-                Ok(p.file_name().is_some_and(|n| n == ".git"))
+                Probed::Absent
             }
-        };
-        match probe_local_with("/w/proj/sub", None, inner_denied) {
+        });
+        match probe_local_with("/w/proj/sub", None, &inner_denied) {
             Probe::Failed { reason } => assert!(reason.contains("sub"), "got {reason}"),
             other => panic!("内层没问成时不能归到外层根，得到 {other:?}"),
         }
@@ -622,15 +651,17 @@ mod tests {
         //
         // 没有这一条，「更严格」会滑成「一路探到底」：一个无关的外层权限问题又能
         // 推翻一个已经确定的结论。
-        let outer_denied = |p: &Path| -> std::io::Result<bool> {
+        let outer_denied = FnBackend(|p: &Path| {
             let s = p.to_string_lossy().into_owned();
-            if s.contains("sub") {
-                Ok(p.file_name().is_some_and(|n| n == ".git")) // sub/.git 确实在
+            if !s.contains("sub") {
+                Probed::Unknown(ProbeError::new(p, "denied"))
+            } else if p.file_name().is_some_and(|n| n == ".git") {
+                Probed::Found(FileKind::Dir) // sub/.git 确实在
             } else {
-                Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+                Probed::Absent
             }
-        };
-        match probe_local_with("/w/proj/sub", None, outer_denied) {
+        });
+        match probe_local_with("/w/proj/sub", None, &outer_denied) {
             Probe::Found { root, source } => {
                 assert_eq!(source, RootSource::Git);
                 assert!(root.ends_with("sub"), "最近的那个根就是答案，got {root}");
@@ -643,25 +674,28 @@ mod tests {
         //
         // ⚠️ 这条是变异验证逼出来的：上面几段的探测器都在 `.git` 那遍就失败了，
         // **从没走到 marker 那遍**，于是「marker 失败后继续上溯」这个变异全绿。
-        let marker_denied = |p: &Path| -> std::io::Result<bool> {
+        let marker_denied = FnBackend(|p: &Path| {
             let s = p.to_string_lossy().into_owned();
             if s.ends_with(".git") {
-                return Ok(false); // `.git` 那遍一路答得上来、就是没有
+                return Probed::Absent; // `.git` 那遍一路答得上来、就是没有
             }
             if s.contains("sub") {
-                Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+                Probed::Unknown(ProbeError::new(p, "denied"))
+            } else if s.ends_with("Cargo.toml") {
+                Probed::Found(FileKind::File)
             } else {
-                Ok(s.ends_with("Cargo.toml"))
+                Probed::Absent
             }
-        };
-        match probe_local_with("/w/proj/sub", None, marker_denied) {
+        });
+        match probe_local_with("/w/proj/sub", None, &marker_denied) {
             Probe::Failed { reason } => assert!(reason.contains("sub"), "got {reason}"),
             other => panic!("marker 那遍内层没问成也不能归到外层，得到 {other:?}"),
         }
 
         // 反向：一路都答得上来、就是没有 ⇒ `None`（那才是「问了、没有」）。
+        let all_absent = FnBackend(|_: &Path| Probed::Absent);
         assert!(matches!(
-            probe_local_with("/w/proj/sub", None, |_: &Path| Ok(false)),
+            probe_local_with("/w/proj/sub", None, &all_absent),
             Probe::None
         ));
     }

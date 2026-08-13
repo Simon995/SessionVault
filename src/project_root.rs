@@ -87,12 +87,26 @@ pub fn resolve_project_root(cwd: Option<&str>, host: HostPlatform) -> ProjectRoo
 }
 
 /// 从 `start` 向上逐级找最近的 marker 命中，返回 `(命中目录, marker 文件名)`。
+///
+/// 🔴 **探测失败当作「这一层没有 marker」**，继续上溯。这与 `discovery::probe_local_with`
+/// 的规则（ADR-051 §5 规则 ③：没问成就停下）**故意不同** —— 本模块是 ADR-050 之前的
+/// 旧解析器，**已不在任何生产路径上**（唯一消费者是 `examples/project_root_scope.rs`，
+/// 它存在的目的正是量出旧行为的影响范围）。改成三态会让那个诊断量的不再是它要量的
+/// 东西；而把它接回生产路径是 ADR-050 明确要消除的方向。
+///
+/// 探测经 [`crate::probe`] 而不是 `Path::exists()`：**折叠这件事要写出来**，
+/// 不能由一个看不出取舍的 `.exists()` 顺手完成。
 fn find_upward(start: &Path) -> Option<(PathBuf, &'static str)> {
+    use crate::probe::{ProbeBackend, Probed};
     let mut cur = Some(start);
     while let Some(dir) = cur {
         for marker in MARKERS {
-            if dir.join(marker).exists() {
-                return Some((dir.to_path_buf(), marker));
+            match crate::probe::LocalBackend
+                .probe(&dir.join(marker), crate::deadline::Deadline::unbounded())
+            {
+                Probed::Found(_) => return Some((dir.to_path_buf(), marker)),
+                // 旧解析器的既有行为：两者都当「这一层没有」。见上面的说明。
+                Probed::Absent | Probed::Unknown(_) => {}
             }
         }
         cur = dir.parent();

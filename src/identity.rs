@@ -37,22 +37,58 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::deadline::Deadline;
+use crate::probe::{ProbeBackend, Probed};
+
+/// 一次 git 根查找的结果 —— **三态**。
+///
+/// 🔴 从前是 `Option<PathBuf>`，而两处 `.exists()` 把「没问成」折叠进了 `None`。
+/// 后果不是崩溃，是**静默**：`store.rs` 的 `note_project_identity` 拿到 `None` 就
+/// `return`，且它**先记后算**（`identity_seen` 在计算前就插了 key）—— 于是一次
+/// 权限错误 / UNC 不通让这个项目在本进程生命周期内**永远**算不出 `git:` 身份，
+/// 没有别名组，跨 checkout 的 Class-A 证据在 project 作用域里蒸发。
+/// 而界面上什么都不会说。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitRoot {
+    Found(PathBuf),
+    /// 探明白了：起点已不在磁盘上，或整条链上没有 `.git`。**这是事实。**
+    Absent,
+    /// **没问成** —— 本轮这个答案不作数，别据此写「这个项目没有身份」。
+    Unknown(crate::probe::ProbeError),
+}
+
 /// 从 `start` 向上找最近的含 `.git` 的目录。
 ///
-/// **路径不存在时返回 `None`**，而不是继续向上走 —— 一个已被删除的 checkout 的
-/// 父目录可能恰好是另一个仓库，那样会把它的身份安到一个不相干的项目上。
-pub fn find_git_root(start: &Path) -> Option<PathBuf> {
-    if !start.exists() {
-        return None;
+/// **起点不存在时返回 [`GitRoot::Absent`]**，而不是继续向上走 —— 一个已被删除的
+/// checkout 的父目录可能恰好是另一个仓库，那样会把它的身份安到一个不相干的项目上。
+///
+/// 🔴 **一层没问成就停在那里**（ADR-051 §5 规则 ③，与 `discovery::probe_local_with`
+/// 同一条）：继续上溯会把一个**错误的归属**说成成功 —— `/w/proj/sub` 的 `.git` 读不到、
+/// 于是上溯到 `/w/proj` 命中，可 `sub` 很可能本来就有 `.git`。报 `Unknown` 走重试，
+/// 错误归属只会安静地留在库里。
+pub fn find_git_root(start: &Path) -> GitRoot {
+    find_git_root_with(start, &crate::probe::LocalBackend)
+}
+
+/// [`find_git_root`] 的可测形态 —— **backend 注入**（「探测失败」在本机造不出来）。
+pub fn find_git_root_with(start: &Path, backend: &dyn ProbeBackend) -> GitRoot {
+    let d = Deadline::unbounded();
+    match backend.probe(start, d) {
+        Probed::Found(_) => {}
+        Probed::Absent => return GitRoot::Absent,
+        Probed::Unknown(e) => return GitRoot::Unknown(e),
     }
     let mut cur = Some(start);
     while let Some(dir) = cur {
-        if dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
+        match backend.probe(&dir.join(".git"), d) {
+            // `.git` 是**文件**时同样成立（子模块 / worktree）。
+            Probed::Found(_) => return GitRoot::Found(dir.to_path_buf()),
+            Probed::Absent => {}
+            Probed::Unknown(e) => return GitRoot::Unknown(e),
         }
         cur = dir.parent();
     }
-    None
+    GitRoot::Absent
 }
 
 /// 读 `.git/config` 里 `[remote "origin"]` 的 `url`。
@@ -228,7 +264,7 @@ mod tests {
         let gone = root.join("was-a-checkout");
         assert_eq!(
             find_git_root(&gone),
-            None,
+            GitRoot::Absent,
             "路径不存在时必须拒绝，不能上溯到 {root:?}"
         );
     }
@@ -239,10 +275,49 @@ mod tests {
         seed_repo(&root, Some("git@github.com:o/r.git"));
         let sub = root.join("src").join("deep");
         std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(find_git_root(&sub).as_deref(), Some(root.as_path()));
-        assert_eq!(
-            canonical_repo_id(&find_git_root(&sub).unwrap()),
-            "git:github.com/o/r"
-        );
+        assert_eq!(find_git_root(&sub), GitRoot::Found(root.clone()));
+        let GitRoot::Found(found) = find_git_root(&sub) else {
+            panic!("应当找到 git 根");
+        };
+        assert_eq!(canonical_repo_id(&found), "git:github.com/o/r");
+    }
+
+    /// 🔴 **探测失败不是「这个项目没有 git 根」。**
+    ///
+    /// 两条边都钉：起点探不动、以及链上某一层探不动 —— 从前两处都是 `.exists()`，
+    /// 一次权限拒绝会让调用方（`store::note_project_identity`）当成 `Absent` 静默
+    /// 放弃，而它**先记后算**，于是这个项目在本进程里再也不会被重试。
+    ///
+    /// ⚠️ 反向那条（真的没有 ⇒ `Absent`）由上面两条测试钉着 —— 少了它，一个
+    /// 恒 `Unknown` 的实现照样能让本测试通过。
+    #[test]
+    fn a_probe_failure_is_unknown_not_absent() {
+        struct Failing;
+        impl ProbeBackend for Failing {
+            fn probe(&self, p: &Path, _d: Deadline) -> Probed<crate::probe::FileKind> {
+                Probed::Unknown(crate::probe::ProbeError::new(p, "permission denied"))
+            }
+        }
+        assert!(matches!(
+            find_git_root_with(Path::new("/w/proj/sub"), &Failing),
+            GitRoot::Unknown(_)
+        ));
+
+        // 起点探得到、`.git` 探不动 —— 这条链上**可能**有根，只是没问成。
+        // 从前它会一路上溯，把子仓库的会话记到父仓库名下（ADR-051 §5 规则 ③）。
+        struct StartOkThenFailing;
+        impl ProbeBackend for StartOkThenFailing {
+            fn probe(&self, p: &Path, _d: Deadline) -> Probed<crate::probe::FileKind> {
+                if p.file_name().is_some_and(|n| n == ".git") {
+                    Probed::Unknown(crate::probe::ProbeError::new(p, "handle exhausted"))
+                } else {
+                    Probed::Found(crate::probe::FileKind::Dir)
+                }
+            }
+        }
+        assert!(matches!(
+            find_git_root_with(Path::new("/w/proj/sub"), &StartOkThenFailing),
+            GitRoot::Unknown(_)
+        ));
     }
 }

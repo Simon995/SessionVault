@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{self, Status};
 use crate::logging::tag;
+use crate::probe::ProbeBackend;
 use crate::rawevent::{SourceLocation, SourceMode, SourceType};
 use crate::Result;
 
@@ -103,13 +104,16 @@ enum FileProbe {
     Failed,
 }
 
+/// ⚠️ 这里从前自带一份 `match std::fs::metadata` —— 与 `discovery.rs`、
+/// `memory/sources.rs` 各一份，共四份手抄本。判据现在只在 `probe::classify` 里，
+/// 本函数只剩「我要的是**文件**」这个本地决定。
 fn probe_host_file(path: &std::path::Path) -> FileProbe {
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => FileProbe::Present,
+    match crate::probe::LocalBackend.probe(path, crate::deadline::Deadline::unbounded()) {
+        crate::probe::Probed::Found(crate::probe::FileKind::File) => FileProbe::Present,
         // 存在但不是文件（目录 / 断掉的符号链）—— 那个**文件**确实没有，是事实。
-        Ok(_) => FileProbe::Absent,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileProbe::Absent,
-        Err(_) => FileProbe::Failed,
+        crate::probe::Probed::Found(_) => FileProbe::Absent,
+        crate::probe::Probed::Absent => FileProbe::Absent,
+        crate::probe::Probed::Unknown(_) => FileProbe::Failed,
     }
 }
 
@@ -244,12 +248,12 @@ fn discover_by_mode(
             // 元数据读失败，全都长得像「这个目录不存在」。而下面那个错误感知的遍历
             // 压根走不到，于是 `local` 不会进 `unreachable`，prune 照样删存量。
             // 判据必须显式区分 `NotFound`（事实）与其余（没问成）。
-            match std::fs::metadata(&dir) {
-                Ok(m) if m.is_dir() => {}
-                Ok(_) => continue, // 存在但不是目录 —— 那是事实，不是故障
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    log::warn!(target: tag::DISCOVER, "stat failed: {} err={e}", dir.display());
+            match crate::probe::LocalBackend.probe(&dir, crate::deadline::Deadline::unbounded()) {
+                crate::probe::Probed::Found(crate::probe::FileKind::Dir) => {}
+                crate::probe::Probed::Found(_) => continue, // 存在但不是目录 —— 那是事实，不是故障
+                crate::probe::Probed::Absent => continue,
+                crate::probe::Probed::Unknown(e) => {
+                    log::warn!(target: tag::DISCOVER, "stat failed: {e}");
                     if !unreachable.contains(&LOCAL_LOCATION.to_string()) {
                         unreachable.push(LOCAL_LOCATION.to_string());
                     }

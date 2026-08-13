@@ -424,9 +424,8 @@ fn run_snapshots(store_arg: Option<PathBuf>) -> i32 {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    if !store_path.exists() {
-        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
-        return 1;
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     let store = match open_total_store(&store_path) {
         Ok(store) => store,
@@ -593,13 +592,21 @@ fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option
         }
     };
     // 库不存在 = 宿主还没扫过一轮（写者尚未建库）。明确报错而非静默吐空，便于排查。
-    if !store_path.exists() {
-        log::error!(
-            target: tag::CLI,
-            "total store not found: path={} (host writes it on first scan)",
-            store_path.display()
-        );
-        return 1;
+    // 而**探不动**是第三种情况，不能说成「还没扫过」—— 两者的处置完全不同。
+    match total_store_present(&store_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::error!(
+                target: tag::CLI,
+                "total store not found: path={} (host writes it on first scan)",
+                store_path.display()
+            );
+            return 1;
+        }
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            return 1;
+        }
     }
     let store = match open_total_store(&store_path) {
         Ok(s) => s,
@@ -670,9 +677,14 @@ fn run_erase(
         return 2;
     }
     let store_path = match resolve_store_path(store_arg) {
-        Some(path) if path.exists() => path,
-        Some(_) => {
-            log::error!(target: tag::CLI, "total store not found for erase");
+        // 🔴 erase 是**不可逆**操作。「探不动」绝不能长得像「没有可删的库」——
+        // 后者会让用户以为已经删干净了。
+        Some(path) if matches!(total_store_present(&path), Ok(true)) => path,
+        Some(path) => {
+            match total_store_present(&path) {
+                Ok(_) => log::error!(target: tag::CLI, "total store not found for erase"),
+                Err(why) => log::error!(target: tag::CLI, "erase aborted: {why}"),
+            }
             return 1;
         }
         None => {
@@ -813,9 +825,20 @@ where
 #[cfg(feature = "store")]
 fn project_roots() -> session_vault::attribution::RootRegistry {
     let empty = session_vault::attribution::RootRegistry::new;
-    let Some(p) = resolve_store_path(None).filter(|p| p.exists()) else {
+    let Some(p) = resolve_store_path(None) else {
         return empty();
     };
+    match total_store_present(&p) {
+        Ok(true) => {}
+        // 没有注册表就是空注册表 —— 事实。
+        Ok(false) => return empty(),
+        // 探不动也只能返回空（本函数的返回类型说不出第三种），但**要留一行**：
+        // 否则「归属注册表突然空了」与「这台机器还没建库」在日志里一模一样。
+        Err(why) => {
+            log::warn!(target: tag::CLI, "project roots unavailable: {why}");
+            return empty();
+        }
+    }
     match open_total_store(&p) {
         Ok(store) => {
             session_vault::project_root_registry(&store, &session_vault::host_drive_mounts())
@@ -838,6 +861,40 @@ fn project_roots() -> session_vault::attribution::RootRegistry {
 }
 
 /// 解析总库路径：`--store` 优先，否则 `<data_local_dir>/svault/total_store.db`
+/// 总库在不在 —— **三态收口**（task #43）。
+///
+/// 🔴 这里从前是九处 `if !store_path.exists()`。一次探测失败（权限、盘没挂上、
+/// UNC 不通）会让 CLI 打印「total store not found」并退出 —— 一个**说得出口但错误**
+/// 的诊断，而 QuotaBar / TumeFlow 那侧的调用点是 `catch SvaultError` 后静默降级
+/// （beta.31 那次装机 svault 落后一个月、界面全程正常，正是这个接缝）。
+///
+/// `Ok(true)` 在；`Ok(false)` **确认**不在；`Err(msg)` 没问成，消息可直接打印。
+#[cfg(feature = "store")]
+fn total_store_present(path: &std::path::Path) -> Result<bool, String> {
+    use session_vault::probe::{LocalBackend, ProbeBackend, Probed};
+    match LocalBackend.probe(path, session_vault::deadline::Deadline::unbounded()) {
+        Probed::Found(_) => Ok(true),
+        Probed::Absent => Ok(false),
+        Probed::Unknown(e) => Err(format!("cannot tell whether the total store exists: {e}")),
+    }
+}
+
+/// 九个「库不在就报错退出」的调用点共用的那段。返回 `Some(exit_code)` 表示该退出。
+#[cfg(feature = "store")]
+fn bail_unless_store_present(path: &std::path::Path, missing_code: i32) -> Option<i32> {
+    match total_store_present(path) {
+        Ok(true) => None,
+        Ok(false) => {
+            log::error!(target: tag::CLI, "total store not found: {}", path.display());
+            Some(missing_code)
+        }
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            Some(missing_code)
+        }
+    }
+}
+
 /// （与 QuotaBar 写者 `main.rs` 同址）。无法确定数据目录时返回 `None`。
 #[cfg(feature = "store")]
 fn resolve_store_path(arg: Option<PathBuf>) -> Option<PathBuf> {
@@ -1132,9 +1189,8 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    if !store_path.exists() {
-        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
-        return 1;
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     let store = match open_total_store(&store_path) {
         Ok(s) => s,
@@ -1179,9 +1235,8 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    if !store_path.exists() {
-        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
-        return 1;
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     let store = match open_total_store(&store_path) {
         Ok(s) => s,
@@ -1222,9 +1277,8 @@ fn run_gc(dry_run: bool, store_arg: Option<PathBuf>) -> i32 {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    if !store_path.exists() {
-        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
-        return 1;
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     let store = match open_total_store(&store_path) {
         Ok(s) => s,
@@ -1256,9 +1310,8 @@ fn run_sessions_read(specs: Vec<String>, max_events: usize, store_arg: Option<Pa
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    if !store_path.exists() {
-        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
-        return 1;
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     // `<type>/<location>/<path>/<session>`：path 可能含 `/`，所以从两端切 —— 前两段
     // 与最后一段取值受限且不含分隔符，中间全归 path。与 EvidenceRef v1 同一个道理。
@@ -1312,9 +1365,8 @@ fn run_changes(since_seq: i64, limit: usize, store_arg: Option<PathBuf>) -> i32 
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    if !store_path.exists() {
-        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
-        return 1;
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     let store = match open_total_store(&store_path) {
         Ok(s) => s,
