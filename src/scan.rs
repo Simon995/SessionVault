@@ -36,7 +36,7 @@ pub fn scan_source(
     match source.source_mode {
         SourceMode::AppendLog => {
             let (obs, report) =
-                scan_append_log_observed(source, cursor_in, profile, roots, deadline);
+                scan_append_log_observed(source, cursor_in, None, profile, roots, deadline);
             obs.into_scan_result(report)
         }
         SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile),
@@ -52,6 +52,7 @@ pub fn scan_source(
 pub fn scan_append_log_observed(
     source: &SourceRef,
     cursor_in: Option<Cursor>,
+    prior_fingerprint: Option<SourceFingerprint>,
     profile: Profile,
     roots: Arc<RootRegistry>,
     deadline: crate::deadline::Deadline,
@@ -61,6 +62,7 @@ pub fn scan_append_log_observed(
             &LocalSource { path: &source.path },
             source,
             cursor_in,
+            prior_fingerprint,
             profile,
             roots,
         ),
@@ -74,6 +76,7 @@ pub fn scan_append_log_observed(
                 },
                 source,
                 cursor_in,
+                prior_fingerprint,
                 profile,
                 roots,
             )
@@ -289,6 +292,7 @@ fn scan_append_log<S: ByteSource>(
     src: &S,
     source: &SourceRef,
     cursor_in: Option<Cursor>,
+    prior_fingerprint: Option<SourceFingerprint>,
     profile: Profile,
     roots: Arc<RootRegistry>,
 ) -> (AppendLogObservation, SourceReport) {
@@ -390,7 +394,14 @@ fn scan_append_log<S: ByteSource>(
         // 🔴 同尺寸原地重写：size 与 mtime 都可能一字不变，只有内容变了。
         // 不在这里认出来，UI 索引会 `ReplaceFile` 而总库走 `Append` 把新 seq 当重复
         // 丢弃 —— 两层从此不一致，且没有任何东西会说出来。
-        if let Some(prev) = cursor.content_hash.as_deref() {
+        // 🔴 **比对用独立的 `prior_fingerprint`，不用 `cursor.content_hash`。**
+        //
+        // 「从哪里开始读」与「上一版内容是什么」是两件事，而 `cursor_in: None`
+        // 同时表达了它们 —— 强制全读时游标被整个丢掉，指纹也就一起没了。
+        // 结果：QuotaBar 的生产路径**永远**传不进上一版指纹，同尺寸原地重写
+        // 从来没有被识别过，而 SessionVault 这边的性质测试是手工存下指纹再传回的
+        // ——**测的是测试自己设计的路径**。
+        if let Some(prev) = prior_fingerprint.as_ref().map(|f| f.as_str()) {
             if prev != fp.as_str() {
                 change = SourceChange::RollbackOrRewrite;
                 log::warn!(
@@ -1021,9 +1032,18 @@ mod tests {
             src: &SourceRef,
             cursor: Option<Cursor>,
         ) -> (crate::observation::AppendLogObservation, SourceReport) {
+            scan_obs_with(src, cursor, None)
+        }
+
+        fn scan_obs_with(
+            src: &SourceRef,
+            cursor: Option<Cursor>,
+            prior: Option<crate::observation::SourceFingerprint>,
+        ) -> (crate::observation::AppendLogObservation, SourceReport) {
             scan_append_log_observed(
                 src,
                 cursor,
+                prior,
                 Profile::Full,
                 no_roots(),
                 crate::deadline::Deadline::unbounded(),
@@ -1052,12 +1072,14 @@ mod tests {
                 "前提：这次重写确实没改变文件大小"
             );
 
-            // 再次全读（`cursor_in=None`，但带上上次的指纹）——
-            // 这正是 `ForceVerify` 的形状：强制全读，且不能预先宣称「字节未变」。
-            let mut carry = first.cursor.clone();
-            carry.safe_offset = 0;
-            carry.next_seq = 0;
-            let (second, _) = scan_obs(&src, Some(carry));
+            // 🔴 **走生产路径的形状**：强制全读就是 `cursor_in = None`，
+            // 上一版指纹**单独**传进来。
+            //
+            // ⚠️ 这条测试原先是造一个 `safe_offset = 0` 的游标把指纹「夹带」进去 ——
+            // 而生产路径（QuotaBar 的 `scan_one`）force 时传的就是 `None`，游标连同
+            // 指纹一起丢掉。于是被证明的性质**在真实运行里从没生效过**：
+            // 测的是测试自己设计的那条路径（评审 P1-2）。
+            let (second, _) = scan_obs_with(&src, None, Some(fp1.clone()));
             assert_ne!(
                 second.source_fingerprint.as_ref().unwrap(),
                 &fp1,
