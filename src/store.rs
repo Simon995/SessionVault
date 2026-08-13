@@ -279,6 +279,23 @@ pub struct ProjectRootRow {
     /// 这个进程手上没有。缺席是诚实的「我算不出来」；按盘符猜出一个 `C:\…` 才是
     /// 编造 —— `automount.root` 可以被改，猜错就把两个不相干的项目并成一个。
     pub aliases: Vec<String>,
+    /// 这个根的**跨系统身份**（git origin 归一化后的 id），没有就是 `None`。
+    ///
+    /// # 与 `aliases` 是两件不同的事，缺一不可
+    ///
+    /// | | 收敛什么 | 例子 |
+    /// | --- | --- | --- |
+    /// | `aliases` | 同一条路径的**不同写法** | `wsl:U:/home/u/p` ⇄ `\\wsl.localhost\U\home\u\p` |
+    /// | `canonical_id` | **不同路径**上的同一个 repo | Windows 一份 checkout + WSL 一份 |
+    ///
+    /// 路径归一认不出两份 checkout（它们的路径毫不相干），git 身份认不出写法差异
+    /// （同一个 checkout 换个写法，`.git` 还是那个）。消费方要把同一个项目聚成一组，
+    /// **两样都得有**。
+    ///
+    /// `None` 的两种含义调用方通常不必区分（没扫到过 / 扫到时就没有 git remote），
+    /// 都表示「说不出它的跨系统身份」—— 而那是诚实的答案，见
+    /// [`TotalStore::project_identity`]。
+    pub canonical_id: Option<String>,
 }
 
 /// 一个根路径的其它等价写法。
@@ -1590,6 +1607,32 @@ impl TotalStore {
             .conn
             .lock()
             .map_err(|e| format!("total store mutex poisoned: {e}"))?;
+        // 身份先读进来 —— 同一次持锁，理由与修订号相同。
+        //
+        // 🔴 **按 `registry_key` 匹配，不按字面相等**：两张表的路径来自不同时刻的
+        // 归属，写法可能不同（大小写、斜杠方向）。字面比会让一个明明记着身份的项目
+        // 报成「说不出身份」，而那是**看得见的功能缺失**（两份 checkout 不再聚成
+        // 一组），却不会有任何东西报错。用同一条归一化规则，写法差异就不参与。
+        let mut identity_by_key: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT project_root, canonical_id FROM project_identity \
+                       ORDER BY last_seen_ms ASC",
+                )
+                .map_err(|e| format!("prepare project_identity failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| format!("query project_identity failed: {e}"))?;
+            for row in rows {
+                let (root, cid) =
+                    row.map_err(|e| format!("decode project_identity row failed: {e}"))?;
+                // ASC + 覆盖插入 ⇒ 留下的是 `last_seen_ms` 最大的那条（与
+                // `all_project_identities` 同一条规则）。
+                identity_by_key.insert(crate::attribution::registry_key(&root, &Vec::new()), cid);
+            }
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT root_key, root_path, root_source, first_seen_ms, last_seen_ms \
@@ -1599,8 +1642,13 @@ impl TotalStore {
         let rows = stmt
             .query_map([], |r| {
                 let root_path: String = r.get(1)?;
+                let key: String = r.get(0)?;
                 Ok(ProjectRootRow {
-                    root_key: r.get(0)?,
+                    canonical_id: identity_by_key
+                        .get(&crate::attribution::registry_key(&root_path, &Vec::new()))
+                        .or_else(|| identity_by_key.get(&key))
+                        .cloned(),
+                    root_key: key,
                     aliases: alias_forms_of(&root_path),
                     root_path,
                     root_source: r.get(2)?,
@@ -5500,6 +5548,77 @@ mod project_identity_tests {
             !roots[0].aliases.contains(&roots[0].root_path),
             "别名里不该含 root_path 自身 —— 消费方会把它当成第二个身份"
         );
+    }
+
+    /// 🔴 **跨系统身份要带出来 —— 别名收敛不了「两份 checkout」。**
+    ///
+    /// Windows 一份、WSL 一份，路径毫不相干，`aliases` 永远认不出它们是同一个项目；
+    /// 认得出的是 git origin。消费方要把同一个项目聚成一组，两样都得有。
+    #[test]
+    fn two_checkouts_of_one_repo_share_a_canonical_id() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(r"D:\work\proj", RootSource::Git);
+        st.register_project_root("/home/u/proj", RootSource::Git);
+        {
+            let conn = st.conn.lock().unwrap();
+            for root in [r"D:\work\proj", "/home/u/proj"] {
+                conn.execute(
+                    "INSERT INTO project_identity (source_type, source_location, project_root, \
+                       canonical_id, first_seen_ms, last_seen_ms) \
+                     VALUES ('claude_code', 'local', ?1, 'git:example.com/o/r', 1, 2)",
+                    rusqlite::params![root],
+                )
+                .unwrap();
+            }
+        }
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        let ids: Vec<_> = roots.iter().map(|r| r.canonical_id.as_deref()).collect();
+        assert_eq!(
+            ids,
+            vec![Some("git:example.com/o/r"), Some("git:example.com/o/r")],
+            "两份 checkout 要报出同一个身份，消费方才聚得起来"
+        );
+    }
+
+    /// 🔴 **身份按归一化键匹配，不按字面相等。**
+    ///
+    /// 两张表的路径来自不同时刻的归属，写法可能不同（大小写、斜杠方向）。字面比会让
+    /// 一个明明记着身份的项目报成「说不出身份」—— 一个**看得见的功能缺失**
+    /// （两份 checkout 不再聚成一组），却不会有任何东西报错。
+    #[test]
+    fn a_differently_spelled_identity_row_still_matches() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(r"D:\Work\Proj", RootSource::Git);
+        {
+            let conn = st.conn.lock().unwrap();
+            // 身份行用小写正斜杠写法 —— 与注册表那条字面不等，但归一化后同键。
+            conn.execute(
+                "INSERT INTO project_identity (source_type, source_location, project_root, \
+                   canonical_id, first_seen_ms, last_seen_ms) \
+                 VALUES ('claude_code', 'local', 'd:/work/proj/', 'git:example.com/o/r', 1, 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(
+            roots[0].canonical_id.as_deref(),
+            Some("git:example.com/o/r"),
+            "写法差异不该让身份丢掉"
+        );
+    }
+
+    /// 没记过身份 ⇒ `None`。**不是空串、不是拿 `root_path` 兜底** —— 一个不跨 checkout
+    /// 稳定的兜底 id 会让「查得到身份」变成一句不能信的话（同 `record_project_identity`
+    /// 的约束 1）。
+    #[test]
+    fn a_root_without_a_recorded_identity_says_so() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/home/u/proj", RootSource::Git);
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(roots[0].canonical_id, None);
     }
 
     /// 🔴 **不认识的来源标签原样透传，不改写。**

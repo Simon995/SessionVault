@@ -120,6 +120,12 @@ fn every_registered_root_is_actually_emitted_as_a_row() {
         ] {
             assert!(!r[field].is_null(), "{field} 缺失：{r}");
         }
+        // `canonical_id` 可以是 null（说不出身份是诚实答案），但**键必须在** ——
+        // 缺键与 null 在消费方那边不是一回事：前者是「这个版本不懂身份」。
+        assert!(
+            r.get("canonical_id").is_some(),
+            "canonical_id 键必须存在（可为 null）：{r}"
+        );
     }
 
     // 🔴 等价写法要跨过进程边界到达消费方 —— 这才是它存在的意义。

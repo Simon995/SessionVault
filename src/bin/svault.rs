@@ -307,6 +307,10 @@ enum Out<'a> {
         /// 同一个根的其它等价写法 —— 消费方手上的路径未必是注册表存的那种形式。
         /// 见 `store::ProjectRootRow::aliases`（含「为什么 `/mnt/…` 不在里面」）。
         aliases: Vec<String>,
+        /// 跨系统身份（git origin 归一化）。**与 `aliases` 收敛的是两件不同的事**：
+        /// 别名管「同一条路径的不同写法」，这个管「不同路径上的同一个 repo」
+        /// （Windows 一份 checkout + WSL 一份）。见 `store::ProjectRootRow::canonical_id`。
+        canonical_id: Option<String>,
     },
     /// `roots` 的收尾摘要。
     ///
@@ -1201,6 +1205,7 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
             first_seen_ms: r.first_seen_ms,
             last_seen_ms: r.last_seen_ms,
             aliases: r.aliases.clone(),
+            canonical_id: r.canonical_id.clone(),
         });
     }
     emit(&Out::RootsSummary {
