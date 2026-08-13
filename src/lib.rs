@@ -85,8 +85,20 @@ pub fn discover_transcripts() -> Result<Vec<SourceRef>> {
 
 /// 同 [`discover_transcripts`]，但报出哪些位置没问成 —— 要据发现结果删存量的调用方
 /// **必须**用这个（见 [`DiscoveryOutcome`]）。
-pub fn discover_transcripts_reported() -> Result<DiscoveryOutcome> {
-    discover::discover_transcripts_reported(crate::deadline::Deadline::unbounded())
+///
+/// 🔴 **预算由调用方给，这里不再兜底成 `unbounded()`。**（评审 P2-3）
+///
+/// 同族其它包装都是「注入 `unbounded()`」的便利函数，而这一个的调用方
+/// （QuotaBar 的整轮刷新）**手上正好有一份预算**，却因为签名不收就把它丢了 ——
+/// 那边的注释写着「一整轮的 deadline 覆盖发现与扫描」，而发现阶段实际不受约束：
+/// 一个卡住的 WSL 下，同一 distro 四个 artifact 各等一次 `find` 超时，整轮预算
+/// 在扫描开始前就见底了。
+///
+/// **一个默认参数省下的那点便利，换来的是一条无人知晓的无界路径。**
+pub fn discover_transcripts_reported(
+    deadline: crate::deadline::Deadline,
+) -> Result<DiscoveryOutcome> {
+    discover::discover_transcripts_reported(deadline)
 }
 
 pub fn discover_transcripts_local() -> Result<Vec<SourceRef>> {
