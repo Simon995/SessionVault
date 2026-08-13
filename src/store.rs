@@ -166,6 +166,15 @@ pub struct FileProjectionBatch {
     pub parser_revision: Option<u32>,
     pub mode: Projection,
     pub events: Vec<RawEvent>,
+    /// 这次**开新代**操作的稳定身份（ADR-051 I7）。
+    ///
+    /// 给了它，同一个 token 的第二次应用直接返回**原来的头**，不开新代 ——
+    /// 崩溃重放因此不再每次留一代不可回收的源版本。
+    ///
+    /// 🔴 **`Append` 不需要它**（靠 `seq` 去重，天然幂等），传 `None` 即可。
+    /// `Rollback` / `Reparse` 传 `None` 也能工作 —— 只是退回到旧的、不幂等的行为，
+    /// 所以**新调用点一律要传**。
+    pub token: Option<crate::token::ProjectionToken>,
 }
 
 /// 一次 [`TotalStore::apply_projection`] 的结果。比 [`AppendStats`] 多出「落在哪个投影」
@@ -588,6 +597,42 @@ CREATE TABLE IF NOT EXISTS projections (
 );
 "#;
 
+/// 已经应用过的**开新代**操作（ADR-051 I7）。
+///
+/// # 为什么非有不可
+///
+/// `Rollback` 与 `Reparse` 开新代。开新代的操作不幂等时，一次崩溃就留下一代垃圾：
+///
+/// ```text
+/// ① 总库成功 Rollback，推进 source_revision
+/// ② UI 索引提交前进程退出
+/// ③ UI 仍是旧游标 ⇒ 下轮再次检出 rollback
+/// ④ 总库再次推进 source_revision
+/// ⑤ Rollback 的旧版本**按设计永不自动回收**（见 `Projection::Rollback` 的注释：
+///    磁盘上那段内容已经不存在，前一个源版本是它的唯一副本）
+/// ```
+///
+/// 于是**每崩一次留一代不可回收的源版本**。`Reparse` 稍好（它取代被超越的那代），
+/// 但也会多开一代。
+///
+/// 🔴 **`Append` 不在这里** —— 它靠 `seq` 去重，重放同一批事件天然幂等。需要 token
+/// 的恰恰是「开新代」这个动作本身。
+///
+/// `token` 作主键即唯一约束：同一个 token 第二次应用直接命中，返回**原来的头**。
+const APPLIED_PROJECTIONS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS applied_projections (
+    token               TEXT    PRIMARY KEY,
+    source_type         TEXT    NOT NULL,
+    source_location     TEXT    NOT NULL,
+    source_path         TEXT    NOT NULL,
+    -- 那一次操作产生的头。重复应用时原样返回它 —— 而不是「当前头」：
+    -- 中间可能已经有别的操作推进过，返回当前头会让调用方以为自己的操作生效了。
+    source_revision     INTEGER NOT NULL,
+    projection_revision INTEGER NOT NULL,
+    applied_at          INTEGER NOT NULL
+);
+"#;
+
 /// 每个源文件的当前头：哪个源版本、以及该源版本的哪份投影是**当前**的。
 ///
 /// 🔴 它取代的是 `read_session` 里那个 `MAX(generation)` 相关子查询。区别不是性能，是
@@ -1004,6 +1049,7 @@ impl TotalStore {
             conn.execute_batch("ALTER TABLE raw_events ADD COLUMN occurred_at_unix_ms INTEGER;")?;
         }
         conn.execute_batch(PROJECTIONS_DDL)?;
+        conn.execute_batch(APPLIED_PROJECTIONS_DDL)?;
         conn.execute_batch(CURRENT_HEAD_DDL)?;
         conn.execute_batch(PROJECTION_LOG_DDL)?;
         // 🔴 **回填是一次性的，用标记闸住，别靠 `INSERT OR IGNORE` 幂等来兜。**
@@ -1273,6 +1319,9 @@ impl TotalStore {
             source: SourceKey::from_event(first),
             parser_revision: None,
             mode: projection,
+            // 这条兼容入口的调用方（CLI fixture / 老路径）不提供 token —— 保持
+            // 旧的、不幂等的行为。**新调用点一律要传**，见 `FileProjectionBatch::token`。
+            token: None,
             events: events.to_vec(),
         })?;
         Ok(AppendStats {
@@ -1746,9 +1795,70 @@ impl TotalStore {
         let events = &batch.events;
         let projection = batch.mode;
         let mut conn = self.conn.lock().unwrap();
+
+        // ── 幂等短路（ADR-051 I7）────────────────────────────────────────
+        //
+        // 同一个 token 已经应用过 ⇒ 返回**那一次**的头，一个字都不写。
+        //
+        // 🔴 返回的是记录里的头，**不是当前头**：中间可能已经有别的操作推进过，
+        // 返回当前头会让调用方以为自己这次操作生效了。
+        if let Some(token) = batch.token.as_ref() {
+            let prior: Option<(i64, i64)> = conn
+                .query_row(
+                    "SELECT source_revision, projection_revision FROM applied_projections \
+                       WHERE token = ?1",
+                    params![token.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((sr, pr)) = prior {
+                log::info!(
+                    target: crate::logging::tag::SQLITE,
+                    "projection already applied, returning prior head: path={source_path} rev={sr}/{pr}"
+                );
+                let max_offset: i64 =
+                    conn.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
+                        r.get(0)
+                    })?;
+                return Ok(ProjectionStats {
+                    appended: 0,
+                    skipped_dup: 0,
+                    skipped_erased: 0,
+                    max_offset,
+                    source_revision: sr,
+                    projection_revision: pr,
+                    // 头没动 —— 这次什么都没做。谎报 true 会让 QuotaBar 推进
+                    // `parser_revision`，而那正是「重投影没落库却以为落了」。
+                    head_moved: false,
+                    superseded_removed: 0,
+                    // 没做任何取代，谈不上「事件变少」。
+                    loses_events: None,
+                });
+            }
+        }
+
         let head = head_of(&conn, &source_type, &source_location, &source_path)?;
         let (source_revision, projection_revision) = projection.target_revisions(head);
         let tx = conn.transaction()?;
+        // token 记账与事件写入**同一事务** —— 分开写就会造出「token 记了但事件没写」
+        // （下轮短路返回一个从未存在的头）或反之（崩溃重放又开一代）的窗口。
+        if let Some(token) = batch.token.as_ref() {
+            tx.execute(
+                r#"INSERT INTO applied_projections
+                     (token, source_type, source_location, source_path,
+                      source_revision, projection_revision, applied_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                params![
+                    token.as_str(),
+                    source_type,
+                    source_location,
+                    source_path,
+                    source_revision,
+                    projection_revision,
+                    now,
+                ],
+            )?;
+        }
         // 台账：这份投影为什么存在。`INSERT OR IGNORE` 因为增量 append 会反复落在同一
         // 投影上 —— 第一次记账即可。
         tx.execute(
@@ -3721,6 +3831,217 @@ mod tests {
         );
     }
 
+    // ── 开新代的幂等（ADR-051 I7 / 步 4）────────────────────────────
+
+    fn key() -> SourceKey {
+        SourceKey {
+            source_type: crate::rawevent::SourceType::ClaudeCode,
+            source_location: crate::rawevent::SourceLocation::Local,
+            source_path: "/p/file.jsonl".to_string(),
+        }
+    }
+
+    fn token_for(fp: &str) -> crate::token::ProjectionToken {
+        crate::token::ProjectionToken::new(&key(), Some(fp), 4, 1, (0, 100))
+    }
+
+    fn batch(
+        mode: Projection,
+        seq: u64,
+        body: &str,
+        token: Option<crate::token::ProjectionToken>,
+    ) -> FileProjectionBatch {
+        FileProjectionBatch {
+            source: key(),
+            parser_revision: Some(4),
+            mode,
+            events: vec![mk_event(seq, "s", Some(body))],
+            token,
+        }
+    }
+
+    fn head_of_store(s: &TotalStore) -> (i64, i64) {
+        let conn = s.conn.lock().unwrap();
+        head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap()
+    }
+
+    /// 🔴 **ADR-051 描述的那个崩溃序列，逐步复现。**
+    ///
+    /// ```text
+    /// ① 总库成功 Rollback，推进 source_revision
+    /// ② UI 索引提交前进程退出
+    /// ③ UI 仍是旧游标 ⇒ 下轮再次检出 rollback
+    /// ④ 总库再次推进 source_revision   ← 这一步必须被挡住
+    /// ⑤ Rollback 的旧版本永不自动回收 ⇒ 每崩一次留一代垃圾
+    /// ```
+    #[test]
+    fn a_replayed_rollback_does_not_open_another_generation() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (0, 0));
+
+        let t = token_for("fp-after-rewrite");
+        let first = store
+            .apply_projection(batch(Projection::Rollback, 0, "v2", Some(t.clone())))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (1, 0), "第一次 Rollback 开新源版本");
+        assert!(first.head_moved);
+
+        // ② 崩溃 → ③ 下轮同一个 token 重放。
+        let second = store
+            .apply_projection(batch(Projection::Rollback, 0, "v2", Some(t)))
+            .unwrap();
+        assert_eq!(
+            head_of_store(&store),
+            (1, 0),
+            "重放不得再开一代 —— Rollback 的旧版本永不回收，每崩一次留一代垃圾"
+        );
+        assert_eq!(
+            (second.source_revision, second.projection_revision),
+            (1, 0),
+            "返回的是**那一次**的头"
+        );
+        assert!(!second.head_moved, "头没动就不能说动了");
+        assert_eq!(second.appended, 0, "一个字都没写");
+    }
+
+    /// `Reparse` 同理 —— 它会取代被超越的那代，但仍然多开一代。
+    #[test]
+    fn a_replayed_reparse_does_not_open_another_generation() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+        let t = token_for("same-bytes-better-parser");
+        store
+            .apply_projection(batch(Projection::Reparse, 0, "v2", Some(t.clone())))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (0, 1));
+        store
+            .apply_projection(batch(Projection::Reparse, 0, "v2", Some(t)))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (0, 1), "重放不得再开一代");
+    }
+
+    /// 🔴 **不同的操作必须各自开代** —— 幂等不能退化成「一律不做」。
+    ///
+    /// 少一个 token 分量就会把两次不同的操作当成同一次，第二次被静默忽略；
+    /// 那比多开一代更糟 —— 它会让新解析器的结果永远进不去。
+    #[test]
+    fn a_genuinely_different_operation_still_opens_its_generation() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+        store
+            .apply_projection(batch(
+                Projection::Rollback,
+                0,
+                "v2",
+                Some(token_for("fp-a")),
+            ))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (1, 0));
+        // 又一次真实的重写 —— 指纹不同 ⇒ 另一个 token ⇒ 必须开新代。
+        store
+            .apply_projection(batch(
+                Projection::Rollback,
+                0,
+                "v3",
+                Some(token_for("fp-b")),
+            ))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (2, 0), "不同的操作要各自开代");
+    }
+
+    /// `Append` 不带 token 也照旧幂等（靠 seq 去重）—— 不因这套机制而改变。
+    #[test]
+    fn append_stays_idempotent_without_a_token() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+        let again = store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (0, 0));
+        assert_eq!(again.appended, 0, "同 seq 同内容按重复丢弃");
+        assert_eq!(again.skipped_dup, 1);
+    }
+
+    /// 🔴 **短路返回的是「那一次」的头，不是「当前」头。**
+    ///
+    /// 中间可能已经有别的操作推进过。返回当前头会让调用方以为自己这次操作生效了 ——
+    /// 它拿着一个别人造的版本号去 ack，两层从此对「当前是哪一代」各执一词。
+    ///
+    /// ⚠️ 这条是补写的：原先只有一条「中间没有别的操作」的测试，而它在两种实现下
+    /// 都绿 —— 规则被写下、被相信、且没有被测。变异验证抓出来的。
+    #[test]
+    fn a_replay_reports_its_own_head_even_after_the_store_moved_on() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+
+        let first = token_for("fp-first");
+        store
+            .apply_projection(batch(Projection::Rollback, 0, "v2", Some(first.clone())))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (1, 0));
+
+        // 又一次**真实的**重写把库推到了下一代。
+        store
+            .apply_projection(batch(
+                Projection::Rollback,
+                0,
+                "v3",
+                Some(token_for("fp-second")),
+            ))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (2, 0), "前提：库已经往前走了");
+
+        // 现在重放第一个 token（崩溃恢复的典型形状）。
+        let replay = store
+            .apply_projection(batch(Projection::Rollback, 0, "v2", Some(first)))
+            .unwrap();
+        assert_eq!(
+            (replay.source_revision, replay.projection_revision),
+            (1, 0),
+            "要报**它自己那次**的头，不是当前头 —— 后者会让调用方拿着别人的版本号去 ack"
+        );
+        assert_eq!(
+            head_of_store(&store),
+            (2, 0),
+            "重放不得把库拉回去，也不得再推进"
+        );
+    }
+
+    /// token 与事件写在同一事务：短路返回的头必须真的存在于库里。
+    ///
+    /// ⚠️ 这条**只**钉「记录的头不是凭空的」；「不是当前头」由上一条钉
+    /// —— 本例中间没有别的操作，两者恰好相等，所以它证明不了那一半。
+    #[test]
+    fn the_recorded_head_matches_what_the_store_actually_has() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 0, "v1", None))
+            .unwrap();
+        let t = token_for("fp-x");
+        store
+            .apply_projection(batch(Projection::Rollback, 0, "v2", Some(t.clone())))
+            .unwrap();
+        let replay = store
+            .apply_projection(batch(Projection::Rollback, 0, "v2", Some(t)))
+            .unwrap();
+        assert_eq!(
+            (replay.source_revision, replay.projection_revision),
+            head_of_store(&store),
+            "短路返回的头要与库里的当前头一致（本例中间没有别的操作）"
+        );
+    }
+
     /// 台账记下每份投影**为什么**存在。留存策略跟着理由走（ADR-044 决定 7），
     /// 所以理由必须是持久化的事实，不能事后从编号反推 —— 反推正是本次事故的形状。
     #[test]
@@ -3927,6 +4248,7 @@ mod tests {
                 source: source.clone(),
                 parser_revision: Some(1),
                 mode: Projection::Append,
+                token: None,
                 events: vec![mk_event(0, "s", Some("v1"))],
             })
             .unwrap();
@@ -3937,6 +4259,7 @@ mod tests {
                 source: source.clone(),
                 parser_revision: Some(2),
                 mode: Projection::Reparse,
+                token: None,
                 events: vec![],
             })
             .unwrap();
@@ -3976,6 +4299,7 @@ mod tests {
                 source: source.clone(),
                 parser_revision: Some(1),
                 mode: Projection::Append,
+                token: None,
                 events: vec![mk_event(0, "s", Some("v1"))],
             })
             .unwrap();
@@ -3985,6 +4309,7 @@ mod tests {
                 source,
                 parser_revision: Some(1),
                 mode: Projection::Append,
+                token: None,
                 events: vec![],
             })
             .unwrap();
@@ -4011,6 +4336,7 @@ mod tests {
                 },
                 parser_revision: Some(1),
                 mode: Projection::Append,
+                token: None,
                 events: vec![
                     mk_event_at(0, "s", "/p/a.jsonl"),
                     mk_event_at(1, "s", "/p/b.jsonl"),
@@ -4045,6 +4371,7 @@ mod tests {
                     source: source.clone(),
                     parser_revision: Some(parser_revision),
                     mode,
+                    token: None,
                     events: vec![mk_event(0, "s", Some("x"))],
                 })
                 .unwrap();
@@ -4308,6 +4635,7 @@ mod tests {
                 },
                 parser_revision: Some(2),
                 mode: Projection::Reparse,
+                token: None,
                 events: vec![mk_event(0, "s", Some("only-a"))],
             })
             .unwrap();
@@ -4357,6 +4685,7 @@ mod tests {
                 source: source.clone(),
                 parser_revision: Some(1),
                 mode: Projection::Append,
+                token: None,
                 events: vec![mk_event(0, "s", Some("v1"))],
             })
             .unwrap();
@@ -4365,6 +4694,7 @@ mod tests {
                 source,
                 parser_revision: Some(2),
                 mode: Projection::Reparse,
+                token: None,
                 events: vec![],
             })
             .unwrap();
@@ -4398,6 +4728,7 @@ mod tests {
                     source: src.clone(),
                     parser_revision: Some(1),
                     mode,
+                    token: None,
                     events: vec![ev],
                 })
                 .unwrap()
@@ -4507,6 +4838,7 @@ mod tests {
                     source: source.clone(),
                     parser_revision: Some(1),
                     mode,
+                    token: None,
                     events: vec![mk_event(0, "s", Some(tag))],
                 })
                 .unwrap();
@@ -4688,6 +5020,7 @@ mod tests {
                 source: source.clone(),
                 parser_revision: Some(1),
                 mode: Projection::Append,
+                token: None,
                 events: vec![mk_event(0, "s", Some("A")), mk_event(1, "s", Some("B"))],
             })
             .unwrap();
@@ -4697,6 +5030,7 @@ mod tests {
                 source,
                 parser_revision: Some(2),
                 mode: Projection::Reparse,
+                token: None,
                 events: vec![mk_event(0, "s", Some("A"))],
             })
             .unwrap();
@@ -4737,6 +5071,7 @@ mod tests {
                     source: source.clone(),
                     parser_revision: Some(1),
                     mode: Projection::Append,
+                    token: None,
                     events: vec![mk_event(seq, "s", Some("x"))],
                 })
                 .unwrap();
@@ -4770,6 +5105,7 @@ mod tests {
                     source: source.clone(),
                     parser_revision: Some(1),
                     mode,
+                    token: None,
                     events: vec![mk_event(0, "s", Some(tag))],
                 })
                 .unwrap();
@@ -5174,6 +5510,7 @@ mod project_identity_tests {
                 source: SourceKey::from_event(&ev),
                 parser_revision: None,
                 mode: Projection::Append,
+                token: None,
                 events: vec![ev],
             })
             .unwrap();
@@ -5276,6 +5613,7 @@ mod project_identity_tests {
                 source: SourceKey::from_event(&ev),
                 parser_revision: None,
                 mode: Projection::Append,
+                token: None,
                 events: vec![ev],
             })
             .expect("身份记不下来时，摄取必须照常成功");
