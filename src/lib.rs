@@ -25,6 +25,7 @@ pub mod scan;
 pub mod store;
 #[cfg(feature = "store")]
 mod store_crypto;
+pub mod token;
 pub mod wsl;
 
 pub use catalog::{Artifact, Profile, ProviderDescriptor};

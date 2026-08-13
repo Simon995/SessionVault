@@ -597,6 +597,17 @@ pub struct TotalStore {
     identity_seen: Mutex<std::collections::HashSet<(String, String, String)>>,
 }
 
+/// 递增注册表修订号。**只在真的插入了新根时调用**（见 `register_project_root`）。
+///
+/// 失败静默：修订号停在原地只会让 token 少区分一个维度（偏保守），
+/// 而让注册失败会让整套发现停摆 —— 后者严重得多。
+fn bump_attribution_revision(conn: &Connection) {
+    let _ = conn.execute(
+        "INSERT INTO store_meta (k, v) VALUES ('attribution_revision', '1')          ON CONFLICT(k) DO UPDATE SET v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)",
+        [],
+    );
+}
+
 impl TotalStore {
     /// 打开（或新建）磁盘总库，WAL 模式，建表幂等。父目录自动创建。
     ///
@@ -1356,14 +1367,50 @@ impl TotalStore {
         let key = crate::attribution::registry_key(path, &Vec::new());
         let now = now_unix_millis();
         let Ok(conn) = self.conn.lock() else { return };
-        let _ = conn.execute(
-            "INSERT INTO project_root_registry
-                 (root_key, root_path, root_source, first_seen_ms, last_seen_ms)
-             VALUES (?1, ?2, ?3, ?4, ?4)
-             ON CONFLICT(root_key) DO UPDATE SET
-                 root_path = ?2, root_source = ?3, last_seen_ms = ?4",
-            rusqlite::params![key, path, source.as_str(), now],
-        );
+        // 🔴 **插入与更新要分开**（ADR-051 I7）：`attribution_revision` 只在真的
+        // **多了一个根**时递增。用 `ON CONFLICT DO UPDATE` 一条写完的话，
+        // `changes()` 对两种情况都返回 1，分不出来 —— 而每轮刷新都会把已知的根
+        // 重登记一遍，于是修订号会随刷新次数疯长，把全库 token 全部作废。
+        let inserted = conn
+            .execute(
+                "INSERT INTO project_root_registry
+                     (root_key, root_path, root_source, first_seen_ms, last_seen_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT(root_key) DO NOTHING",
+                rusqlite::params![key, path, source.as_str(), now],
+            )
+            .unwrap_or(0);
+        if inserted > 0 {
+            bump_attribution_revision(&conn);
+        } else {
+            let _ = conn.execute(
+                "UPDATE project_root_registry
+                    SET root_path = ?2, root_source = ?3, last_seen_ms = ?4
+                  WHERE root_key = ?1",
+                rusqlite::params![key, path, source.as_str(), now],
+            );
+        }
+    }
+
+    /// 注册表的修订号 —— [`crate::token::ProjectionToken`] 的一个分量。
+    ///
+    /// 🔴 **它不是「注册表被写过几次」，是「注册表长出过几个根」。** 前者会随每轮
+    /// 刷新递增（注册是幂等的，已知的根每轮都重登记一遍），于是全库 token 每分钟
+    /// 作废一次 —— 那等于没有幂等。
+    ///
+    /// 读不出来返回 0：那会让 token 退化成「不区分归属版本」，**偏保守**
+    /// （两次不同归属的操作被当成同一次），所以调用方在 token 之外仍要靠
+    /// `parser_revision` 与字节范围兜底。⚠️ 这是已知的降级，写在这里而不是假装没有。
+    pub fn attribution_revision(&self) -> i64 {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        conn.query_row(
+            "SELECT v FROM store_meta WHERE k = 'attribution_revision'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
     }
 
     /// 库里出现过的所有 `project_root` 取值 —— **发现的候选清单**。
@@ -5131,6 +5178,52 @@ mod project_identity_tests {
             attribute(Some(r"C:\w\QuotaBar\src"), &reg).root(),
             None,
             r"空表下不该把 C:\ 认成 /mnt/c"
+        );
+    }
+
+    /// 🔴 **修订号数的是「长出过几个根」，不是「注册表被写过几次」**（ADR-051 I7）。
+    ///
+    /// 注册是幂等的：每轮发现都会把已知的根重登记一遍。若按写入次数计，
+    /// 修订号会随刷新次数疯长，把全库 `ProjectionToken` 每分钟作废一次 ——
+    /// 那等于没有幂等。
+    #[test]
+    fn the_attribution_revision_counts_new_roots_not_writes() {
+        let st = TotalStore::open_in_memory().unwrap();
+        assert_eq!(st.attribution_revision(), 0, "空注册表是 0");
+
+        st.register_project_root("/w/A", RootSource::Git);
+        let after_first = st.attribution_revision();
+        assert_eq!(after_first, 1);
+
+        // 同一个根重登记十次 —— 修订号不能动。
+        for _ in 0..10 {
+            st.register_project_root("/w/A", RootSource::Git);
+        }
+        assert_eq!(
+            st.attribution_revision(),
+            after_first,
+            "幂等重登记不得推高修订号，否则 token 每轮作废"
+        );
+
+        // 换个大小写/尾斜杠仍是同一个根（比较键归一），也不能动。
+        st.register_project_root("/w/A/", RootSource::Marker);
+        assert_eq!(
+            st.attribution_revision(),
+            after_first,
+            "同一个键就是同一个根"
+        );
+
+        // 真的新根才 +1。
+        st.register_project_root("/w/B", RootSource::Git);
+        assert_eq!(st.attribution_revision(), after_first + 1);
+
+        // 重登记不能丢掉 last_seen / source 的更新 —— 拆成两条语句时最容易漏这一半。
+        let reg = st.project_root_registry(&Vec::new());
+        assert_eq!(reg.len(), 2);
+        assert_eq!(
+            reg.roots().find(|(p, _)| *p == "/w/A/").map(|(_, s)| s),
+            Some(RootSource::Marker),
+            "重登记要更新 source 与原始路径"
         );
     }
 
