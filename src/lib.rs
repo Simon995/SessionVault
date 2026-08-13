@@ -18,6 +18,8 @@ pub mod logging;
 pub mod observation;
 pub mod parser;
 pub mod pathnorm;
+/// 存在性探测的唯一原语（ADR-051 §5 / §8）——`std::fs` 的存在性调用只许出现在这里。
+pub mod probe;
 pub mod project_root;
 pub mod rawevent;
 pub mod report;
