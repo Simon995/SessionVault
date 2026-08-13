@@ -263,6 +263,37 @@ pub struct ProjectRootRow {
     pub root_source: String,
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
+    /// 同一个根的**其它等价写法**（不含 `root_path` 自身），由 [`crate::pathnorm`] 推出。
+    ///
+    /// # 为什么这属于报告面
+    ///
+    /// 消费方手上的路径未必是注册表存的那种形式：一个 Windows 进程枚举出的是
+    /// `\\wsl.localhost\<distro>\…`，而注册表可能存着 `wsl:<distro>:/…`。**同一个项目、
+    /// 两个字符串**，用 `==` 一比就是两个项目 —— 实测后果是同一个项目在记忆库里存成
+    /// 两个身份，各持一半记忆且互相看不见。
+    ///
+    /// 让消费方自己换算，等于把这条规则复制一份到每个客户端。给出来，规则就还是一份。
+    ///
+    /// ⚠️ **`/mnt/<drive>/…` 那一族不在里面。** 它要挂载表才能换算
+    /// （[`crate::pathnorm::mnt_to_windows`]），而挂载表是**运行期发现的事实**，
+    /// 这个进程手上没有。缺席是诚实的「我算不出来」；按盘符猜出一个 `C:\…` 才是
+    /// 编造 —— `automount.root` 可以被改，猜错就把两个不相干的项目并成一个。
+    pub aliases: Vec<String>,
+}
+
+/// 一个根路径的其它等价写法。
+///
+/// 只做**双向的 WSL 规范形 ⇄ UNC**：两个方向都可能是注册表里存的那一种，取决于
+/// 归属发生在哪一侧。纯 Windows 路径与纯 Linux 路径没有第二种写法，返回空。
+fn alias_forms_of(root_path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(unc) = crate::pathnorm::canonical_wsl_to_unc(root_path) {
+        out.push(unc);
+    }
+    if let Some(canonical) = crate::pathnorm::canonical_wsl_unc(root_path) {
+        out.push(canonical);
+    }
+    out
 }
 
 /// 某个源文件的当前头；无记录时 `(0, 0)`。
@@ -1567,9 +1598,11 @@ impl TotalStore {
             .map_err(|e| format!("prepare project_root_registry failed: {e}"))?;
         let rows = stmt
             .query_map([], |r| {
+                let root_path: String = r.get(1)?;
                 Ok(ProjectRootRow {
                     root_key: r.get(0)?,
-                    root_path: r.get(1)?,
+                    aliases: alias_forms_of(&root_path),
+                    root_path,
                     root_source: r.get(2)?,
                     first_seen_ms: r.get(3)?,
                     last_seen_ms: r.get(4)?,
@@ -5413,6 +5446,60 @@ mod project_identity_tests {
         let (roots2, rev2) = st.project_roots_report().unwrap();
         assert_eq!(roots2.len(), 2, "清单跟上了");
         assert_eq!(rev2, 2, "修订号也跟上了 —— 两者必然同代");
+    }
+
+    /// 🔴 **等价写法要给出来，否则消费方会把同一个项目当成两个。**
+    ///
+    /// 一个 Windows 上的消费方枚举出 `\\wsl.localhost\<distro>\…`，注册表里存的却是
+    /// `wsl:<distro>:/…` —— 用 `==` 一比就是两个项目。实测后果：同一个项目在记忆库里
+    /// 存成两个身份，各持一半记忆且互相看不见。
+    #[test]
+    fn a_wsl_root_carries_the_form_a_windows_consumer_can_open() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("wsl:Ubuntu-22.04:/home/u/proj", RootSource::Git);
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(
+            roots[0].aliases,
+            vec![r"\\wsl.localhost\Ubuntu-22.04\home\u\proj"],
+            "规范形要带上 Windows 侧能打开的 UNC 形"
+        );
+
+        // 反过来也要成立 —— 归属发生在哪一侧决定了注册表存的是哪一种。
+        let st2 = TotalStore::open_in_memory().unwrap();
+        st2.register_project_root(r"\\wsl.localhost\Ubuntu-22.04\home\u\proj", RootSource::Git);
+        let (roots2, _) = st2.project_roots_report().unwrap();
+        assert_eq!(roots2[0].aliases, vec!["wsl:Ubuntu-22.04:/home/u/proj"]);
+    }
+
+    /// 🔴 **`/mnt/<drive>/…` 的换算要挂载表，这个进程没有 ⇒ 不给别名，而不是猜一个。**
+    ///
+    /// 按盘符猜出 `C:\…` 在 `automount.root` 被改过的机器上会把两个不相干的项目并成
+    /// 一个。空别名是诚实的「我算不出来」，与本仓「没问成不能长得像这里是空的」互为
+    /// 表里：那条讲不许把失败说成空，这条讲不许把不知道说成知道。
+    #[test]
+    fn a_mnt_root_gets_no_guessed_alias() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/mnt/c/work/proj", RootSource::Git);
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert!(
+            roots[0].aliases.is_empty(),
+            "没有挂载表就不该猜出一个 Windows 形式：{:?}",
+            roots[0].aliases
+        );
+    }
+
+    /// 纯 Windows / 纯 Linux 路径没有第二种写法 —— 空表，不是把自己复制一份。
+    #[test]
+    fn a_plain_path_has_no_aliases() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(r"D:\work\proj", RootSource::Git);
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert!(roots[0].aliases.is_empty());
+        assert!(
+            !roots[0].aliases.contains(&roots[0].root_path),
+            "别名里不该含 root_path 自身 —— 消费方会把它当成第二个身份"
+        );
     }
 
     /// 🔴 **不认识的来源标签原样透传，不改写。**

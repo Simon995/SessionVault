@@ -304,6 +304,9 @@ enum Out<'a> {
         root_source: String,
         first_seen_ms: i64,
         last_seen_ms: i64,
+        /// 同一个根的其它等价写法 —— 消费方手上的路径未必是注册表存的那种形式。
+        /// 见 `store::ProjectRootRow::aliases`（含「为什么 `/mnt/…` 不在里面」）。
+        aliases: Vec<String>,
     },
     /// `roots` 的收尾摘要。
     ///
@@ -1197,6 +1200,7 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
             root_source: r.root_source.clone(),
             first_seen_ms: r.first_seen_ms,
             last_seen_ms: r.last_seen_ms,
+            aliases: r.aliases.clone(),
         });
     }
     emit(&Out::RootsSummary {

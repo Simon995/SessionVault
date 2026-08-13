@@ -84,6 +84,59 @@ pub fn split_canonical_wsl(path: &str) -> Option<(&str, &str)> {
     Some((distro, linux_path))
 }
 
+/// 规范形 `wsl:<distro>:/abs` → Windows 侧能打开的 UNC 形；非规范形返回 `None`。
+///
+/// [`canonical_wsl_unc`] 的反向。**两个方向都必须住在这里**：一个 Windows 上的消费者
+/// 拿到 `wsl:Ubuntu:/home/u/proj` 是打不开的，它需要 `\\wsl.localhost\Ubuntu\home\u\proj`；
+/// 若让它自己拼，同一条规则就有了第二份实现 —— 而两份都活着的时候，没有任何东西会
+/// 说出它们不一致（本仓判例：同一个项目在记忆库里存成两个身份，各持一半互不可见）。
+///
+/// 用 `wsl.localhost` 而非老的 `wsl$`：后者在新版 Windows 上仍可用但已不是官方写法，
+/// 而**产生**一律用一种形式、**接受**两种都认（见 [`canonical_wsl_unc`]）—— 宽进严出。
+pub fn canonical_wsl_to_unc(path: &str) -> Option<String> {
+    let (distro, linux_path) = split_canonical_wsl(path)?;
+    let windows_tail = linux_path.trim_start_matches('/').replace('/', "\\");
+    Some(format!("\\\\wsl.localhost\\{distro}\\{windows_tail}"))
+}
+
+#[cfg(test)]
+mod unc_round_trip_tests {
+    use super::*;
+
+    /// 🔴 **两个方向必须真的互为逆**，否则「同一个根的两种写法」会在某一侧多出一个
+    /// 身份 —— 而那正是这对函数存在的理由。
+    #[test]
+    fn the_two_directions_round_trip() {
+        let canonical = "wsl:Ubuntu-22.04:/home/u/proj";
+        let unc = canonical_wsl_to_unc(canonical).unwrap();
+        assert_eq!(unc, r"\\wsl.localhost\Ubuntu-22.04\home\u\proj");
+        assert_eq!(canonical_wsl_unc(&unc).as_deref(), Some(canonical));
+    }
+
+    /// 产生只用 `wsl.localhost`，接受两种 —— 宽进严出。
+    #[test]
+    fn the_legacy_unc_form_is_accepted_but_never_produced() {
+        let legacy = r"\\wsl$\Ubuntu\home\u\proj";
+        let canonical = canonical_wsl_unc(legacy).unwrap();
+        assert_eq!(canonical, "wsl:Ubuntu:/home/u/proj");
+        assert!(
+            canonical_wsl_to_unc(&canonical)
+                .unwrap()
+                .contains("wsl.localhost"),
+            "产生的一律是新写法"
+        );
+    }
+
+    /// 不是 WSL 的路径没有第二种写法 —— **返回 `None`，不是返回它自己**。
+    /// 后者会让调用方把「没有别名」与「别名恰好等于自己」混起来。
+    #[test]
+    fn a_non_wsl_path_has_no_second_form() {
+        assert_eq!(canonical_wsl_to_unc(r"C:\work\proj"), None);
+        assert_eq!(canonical_wsl_to_unc("/home/u/proj"), None);
+        assert_eq!(canonical_wsl_to_unc("wsl:Ubuntu:relative"), None);
+    }
+}
+
 /// `/mnt/<drive>/…`：WSL 里挂载的 Windows 盘。工程物理在 Windows → 应判为 `local`。
 ///
 /// 仅匹配单个盘符字母后接 `/` 或路径结束（`/mnt/c`、`/mnt/c/...`），避免把

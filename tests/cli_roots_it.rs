@@ -79,7 +79,7 @@ fn every_registered_root_is_actually_emitted_as_a_row() {
             TotalStore::open_with_key(&path, StoreKey::from_encoded(TEST_KEY).unwrap()).unwrap();
         store.register_project_root("/home/u/proj", RootSource::Git);
         store.register_project_root(r"D:\work\code\other", RootSource::Marker);
-        store.register_project_root("/home/u/third", RootSource::Configured);
+        store.register_project_root("wsl:Ubuntu-22.04:/home/u/third", RootSource::Configured);
     }
 
     let (code, stdout) = run_roots(&path);
@@ -116,10 +116,34 @@ fn every_registered_root_is_actually_emitted_as_a_row() {
             "root_source",
             "first_seen_ms",
             "last_seen_ms",
+            "aliases",
         ] {
             assert!(!r[field].is_null(), "{field} 缺失：{r}");
         }
     }
+
+    // 🔴 等价写法要跨过进程边界到达消费方 —— 这才是它存在的意义。
+    // 一个 Windows 上的消费方枚举出 UNC 形，注册表存的是规范形，`==` 一比就是两个项目。
+    let wsl_row = roots
+        .iter()
+        .find(|r| r["root_path"] == "wsl:Ubuntu-22.04:/home/u/third")
+        .expect("规范形那条要在");
+    assert_eq!(
+        wsl_row["aliases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![r"\\wsl.localhost\Ubuntu-22.04\home\u\third"],
+        "Windows 侧能打开的那种形式必须发出来"
+    );
+    // 纯 Windows 路径没有第二种写法：空数组，不是把自己复制一份。
+    let win_row = roots
+        .iter()
+        .find(|r| r["root_path"] == r"D:\work\code\other")
+        .unwrap();
+    assert_eq!(win_row["aliases"].as_array().unwrap().len(), 0);
 
     // 两个字段都给，且 `root_path` 是**原始形式**（归一化只用于比较键）。
     //
