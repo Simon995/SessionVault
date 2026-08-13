@@ -116,57 +116,71 @@ pub(crate) fn probe_local_with(
     // 按「确认没有根」写进 6 小时负缓存 —— 而那正是本 ADR 立的 `None` / `Failed`
     // 契约要防的：**「问了、没有」与「没问成」必须分开**。
     // 用 `try_exists()`：只有 `NotFound` 才是「没有」。
-    let mut failure: Option<String> = None;
-    let mut hit = |dir: &Path, name: &str| -> bool {
-        match exists(&dir.join(name)) {
-            Ok(v) => v,
-            Err(e) => {
-                failure.get_or_insert_with(|| format!("{}: {e}", dir.join(name).display()));
-                false
-            }
-        }
+    // 🔴 **一层没问成就停在那里，不许继续向父目录找**（ADR-051 §5 规则 ③）。
+    //
+    // 从前是「记下失败、继续上溯，只在一路没探到时才用它」。那条规则把一个**错误的
+    // 归属**说成了成功：`/w/proj/sub` 的 `.git` 读不到、于是上溯到 `/w/proj` 命中 ——
+    // 可 `sub` 很可能**本来就有** `.git`，真正的根是它。结果是把子仓库的会话记到父
+    // 仓库名下，**而且静默**。
+    //
+    // 报 `Failed` 会走短退避、下轮重试；错误归属只会安静地留在库里。两者的代价
+    // 差着数量级。
+    //
+    // ⚠️ 命中之后的失败不算：命中即返回，根本不会去探更外层（有测试钉这条 ——
+    // 否则「更严格」会变成「一路探到底」，一个无关的外层权限问题又能推翻结论）。
+    let probe_layer = |dir: &Path, name: &str| -> Result<bool, String> {
+        exists(&dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()))
+    };
+    let cannot_tell = |why: String| Probe::Failed {
+        reason: format!("cannot tell whether a root exists ({why})"),
     };
 
-    let mut found = None;
-    let mut cur = Some(Path::new(path));
     // 第一遍：最近的 `.git`（对子模块的 `.git` **文件**同样为真）。
+    //
+    // ⚠️ 两遍而不是逐层「`.git` 与 marker 一起看」—— `.git` 全局优先于 marker 是
+    // 既有语义（改它是另一个决定，见 #34），本次只改失败处理。
+    let mut cur = Some(Path::new(path));
     while let Some(dir) = cur {
-        if Some(dir) != home && hit(dir, ".git") {
-            found = Some((dir.to_string_lossy().into_owned(), RootSource::Git));
-            break;
+        if Some(dir) != home {
+            match probe_layer(dir, ".git") {
+                Err(why) => return cannot_tell(why),
+                Ok(true) => {
+                    return Probe::Found {
+                        root: dir.to_string_lossy().into_owned(),
+                        source: RootSource::Git,
+                    }
+                }
+                Ok(false) => {}
+            }
         }
         cur = dir.parent();
     }
+
     // 第二遍：最近的构建 marker。
-    if found.is_none() {
-        let mut cur = Some(Path::new(path));
-        'outer: while let Some(dir) = cur {
-            if Some(dir) != home {
-                for m in crate::project_root::MARKERS
-                    .iter()
-                    .filter(|m| **m != ".git")
-                {
-                    if hit(dir, m) {
-                        found = Some((dir.to_string_lossy().into_owned(), RootSource::Marker));
-                        break 'outer;
+    let mut cur = Some(Path::new(path));
+    while let Some(dir) = cur {
+        if Some(dir) != home {
+            for m in crate::project_root::MARKERS
+                .iter()
+                .filter(|m| **m != ".git")
+            {
+                match probe_layer(dir, m) {
+                    Err(why) => return cannot_tell(why),
+                    Ok(true) => {
+                        return Probe::Found {
+                            root: dir.to_string_lossy().into_owned(),
+                            source: RootSource::Marker,
+                        }
                     }
+                    Ok(false) => {}
                 }
             }
-            cur = dir.parent();
         }
+        cur = dir.parent();
     }
 
-    match found {
-        Some((root, source)) => Probe::Found { root, source },
-        // 🔴 探到了才算数；**一路没探到但中途有访问失败 ⇒ 说不出来**，
-        // 不能报 `None`（那会被当成「确认没有根」缓存 6 小时）。
-        None => match failure {
-            Some(why) => Probe::Failed {
-                reason: format!("cannot tell whether a root exists ({why})"),
-            },
-            None => Probe::None,
-        },
-    }
+    // 一路都答得上来、就是没有 —— 那才是「问了、没有」。
+    Probe::None
 }
 
 /// 经访问桥在 WSL 内探测 —— **一次 `wsl.exe` 调用走完整条祖先链**。
@@ -568,21 +582,65 @@ mod tests {
             other => panic!("权限失败必须报 Failed，得到 {other:?}"),
         }
 
-        // 🔴 **中途失败但最终探到了根 ⇒ 仍是 Found**。失败只在「一路没探到」时才决定
-        // 结论 —— 否则一个无关目录的权限问题会把一次成功的归属打成失败。
-        let flaky = |p: &Path| -> std::io::Result<bool> {
+        // 🔴 **内层没问成 ⇒ Failed，即使外层探得到根**（ADR-051 §5 规则 ③）。
+        //
+        // ⚠️ 这一段从前断言的是 `Found(/w/proj)`，理由写着「否则一个无关目录的权限
+        // 问题会把一次成功的归属打成失败」。**那个「无关」不成立**：上溯路径上的每
+        // 一层都可能就是真正的根。`/w/proj/sub` 的 `.git` 读不到，而它很可能本来就有
+        // —— 归到 `/w/proj` 就是把子仓库的会话记到父仓库名下，**而且静默**。
+        //
+        // 一条把错误行为钉死的测试比没有测试更糟：它让后来者以为这是想要的。
+        let inner_denied = |p: &Path| -> std::io::Result<bool> {
             if p.to_string_lossy().contains("sub") {
                 Err(Error::new(ErrorKind::PermissionDenied, "denied"))
             } else {
                 Ok(p.file_name().is_some_and(|n| n == ".git"))
             }
         };
-        match probe_local_with("/w/proj/sub", None, flaky) {
+        match probe_local_with("/w/proj/sub", None, inner_denied) {
+            Probe::Failed { reason } => assert!(reason.contains("sub"), "got {reason}"),
+            other => panic!("内层没问成时不能归到外层根，得到 {other:?}"),
+        }
+
+        // 🔴 反向：**命中之后的失败不算** —— 命中即返回，根本不会去探更外层。
+        //
+        // 没有这一条，「更严格」会滑成「一路探到底」：一个无关的外层权限问题又能
+        // 推翻一个已经确定的结论。
+        let outer_denied = |p: &Path| -> std::io::Result<bool> {
+            let s = p.to_string_lossy().into_owned();
+            if s.contains("sub") {
+                Ok(p.file_name().is_some_and(|n| n == ".git")) // sub/.git 确实在
+            } else {
+                Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+            }
+        };
+        match probe_local_with("/w/proj/sub", None, outer_denied) {
             Probe::Found { root, source } => {
                 assert_eq!(source, RootSource::Git);
-                assert!(root.ends_with("proj"), "got {root}");
+                assert!(root.ends_with("sub"), "最近的那个根就是答案，got {root}");
             }
-            other => panic!("探到了根就该是 Found，得到 {other:?}"),
+            other => panic!("已经命中就不该再往外探，得到 {other:?}"),
+        }
+
+        // 🔴 **marker 那一遍同样适用** —— 两遍是两条独立的循环，改一条不改另一条
+        // 不会有任何东西报错。
+        //
+        // ⚠️ 这条是变异验证逼出来的：上面几段的探测器都在 `.git` 那遍就失败了，
+        // **从没走到 marker 那遍**，于是「marker 失败后继续上溯」这个变异全绿。
+        let marker_denied = |p: &Path| -> std::io::Result<bool> {
+            let s = p.to_string_lossy().into_owned();
+            if s.ends_with(".git") {
+                return Ok(false); // `.git` 那遍一路答得上来、就是没有
+            }
+            if s.contains("sub") {
+                Err(Error::new(ErrorKind::PermissionDenied, "denied"))
+            } else {
+                Ok(s.ends_with("Cargo.toml"))
+            }
+        };
+        match probe_local_with("/w/proj/sub", None, marker_denied) {
+            Probe::Failed { reason } => assert!(reason.contains("sub"), "got {reason}"),
+            other => panic!("marker 那遍内层没问成也不能归到外层，得到 {other:?}"),
         }
 
         // 反向：一路都答得上来、就是没有 ⇒ `None`（那才是「问了、没有」）。
