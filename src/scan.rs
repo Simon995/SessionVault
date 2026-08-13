@@ -401,8 +401,14 @@ fn scan_append_log<S: ByteSource>(
         // 结果：QuotaBar 的生产路径**永远**传不进上一版指纹，同尺寸原地重写
         // 从来没有被识别过，而 SessionVault 这边的性质测试是手工存下指纹再传回的
         // ——**测的是测试自己设计的路径**。
-        if let Some(prev) = prior_fingerprint.as_ref().map(|f| f.as_str()) {
-            if prev != fp.as_str() {
+        // 🔴 **比前缀，不比全文**（第二轮评审 P1-B）。
+        //
+        // 第一版是 `prev != fp`，即拿两个**全文**哈希比 —— 而中间只要发生过
+        // 一次正常追加，两者就必然不等，于是纯追加被判成原地重写、走 `Rollback`、
+        // 在总库留下一代**永不自动回收**的旧版本。新增的测试当时恰好在追加之后
+        // 又做了一次真实重写，因此**没有覆盖「追加后直接强制全读」**。
+        if let Some(prev) = prior_fingerprint.as_ref() {
+            if prev.prefix_differs_from(&tail) {
                 change = SourceChange::RollbackOrRewrite;
                 log::warn!(
                     target: tag::CURSOR,

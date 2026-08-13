@@ -118,20 +118,58 @@ impl ScanFailure {
 /// 沿用快照路径已在用的 `sha256:` 形式（`scan.rs::scan_snapshot_file`）与同一个
 /// `sha2` 依赖 —— 一个仓里两种指纹格式，早晚会有人把它们拿去比较。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SourceFingerprint(String);
+pub struct SourceFingerprint {
+    hash: String,
+    /// 这个哈希**覆盖到文件的第几个字节** —— 少了它，指纹就说不清自己在描述什么。
+    ///
+    /// 🔴 第一版只存哈希，于是「全读 N 字节 → 追加到 M 字节 → 再全读」时，
+    /// 拿 `hash(M)` 与 `hash(N)` 比，**必然不等**，一次纯追加被判成原地重写 ⇒
+    /// `Rollback` ⇒ 总库开一代**按设计永不自动回收**的旧版本。而强制全读并不
+    /// 罕见（`force_refresh` / 归属过期 / 欠账）。
+    covered_len: u64,
+}
 
 impl SourceFingerprint {
     pub fn of(bytes: &[u8]) -> Self {
         use sha2::{Digest, Sha256};
-        Self(format!("sha256:{:x}", Sha256::digest(bytes)))
+        Self {
+            hash: format!("sha256:{:x}", Sha256::digest(bytes)),
+            covered_len: bytes.len() as u64,
+        }
+    }
+
+    /// 这个指纹覆盖到第几个字节。
+    pub fn covered_len(&self) -> u64 {
+        self.covered_len
+    }
+
+    /// 当前全文与上一版指纹比对：**只比它覆盖过的那段前缀**。
+    ///
+    /// - 前缀一致 ⇒ 只发生过追加（或什么都没变）—— **不是重写**；
+    /// - 前缀不一致 ⇒ 那段字节被改过 ⇒ 重写（同尺寸与「重写且变长」都在内）；
+    /// - 当前比上一版还短 ⇒ 无法比对，交给 stat 那层的回退判定（它已经认得变短）。
+    ///
+    /// 比全文哈希强：全文哈希只在尺寸恰好相同时有意义，而这里「重写且变长」
+    /// 也认得出。
+    pub fn prefix_differs_from(&self, current_full: &[u8]) -> bool {
+        let n = self.covered_len as usize;
+        if current_full.len() < n {
+            return false; // 变短 —— 不由指纹这一层判
+        }
+        Self::of(&current_full[..n]).hash != self.hash
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.hash
     }
 
-    pub fn from_stored(s: impl Into<String>) -> Self {
-        Self(s.into())
+    /// 从持久化的 `(哈希, 覆盖长度)` 还原。**两者缺一不可** —— 只存哈希
+    /// 就退回第一版那个「纯追加被判成重写」的缺陷。
+    pub fn from_stored(hash: impl Into<String>, covered_len: u64) -> Self {
+        Self {
+            hash: hash.into(),
+            covered_len,
+        }
     }
 }
 
