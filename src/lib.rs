@@ -33,7 +33,8 @@ pub mod wsl;
 pub use catalog::{Artifact, Profile, ProviderDescriptor};
 pub use cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
 pub use discover::{
-    DiscoveryOutcome, ProjectSnapshotRoot, SourceRef, LOCAL_LOCATION, UNREACHABLE_ALL_WSL,
+    DiscoveryOutcome, ProjectSnapshotOutcome, ProjectSnapshotRoot, SourceRef, LOCAL_LOCATION,
+    UNREACHABLE_ALL_WSL,
 };
 pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
@@ -109,8 +110,15 @@ pub fn discover_snapshots() -> Result<Vec<SourceRef>> {
     discover::discover_snapshots(crate::deadline::Deadline::unbounded())
 }
 
-pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRef> {
-    discover::discover_project_snapshots(roots)
+/// 在宿主已确认的项目根内发现 CLAUDE.md / AGENTS.md。
+///
+/// 🔴 返回 [`discover::ProjectSnapshotOutcome`] 而不是裸列表 —— 「没问成」必须
+/// 能说出口；预算由调用方给，理由同 [`discover_transcripts_reported`]。
+pub fn discover_project_snapshots(
+    roots: &[ProjectSnapshotRoot],
+    deadline: crate::deadline::Deadline,
+) -> discover::ProjectSnapshotOutcome {
+    discover::discover_project_snapshots(roots, deadline)
 }
 
 /// 本机 WSL 里 Windows 盘的挂载表 —— **发现与归属共用的一项运行期事实**。

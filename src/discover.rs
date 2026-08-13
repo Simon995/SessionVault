@@ -77,8 +77,48 @@ pub struct ProjectSnapshotRoot {
 
 /// 在宿主已确认的项目根内发现 CLAUDE.md / AGENTS.md。身份仍由宿主算一次；
 /// SessionVault 只负责受限路径发现和读取。
-pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRef> {
+/// 一次项目内指令文件发现的结果。
+///
+/// 🔴 **`unreachable` 与「这个根下没有指令文件」是两件事。** 上一版返回一个裸
+/// `Vec<SourceRef>`，把两者压成同一个「不在列表里」：`is_file()` 把权限拒绝、
+/// 句柄耗尽、瞬时 IO 错误全返回 `false`，WSL 那支更是
+/// `.ok().flatten().is_some()` —— 一次 `wsl.exe` 卡死与「这个项目没写过
+/// CLAUDE.md」在调用方眼里一模一样。
+///
+/// 这是本仓反复栽的同一个形状（`Probe::{Seen,Absent,Unreachable}`、
+/// `DiscoveryOutcome`、`Probe::None` vs `Probe::Failed`）在又一层的重演。
+pub struct ProjectSnapshotOutcome {
+    pub sources: Vec<SourceRef>,
+    /// 探测失败的项目根（`project_root` 原样）。调用方**不得**把它读作
+    /// 「这个项目没有指令文件」。
+    pub unreachable: Vec<String>,
+}
+
+/// 一次文件探测的三态。`NotFound` 是**事实**（那里确实没有），其余 IO 错误是
+/// 「没问成」—— 按 AGENTS.md：把不存在报成不可达，会让每个没写过 CLAUDE.md 的
+/// 项目永久带着一个假故障。
+enum FileProbe {
+    Present,
+    Absent,
+    Failed,
+}
+
+fn probe_host_file(path: &std::path::Path) -> FileProbe {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => FileProbe::Present,
+        // 存在但不是文件（目录 / 断掉的符号链）—— 那个**文件**确实没有，是事实。
+        Ok(_) => FileProbe::Absent,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileProbe::Absent,
+        Err(_) => FileProbe::Failed,
+    }
+}
+
+pub fn discover_project_snapshots(
+    roots: &[ProjectSnapshotRoot],
+    deadline: crate::deadline::Deadline,
+) -> ProjectSnapshotOutcome {
     let mut out = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
     for root in roots {
         for (source_type, rel) in [
             (SourceType::ClaudeCode, "CLAUDE.md"),
@@ -94,32 +134,43 @@ pub fn discover_project_snapshots(roots: &[ProjectSnapshotRoot]) -> Vec<SourceRe
                 )),
             };
             let probe = root.probe_path.as_ref().map(|base| base.join(rel));
-            let exists = match (&root.source_location, probe) {
-                (_, Some(path)) => path.is_file(),
-                (SourceLocation::Local, None) => path.is_file(),
-                (SourceLocation::Wsl(distro), None) => crate::wsl::stat(
-                    distro,
-                    &path.to_string_lossy(),
-                    crate::deadline::Deadline::unbounded(),
-                )
-                .ok()
-                .flatten()
-                .is_some(),
+            let seen = match (&root.source_location, probe) {
+                (_, Some(p)) => probe_host_file(&p),
+                (SourceLocation::Local, None) => probe_host_file(&path),
+                (SourceLocation::Wsl(distro), None) => {
+                    match crate::wsl::stat(distro, &path.to_string_lossy(), deadline) {
+                        Ok(Some(_)) => FileProbe::Present,
+                        Ok(None) => FileProbe::Absent,
+                        // 问不到那台 VM —— 不是「这个项目没有 CLAUDE.md」。
+                        Err(_) => FileProbe::Failed,
+                    }
+                }
             };
-            if exists {
-                out.push(SourceRef {
+            match seen {
+                FileProbe::Present => out.push(SourceRef {
                     source_type,
                     source_location: root.source_location.clone(),
                     source_mode: SourceMode::SnapshotFile,
                     path,
                     project_root: Some(root.project_root.clone()),
                     artifact_kind: Some("instruction".to_string()),
-                });
+                }),
+                FileProbe::Absent => {}
+                FileProbe::Failed => {
+                    // 按**根**记账：一个根下三个候选，任一没问成就说不出
+                    // 「这个项目的指令文件是哪些」。
+                    if !unreachable.contains(&root.project_root) {
+                        unreachable.push(root.project_root.clone());
+                    }
+                }
             }
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    ProjectSnapshotOutcome {
+        sources: out,
+        unreachable,
+    }
 }
 
 fn discover(local_only: bool, deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
@@ -565,16 +616,113 @@ mod tests {
             probe_path: Some(probe.clone()),
             project_root: r"\\wsl.localhost\Ubuntu-22.04\home\u\project".into(),
         }];
-        let sources = discover_project_snapshots(&roots);
-        assert_eq!(sources.len(), 1);
+        let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
+        assert_eq!(found.sources.len(), 1);
         assert_eq!(
-            sources[0].path.to_string_lossy(),
+            found.sources[0].path.to_string_lossy(),
             "/home/u/project/AGENTS.md"
         );
         assert_eq!(
-            sources[0].project_root.as_deref(),
+            found.sources[0].project_root.as_deref(),
             Some(roots[0].project_root.as_str())
         );
+        // 探测**成功**且只是没找到另外两个候选 ⇒ 不算不可达。
+        assert!(
+            found.unreachable.is_empty(),
+            "问到了、答案是「没有」—— 那不是故障：{:?}",
+            found.unreachable
+        );
         let _ = std::fs::remove_dir_all(probe);
+    }
+
+    /// 🔴 **「没问成」不许长得像「这里没有」**（评审 P2-5）。
+    ///
+    /// 上一版整个函数是 `is_file()` / `.ok().flatten().is_some()` —— 权限拒绝、
+    /// 句柄耗尽、`wsl.exe` 卡死，全部返回 `false`，与「这个项目没写过 CLAUDE.md」
+    /// 一模一样。调用方（记忆源枚举）据此决定要不要蒸馏这个项目的指令文件，
+    /// 于是一次瞬时故障 = 这个项目的规则**静默不进记忆**。
+    ///
+    /// 驱动方式：一个**不存在的发行版**（`wsl.exe` 约 0.1s 失败），与
+    /// `unreachable_client()` / `WSL_E_DISTRO_NOT_FOUND` 是同一个手法 ——
+    /// 打真实路径，而不是断言某个 helper 返回什么。
+    #[test]
+    fn a_probe_that_could_not_be_made_is_not_reported_as_absent() {
+        let roots = [ProjectSnapshotRoot {
+            source_location: SourceLocation::Wsl("svault-no-such-distro-9c1f".into()),
+            // 没有 `probe_path` ⇒ 走 WSL 那一支，也就是被测的那条。
+            path: "/home/u/project".into(),
+            probe_path: None,
+            project_root: "wsl:svault-no-such-distro-9c1f:/home/u/project".into(),
+        }];
+        let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
+
+        assert!(
+            found.sources.is_empty(),
+            "问不到就不该产出来源 —— 那会凭空造一个读不了的文件"
+        );
+        assert_eq!(
+            found.unreachable,
+            vec!["wsl:svault-no-such-distro-9c1f:/home/u/project".to_string()],
+            "🔴 但它必须**说出来**：空列表 + 空 unreachable 读作「这个项目没有指令文件」"
+        );
+    }
+
+    /// 同一条判据的**本机**那一半。
+    ///
+    /// 🔴 头一版只测了 WSL 支，于是把本机支的 `Err(_) => Absent` 变异掉照样全绿 ——
+    /// 「WSL 做对了不等于 local 做对了」，AGENTS.md 里这句话是有判例的。
+    ///
+    /// 真正要防的是 `probe_path` 指向一个**死掉的 UNC**（`\\wsl.localhost\<distro>`
+    /// 在发行版停了之后）或一个 ACL 拒绝的目录 —— 两者都构造不成确定性测试，
+    /// 所以这里用路径里的 NUL 字节：Rust 在发系统调用前就返回 `InvalidInput`，
+    /// 瞬时、跨平台，且**恰好是那一类**「不是 NotFound 的 IO 错误」。
+    #[test]
+    fn a_host_probe_that_errors_is_not_reported_as_absent() {
+        let roots = [ProjectSnapshotRoot {
+            source_location: SourceLocation::Local,
+            path: std::path::PathBuf::from("/tmp/svault-probe-err\u{0}x"),
+            probe_path: None,
+            project_root: "/tmp/svault-probe-err".into(),
+        }];
+        let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
+
+        assert!(found.sources.is_empty(), "问不成就不产出来源");
+        assert_eq!(
+            found.unreachable,
+            vec!["/tmp/svault-probe-err".to_string()],
+            "🔴 本机 IO 错误同样是「没问成」—— 只有 NotFound 才是「确实没有」"
+        );
+    }
+
+    /// 反方向：`NotFound` **必须**读作「确实没有」。
+    ///
+    /// ⚠️ 少了这一条，把整个 `probe_host_file` 写成恒 `Failed` 也能通过上面那条 ——
+    /// 而那会让每个没写过 CLAUDE.md 的项目永久带着一个假故障，正是 AGENTS.md
+    /// 里那句「目录不存在是事实」在防的。
+    #[test]
+    fn a_root_without_instruction_files_is_absent_not_unreachable() {
+        let dir = std::env::temp_dir().join(format!(
+            "svault-empty-root-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = [ProjectSnapshotRoot {
+            source_location: SourceLocation::Local,
+            path: dir.clone(),
+            probe_path: None,
+            project_root: dir.to_string_lossy().into_owned(),
+        }];
+        let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
+
+        assert!(found.sources.is_empty(), "这个根下确实一个指令文件都没有");
+        assert!(
+            found.unreachable.is_empty(),
+            "问到了、答案是「没有」—— 报成不可达会让每个干净项目永久挂个假故障：{:?}",
+            found.unreachable
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
