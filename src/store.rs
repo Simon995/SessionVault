@@ -1626,6 +1626,27 @@ impl TotalStore {
         reg
     }
 
+    /// 某个源文件的当前头 `(source_revision, projection_revision)`。
+    ///
+    /// 对外暴露是为了让**跨层的崩溃恢复**可断言（ADR-051 §9 性质测试）：
+    /// 「总库提交后、UI 索引提交前崩溃 ⇒ 恢复后两边收敛且**不留额外代**」——
+    /// 后半句只有读得到头才验得了，而那正是最容易悄悄退化的一半
+    /// （每崩一次多留一代，界面上完全看不出来）。
+    ///
+    /// 无记录 ⇒ `(0, 0)`，与内部的 `head_of` 同一口径。
+    pub fn current_head(
+        &self,
+        source_type: &str,
+        source_location: &str,
+        source_path: &str,
+    ) -> StoreResult<(i64, i64)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        head_of(&conn, source_type, source_location, source_path)
+    }
+
     /// 注册表全部条目 + 当前归属修订号，**读不到就报错**（ADR-050 对外报告面）。
     ///
     /// # 为什么不复用 [`Self::project_root_registry`]
