@@ -247,6 +247,24 @@ impl RecentSession {
     }
 }
 
+/// [`TotalStore::project_roots_report`] 的一行 —— 注册表里一个项目根。
+///
+/// `root_key` 是归一化后的比较键（小写、正斜杠、无尾斜杠），`root_path` 是原始形式。
+/// **两个都给**：消费方要拿 `root_key` 做稳定标识（跨视角不变），拿 `root_path` 显示
+/// 给人看。只给后者会逼每个消费方自己再归一化一遍 —— 那正是同一条规则长出第二份
+/// 实现的入口。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRootRow {
+    pub root_key: String,
+    pub root_path: String,
+    /// `git` / `marker` / `scan` / `configured`（[`crate::attribution::RootSource`]）。
+    /// **原样透传，不解析** —— 一个本层不认识的来源标签不该在报告里消失或被改写成
+    /// 别的值；消费方看得见「有个我不认识的来源」，比看见一个伪造的 `scan` 好。
+    pub root_source: String,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
 /// 某个源文件的当前头；无记录时 `(0, 0)`。
 ///
 /// 读 `current_head` 而不是 `MAX(source_revision, projection_revision)`：后者表达不了
@@ -1509,6 +1527,77 @@ impl TotalStore {
             reg.insert(&row.0, src);
         }
         reg
+    }
+
+    /// 注册表全部条目 + 当前归属修订号，**读不到就报错**（ADR-050 对外报告面）。
+    ///
+    /// # 为什么不复用 [`Self::project_root_registry`]
+    ///
+    /// 那个服务**归属计算**：读不到 ⇒ 空注册表 ⇒ 每个路径一致地归到 `Unattributed`，
+    /// 一个诚实的「说不出来」（论证见它自己的注释）。
+    ///
+    /// 这个服务**对外报告**，而消费方会据结果决定要不要自己去发现项目。同一个空列表
+    /// 在那边读作「这台机器上没有项目」—— **一个说得出口但错误的答案**，正是本仓
+    /// 「降级要降到说不出来，不是降到另一个答案」那条要防的。所以它返回 `Result`：
+    /// 读到了、有 0 个根 ⇒ `Ok(空)`；**读不到 ⇒ `Err`**。两者在类型上就不同。
+    ///
+    /// # 为什么清单与修订号是一次调用
+    ///
+    /// `attribution_revision` 是消费方的**缓存失效锚**：它没变就可以继续用上次的
+    /// 清单。分成两次调用，中间的锁间隙足够一次注册写入挤进来 —— 消费方于是拿到
+    /// 「新清单 + 旧修订号」或反过来，而**两种都会让它认为缓存仍然有效**。
+    /// 一次持锁读完，两者必然同代。
+    ///
+    /// ⚠️ 修订号这里**不能**沿用 [`Self::attribution_revision`] 的 `unwrap_or(0)`：
+    /// 那个降级在归属计算里无害（0 只是个比较基准），在这里却会让消费方读作
+    /// 「归属从没变过」⇒ 缓存**永不失效**。同一个值，两种语境，两种正确的错误处理。
+    ///
+    /// 🔴 **不分页**：根是 O(100) 的有界集合。加 `--limit` 只会引入一条静默截断的
+    /// 路径（`sessions-read` 为此不得不带 `truncated` 标志），收益为零。
+    pub fn project_roots_report(&self) -> Result<(Vec<ProjectRootRow>, i64), String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| format!("total store mutex poisoned: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT root_key, root_path, root_source, first_seen_ms, last_seen_ms \
+                   FROM project_root_registry ORDER BY root_key",
+            )
+            .map_err(|e| format!("prepare project_root_registry failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(ProjectRootRow {
+                    root_key: r.get(0)?,
+                    root_path: r.get(1)?,
+                    root_source: r.get(2)?,
+                    first_seen_ms: r.get(3)?,
+                    last_seen_ms: r.get(4)?,
+                })
+            })
+            .map_err(|e| format!("query project_root_registry failed: {e}"))?;
+        // `rows.flatten()` 会把逐行的解码失败悄悄跳过 —— 那正是「少几行」冒充
+        // 「就这么多」。逐行 `?`，一行坏掉整份报告就失败。
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("decode project_root_registry row failed: {e}"))?);
+        }
+        // 同一次持锁 —— 见上方「为什么清单与修订号是一次调用」。
+        let revision: i64 = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'attribution_revision'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("read attribution_revision failed: {e}"))?
+            // 行不存在 = 还没注册过任何根，修订号就是初始值 0。这与「读失败」不同，
+            // 上一行的 `?` 已经把后者分了出去。
+            .map_or(Ok(0), |v| {
+                v.parse::<i64>()
+                    .map_err(|e| format!("attribution_revision is not an integer ({v:?}): {e}"))
+            })?;
+        Ok((out, revision))
     }
 
     /// 注册表里有多少个根。诊断用（验收第 3 条：`Unattributed` 的数量要报得出来）。
@@ -5253,6 +5342,105 @@ mod project_identity_tests {
         let reg = st.project_root_registry(&Vec::new());
         let a = attribute(Some(r"c:\users\u\quotabar\src-tauri"), &reg);
         assert_eq!(a.root(), Some(r"C:\Users\u\QuotaBar"));
+    }
+
+    // ── 对外报告面：`project_roots_report`（#40 步 1）────────────────────
+
+    /// 🔴 **「读到了、没有根」与「没读成」必须是两种结果。**
+    ///
+    /// 这个命令存在的全部理由，是让走 CLI 的消费方不必自己再发现一遍项目。
+    /// 若读失败也返回空列表，消费方会读作「这台机器上没有项目」，然后心安理得地
+    /// 回退到它自己那套发现 —— 正好把要消除的第二份实现请回来。
+    #[test]
+    fn an_empty_registry_and_an_unreadable_one_are_different_answers() {
+        let st = TotalStore::open_in_memory().unwrap();
+
+        // ① 读到了，确实没有根 ⇒ Ok(空)。
+        let (roots, rev) = st.project_roots_report().expect("空注册表要能读出来");
+        assert!(roots.is_empty());
+        assert_eq!(rev, 0, "还没注册过根，修订号是初始值 0");
+
+        // ② 读不成 ⇒ Err。打真实失败路径：把表拆掉，让 prepare 真的失败。
+        st.conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE project_root_registry", [])
+            .unwrap();
+        let err = st
+            .project_roots_report()
+            .expect_err("读不到注册表必须报错，不能返回空列表冒充「没有项目」");
+        assert!(
+            err.contains("project_root_registry"),
+            "错误要说出是哪张表读不到：{err}"
+        );
+    }
+
+    /// 一行的五个字段如实返回，且 `root_key` 与 `root_path` **都给**。
+    ///
+    /// 只给原始形式会逼每个消费方自己再归一化一遍 —— 同一条规则长出第二份实现的入口。
+    #[test]
+    fn a_reported_root_carries_both_the_key_and_the_original_form() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(r"C:\Users\u\Proj", RootSource::Git);
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(roots.len(), 1);
+        let r = &roots[0];
+        assert_eq!(r.root_path, r"C:\Users\u\Proj", "原始形式原样返回");
+        assert_ne!(
+            r.root_key, r.root_path,
+            "比较键是归一化过的，不该等于原始形式"
+        );
+        assert_eq!(r.root_key, "c:/users/u/proj", "小写、正斜杠、无尾斜杠");
+        assert_eq!(r.root_source, "git");
+        assert!(r.first_seen_ms > 0 && r.last_seen_ms > 0, "时间戳要落库");
+    }
+
+    /// 🔴 **清单与修订号必须同代。**
+    ///
+    /// `attribution_revision` 是消费方的缓存失效锚。若它与清单来自两次读，中间的
+    /// 锁间隙足够一次注册挤进来，消费方就会拿到「新清单 + 旧修订号」（或反过来）——
+    /// 而**两种都会让它认为缓存仍然有效**。
+    #[test]
+    fn the_report_and_its_revision_come_from_one_read() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/w/A", RootSource::Git);
+        let (roots1, rev1) = st.project_roots_report().unwrap();
+        assert_eq!(roots1.len(), 1);
+        assert_eq!(rev1, 1, "一个新根 ⇒ 修订号 1");
+
+        st.register_project_root("/w/B", RootSource::Git);
+        let (roots2, rev2) = st.project_roots_report().unwrap();
+        assert_eq!(roots2.len(), 2, "清单跟上了");
+        assert_eq!(rev2, 2, "修订号也跟上了 —— 两者必然同代");
+    }
+
+    /// 🔴 **不认识的来源标签原样透传，不改写。**
+    ///
+    /// 与 [`TotalStore::project_root_registry`] 的 `unwrap_or(Scan)` 是**有意的**
+    /// 分野：那里在算归属，一个不认识的标签不该让整个根消失，所以取个保守默认；
+    /// 这里在**报告事实**，把未来版本写下的 `configured_v2` 报成 `scan` 就是在
+    /// 编造。消费方看见一个自己不认识的来源，好过看见一个伪造的熟面孔。
+    #[test]
+    fn an_unknown_root_source_is_reported_verbatim() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO project_root_registry \
+                   (root_key, root_path, root_source, first_seen_ms, last_seen_ms) \
+                 VALUES ('/w/x', '/w/X', 'from_the_future', 1, 2)",
+                [],
+            )
+            .unwrap();
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0].root_source, "from_the_future",
+            "报告面不得把不认识的来源改写成一个认识的"
+        );
     }
 
     #[test]

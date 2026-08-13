@@ -110,6 +110,20 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 总库记下的项目根（ADR-050 注册表）—— **项目身份的唯一对外出口**。
+    ///
+    /// 没有这个口的时候，只有能直链 Rust crate 的消费者拿得到注册表，走 CLI 的那些
+    /// 只能自己再发现一遍。实测的后果：同一个项目在记忆库里存成两个身份，各自
+    /// 持有一半的记忆且互相看不见。
+    ///
+    /// 🔴 **不做命名空间翻译。** 给出的是注册表里的原始形式（可能是 `C:\…`，也可能
+    /// 是 `wsl:<distro>:/…`）。翻译成「消费方能打开的物理路径」是它自己的事 ——
+    /// 在这里替它猜，等于把宿主视野的假设烧进一个跨进程接口。
+    #[cfg(feature = "store")]
+    Roots {
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 投影替换的变更流（ADR-044 决定 6）。
     ///
     /// 只读「当前投影」不足以让消费者收敛：一次重投影把 `{A,B}` 换成 `{A}` 之后，
@@ -282,6 +296,25 @@ enum Out<'a> {
     Snapshot { offset: i64, event: &'a RawEvent },
     #[cfg(feature = "store")]
     SnapshotSummary { snapshots: u64 },
+    /// `roots` 的一行。
+    #[cfg(feature = "store")]
+    ProjectRoot {
+        root_key: String,
+        root_path: String,
+        root_source: String,
+        first_seen_ms: i64,
+        last_seen_ms: i64,
+    },
+    /// `roots` 的收尾摘要。
+    ///
+    /// 🔴 `attribution_revision` 是消费方的**缓存失效锚**，与上面那些行来自同一次
+    /// 持锁读（见 `TotalStore::project_roots_report`）。没有它，消费方要么每次全量
+    /// 重算，要么用一份自己也说不清有没有过期的缓存。
+    #[cfg(feature = "store")]
+    RootsSummary {
+        roots: usize,
+        attribution_revision: i64,
+    },
     /// 一条投影替换记录。消费者读到它就按 `source_*` **原子替换**自己那份物化。
     #[cfg(feature = "store")]
     ProjectionReplaced {
@@ -355,6 +388,8 @@ fn main() {
         } => run_sessions_read(sessions, max_events, store),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
+        #[cfg(feature = "store")]
+        Command::Roots { store } => run_roots(store),
         #[cfg(feature = "store")]
         Command::Changes {
             since_seq,
@@ -1121,6 +1156,52 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
     }
     emit(&Out::RecentSessionsSummary {
         sessions: sessions.len(),
+    });
+    0
+}
+
+/// `roots`：列出注册表里的项目根 + 归属修订号。
+///
+/// 🔴 **每一条失败路径都退非零**，一条都不吞。这个命令的全部价值就是让消费方
+/// 不必自己再发现一遍项目 —— 而一个「成功但空」的输出会让它读作「这台机器上没有
+/// 项目」，然后**心安理得地回退到自己那套发现**，正好把这个命令要消除的第二份
+/// 实现重新请回来。空列表只有一个合法含义：读到了，注册表里确实没有根。
+#[cfg(feature = "store")]
+fn run_roots(store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if !store_path.exists() {
+        log::error!(target: tag::CLI, "total store not found: {}", store_path.display());
+        return 1;
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    let (roots, attribution_revision) = match store.project_roots_report() {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!(target: tag::CLI, "project_roots_report failed: {e}");
+            return 1;
+        }
+    };
+    for r in &roots {
+        emit(&Out::ProjectRoot {
+            root_key: r.root_key.clone(),
+            root_path: r.root_path.clone(),
+            root_source: r.root_source.clone(),
+            first_seen_ms: r.first_seen_ms,
+            last_seen_ms: r.last_seen_ms,
+        });
+    }
+    emit(&Out::RootsSummary {
+        roots: roots.len(),
+        attribution_revision,
     });
     0
 }
