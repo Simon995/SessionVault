@@ -541,6 +541,55 @@ CREATE TABLE IF NOT EXISTS raw_events (
 /// 放在迁移分支里的话，一旦进程在「表已改形状、索引还没建」之间被杀，下次启动会因为
 /// `source_revision` 已存在而跳过整个分支 —— 库从此没有索引，而这不报错，只是所有
 /// 会话/项目查询退化成全表扫。
+/// 项目的规范身份。**提成常量是为了让迁移能复用它** —— 与 `RAW_EVENTS_DDL` 同一个理由。
+const PROJECT_IDENTITY_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS project_identity (
+    project_root    TEXT    NOT NULL,
+    canonical_id    TEXT    NOT NULL,
+    -- 🔴 毫秒，不是秒：`last_seen_ms` 是**排序键**（默认查询取最新的那条），
+    -- 而秒级精度下同一秒内的两个身份会平局、退化成按 id 字母序。
+    first_seen_ms   INTEGER NOT NULL,
+    last_seen_ms    INTEGER NOT NULL,
+    PRIMARY KEY (project_root, canonical_id)
+);
+"#;
+
+const PROJECT_IDENTITY_INDEX_DDL: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_identity_cid ON project_identity(canonical_id);
+"#;
+
+/// 一个根的身份记录结果。
+///
+/// 🔴 **四态，不是 `bool`/`Option`。** 「问过了没变」「刚记上」「确认没有 remote」
+/// 「没问成」对调用方是四种不同的处置，压成两态就又造一个「没问成长得像没有」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityOutcome {
+    /// 本进程已经问过这个根（终态缓存命中）。
+    AlreadyProbed,
+    /// 身份行已落库。
+    Recorded,
+    /// **确认**这个根没有可用的 remote —— 事实，不写 `path:` 兜底行（约束 1）。
+    NoRemote,
+    /// **没问成**：探测失败 / 拿不到锁 / 写失败。缓存已撤回，下一轮重试。
+    Unresolved,
+}
+
+/// 一轮 [`TotalStore::sweep_registered_root_identities`] 的统计。
+///
+/// 🔴 `skipped_out_of_budget` 必须报出来：「本轮只看了一半」和「本轮全看过了」
+/// 在结果上长得一模一样，静默截断读起来就是「覆盖完了」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentitySweep {
+    pub registered: usize,
+    pub recorded: usize,
+    pub already_probed: usize,
+    pub no_remote: usize,
+    pub unresolved: usize,
+    pub skipped_out_of_budget: usize,
+    /// 连注册表都没读成 —— 这一轮**什么都没扫**，与「扫了但零结果」不同。
+    pub unreadable: Option<String>,
+}
+
 const RAW_EVENTS_INDEX_DDL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
@@ -707,7 +756,9 @@ pub struct TotalStore {
     /// ⚠️ 代价写在这里：**同一进程内身份变更不会被发现**（改了 remote 要重启才看得到）。
     /// 可接受 —— 身份变更极罕见，而 upsert 保证下一个进程立刻纠正；反过来，
     /// 为了捕捉一件几乎不发生的事而每个文件读一次盘，是明确的坏交易。
-    identity_seen: Mutex<std::collections::HashSet<(String, String, String)>>,
+    /// 本进程已经问过身份的项目根。**键只有根** —— 身份是根的属性，与谁扫到它无关
+    /// （同 `project_identity` 主键那次收敛）。
+    identity_seen: Mutex<std::collections::HashSet<String>>,
 }
 
 /// 递增注册表修订号。**只在真的插入了新根时调用**（见 `register_project_root`）。
@@ -817,33 +868,7 @@ impl TotalStore {
                 v TEXT NOT NULL
             );
 
-            -- 项目的规范身份（`identity::canonical_repo_id`），**在扫描时记下来**。
-            --
-            -- 🔴 存在的理由：身份靠读磁盘上的 `.git/config` 现算，而 checkout 一旦被
-            -- 删除就再也算不出来 —— 实测有一个项目留着 161,256 条历史事件，却没有任何
-            -- 东西能说出它属于哪个仓库。扫描时 `.git` 还在，那是唯一能记下它的时刻。
-            --
-            -- 🔴 **主键带 `canonical_id`，不做 latest-wins。** 同一个 `project_root`
-            -- 先后观察到两个身份有两种可能，看起来一模一样而后果相反：
-            --   ① 同一个仓改了 remote / 迁移了 ⇒ 指同一个项目，可合并
-            --   ② **路径被另一个仓复用**（删掉重新 clone 别的）⇒ 是两个项目，绝不能合
-            -- ② 一点也不罕见，而 latest-wins 会把前一个仓的整段历史划到后一个名下。
-            -- 区分两者要仓库自身的连续性证据（首次提交 hash），代价远超「只读
-            -- `.git/config`」这个定位 ⇒ 不区分，改为**不丢信息**：两个身份就是两行，
-            -- 默认取 `last_seen` 最大的那条（行为等同 latest-wins），历史需要时可查。
-            CREATE TABLE IF NOT EXISTS project_identity (
-                source_type     TEXT    NOT NULL,
-                source_location TEXT    NOT NULL,
-                project_root    TEXT    NOT NULL,
-                canonical_id    TEXT    NOT NULL,
-                -- 🔴 毫秒，不是秒：`last_seen_ms` 是**排序键**（默认查询取最新的那条），
-                -- 而秒级精度下同一秒内的两个身份会平局、退化成按 id 字母序。
-                first_seen_ms   INTEGER NOT NULL,
-                last_seen_ms    INTEGER NOT NULL,
-                PRIMARY KEY (source_type, source_location, project_root, canonical_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_identity_root ON project_identity(project_root);
-            CREATE INDEX IF NOT EXISTS idx_identity_cid ON project_identity(canonical_id);
+            -- 项目的规范身份见 [`PROJECT_IDENTITY_DDL`]（提成常量，迁移要复用它）。
 
             -- 🔴 **项目根注册表（ADR-050 决定 3）—— 与 `project_identity` 分开，
             -- 因为两者回答的是不同的问题。**
@@ -887,6 +912,65 @@ impl TotalStore {
             );
             "#,
         )?;
+
+        // ── project_identity：去掉观察者列（2026-08-14） ─────────────────────────
+        //
+        // 🔴 **主键曾是 `(source_type, source_location, project_root, canonical_id)`。**
+        // 隔壁 `project_root_registry` 的注释早就写下了反对它的理由，只是写给了另一张表：
+        // 「一个路径是不是项目根，与谁在什么位置扫到它无关；带上它们会让同一个根按
+        // 发现者分裂成多行」。**这句话对身份一字不差地成立** —— 一个路径属于哪个仓库，
+        // 由那里的 `.git/config` 决定，与观察者无关。实测就是那个形状：同一个
+        // QuotaBar 根、同一个 `git:` 身份、**三行**（claude_code@local /
+        // claude_code@wsl / codex@local），而唯一的消费者 `project_roots_report`
+        // 把这两列**整个忽略**（它建的是 `root → cid`）。
+        //
+        // 🔴 **更要紧的是它让一件事根本没法表达**：注册表只有根、没有观察者，所以
+        // 「为注册表里每个根记一次身份」写不出来。身份记录因此只能挂在**事件投影**上，
+        // 于是一个近期没有活动的项目 —— 哪怕注册表认得它、`.git` 就在那儿 ——
+        // 永远拿不到身份。实测：`wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar` 是
+        // `root_source=git` 的注册根，桥读得到它的 origin，而身份表里 **0 行**，
+        // 因为那个项目最后一个会话文件停在一个月前。
+        //
+        // 这与本表自己的文档也是矛盾的：它写着身份要「**在扫描时**记下来，趁 `.git`
+        // 还在」，而实现挂在投影时。现在两者对齐。
+        //
+        // 合并规则：`MIN(first_seen_ms)` / `MAX(last_seen_ms)` —— 观察者不同不代表
+        // 看到的是不同的东西，取并集是对「什么时候第一次/最后一次看到这个身份」的
+        // 忠实回答。
+        //
+        // `idx_identity_root` 一并删除：`project_root` 现在是主键的前导列，
+        // SQLite 自带索引，再建一棵是纯开销。
+        let identity_has_observer: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('project_identity') WHERE name='source_type'",
+            )?
+            .query_row([], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if identity_has_observer {
+            // 整个重写包在一个事务里 —— 与 `raw_events` 那次迁移同一条理由：
+            // 中途夭折会留下一个空的新表加一个藏着数据的旧表，而下次启动看不出区别。
+            let tx = conn.transaction()?;
+            tx.execute_batch(&format!(
+                r#"
+                DROP INDEX IF EXISTS idx_identity_root;
+                DROP INDEX IF EXISTS idx_identity_cid;
+                ALTER TABLE project_identity RENAME TO project_identity_pre_rootkey;
+                {PROJECT_IDENTITY_DDL}
+                INSERT INTO project_identity
+                       (project_root, canonical_id, first_seen_ms, last_seen_ms)
+                SELECT project_root, canonical_id, MIN(first_seen_ms), MAX(last_seen_ms)
+                  FROM project_identity_pre_rootkey
+                 GROUP BY project_root, canonical_id;
+                DROP TABLE project_identity_pre_rootkey;
+                {PROJECT_IDENTITY_INDEX_DDL}
+                "#
+            ))?;
+            tx.commit()?;
+        } else {
+            conn.execute_batch(PROJECT_IDENTITY_DDL)?;
+            conn.execute_batch(PROJECT_IDENTITY_INDEX_DDL)?;
+        }
 
         let raw_exists: bool = conn
             .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_events'")?
@@ -1348,47 +1432,104 @@ impl TotalStore {
     ///    仍须是 `Reparse`，否则退化成 `Append`，同 seq 被 dedup 丢弃，新解析永久丢失。
     ///
     /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
-    /// 记下这批事件所属项目的规范身份 —— **趁 `.git` 还在**。
     ///
-    /// 见 `migrate()` 里 `project_identity` 的注释与 `docs/project-identity.md`。
-    /// 三条约束，都在下面的代码里：
+    /// 🔴 **本函数不再记项目身份**（2026-08-14）。那件事现在由
+    /// [`sweep_registered_root_identities`] 按注册表驱动 —— 挂在这里的盲区是
+    /// 「近期没有活动的项目永远拿不到身份」，理由写在那个函数上。
     ///
-    /// 1. **算不出身份就什么都不写**，尤其不写 `path:` 兜底行 —— 那种 id 不跨 checkout
-    ///    稳定，记下来只会让「查得到身份」变成一句不能信的话。
-    /// 2. 每个 `(来源, project_root)` **本进程至多问一次盘**（`identity_seen`）。
-    /// 3. 🔴 **失败绝不影响摄取**：身份是**加法**能力，它坏了不该让事件写不进总库。
-    ///    所以本函数不返回 `Result` —— 调用点连忽略错误的机会都不需要有。
+    /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
+
     /// 把一条「问过了」从 `identity_seen` 里撤回。
     ///
     /// 🔴 **「问过了」这个缓存只该记住终态。** `identity_seen` 是**先记后算**的
-    /// （避免一个读不到的项目让它名下每个文件都去试一次盘），代价是任何在计算中途
-    /// 退出的分支都必须把它撤回 —— 否则那不是「至多问一次盘」，是「永远不再问」。
-    /// 现在有两个这样的分支（探不到 `.git`、读不了 config），且都在同一个函数里，
-    /// 所以收成一个函数：下一个人加第三个分支时，撤回这件事有名字可用。
-    fn forget_identity_probe(&self, key: &(String, String, String)) {
+    /// （避免一个读不到的项目每轮扫描都重付一次探测代价），代价是任何在计算中途
+    /// 退出的分支都必须把它撤回 —— 否则那不是「至多问一次」，是「永远不再问」。
+    /// 现在有三个这样的分支（探不到 `.git`、拿不到锁、写失败），所以收成一个函数：
+    /// 下一个人加第四个分支时，撤回这件事有名字可用。
+    fn forget_identity_probe(&self, root: &str) {
         if let Ok(mut seen) = self.identity_seen.lock() {
-            seen.remove(key);
+            seen.remove(root);
         }
     }
 
-    fn record_project_identity(&self, events: &[RawEvent]) {
-        let Some(ev) = events.first() else { return };
-        let Some(root) = ev.project_root.as_deref().filter(|r| !r.is_empty()) else {
-            return;
+    /// 给注册表里**每一个**项目根记一次身份 —— 一轮扫描调一次。
+    ///
+    /// 🔴 **为什么由注册表驱动，而不是由事件驱动**（2026-08-14 实测改的）。
+    ///
+    /// 从前这件事挂在 `apply_projection` 上：有事件落库才顺带记一次身份。那条路
+    /// 有一个静默的盲区 —— **一个近期没有活动的项目永远拿不到身份**，哪怕注册表
+    /// 认得它、`.git` 就在那儿、桥读得到它的 origin。实测：
+    /// `wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar` 是 `root_source=git` 的
+    /// 注册根，而身份表里 **0 行** —— 因为那个项目最后一个会话文件停在一个月前。
+    ///
+    /// 后果不是「少一行」：TumeFlow 的 merge key 是「有身份用身份，没有退回路径」，
+    /// 所以身份在与不在会给出**两个不同的 key**。于是同一份记忆会随身份表的有无
+    /// 落进不同的桶，而没有任何东西会说出它们不一致。
+    ///
+    /// 本表自己的文档一直写着身份要「**在扫描时**记下来，趁 `.git` 还在」——
+    /// 那是**扫描**时的关注点，不是**投影**时的。现在两者对齐。
+    ///
+    /// 🔴 **锁不跨探测。** 读根（持锁）→ 放锁 → 逐个算身份（每个 WSL 根要起
+    /// `wsl.exe`，实测一次往返 ≈1.5 秒）→ 写回（持锁）。把探测放在锁里，一个卡住的
+    /// 发行版会连带冻住所有读总库的路径。
+    ///
+    /// `deadline` 是**整轮**预算：耗尽后剩下的根这一轮不问，`identity_seen` 里也不
+    /// 留记录 ⇒ 下一轮自然重试。
+    pub fn sweep_registered_root_identities(&self, deadline: Deadline) -> IdentitySweep {
+        let mut sweep = IdentitySweep::default();
+        let roots: Vec<String> = {
+            let Ok(conn) = self.conn.lock() else {
+                sweep.unreadable = Some("total store mutex poisoned".to_string());
+                return sweep;
+            };
+            let Ok(mut stmt) = conn.prepare("SELECT root_path FROM project_root_registry") else {
+                sweep.unreadable = Some("prepare project_root_registry failed".to_string());
+                return sweep;
+            };
+            // 先绑定再离开块 —— `conn` / `stmt` 是块内局部，让 `match` 直接当块的值
+            // 会借用它们到块外。
+            let collected = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+                Ok(rows) => rows.flatten().collect::<Vec<_>>(),
+                Err(e) => {
+                    sweep.unreadable = Some(format!("query project_root_registry failed: {e}"));
+                    return sweep;
+                }
+            };
+            collected
         };
-        let key = (
-            source_type_key(ev.source_type).to_string(),
-            ev.source_location.as_key(),
-            root.to_string(),
-        );
+        sweep.registered = roots.len();
+        for root in roots {
+            if deadline.expired() {
+                // 说出来，不要静默截断 —— 「本轮只看了一半」和「本轮全看过了」在
+                // 结果上长得一模一样。
+                sweep.skipped_out_of_budget += 1;
+                continue;
+            }
+            match self.record_identity_for_root(&root, deadline) {
+                IdentityOutcome::AlreadyProbed => sweep.already_probed += 1,
+                IdentityOutcome::Recorded => sweep.recorded += 1,
+                IdentityOutcome::NoRemote => sweep.no_remote += 1,
+                IdentityOutcome::Unresolved => sweep.unresolved += 1,
+            }
+        }
+        sweep
+    }
+
+    /// 一个根的身份 —— [`sweep_registered_root_identities`] 的单步。
+    ///
+    /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
+    fn record_identity_for_root(&self, root: &str, deadline: Deadline) -> IdentityOutcome {
+        if root.is_empty() {
+            return IdentityOutcome::NoRemote;
+        }
         {
             let Ok(mut seen) = self.identity_seen.lock() else {
-                return;
+                return IdentityOutcome::Unresolved;
             };
             // 🔴 **先记后算**：算不出来的（无 `.git`、UNC 回环读不到）也算「问过了」，
-            // 否则一个读不到的项目会让它名下每个文件都去试一次盘。
-            if !seen.insert(key.clone()) {
-                return;
+            // 否则一个读不到的项目每一轮扫描都要重付一次探测代价。
+            if !seen.insert(root.to_string()) {
+                return IdentityOutcome::AlreadyProbed;
             }
         }
 
@@ -1402,63 +1543,54 @@ impl TotalStore {
         // 各持一半互相看不见；而按 `root_key` 迁移**修不了它**（干跑：79 条换 key、
         // 合并 0 组）—— 两份 checkout 的 root_key 本来就不同，能合并它们的只有身份。
         //
-        // ⚠️ **UNC 换算那条路走不通，量过才知道**：换成 `\\wsl.localhost\…` 之后，
-        // 本进程里 `metadata(base)` 返回「既不是文件也不是目录」，而它底下每一项
-        // 都是 `os error 267`（连 `read_dir` 也是）—— 整棵子树进不去。同一条路径
-        // Git Bash 的 `ls` 却能列，所以那不是路径写错，是**进程之间行为不同**。
-        // 访问桥不受影响：`wsl.exe` 在发行版**内部**读。
-        //
         // 三态各有各的处置：`Unknown` 是「本轮没问成」，它**已经**被上面的
         // `identity_seen` 记成「问过了」，所以必须撤回 —— 否则一次瞬时故障让这个
         // 项目在本进程内永远算不出身份。
-        //
-        // ⚠️ 给一个**固定的小上限**：身份是加法能力，不该让一个卡住的发行版拖住摄取。
-        // 这里拿不到整轮预算（`record_project_identity` 不在刷新循环的调用链上），
-        // 所以上限写在这里并说明理由，而不是假装它来自别处。
-        let cid = match crate::identity::repo_id_for_root(
-            root,
-            crate::deadline::Deadline::after(std::time::Duration::from_secs(10)),
-        ) {
+        let cid = match crate::identity::repo_id_for_root(root, deadline) {
             Ok(identity) => identity.id,
             Err(e) => {
                 log::debug!(
                     target: crate::logging::tag::SQLITE,
                     "project identity unresolved, will retry: {e}"
                 );
-                self.forget_identity_probe(&key);
-                return;
+                self.forget_identity_probe(root);
+                return IdentityOutcome::Unresolved;
             }
         };
         if !cid.starts_with("git:") {
-            return; // 约束 1：不写 `path:` 兜底行（这是**确认**没有 remote 的情形）
+            // 约束 1：不写 `path:` 兜底行（这是**确认**没有 remote 的情形）。
+            // 「问过了」保留 —— 它是终态，下一轮不必再问。
+            return IdentityOutcome::NoRemote;
         }
 
         let now = now_unix_millis();
         // 🔴 **第三个失败出口**（三轮评审 P2）。前两个（探不到 `.git`、读不了 config）
         // 已经会撤回缓存，而这里从前是 `let _ = conn.execute(...)` —— 拿不到锁、
         // 并发写、磁盘 IO 或任何 SQLite 错误都被丢弃，**而 `identity_seen` 已经先记过**。
-        // 事件投影随后照常成功，这个项目却在本进程内**再也不会尝试写身份**。
+        // 扫描随后照常成功，这个项目却在本进程内**再也不会尝试写身份**。
         //
         // 判据统一成一句：**只有身份行确实落库，才配保留「问过了」。**
         let Ok(conn) = self.conn.lock() else {
-            self.forget_identity_probe(&key);
-            return;
+            self.forget_identity_probe(root);
+            return IdentityOutcome::Unresolved;
         };
         let written = conn.execute(
             "INSERT INTO project_identity
-                 (source_type, source_location, project_root, canonical_id, first_seen_ms, last_seen_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-             ON CONFLICT(source_type, source_location, project_root, canonical_id)
-             DO UPDATE SET last_seen_ms = ?5",
-            rusqlite::params![key.0, key.1, key.2, cid, now],
+                 (project_root, canonical_id, first_seen_ms, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(project_root, canonical_id)
+             DO UPDATE SET last_seen_ms = ?3",
+            rusqlite::params![root, cid, now],
         );
         if let Err(e) = written {
             log::debug!(
                 target: crate::logging::tag::SQLITE,
-                "project identity insert failed, will retry: root={} err={e}", key.2
+                "project identity insert failed, will retry: root={root} err={e}"
             );
-            self.forget_identity_probe(&key);
+            self.forget_identity_probe(root);
+            return IdentityOutcome::Unresolved;
         }
+        IdentityOutcome::Recorded
     }
 
     /// 这个项目当前的规范身份 —— `last_seen` 最大的那条。
@@ -1466,22 +1598,25 @@ impl TotalStore {
     /// 🔴 **即使 checkout 已经从磁盘上消失，这里依然答得出来**，只要它被扫描过一次。
     /// 那正是 `project_identity` 表存在的全部理由。
     ///
-    /// 返回 `None` 有两种含义，**调用方通常不需要区分**：没扫到过，或扫到时就没有
-    /// git remote（后者不写行，见 `record_project_identity` 的约束 1）。两种都表示
-    /// 「说不出这个项目的跨系统身份」，而那是诚实的答案。
-    pub fn project_identity(
-        &self,
-        source_type: &str,
-        source_location: &str,
-        project_root: &str,
-    ) -> Option<String> {
+    /// ⚠️ **`None` 现在盖着三种情况**：没扫到过、扫到时没有 git remote（不写行，见
+    /// `record_identity_for_root` 的约束 1）、以及**这次查询本身失败了**（下面
+    /// `.ok().flatten()`）。前两种都是「说不出这个项目的身份」，是诚实的答案；
+    /// 第三种不是 —— 它是本仓那条「没问成长得像这里是空的」在一个公开 API 上的
+    /// 残留。**本轮不改**（改它要三态返回，会波及每个调用点），但写在这里，
+    /// 免得下一个人以为 `None` 就等于「确实没有」。
+    ///
+    /// 🔴 **不带 `source_type` / `source_location`**：一个路径属于哪个仓库，由那里的
+    /// `.git/config` 决定，与谁在什么位置扫到它无关（与 `project_root_registry`
+    /// 同一条理由，见 `migrate()`）。带着它们的那一版让同一个根按发现者分裂成三行，
+    /// 而且让「为注册表里每个根记身份」根本没法表达。
+    pub fn project_identity(&self, project_root: &str) -> Option<String> {
         let conn = self.conn.lock().ok()?;
         conn.query_row(
             "SELECT canonical_id FROM project_identity
-              WHERE source_type = ?1 AND source_location = ?2 AND project_root = ?3
+              WHERE project_root = ?1
               ORDER BY last_seen_ms DESC, canonical_id ASC
               LIMIT 1",
-            rusqlite::params![source_type, source_location, project_root],
+            rusqlite::params![project_root],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -1825,26 +1960,20 @@ impl TotalStore {
     /// 一个项目**观察到过的全部**身份，新到旧。多于一条即意味着这个路径的身份变过 ——
     /// 可能是改了 remote，也可能是路径被另一个仓复用，**本层不替调用方判断**
     /// （见 `migrate()` 里那段注释）。
-    pub fn project_identity_history(
-        &self,
-        source_type: &str,
-        source_location: &str,
-        project_root: &str,
-    ) -> Vec<(String, i64, i64)> {
+    pub fn project_identity_history(&self, project_root: &str) -> Vec<(String, i64, i64)> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT canonical_id, first_seen_ms, last_seen_ms FROM project_identity
-              WHERE source_type = ?1 AND source_location = ?2 AND project_root = ?3
+              WHERE project_root = ?1
               ORDER BY last_seen_ms DESC",
         ) else {
             return Vec::new();
         };
-        let rows = stmt.query_map(
-            rusqlite::params![source_type, source_location, project_root],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        );
+        let rows = stmt.query_map(rusqlite::params![project_root], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        });
         match rows {
             Ok(it) => it.flatten().collect(),
             Err(_) => Vec::new(),
@@ -1852,9 +1981,6 @@ impl TotalStore {
     }
 
     pub fn apply_projection(&self, batch: FileProjectionBatch) -> StoreResult<ProjectionStats> {
-        // 趁 `.git` 还在把身份记下来。**放在校验之前**是有意的：身份与这批事件写不写得
-        // 进去无关，而一次 `ForeignEvent` 提前返回不该让这个项目的身份永远记不上。
-        self.record_project_identity(&batch.events);
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();
         let source_type = type_key.to_string();
@@ -5713,6 +5839,10 @@ mod project_identity_tests {
     /// —— 后者只能证明我理解得对，证明不了它在真实写入路径上被调到。
     fn ingest(store: &TotalStore, root: &std::path::Path, seq: u64) {
         let ev = event_in(root, seq);
+        let root_str = ev
+            .project_root
+            .clone()
+            .expect("event carries a project root");
         store
             .apply_projection(FileProjectionBatch {
                 source: SourceKey::from_event(&ev),
@@ -5722,6 +5852,13 @@ mod project_identity_tests {
                 events: vec![ev],
             })
             .unwrap();
+        // 🔴 **身份不再由 `apply_projection` 顺带记**（2026-08-14）——它现在由**注册表**
+        // 驱动。助手必须跟着改，否则这些测试测的是一条生产不再走的路（而它们会
+        // 全部变绿，因为「什么都不写」也满足不了断言 —— 那一半是运气）。
+        //
+        // 生产里登记根的是归属；这里复述那一步，再跑一轮扫描。
+        store.register_project_root(&root_str, crate::attribution::RootSource::Git);
+        store.sweep_registered_root_identities(Deadline::unbounded());
     }
 
     /// 🔴 **身份行没落库，就不配保留「问过了」**（三轮评审 P2）。
@@ -5755,7 +5892,7 @@ mod project_identity_tests {
 
         ingest(&store, &proj, 0);
         assert_eq!(
-            store.project_identity("claude_code", "local", &root_str),
+            store.project_identity(&root_str),
             None,
             "前提：这一轮身份确实没写进去"
         );
@@ -5770,12 +5907,76 @@ mod project_identity_tests {
         // 🔴 第二轮：`identity_seen` 若没撤回，这里永远补不上。
         ingest(&store, &proj, 1);
         assert_eq!(
-            store.project_identity("claude_code", "local", &root_str),
+            store.project_identity(&root_str),
             Some("git:github.com/o/proj".to_string()),
             "身份没落库却保留了「问过了」—— 这个项目在本进程内再也拿不到跨 checkout 身份"
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 🔴 **一个近期没有活动的项目照样要拿到身份 —— 这是本轮改动的全部理由。**
+    ///
+    /// 身份从前挂在 `apply_projection` 上：有事件落库才顺带记一次。于是注册表认得的
+    /// 根、`.git` 就在那儿、origin 读得出来，而身份表里 **0 行**，只因为那个项目
+    /// 最近没人动过。实测形状：`wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar`
+    /// 最后一个会话文件停在一个月前。
+    ///
+    /// 后果不是「少一行」：TumeFlow 的 merge key 是「有身份用身份、没有退回路径」，
+    /// 所以身份在与不在给出**两个不同的 key** —— 同一份记忆会随身份表的有无落进
+    /// 不同的桶，而没有任何东西会说出它们不一致。
+    ///
+    /// 判据故意**一条事件都不摄取**：把 `sweep_registered_root_identities` 改回
+    /// 由投影驱动，这条当场变红。
+    #[test]
+    fn a_project_with_no_recent_activity_still_gets_its_identity() {
+        let root = scratch("no-activity");
+        seed_repo(&root, Some("git@github.com:o/dormant.git"));
+        let st = TotalStore::open_in_memory().unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        // 归属登记了这个根 —— 而它名下**一条事件都没有**。
+        st.register_project_root(&root_str, RootSource::Git);
+        assert_eq!(
+            st.project_identity(&root_str),
+            None,
+            "前提：扫描之前本来就没有身份行"
+        );
+
+        let sweep = st.sweep_registered_root_identities(Deadline::unbounded());
+        assert_eq!(sweep.registered, 1);
+        assert_eq!(sweep.recorded, 1, "注册表里的根必须被问到");
+        assert_eq!(
+            st.project_identity(&root_str).as_deref(),
+            Some("git:github.com/o/dormant"),
+            "没有活动的项目照样要有身份"
+        );
+
+        // 第二轮不再重复问盘，但也不该把已有的行弄丢。
+        let again = st.sweep_registered_root_identities(Deadline::unbounded());
+        assert_eq!(
+            (again.recorded, again.already_probed),
+            (0, 1),
+            "终态缓存命中，不重复付探测代价"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 预算耗尽必须**说出来**：「本轮只看了一半」与「本轮全看过了」在结果上一样。
+    #[test]
+    fn a_sweep_that_ran_out_of_budget_says_so() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root("/w/a", RootSource::Git);
+        st.register_project_root("/w/b", RootSource::Git);
+        let sweep = st
+            .sweep_registered_root_identities(Deadline::after(std::time::Duration::from_millis(0)));
+        assert_eq!(sweep.registered, 2);
+        assert_eq!(
+            sweep.skipped_out_of_budget, 2,
+            "预算为零时一个都不该问，而且要报出来"
+        );
+        assert_eq!((sweep.recorded, sweep.unresolved), (0, 0));
     }
 
     #[test]
@@ -5791,7 +5992,7 @@ mod project_identity_tests {
         ingest(&store, &proj, 0);
         let root_str = proj.to_string_lossy().into_owned();
         assert_eq!(
-            store.project_identity("claude_code", "local", &root_str),
+            store.project_identity(&root_str),
             Some("git:github.com/o/proj".to_string())
         );
 
@@ -5803,7 +6004,7 @@ mod project_identity_tests {
             "前提：磁盘上真的没了"
         );
         assert_eq!(
-            store.project_identity("claude_code", "local", &root_str),
+            store.project_identity(&root_str),
             Some("git:github.com/o/proj".to_string()),
             "记下来的身份必须活过 checkout 的删除"
         );
@@ -5831,14 +6032,14 @@ mod project_identity_tests {
         ingest(&store, &proj, 1);
 
         let root_str = proj.to_string_lossy().into_owned();
-        let hist = store.project_identity_history("claude_code", "local", &root_str);
+        let hist = store.project_identity_history(&root_str);
         let ids: Vec<&str> = hist.iter().map(|(c, _, _)| c.as_str()).collect();
         assert!(
             ids.contains(&"git:github.com/o/first") && ids.contains(&"git:github.com/o/second"),
             "两个身份都得留着，不能被覆盖：{ids:?}"
         );
         assert_eq!(
-            store.project_identity("claude_code", "local", &root_str),
+            store.project_identity(&root_str),
             Some("git:github.com/o/second".to_string()),
             "默认查询取 last_seen 最新的那条"
         );
@@ -5856,7 +6057,7 @@ mod project_identity_tests {
         let store = TotalStore::open_in_memory().unwrap();
         ingest(&store, &proj, 0);
         assert_eq!(
-            store.project_identity("claude_code", "local", &proj.to_string_lossy()),
+            store.project_identity(&proj.to_string_lossy()),
             None,
             "没有 remote 时不得写 path: 兜底行"
         );
@@ -5881,7 +6082,7 @@ mod project_identity_tests {
             .expect("身份记不下来时，摄取必须照常成功");
         assert!(stats.appended > 0, "事件没进库：{stats:?}");
         assert_eq!(
-            store.project_identity("claude_code", "local", "wsl:Ubuntu-22.04:/home/u/Proj"),
+            store.project_identity("wsl:Ubuntu-22.04:/home/u/Proj"),
             None
         );
     }
@@ -5901,7 +6102,7 @@ mod project_identity_tests {
         ingest(&store, &proj, 1);
 
         assert_eq!(
-            store.project_identity("claude_code", "local", &proj.to_string_lossy()),
+            store.project_identity(&proj.to_string_lossy()),
             Some("git:github.com/o/proj".to_string()),
             "第二次不该再问盘，身份应保持"
         );
@@ -6163,9 +6364,9 @@ mod project_identity_tests {
             let conn = st.conn.lock().unwrap();
             for root in [r"D:\work\proj", "/home/u/proj"] {
                 conn.execute(
-                    "INSERT INTO project_identity (source_type, source_location, project_root, \
-                       canonical_id, first_seen_ms, last_seen_ms) \
-                     VALUES ('claude_code', 'local', ?1, 'git:example.com/o/r', 1, 2)",
+                    "INSERT INTO project_identity \
+                       (project_root, canonical_id, first_seen_ms, last_seen_ms) \
+                     VALUES (?1, 'git:example.com/o/r', 1, 2)",
                     rusqlite::params![root],
                 )
                 .unwrap();
@@ -6194,9 +6395,9 @@ mod project_identity_tests {
             let conn = st.conn.lock().unwrap();
             // 身份行用小写正斜杠写法 —— 与注册表那条字面不等，但归一化后同键。
             conn.execute(
-                "INSERT INTO project_identity (source_type, source_location, project_root, \
-                   canonical_id, first_seen_ms, last_seen_ms) \
-                 VALUES ('claude_code', 'local', 'd:/work/proj/', 'git:example.com/o/r', 1, 2)",
+                "INSERT INTO project_identity \
+                   (project_root, canonical_id, first_seen_ms, last_seen_ms) \
+                 VALUES ('d:/work/proj/', 'git:example.com/o/r', 1, 2)",
                 [],
             )
             .unwrap();
@@ -6271,7 +6472,7 @@ mod project_identity_tests {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("/w/no-remote-project", RootSource::Marker);
         assert_eq!(
-            st.project_identity("claude_code", "local", "/w/no-remote-project"),
+            st.project_identity("/w/no-remote-project"),
             None,
             "身份表不该有它"
         );
