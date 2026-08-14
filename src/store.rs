@@ -1392,35 +1392,38 @@ impl TotalStore {
             }
         }
 
-        // `project_root` 可能是 `wsl:<distro>:/abs` 这类规范形 —— 那不是本机可打开的
-        // 路径，`find_git_root` 会（正确地）拒绝。这里不做任何路径改写：改写等于猜，
-        // 而猜错会把身份安到别的项目上。
-        // 🔴 三态各有各的处置：`Absent` 是事实（这个根确实没有 `.git`），
-        // `Unknown` 是「本轮没问成」—— 它**已经**被上面的 `identity_seen` 记成
-        // 「问过了」，所以这里要把它从缓存里撤回，否则一次权限错误 / UNC 不通会让
-        // 这个项目在本进程生命周期内永远算不出身份。
-        let git_root = match crate::identity::find_git_root(std::path::Path::new(root)) {
-            crate::identity::GitRoot::Found(p) => p,
-            crate::identity::GitRoot::Absent => return,
-            crate::identity::GitRoot::Unknown(e) => {
-                log::debug!(
-                    target: crate::logging::tag::SQLITE,
-                    "project identity probe failed, will retry: {e}"
-                );
-                self.forget_identity_probe(&key);
-                return;
-            }
-        };
-        // 🔴 读 config 也可能「没问成」（三轮评审 P2-1）：从前 `canonical_repo_id`
-        // 返回 `String`，把它压成 `path:` 兜底身份，而下一行正好把 `path:` 丢掉 ——
-        // 于是一次瞬时故障与「这个仓真的没配 origin」结果完全相同，且因为**先记后算**
-        // 再也不会重试。撤回缓存，下轮重来。
-        let cid = match crate::identity::canonical_repo_id(&git_root) {
+        // 🔴 **身份解析按「根的形态」分派**（2026-08-14）—— `repo_id_for_root`：
+        // 本机路径走 FS，`wsl:<distro>:/abs` 规范形走 `wsl.exe` 访问桥。
+        //
+        // 这里原本写着「不做任何路径改写：改写等于猜，而猜错会把身份安到别的项目上」。
+        // 那句话对**猜**是对的，但它的后果是：**每一个 WSL 根的 `canonical_id` 恒为
+        // `null`**，而同一个仓的 Windows checkout 有 `git:github.com/…` ⇒ 两份
+        // checkout 永远不同身份。记忆库里因此 QuotaBar 被拆成 37 条 + 24 条，
+        // 各持一半互相看不见；而按 `root_key` 迁移**修不了它**（干跑：79 条换 key、
+        // 合并 0 组）—— 两份 checkout 的 root_key 本来就不同，能合并它们的只有身份。
+        //
+        // ⚠️ **UNC 换算那条路走不通，量过才知道**：换成 `\\wsl.localhost\…` 之后，
+        // 本进程里 `metadata(base)` 返回「既不是文件也不是目录」，而它底下每一项
+        // 都是 `os error 267`（连 `read_dir` 也是）—— 整棵子树进不去。同一条路径
+        // Git Bash 的 `ls` 却能列，所以那不是路径写错，是**进程之间行为不同**。
+        // 访问桥不受影响：`wsl.exe` 在发行版**内部**读。
+        //
+        // 三态各有各的处置：`Unknown` 是「本轮没问成」，它**已经**被上面的
+        // `identity_seen` 记成「问过了」，所以必须撤回 —— 否则一次瞬时故障让这个
+        // 项目在本进程内永远算不出身份。
+        //
+        // ⚠️ 给一个**固定的小上限**：身份是加法能力，不该让一个卡住的发行版拖住摄取。
+        // 这里拿不到整轮预算（`record_project_identity` 不在刷新循环的调用链上），
+        // 所以上限写在这里并说明理由，而不是假装它来自别处。
+        let cid = match crate::identity::repo_id_for_root(
+            root,
+            crate::deadline::Deadline::after(std::time::Duration::from_secs(10)),
+        ) {
             Ok(cid) => cid,
             Err(e) => {
                 log::debug!(
                     target: crate::logging::tag::SQLITE,
-                    "project identity config unreadable, will retry: {e}"
+                    "project identity unresolved, will retry: {e}"
                 );
                 self.forget_identity_probe(&key);
                 return;

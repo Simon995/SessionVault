@@ -275,6 +275,87 @@ pub fn normalize_remote(url: &str) -> Option<String> {
     }
 }
 
+/// 一个**根**（可能是本机路径，也可能是 `wsl:<distro>:/abs` 规范形）的身份。
+///
+/// 🔴 **规范形 WSL 根本机 stat 不了，必须经访问桥**（2026-08-14 实测）。
+/// 在此之前这里只走本机 FS，于是每一个 WSL 根的 `canonical_id` 恒为 `null` ——
+/// 而同一个仓的 Windows checkout 有 `git:…`，**两份 checkout 因此永远不同身份**。
+/// 记忆库里的直接后果：QuotaBar 被拆成 37 条 + 24 条，各持一半互相看不见。
+///
+/// ⚠️ **UNC 换算这条路走不通**，量过才知道：把规范形换成
+/// `\\wsl.localhost\<distro>\…` 之后，本进程里 `metadata(base)` 返回
+/// 「既不是文件也不是目录」，而它**底下每一项**都是 `os error 267`
+/// （连 `read_dir` 也是）—— 整棵子树进不去。同一条路径 Git Bash 的 `ls` 却能列，
+/// 所以这不是「路径不对」，是**进程之间行为不同**（本仓那条「在 A 环境量到的值
+/// 不能给 B 环境结案」）。访问桥不受这个影响：`wsl.exe` 在发行版**内部**读。
+pub fn repo_id_for_root(
+    root: &str,
+    deadline: Deadline,
+) -> Result<String, crate::probe::ProbeError> {
+    let Some((distro, linux_path)) = crate::pathnorm::split_canonical_wsl(root) else {
+        // 本机路径：老路不变。
+        return match find_git_root(Path::new(root)) {
+            GitRoot::Found(p) => canonical_repo_id(&p),
+            GitRoot::Absent => Ok(format!("path:{root}")),
+            GitRoot::Unknown(e) => Err(e),
+        };
+    };
+    wsl_repo_id(distro, linux_path, root, deadline)
+}
+
+/// 经 `wsl.exe` 在发行版内部读 `.git/config`。
+///
+/// 只向上找**一层**（`<root>/.git`）而不是整条祖先链：调用方给的已经是注册表判定的
+/// 项目根，再上溯等于替它重做一遍归属 —— 而归属只有一个权威（ADR-050）。
+fn wsl_repo_id(
+    distro: &str,
+    linux_path: &str,
+    original_root: &str,
+    deadline: Deadline,
+) -> Result<String, crate::probe::ProbeError> {
+    let base = linux_path.trim_end_matches('/');
+    let err = |m: String| crate::probe::ProbeError::new(Path::new(original_root), m);
+
+    // `.git` 是目录时 config 就在下面；是文件时（worktree / submodule）它是
+    // `gitdir: <path>` 指针 —— 与本机那条同一套规则，只是换了访问方式。
+    let direct = crate::wsl::read_file_at(distro, &format!("{base}/.git/config"), deadline)
+        .map_err(|e| err(format!("wsl read .git/config: {e}")))?;
+    let text = match direct {
+        Some(t) => t,
+        None => {
+            let pointer = crate::wsl::read_file_at(distro, &format!("{base}/.git"), deadline)
+                .map_err(|e| err(format!("wsl read .git: {e}")))?;
+            let Some(p) = pointer else {
+                // 探明白了：这个根下没有 `.git` —— 事实，不是没问成。
+                return Ok(format!("path:{original_root}"));
+            };
+            let Some(rel) = p
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("gitdir:"))
+                .map(str::trim)
+            else {
+                return Ok(format!("path:{original_root}"));
+            };
+            let gitdir = if rel.starts_with('/') {
+                rel.to_string()
+            } else {
+                format!("{base}/{rel}")
+            };
+            match crate::wsl::read_file_at(distro, &format!("{gitdir}/config"), deadline)
+                .map_err(|e| err(format!("wsl read gitdir config: {e}")))?
+            {
+                Some(t) => t,
+                None => return Ok(format!("path:{original_root}")),
+            }
+        }
+    };
+    match parse_origin_url(&text).and_then(|u| normalize_remote(&u)) {
+        Some(norm) => Ok(format!("git:{norm}")),
+        // 读到了、里面没有 origin —— 事实。
+        None => Ok(format!("path:{original_root}")),
+    }
+}
+
 /// 一个 git 仓库根的规范身份：`git:<host>/<owner>/<repo>`，**确认**拿不到 remote 时
 /// `path:<git root>`。前缀是契约的一部分 —— 见模块文档「拿不到 origin 时」。
 ///
@@ -500,6 +581,52 @@ mod tests {
             canonical_repo_id_with(root, &ConfigDenied).is_err(),
             "读不了 config 却给出了一个 path: 身份 —— store 会丢弃它且永不重试"
         );
+    }
+
+    /// 🔴 **规范形 WSL 根不再走本机 FS**（2026-08-14）。
+    ///
+    /// 这条钉的是**分派**：本机路径仍走 FS（下面那半），而 `wsl:<distro>:/abs`
+    /// 必须转到访问桥 —— 因为它作为字面量在 Windows 上 `metadata` 会得到
+    /// `InvalidFilename`（实测 raw 123），于是老代码对**每一个** WSL 根都返回
+    /// `Unknown` ⇒ `canonical_id` 恒为 `null` ⇒ 同一个仓的两份 checkout 永远
+    /// 不同身份（记忆库里 37 条 + 24 条各持一半）。
+    ///
+    /// ⚠️ 用**不存在的发行版**驱动（约 0.1s 失败，不必等超时），与
+    /// `unreachable_client()` 走死代理、`WSL_E_DISTRO_NOT_FOUND` 同一个手法：
+    /// 走真实路径，不伪造错误。
+    ///
+    /// 🔴 **判据必须能把两条路分开，而这一点我第一版写错了。** 第一版断言
+    /// `msg.contains("wsl")` —— 而**被探的路径本身就含 `wsl:`**，于是取消分派、
+    /// 全走本机 FS 的变异**照样全绿**。观测量选错，护栏就是装饰。
+    /// 现在断言桥自己的前缀 `wsl read`，那是本机那条路产不出来的。
+    #[test]
+    #[cfg(windows)]
+    fn a_canonical_wsl_root_goes_through_the_bridge_not_the_local_fs() {
+        let err = repo_id_for_root(
+            "wsl:NoSuchDistro_quotabar_xyz:/home/u/proj",
+            Deadline::after(std::time::Duration::from_secs(20)),
+        )
+        .expect_err("不存在的发行版必须报「没问成」，不能给出一个身份");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wsl read"),
+            "错误应带访问桥自己的前缀；走本机 FS 时这里会是 InvalidFilename。实际：{msg}"
+        );
+    }
+
+    /// 反向：本机路径**不能**被误判成 WSL 规范形而走桥。
+    ///
+    /// 少了这一条，一个「无脑全走桥」的实现照样让上面那条通过 —— 而那会让每个
+    /// 本机项目都去 spawn 一次 `wsl.exe`。
+    #[test]
+    fn a_local_path_still_resolves_on_the_local_fs() {
+        let root = scratch("local-still-local");
+        seed_repo(&root, Some("git@github.com:o/r.git"));
+        assert_eq!(
+            repo_id_for_root(&root.to_string_lossy(), Deadline::unbounded()).unwrap(),
+            "git:github.com/o/r"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 🔴 **探测失败不是「这个项目没有 git 根」。**
