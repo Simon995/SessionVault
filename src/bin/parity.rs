@@ -347,7 +347,7 @@ fn load_files(path: &Option<PathBuf>) -> BTreeMap<String, i64> {
 /// 文件当前大小；探不到 / 确认没有都是 `None`（本探针把两者一起归 "unknown" 桶）。
 fn probe_stat(path: &str) -> Option<u64> {
     use session_vault::probe::{LocalBackend, Probed};
-    match LocalBackend.stat(
+    match LocalBackend::unanchored().stat(
         std::path::Path::new(path),
         session_vault::deadline::Deadline::unbounded(),
     ) {

@@ -107,8 +107,13 @@ enum FileProbe {
 /// ⚠️ 这里从前自带一份 `match std::fs::metadata` —— 与 `discovery.rs`、
 /// `memory/sources.rs` 各一份，共四份手抄本。判据现在只在 `probe::classify` 里，
 /// 本函数只剩「我要的是**文件**」这个本地决定。
-fn probe_host_file(path: &std::path::Path) -> FileProbe {
-    match crate::probe::LocalBackend.probe(path, crate::deadline::Deadline::unbounded()) {
+/// 🔴 **锚定到项目根**（三轮评审 P1）：这条路径的结果会决定该项目的指令文件在不在，
+/// 而调用方据此**不 prune** 那个根。项目根所在的卷被卸载时，锚点探不到 ⇒ `Failed` ⇒
+/// 进 `unreachable`。用语法根锚在 Unix 上等于没锚（`/` 永远可达）。
+fn probe_host_file(path: &std::path::Path, anchor: &std::path::Path) -> FileProbe {
+    match crate::probe::LocalBackend::rooted_at(anchor)
+        .probe(path, crate::deadline::Deadline::unbounded())
+    {
         crate::probe::Probed::Found(crate::probe::FileKind::File) => FileProbe::Present,
         // 存在但不是文件（目录 / 断掉的符号链）—— 那个**文件**确实没有，是事实。
         crate::probe::Probed::Found(_) => FileProbe::Absent,
@@ -137,10 +142,12 @@ pub fn discover_project_snapshots(
                     rel.replace('\\', "/")
                 )),
             };
-            let probe = root.probe_path.as_ref().map(|base| base.join(rel));
-            let seen = match (&root.source_location, probe) {
-                (_, Some(p)) => probe_host_file(&p),
-                (SourceLocation::Local, None) => probe_host_file(&path),
+            let seen = match (&root.source_location, root.probe_path.as_ref()) {
+                // 锚点 = 这次探测所属的**项目根**（`probe_path` 是它在宿主上的可打开
+                // 形式，WSL 项目走 UNC）。它不可达 ⇒ 报 `Failed` 而不是「这个项目
+                // 没写过 CLAUDE.md」。
+                (_, Some(base)) => probe_host_file(&base.join(rel), &base),
+                (SourceLocation::Local, None) => probe_host_file(&path, &root.path),
                 (SourceLocation::Wsl(distro), None) => {
                     match crate::wsl::stat(distro, &path.to_string_lossy(), deadline) {
                         Ok(Some(_)) => FileProbe::Present,
@@ -248,7 +255,9 @@ fn discover_by_mode(
             // 元数据读失败，全都长得像「这个目录不存在」。而下面那个错误感知的遍历
             // 压根走不到，于是 `local` 不会进 `unreachable`，prune 照样删存量。
             // 判据必须显式区分 `NotFound`（事实）与其余（没问成）。
-            match crate::probe::LocalBackend.probe(&dir, crate::deadline::Deadline::unbounded()) {
+            match crate::probe::LocalBackend::rooted_at(root)
+                .probe(&dir, crate::deadline::Deadline::unbounded())
+            {
                 crate::probe::Probed::Found(crate::probe::FileKind::Dir) => {}
                 crate::probe::Probed::Found(_) => continue, // 存在但不是目录 —— 那是事实，不是故障
                 crate::probe::Probed::Absent => continue,

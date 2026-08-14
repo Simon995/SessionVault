@@ -872,7 +872,7 @@ fn project_roots() -> session_vault::attribution::RootRegistry {
 #[cfg(feature = "store")]
 fn total_store_present(path: &std::path::Path) -> Result<bool, String> {
     use session_vault::probe::{LocalBackend, ProbeBackend, Probed};
-    match LocalBackend.probe(path, session_vault::deadline::Deadline::unbounded()) {
+    match LocalBackend::unanchored().probe(path, session_vault::deadline::Deadline::unbounded()) {
         Probed::Found(_) => Ok(true),
         Probed::Absent => Ok(false),
         Probed::Unknown(e) => Err(format!("cannot tell whether the total store exists: {e}")),

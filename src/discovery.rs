@@ -97,7 +97,7 @@ pub fn probe_local(path: &str) -> Probe {
 /// 与本仓一贯的做法同源（`currency.anchor_fn` 注入、`resolve_project_root` 的
 /// `HostPlatform` 注入）：**平台事实作参数，逻辑才可单测**。
 pub(crate) fn probe_local_with_home(path: &str, home: Option<&Path>) -> Probe {
-    probe_local_with(path, home, &crate::probe::LocalBackend)
+    probe_local_with(path, home, &crate::probe::LocalBackend::unanchored())
 }
 
 /// [`probe_local_with_home`] 的可测形态 —— **backend 注入**。

@@ -142,6 +142,32 @@ pub fn classify(path: &Path, meta: std::io::Result<std::fs::Metadata>) -> Probed
     }
 }
 
+/// 这次探测的**命名空间锚点** —— 「什么东西还在，才轮得到说叶子不在」。
+///
+/// 🔴 **上一版从路径语法推导锚点，那在 Unix 上是空操作**（三轮评审 P1）。
+/// `ancestors().last()` 在 Windows 上给出 `C:\` / `\\server\share\`，够用；
+/// 而在 Linux/macOS 上**永远是 `/`**，它永远可达。于是
+/// `/mnt/work/.claude` 或 `/Volumes/Work/.codex` 所在的卷被卸载时：
+/// 叶子 `NotFound` → `/` 可达 → 报 `Absent` → 该位置不进 `unreachable` →
+/// **prune 照常删掉会话与用量投影**。Windows 的目录挂载点、DFS 链接同理 ——
+/// 盘符根还在，挂上去的那个卷已经不在了。
+///
+/// **正解是让调用方给锚点**：只有它知道这次探测属于哪个来源根。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Anchor {
+    /// 调用方声明的来源根（配置目录 / 发现根）。**只有它可达时，其下的缺失才算事实。**
+    /// 这是 prune 驱动路径**必须**用的那一种。
+    Under(std::path::PathBuf),
+    /// 调用方拿不出来源根（一次性 CLI、诊断探针、祖先链上溯 —— 后者本来就是在
+    /// **找**根，没有更上层可锚）。
+    ///
+    /// ⚠️ **它只核到路径语法根**，因此在 Unix 上说不出卷卸载，在 Windows 上说不出
+    /// 目录挂载点消失。**写出 `unanchored()` 就是接受这一点** —— 让它在调用点可见，
+    /// 而不是藏在一个默认值里。
+    /// 要彻底覆盖需要**持久化上次成功扫描时的卷/设备身份**，那是另一件事。
+    None,
+}
+
 /// 🔴 **`Absent` 要以「命名空间根可达」为前提**（三轮评审 P1-1）。
 ///
 /// Windows 上一个**未挂载的盘符**返回的是 `ERROR_PATH_NOT_FOUND`（raw 3），
@@ -170,7 +196,27 @@ pub fn classify(path: &Path, meta: std::io::Result<std::fs::Metadata>) -> Probed
 ///
 /// 代价：每个 `Absent` 多一次 `metadata(root)`。根的元数据被 OS 缓存，且只在
 /// **否定**结论上付费 —— 而否定结论正是会驱动删除的那一种。
-fn namespace_confirms_absence(path: &Path) -> Probed<FileKind> {
+#[allow(clippy::disallowed_methods)] // ← 唯一允许点之一（见 clippy.toml）
+fn namespace_confirms_absence(path: &Path, anchor: &Anchor) -> Probed<FileKind> {
+    // 锚点由调用方给：只有它可达，其下的缺失才算事实。这一支能看见卷卸载 ——
+    // 语法根那一支看不见（Unix 上永远是 `/`）。
+    if let Anchor::Under(root) = anchor {
+        // 锚点自己就是被探的那条路径时，没有更上层可核。
+        if root == path {
+            return Probed::Unknown(ProbeError::new(
+                path,
+                "the source root itself is gone; cannot tell whether it was removed or unmounted",
+            ));
+        }
+        return match std::fs::metadata(root) {
+            Ok(_) => Probed::Absent,
+            Err(e) => Probed::Unknown(ProbeError::new(
+                path,
+                format!("source root {} is not reachable: {e}", root.display()),
+            )),
+        };
+    }
+
     let Some(root) = path.ancestors().last() else {
         return Probed::Absent;
     };
@@ -196,13 +242,42 @@ fn namespace_confirms_absence(path: &Path) -> Probed<FileKind> {
 
 /// 本机文件系统。**全仓唯一为「存在性」调 `std::fs` 的地方之一**（另一个是
 /// [`WslBackend`]，它经访问桥）。
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LocalBackend;
+///
+/// 🔴 **没有 `Default`、没有单元构造** —— 每个调用点必须写出
+/// [`LocalBackend::rooted_at`] 还是 [`LocalBackend::unanchored`]。
+/// 上一版是个单元结构体，于是「用哪种命名空间判据」这个决定**没有人做过**，
+/// 默认落到了在 Unix 上等于没有的那一种（三轮评审 P1）。
+/// 同 `Probed` 不给 `is_found()`：**让类型提出问题，而不是让下一个人记得问**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBackend {
+    anchor: Anchor,
+}
+
+impl LocalBackend {
+    /// 锚定到一个来源根 —— **prune 驱动路径必须用这个**。
+    ///
+    /// 只有 `root` 可达时，其下的 `NotFound` 才被判为 `Absent`；`root` 探不到就是
+    /// `Unknown`（卷卸载 / 挂载点消失 / 网络位置断开都落在这一支）。
+    pub fn rooted_at(root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            anchor: Anchor::Under(root.into()),
+        }
+    }
+
+    /// 没有来源根可给。⚠️ **只核到路径语法根**，在 Unix 上说不出卷卸载 —— 见
+    /// [`Anchor::None`]。写出它就是接受这一点。
+    pub fn unanchored() -> Self {
+        Self {
+            anchor: Anchor::None,
+        }
+    }
+}
 
 impl ProbeBackend for LocalBackend {
     /// ⚠️ **本地同步 stat 不宣称硬超时** —— 一次卡在断开网络盘上的 `metadata` 没有
     /// 办法从外面打断（`deadline.rs` 已把这条写清楚）。预算耗尽时**不发起**这次
     /// 调用，报 `Unknown`：那是诚实的「本轮没问成」，而不是假装有硬超时。
+    #[allow(clippy::disallowed_methods)] // ← 唯一允许点之一（见 clippy.toml）
     fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind> {
         if deadline.expired() {
             return Probed::Unknown(ProbeError::new(path, "round budget exhausted before probe"));
@@ -210,7 +285,7 @@ impl ProbeBackend for LocalBackend {
         match classify(path, std::fs::metadata(path)) {
             // 🔴 系统说「没有」还不算数 —— 未挂载的盘符也这么说。见
             // [`namespace_confirms_absence`]。
-            Probed::Absent => namespace_confirms_absence(path),
+            Probed::Absent => namespace_confirms_absence(path, &self.anchor),
             verdict => verdict,
         }
     }
@@ -232,6 +307,7 @@ pub struct FileFacts {
 
 impl LocalBackend {
     /// 本机文件的大小与 mtime。三态与 [`ProbeBackend::probe`] 一致。
+    #[allow(clippy::disallowed_methods)] // ← 唯一允许点之一（见 clippy.toml）
     pub fn stat(&self, path: &Path, deadline: Deadline) -> Probed<FileFacts> {
         if deadline.expired() {
             return Probed::Unknown(ProbeError::new(path, "round budget exhausted before stat"));
@@ -247,7 +323,7 @@ impl LocalBackend {
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // 同 `probe`：`NotFound` 还要过命名空间这一关。
-                match namespace_confirms_absence(path) {
+                match namespace_confirms_absence(path, &self.anchor) {
                     Probed::Absent => Probed::Absent,
                     Probed::Unknown(e) => Probed::Unknown(e),
                     Probed::Found(_) => Probed::Absent,
@@ -291,6 +367,10 @@ impl ProbeBackend for WslBackend {
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 存在性边界管的是
+// **生产行为**，而 `#[cfg(test)]` 不在生产路径上。允许写在模块上而不是逐个函数：
+// 下一条测试不必再想一遍这件事，而生产代码里加一行照样会被 clippy 拦。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
@@ -332,7 +412,7 @@ mod tests {
         let file = tmp.join("f");
         std::fs::write(&file, b"x").unwrap();
 
-        let b = LocalBackend;
+        let b = LocalBackend::unanchored();
         let d = Deadline::unbounded();
         assert_eq!(b.probe(&file, d), Probed::Found(FileKind::File));
         assert_eq!(b.probe(&tmp, d), Probed::Found(FileKind::Dir));
@@ -357,7 +437,7 @@ mod tests {
         // 文件**确实存在**，所以 `Absent` 不可能来自「真的没有」——
         // 这条断言只可能被「预算耗尽被折叠成没有」打破。
         assert!(matches!(
-            LocalBackend.probe(&file, expired),
+            LocalBackend::unanchored().probe(&file, expired),
             Probed::Unknown(_)
         ));
 
@@ -387,7 +467,7 @@ mod tests {
             eprintln!("跳过：本机没有空闲盘符可用来复现");
             return;
         };
-        let b = LocalBackend;
+        let b = LocalBackend::unanchored();
         let d = Deadline::unbounded();
 
         let leaf = std::path::PathBuf::from(format!("{drive}:\\home\\u\\.claude\\projects"));
@@ -406,6 +486,57 @@ mod tests {
         );
     }
 
+    /// 🔴 **锚点不可达 ⇒ `Unknown`，哪怕语法根好好的**（三轮评审 P1）。
+    ///
+    /// 这条**在任何平台上都确定性可复现**，而上面那条未挂载盘符的只在 Windows 上跑
+    /// —— 差别正是这次要修的东西：`ancestors().last()` 在 Unix 上永远是 `/`，
+    /// 于是 `/mnt/work/.claude` 所在的卷被卸载时，语法根那一支**看不出任何异常**，
+    /// 报 `Absent` ⇒ 该位置不进 `unreachable` ⇒ prune 删掉会话与用量投影。
+    ///
+    /// 「锚点整个不见了」正是卷卸载的签名：**分不出「用户删了它」还是「它被卸载了」**，
+    /// 所以只能说不知道。
+    ///
+    /// ⚠️ 三端都断言：锚点在 ⇒ 叶子缺失仍是 `Absent`（否则每个没写过 CLAUDE.md 的
+    /// 项目都变成假故障）；锚点不在 ⇒ `Unknown`；**同一条路径换成 `unanchored()`
+    /// 会得到 `Absent`** —— 最后一条钉的是「这个修复确实改变了行为」，
+    /// 少了它，一个 `rooted_at` 与 `unanchored` 行为相同的实现照样绿。
+    #[test]
+    fn an_unreachable_anchor_is_unknown_even_when_the_syntactic_root_is_fine() {
+        let tmp = std::env::temp_dir().join("sv-probe-anchor-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let d = Deadline::unbounded();
+        let leaf = tmp.join("gone").join(".claude").join("projects");
+
+        // 锚点在（`tmp` 存在）⇒ 叶子确实没有，是事实。
+        assert_eq!(
+            LocalBackend::rooted_at(&tmp).probe(&leaf, d),
+            Probed::Absent,
+            "锚点可达时，叶子的缺失必须仍是事实 —— 否则没装 CLI 的用户永久带假故障"
+        );
+
+        // 锚点整个不见了（= 卷被卸载的签名）⇒ 说不出叶子在不在。
+        let vanished_anchor = tmp.join("gone");
+        assert!(
+            matches!(
+                LocalBackend::rooted_at(&vanished_anchor).probe(&leaf, d),
+                Probed::Unknown(_)
+            ),
+            "来源根不可达却报了「确认不存在」—— prune 会据此删数据"
+        );
+
+        // 🔴 同一条路径，`unanchored()` 看不出异常 —— 这正是 Unix 上的那个洞，
+        // 也是「锚点必须由调用方给」的理由。
+        assert_eq!(
+            LocalBackend::unanchored().probe(&leaf, d),
+            Probed::Absent,
+            "前提：语法根那一支确实说不出来 —— 少了这条，rooted_at 与 unanchored \
+             行为相同的实现也能让上面两条通过"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     /// 死掉的 UNC 主机同样不是「这里没有」—— 实测 raw 53（`ERROR_BAD_NETPATH`）
     /// 也被映射成 `NotFound`。这条不枚举错误码，靠的是同一条「根要可达」判据。
     #[test]
@@ -414,7 +545,7 @@ mod tests {
         let p = std::path::Path::new(r"\\no-such-host-xyz-quotabar\share\f.txt");
         assert!(
             matches!(
-                LocalBackend.probe(p, Deadline::unbounded()),
+                LocalBackend::unanchored().probe(p, Deadline::unbounded()),
                 Probed::Unknown(_)
             ),
             "不可达的 UNC 主机被判成「确认不存在」"

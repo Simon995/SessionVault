@@ -1431,8 +1431,17 @@ impl TotalStore {
         }
 
         let now = now_unix_millis();
-        let Ok(conn) = self.conn.lock() else { return };
-        let _ = conn.execute(
+        // 🔴 **第三个失败出口**（三轮评审 P2）。前两个（探不到 `.git`、读不了 config）
+        // 已经会撤回缓存，而这里从前是 `let _ = conn.execute(...)` —— 拿不到锁、
+        // 并发写、磁盘 IO 或任何 SQLite 错误都被丢弃，**而 `identity_seen` 已经先记过**。
+        // 事件投影随后照常成功，这个项目却在本进程内**再也不会尝试写身份**。
+        //
+        // 判据统一成一句：**只有身份行确实落库，才配保留「问过了」。**
+        let Ok(conn) = self.conn.lock() else {
+            self.forget_identity_probe(&key);
+            return;
+        };
+        let written = conn.execute(
             "INSERT INTO project_identity
                  (source_type, source_location, project_root, canonical_id, first_seen_ms, last_seen_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -1440,6 +1449,13 @@ impl TotalStore {
              DO UPDATE SET last_seen_ms = ?5",
             rusqlite::params![key.0, key.1, key.2, cid, now],
         );
+        if let Err(e) = written {
+            log::debug!(
+                target: crate::logging::tag::SQLITE,
+                "project identity insert failed, will retry: root={} err={e}", key.2
+            );
+            self.forget_identity_probe(&key);
+        }
     }
 
     /// 这个项目当前的规范身份 —— `last_seen` 最大的那条。
@@ -2527,7 +2543,7 @@ impl TotalStore {
     /// 两支的差别不是谁更细心，是本机那支的判定**内联在调用点**、没有类型逼它表态。
     /// 现在两支都经 [`crate::probe`]：三态里只有 `Absent` 才是删除。
     pub fn read_active_latest_snapshots(&self) -> StoreResult<Vec<(i64, RawEvent)>> {
-        self.read_active_latest_snapshots_with(&crate::probe::LocalBackend)
+        self.read_active_latest_snapshots_with(&crate::probe::LocalBackend::unanchored())
     }
 
     /// [`Self::read_active_latest_snapshots`] 的可测形态 —— **本机 backend 注入**。
@@ -2909,7 +2925,7 @@ impl TombstoneScope {
 fn store_has_encrypted_rows(path: &Path) -> StoreResult<bool> {
     // 🔴 本函数返回 `Result`，所以「没问成」有地方可去 —— 从前的 `!path.exists()`
     // 把它折成 `Ok(false)`＝「这个库没有加密行」，而调用方据此决定要不要按明文处理。
-    match crate::probe::LocalBackend.probe(path, Deadline::unbounded()) {
+    match crate::probe::LocalBackend::unanchored().probe(path, Deadline::unbounded()) {
         crate::probe::Probed::Found(_) => {}
         crate::probe::Probed::Absent => return Ok(false),
         crate::probe::Probed::Unknown(e) => {
@@ -3079,6 +3095,10 @@ fn event_type_key(t: EventType) -> &'static str {
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 存在性边界管的是
+// **生产行为**，而 `#[cfg(test)]` 不在生产路径上。允许写在模块上而不是逐个函数：
+// 下一条测试不必再想一遍这件事，而生产代码里加一行照样会被 clippy 拦。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::rawevent::{Actor, SourceLocation, TimeConfidence, TokenUsage, SCHEMA_VERSION};
@@ -5696,6 +5716,60 @@ mod project_identity_tests {
                 events: vec![ev],
             })
             .unwrap();
+    }
+
+    /// 🔴 **身份行没落库，就不配保留「问过了」**（三轮评审 P2）。
+    ///
+    /// `identity_seen` 是**先记后算**的（避免一个读不到的项目让它名下每个文件都试盘），
+    /// 代价是**每一个**中途退出的分支都必须撤回。上一轮补了两个（探不到 `.git`、
+    /// 读不了 config），漏了第三个：`let _ = conn.execute(...)` 把 INSERT 的失败
+    /// 整个丢掉，而缓存已经记过 ⇒ 事件照常写进总库，这个项目却在本进程内**再也不会**
+    /// 尝试写身份。
+    ///
+    /// 用 SQLite trigger 精确阻断 `project_identity` 的 INSERT 来驱动 —— 只挡身份，
+    /// 事件投影照常成功，正是那个真实形状。
+    #[test]
+    fn a_failed_identity_insert_is_retried_on_the_next_pass() {
+        let root = scratch("identity-insert-fails");
+        let proj = root.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, Some("git@github.com:o/Proj.git"));
+        let root_str = proj.to_string_lossy().into_owned();
+
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER block_identity BEFORE INSERT ON project_identity
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .unwrap();
+
+        ingest(&store, &proj, 0);
+        assert_eq!(
+            store.project_identity("claude_code", "local", &root_str),
+            None,
+            "前提：这一轮身份确实没写进去"
+        );
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER block_identity;")
+            .unwrap();
+
+        // 🔴 第二轮：`identity_seen` 若没撤回，这里永远补不上。
+        ingest(&store, &proj, 1);
+        assert_eq!(
+            store.project_identity("claude_code", "local", &root_str),
+            Some("git:github.com/o/proj".to_string()),
+            "身份没落库却保留了「问过了」—— 这个项目在本进程内再也拿不到跨 checkout 身份"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

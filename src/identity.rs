@@ -67,7 +67,7 @@ pub enum GitRoot {
 /// 于是上溯到 `/w/proj` 命中，可 `sub` 很可能本来就有 `.git`。报 `Unknown` 走重试，
 /// 错误归属只会安静地留在库里。
 pub fn find_git_root(start: &Path) -> GitRoot {
-    find_git_root_with(start, &crate::probe::LocalBackend)
+    find_git_root_with(start, &crate::probe::LocalBackend::unanchored())
 }
 
 /// [`find_git_root`] 的可测形态 —— **backend 注入**（「探测失败」在本机造不出来）。
@@ -168,7 +168,7 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBu
 /// 稳定身份。这是 [`find_git_root`] 那次三态化只做了一半 —— stat 阶段分开了，
 /// 紧接着的读取阶段又合上了。
 pub fn read_origin_url(git_root: &Path) -> Probed<String> {
-    read_origin_url_with(git_root, &crate::probe::LocalBackend)
+    read_origin_url_with(git_root, &crate::probe::LocalBackend::unanchored())
 }
 
 /// [`read_origin_url`] 的可测形态 —— backend 注入。
@@ -265,7 +265,7 @@ pub fn normalize_remote(url: &str) -> Option<String> {
 /// `store::note_project_identity` 丢弃 ⇒ 后者被当成前者时，一次瞬时故障就变成
 /// 「这个项目没有跨 checkout 身份」，且因为**先记后算**再也不会重试。
 pub fn canonical_repo_id(git_root: &Path) -> Result<String, crate::probe::ProbeError> {
-    canonical_repo_id_with(git_root, &crate::probe::LocalBackend)
+    canonical_repo_id_with(git_root, &crate::probe::LocalBackend::unanchored())
 }
 
 /// [`canonical_repo_id`] 的可测形态 —— backend 注入。

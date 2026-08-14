@@ -1,0 +1,22 @@
+# 🔴 存在性探测的**编译器级**边界（ADR-051 §8；三轮评审 P2-2 的正解）。
+#
+# 这条边界先后用正则守过两版，两版都被绕过 —— 第二版被评审用六种**合法且可编译**的
+# 写法穿过：`p.metadata()`（`Path` 的方法，不含 `fs::`）、`Path::exists(p)`（UFCS）、
+# `use std::fs as disk;` + `disk::metadata(...)`（别名）、`use std::fs::{self, metadata};`
+# + 裸 `metadata(...)`（重导出）。**正则看的是拼写，而这些拼写各不相同、语义完全一样。**
+#
+# clippy 在**名字解析之后**匹配，认的是 def-path，所以上面六种全部命中同一条规则。
+# 这就是「编译器已经守住的事，不要再用正则守一遍」在本仓的第二次兑现
+# （第一次是 `CommitPlan` 的字段私有）。
+#
+# 唯一允许点：`src/probe.rs`（`#[allow]` 就写在那几行上，看得见）。
+disallowed-methods = [
+  { path = "std::fs::metadata", reason = "存在性探测收口到 probe.rs：用 ProbeBackend::probe / LocalBackend::stat" },
+  { path = "std::fs::symlink_metadata", reason = "同上" },
+  { path = "std::path::Path::metadata", reason = "同上 —— 它不含 `fs::`，正则闸曾整条放行" },
+  { path = "std::path::Path::symlink_metadata", reason = "同上" },
+  { path = "std::path::Path::exists", reason = "把访问失败折叠成 false；用 ProbeBackend::probe" },
+  { path = "std::path::Path::try_exists", reason = "未挂载盘符上返回 Ok(false)，同样答不出「没问成」" },
+  { path = "std::path::Path::is_file", reason = "把访问失败折叠成 false；用 Probed::Found(FileKind::File)" },
+  { path = "std::path::Path::is_dir", reason = "把访问失败折叠成 false；用 Probed::Found(FileKind::Dir)" },
+]

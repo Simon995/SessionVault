@@ -101,7 +101,7 @@ fn find_upward(start: &Path) -> Option<(PathBuf, &'static str)> {
     let mut cur = Some(start);
     while let Some(dir) = cur {
         for marker in MARKERS {
-            match crate::probe::LocalBackend
+            match crate::probe::LocalBackend::unanchored()
                 .probe(&dir.join(marker), crate::deadline::Deadline::unbounded())
             {
                 Probed::Found(_) => return Some((dir.to_path_buf(), marker)),

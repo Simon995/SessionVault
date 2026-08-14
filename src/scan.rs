@@ -254,7 +254,9 @@ impl ByteSource for LocalSource<'_> {
         // 经 `probe` 而不是直接 `std::fs::metadata` —— 见 `FileFacts` 的注释：
         // 这里从前是边界闸唯一的 carve-out，而那个 carve-out 让
         // `std::fs::metadata(p).is_ok()` 能溜过去（三轮评审 P2-2）。
-        match crate::probe::LocalBackend.stat(self.path, crate::deadline::Deadline::unbounded()) {
+        match crate::probe::LocalBackend::unanchored()
+            .stat(self.path, crate::deadline::Deadline::unbounded())
+        {
             crate::probe::Probed::Found(f) => Ok((f.len, f.modified_unix)),
             crate::probe::Probed::Absent => Err(format!("{} not found", self.path.display())),
             crate::probe::Probed::Unknown(e) => Err(e.to_string()),
@@ -589,6 +591,10 @@ pub fn split_complete_jsonl(text: &str) -> (&str, usize) {
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 存在性边界管的是
+// **生产行为**，而 `#[cfg(test)]` 不在生产路径上。允许写在模块上而不是逐个函数：
+// 下一条测试不必再想一遍这件事，而生产代码里加一行照样会被 clippy 拦。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::Arc;
 
