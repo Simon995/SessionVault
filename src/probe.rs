@@ -127,6 +127,11 @@ pub trait ProbeBackend {
 ///
 /// ⚠️ `NotFound` 必须留在 `Absent` 这一侧。把它也报成不可达，会让每个没装某 CLI、
 /// 没写过 `CLAUDE.md` 的用户永久带着一个假故障，prune 全被禁掉（AGENTS.md 已记）。
+///
+/// 🔴 **但 `NotFound` 本身不足以定案** —— 见 [`namespace_confirms_absence`]。本函数只做
+/// 「这一次系统调用说了什么」的忠实翻译，**不是**最终判决；`LocalBackend` 会对
+/// `Absent` 再核一次命名空间。分成两步是因为它们是两个问题：这里是「系统怎么说的」，
+/// 那里是「这个说法算不算数」。
 pub fn classify(path: &Path, meta: std::io::Result<std::fs::Metadata>) -> Probed<FileKind> {
     match meta {
         Ok(m) if m.is_file() => Probed::Found(FileKind::File),
@@ -134,6 +139,58 @@ pub fn classify(path: &Path, meta: std::io::Result<std::fs::Metadata>) -> Probed
         Ok(_) => Probed::Found(FileKind::Other),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probed::Absent,
         Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
+/// 🔴 **`Absent` 要以「命名空间根可达」为前提**（三轮评审 P1-1）。
+///
+/// Windows 上一个**未挂载的盘符**返回的是 `ERROR_PATH_NOT_FOUND`（raw 3），
+/// Rust 映射成 `ErrorKind::NotFound` —— **与「盘符在、文件确实没有」逐位相同**
+/// （后者也是 raw 3）。本机实测：
+///
+/// | 路径 | kind | raw |
+/// | --- | --- | --- |
+/// | `C:\不存在\x.json`（盘符在） | `NotFound` | 3 |
+/// | **未挂载 `Z:\home\u`** | `NotFound` | **3** |
+/// | **死 UNC 主机** | `NotFound` | 53 |
+/// | 死 WSL distro UNC | `Uncategorized` | 64 ✅ 本来就落 `Unknown` |
+///
+/// ⚠️ `try_exists()` 在未挂载盘符上返回 `Ok(false)` —— **它同样答错**，所以「用
+/// `try_exists` 就对了」这条旧说法在这一格上不成立。
+///
+/// 后果不是崩溃：`CLAUDE_CONFIG_DIR` / `CODEX_HOME` 落在临时断开的盘符或网络位置时，
+/// 发现阶段会报「问过了，那里什么都没有」⇒ 调用方不把该位置记为不可达 ⇒ **prune 照常
+/// 执行**，删掉既有的 `agent_session_files` / `agent_sessions` / `usage_facts` 投影。
+/// 那正是这套三态类型存在的理由（ADR-050 那次「WSL 变慢删掉 369 个文件」同形）。
+///
+/// **判据是一条原则，不是一张错误码表**：叶子的缺失只有在**命名空间本身可达**时才算
+/// 事实。根用 `ancestors().last()` 取，粒度天然正确 ——
+/// `C:\` / `\\server\share\` / `\\wsl.localhost\<distro>\`。
+/// raw 53（`ERROR_BAD_NETPATH`）这类被它自然覆盖，不必逐个枚举。
+///
+/// 代价：每个 `Absent` 多一次 `metadata(root)`。根的元数据被 OS 缓存，且只在
+/// **否定**结论上付费 —— 而否定结论正是会驱动删除的那一种。
+fn namespace_confirms_absence(path: &Path) -> Probed<FileKind> {
+    let Some(root) = path.ancestors().last() else {
+        return Probed::Absent;
+    };
+    // 相对路径的根是空串：命名空间就是进程的当前目录，进程活着它就可达。
+    if root.as_os_str().is_empty() {
+        return Probed::Absent;
+    }
+    // 路径本身就是根（`Z:\`）：没有更上层可核，就说不出「它确实不存在」。
+    if root == path {
+        return Probed::Unknown(ProbeError::new(
+            path,
+            "namespace root itself is not reachable, cannot tell whether it exists",
+        ));
+    }
+    match std::fs::metadata(root) {
+        Ok(_) => Probed::Absent,
+        Err(e) => Probed::Unknown(ProbeError::new(
+            path,
+            format!("namespace root {} is not reachable: {e}", root.display()),
+        )),
     }
 }
 
@@ -150,7 +207,54 @@ impl ProbeBackend for LocalBackend {
         if deadline.expired() {
             return Probed::Unknown(ProbeError::new(path, "round budget exhausted before probe"));
         }
-        classify(path, std::fs::metadata(path))
+        match classify(path, std::fs::metadata(path)) {
+            // 🔴 系统说「没有」还不算数 —— 未挂载的盘符也这么说。见
+            // [`namespace_confirms_absence`]。
+            Probed::Absent => namespace_confirms_absence(path),
+            verdict => verdict,
+        }
+    }
+}
+
+/// 一个文件的大小与修改时间。
+///
+/// 🔴 **它和存在性走同一个出口，不是另开一条路。** 从前 `scan.rs` 直接
+/// `std::fs::metadata(...)?` 取这两个数 —— 那次调用本身没有折叠任何东西（错误往上抛），
+/// 但它的存在**逼着边界闸留一个 carve-out**（「带 `?` 的 metadata 放行」），
+/// 而那个 carve-out 正是 `std::fs::metadata(p).is_ok()` 能溜过去的原因
+/// （三轮评审 P2-2）。**闸上每一个例外，都是一条以后会被走的路。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileFacts {
+    pub len: u64,
+    /// UNIX 秒。取不到 mtime 不是错误 —— 有文件系统就是不提供。
+    pub modified_unix: Option<i64>,
+}
+
+impl LocalBackend {
+    /// 本机文件的大小与 mtime。三态与 [`ProbeBackend::probe`] 一致。
+    pub fn stat(&self, path: &Path, deadline: Deadline) -> Probed<FileFacts> {
+        if deadline.expired() {
+            return Probed::Unknown(ProbeError::new(path, "round budget exhausted before stat"));
+        }
+        match std::fs::metadata(path) {
+            Ok(m) => Probed::Found(FileFacts {
+                len: m.len(),
+                modified_unix: m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64),
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 同 `probe`：`NotFound` 还要过命名空间这一关。
+                match namespace_confirms_absence(path) {
+                    Probed::Absent => Probed::Absent,
+                    Probed::Unknown(e) => Probed::Unknown(e),
+                    Probed::Found(_) => Probed::Absent,
+                }
+            }
+            Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+        }
     }
 }
 
@@ -258,6 +362,63 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 🔴 **未挂载的盘符不是「这里没有」**（三轮评审 P1-1）。
+    ///
+    /// Windows 上它返回 `ErrorKind::NotFound`（raw 3），与「盘符在、文件确实没有」
+    /// **逐位相同**。只按 `io::ErrorKind` 分类的实现无法区分，于是一次盘符掉线会被
+    /// 读作「用户把这些会话删了」，prune 随即执行。
+    ///
+    /// 用**真实的**未挂载盘符驱动 —— 与 `unreachable_client()` 走死代理、WSL 那条走
+    /// 不存在的发行版同一个手法：驱动真实路径，不伪造 `io::Error`。
+    ///
+    /// ⚠️ 两端都断言：未挂载盘符 ⇒ `Unknown`，**且**已挂载盘符下的缺失仍是 `Absent`。
+    /// 少了后者，一个「凡 NotFound 都报 Unknown」的实现照样绿 —— 而那会让每个没装
+    /// 某 CLI 的用户永久带着假故障、prune 全被禁掉。
+    #[test]
+    #[cfg(windows)]
+    fn an_unmounted_drive_is_unknown_not_absent() {
+        let free = ('D'..='Z').find(|d| {
+            std::fs::metadata(format!("{d}:\\")).is_err()
+                && std::path::Path::new(&format!("{d}:\\")).ancestors().count() == 1
+        });
+        let Some(drive) = free else {
+            eprintln!("跳过：本机没有空闲盘符可用来复现");
+            return;
+        };
+        let b = LocalBackend;
+        let d = Deadline::unbounded();
+
+        let leaf = std::path::PathBuf::from(format!("{drive}:\\home\\u\\.claude\\projects"));
+        assert!(
+            matches!(b.probe(&leaf, d), Probed::Unknown(_)),
+            "未挂载盘符 {drive}: 下的路径被判成「确认不存在」—— prune 会据此删数据"
+        );
+
+        // 反向：盘符在，文件确实没有 ⇒ 仍是事实。
+        let missing = std::env::temp_dir().join("sv-probe-definitely-absent-xyz-123");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(
+            b.probe(&missing, d),
+            Probed::Absent,
+            "已挂载盘符下的缺失必须仍是 Absent，否则没装 CLI 的用户永久带着假故障"
+        );
+    }
+
+    /// 死掉的 UNC 主机同样不是「这里没有」—— 实测 raw 53（`ERROR_BAD_NETPATH`）
+    /// 也被映射成 `NotFound`。这条不枚举错误码，靠的是同一条「根要可达」判据。
+    #[test]
+    #[cfg(windows)]
+    fn a_dead_unc_host_is_unknown_not_absent() {
+        let p = std::path::Path::new(r"\\no-such-host-xyz-quotabar\share\f.txt");
+        assert!(
+            matches!(
+                LocalBackend.probe(p, Deadline::unbounded()),
+                Probed::Unknown(_)
+            ),
+            "不可达的 UNC 主机被判成「确认不存在」"
+        );
     }
 
     /// `map` 不许改变三态结构 —— 它是唯一的组合子，折叠状态的便利方法一个都不给。

@@ -344,16 +344,31 @@ fn load_files(path: &Option<PathBuf>) -> BTreeMap<String, i64> {
     map
 }
 
+/// 文件当前大小；探不到 / 确认没有都是 `None`（本探针把两者一起归 "unknown" 桶）。
+fn probe_stat(path: &str) -> Option<u64> {
+    use session_vault::probe::{LocalBackend, Probed};
+    match LocalBackend.stat(
+        std::path::Path::new(path),
+        session_vault::deadline::Deadline::unbounded(),
+    ) {
+        Probed::Found(f) => Some(f.len),
+        Probed::Absent | Probed::Unknown(_) => None,
+    }
+}
+
 /// 增长尾归类：QuotaBar 记录 size < 现盘 size（append-only 增长）→ growth；否则 unknown。
 /// WSL Linux 路径在 Windows 上无法 stat → unknown（实测 WSL combo 无尾，安全）。
 fn is_growth(path: &str, qb_files: &BTreeMap<String, i64>) -> bool {
     let Some(&qb_size) = qb_files.get(path) else {
         return false;
     };
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    qb_size < meta.len() as i64
+    // 走 probe 原语：这里的折叠**是对的**（本函数的兜底桶本来就是 "unknown"，
+    // 报 false 不是把失败说成事实），但它得写出来 —— `let Ok(..) else` 让读的人
+    // 分不出「想清楚了」与「没想」，而这正是边界闸不再留例外的理由。
+    match probe_stat(path) {
+        Some(len) => qb_size < len as i64,
+        None => false,
+    }
 }
 
 fn combo_label(key: &Key) -> String {

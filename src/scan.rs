@@ -251,13 +251,14 @@ struct LocalSource<'a> {
 
 impl ByteSource for LocalSource<'_> {
     fn stat(&self) -> Result<(u64, Option<i64>), String> {
-        let meta = std::fs::metadata(self.path).map_err(|e| e.to_string())?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-        Ok((meta.len(), mtime))
+        // 经 `probe` 而不是直接 `std::fs::metadata` —— 见 `FileFacts` 的注释：
+        // 这里从前是边界闸唯一的 carve-out，而那个 carve-out 让
+        // `std::fs::metadata(p).is_ok()` 能溜过去（三轮评审 P2-2）。
+        match crate::probe::LocalBackend.stat(self.path, crate::deadline::Deadline::unbounded()) {
+            crate::probe::Probed::Found(f) => Ok((f.len, f.modified_unix)),
+            crate::probe::Probed::Absent => Err(format!("{} not found", self.path.display())),
+            crate::probe::Probed::Unknown(e) => Err(e.to_string()),
+        }
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
