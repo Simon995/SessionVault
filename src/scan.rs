@@ -4,8 +4,6 @@
 //! 读尾部 → `split_complete_jsonl` 切出完整行（半行留下轮）→ 解析 → 推进游标。
 //! 移植自 QuotaBar `session_index.rs::split_complete_jsonl`（纯函数，带单测）。
 
-use std::io::{Read, Seek, SeekFrom};
-
 use crate::cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
 use crate::discover::SourceRef;
 use crate::logging::tag;
@@ -568,25 +566,19 @@ fn observe(
 }
 
 /// 读文件 `[start, end)` 字节区间。
+///
+/// seek + read 整个在 `probe::read_range` 里做完 —— **`File` 不再逃出边界**
+/// （五轮评审 P2：原始类型外泄时，有限的 def-path 清单实现不了「整个模块面」）。
+/// 三态在这里折成 `io::Result` 交给上层，折叠写在**一处**且是在已分好类之后。
 fn read_range(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
-    // 经 probe 而不是裸 `File::open` —— 后者正是四轮评审点名的绕过写法，而它当时
-    // 就在这一行。ranged read 的失败要往上抛，所以三态在这里折成 `io::Result`：
-    // 折叠写在**一处**、且是在已经分好类之后，与调用点各自折叠不是一回事。
-    let mut f = match crate::probe::open_read(path, None) {
-        crate::probe::Probed::Found(f) => f,
-        crate::probe::Probed::Absent => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "file is gone",
-            ))
-        }
-        crate::probe::Probed::Unknown(e) => return Err(std::io::Error::other(e.to_string())),
-    };
-    f.seek(SeekFrom::Start(start))?;
-    let len = (end - start) as usize;
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+    match crate::probe::read_range(path, start, end) {
+        crate::probe::Probed::Found(buf) => Ok(buf),
+        crate::probe::Probed::Absent => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file is gone",
+        )),
+        crate::probe::Probed::Unknown(e) => Err(std::io::Error::other(e.to_string())),
+    }
 }
 
 /// 把一段文本切成「完整行部分」+「尾部半行字节数」。

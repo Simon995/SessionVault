@@ -186,9 +186,24 @@ pub fn read_origin_url_with(git_root: &Path, backend: &dyn ProbeBackend) -> Prob
         Probed::Absent => return Probed::Absent,
         Probed::Unknown(e) => return Probed::Unknown(e),
     }
+    // 🔴 **判决链中途不许换事实来源**（五轮评审 P2）。
+    //
+    // 上一行刚用 `backend` 确认 config **在**，这里却用全局 `probe::read_text` 去读 ——
+    // 两个来源不一致时（注入后端说远端可达而本机读不到、或文件正好在两步之间消失），
+    // 读到的 `NotFound` 会被降级成 `Absent` ⇒ `canonical_repo_id_with` 给出**终态**
+    // `path:`，而 `identity_seen` 从此不再重试。实测：让注入后端全答 `Found`、真实
+    // config 不存在，得到的是 `Ok("path:…")` 而不是 `Unknown`。
+    //
+    // 「刚确认存在、紧接着读不到」**不是「这个仓没配 origin」** —— 它是「没问成」。
     let text = match crate::probe::read_text(&config, None) {
         Probed::Found(t) => t,
-        Probed::Absent => return Probed::Absent,
+        Probed::Absent => {
+            return Probed::Unknown(crate::probe::ProbeError::new(
+                &config,
+                "config was confirmed present by the probe backend but could not be read \
+                 (source of truth switched mid-decision)",
+            ))
+        }
         Probed::Unknown(e) => return Probed::Unknown(e),
     };
     match parse_origin_url(&text) {

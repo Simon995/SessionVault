@@ -32,6 +32,13 @@ disallowed-methods = [
   { path = "std::fs::canonicalize", reason = "走 probe" },
   { path = "std::fs::File::open", reason = "走 probe::open_read —— 评审点名的绕过，scan.rs 当时就有一处" },
   { path = "std::fs::OpenOptions::open", reason = "同上" },
+  { path = "std::fs::exists", reason = "1.81 新增的自由函数 —— 评审实测它当时整条漏掉" },
+  { path = "std::fs::DirBuilder::create", reason = "create_dir_all 的另一条路，评审实测漏掉" },
+  { path = "std::fs::DirEntry::metadata", reason = "DirEntry 不再逃出边界（EntryFacts），这条是兜底" },
+  { path = "std::fs::DirEntry::file_type", reason = "同上 —— 生产代码里当时真的在调" },
+  { path = "std::fs::File::metadata", reason = "File 不再逃出边界（read_range），这条是兜底" },
+  { path = "std::fs::File::set_permissions", reason = "同上" },
+  { path = "std::fs::File::set_len", reason = "同上" },
   # ── `Path` 上的同族（不含 `fs::`，正则闸曾整条放行）───────────────
   { path = "std::path::Path::metadata", reason = "走 probe" },
   { path = "std::path::Path::symlink_metadata", reason = "走 probe" },

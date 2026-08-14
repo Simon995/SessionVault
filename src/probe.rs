@@ -200,47 +200,33 @@ pub enum Anchor {
 fn namespace_confirms_absence(path: &Path, anchor: &Anchor) -> Probed<FileKind> {
     // 锚点由调用方给：只有它可达，其下的缺失才算事实。这一支能看见卷卸载 ——
     // 语法根那一支看不见（Unix 上永远是 `/`）。
+    // 🔴 **锚点只用来接住「真的问不成」，不再拿它推断卷在不在**（五轮评审 P1）。
+    //
+    // 上一版按「根不见了就再看一层父目录」分「没装」与「掉盘」，**两个方向都错**：
+    //
+    // - Unix 卷卸载后**挂载点目录仍然存在**：`/mnt/work` 照常 `metadata` 得到，
+    //   只有 `.claude` 没了 ⇒ 判成 `Absent` ⇒ local 不进 `unreachable` ⇒ **照样 prune**。
+    //   而「卸载后根与父目录一起消失」是我造的测试形状，不是真实形状。
+    // - 反方向：自定义根 `/home/u/.config/claude` 而 `.config` 尚未建立 ⇒ 父目录不在
+    //   ⇒ 判成 `Unknown` ⇒ **永久阻止 local prune**。
+    //
+    // **路径语法里没有「这个卷还在不在」这个信息**，一层、两层、走到 `/` 都一样 ——
+    // 换个层数只是换一组反例。要真答出来必须持久化上次成功访问的卷/设备身份
+    // （Unix `st_dev` / Windows volume serial），那需要一处存储，是独立一步（task #15）。
+    //
+    // 所以这里**不再猜**：锚点只在给出**明确的不可达信号**时才升级为 `Unknown`
+    // —— 权限拒绝、IO 错误、UNC 不通这些是真的「问不成」；而 `NotFound` 与
+    // 「卷卸载」在这一层不可区分，**归 `Absent`**（与本函数之前的语法根判定一致）。
     if let Anchor::Under(root) = anchor {
-        match std::fs::metadata(root) {
-            // 根在 ⇒ 叶子的缺失是事实。
-            Ok(_) if root != path => return Probed::Absent,
-            Ok(_) => {}
-            // 🔴 **根自己不见了，还不足以定案**（四轮评审 P1）。
-            //
-            // 上一版在这里直接报 `Unknown`，而 `claude_config_dir()` /
-            // `codex_config_dir()` **目录不存在也返回 `Some(~/.claude)`** ——
-            // 于是「只装了 Codex、从来没有 `~/.claude`」这个**完全正常的配置**
-            // 被判成 local 不可达，QuotaBar 因此**永不 prune local**，
-            // 已删除的 Codex 会话 / 用量 / 成本永久残留。
-            // 方向与它要修的那个 bug **正好相反**：修的是误删，造出的是永不删。
-            //
-            // 分开这两种状态**不需要持久化状态**，只要再上溯一层：
-            // - 父目录在（`~` 在、`~/.claude` 没有）⇒ 那个 CLI 没装，**是事实**；
-            // - 父目录也不见了（`/mnt/work` 整个没了）⇒ 命名空间掉了，**没问成**。
-            //
-            // 只上溯**一层**，不是一路走到 `/` —— 走到 `/` 又会回到「Unix 上恒可达」
-            // 那个洞里。一层就够分开这两种，且可解释。
-            Err(_) => {
-                let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) else {
-                    return Probed::Unknown(ProbeError::new(
-                        path,
-                        "source root is gone and has no parent to check against",
-                    ));
-                };
-                return match std::fs::metadata(parent) {
-                    Ok(_) => Probed::Absent,
-                    Err(e) => Probed::Unknown(ProbeError::new(
-                        path,
-                        format!(
-                            "source root {} and its parent are both unreachable: {e}",
-                            root.display()
-                        ),
-                    )),
-                };
+        if let Err(e) = std::fs::metadata(root) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Probed::Unknown(ProbeError::new(
+                    path,
+                    format!("source root {} is not reachable: {e}", root.display()),
+                ));
             }
         }
-        // 锚点自己就是被探的那条路径，且它在 —— 交回上面的常规判定。
-        return Probed::Absent;
+        // 落到下面的语法根判定 —— Windows 未挂载盘符 / 死 UNC 仍然会被它接住。
     }
 
     let Some(root) = path.ancestors().last() else {
@@ -405,18 +391,50 @@ pub fn read_text(path: &Path, anchor_root: Option<&Path>) -> Probed<String> {
     }
 }
 
+/// 一个目录项 —— **不透明**，边界外拿不到 `std::fs::DirEntry`。
+///
+/// 🔴 **这是「模块面清单」能不能成立的关键**（五轮评审 P2）。上一版返回
+/// `Vec<io::Result<DirEntry>>`，于是 `DirEntry` 逃出边界，边界外可以
+/// `entry.metadata()` / `entry.file_type()` —— 而它们又是新的 def-path，
+/// 清单永远补不完。**只要原始类型会外泄，有限清单就实现不了「整个模块面」。**
+/// （生产代码里就有一处：`discover.rs` 当时正在调 `DirEntry::file_type()`。）
+///
+/// 所以这里把需要的事实**在边界内**取好再交出去：名字、路径、以及类型的三态判定。
+#[derive(Debug, Clone)]
+pub struct EntryFacts {
+    pub file_name: std::ffi::OsString,
+    pub path: std::path::PathBuf,
+    /// 这一项是什么 —— `file_type()` 自己也会失败，那同样是「没问成」。
+    pub kind: Probed<FileKind>,
+}
+
 /// 列目录 —— 三态。
 ///
-/// 🔴 **逐条目的错误也保留**：`read_dir` 成功之后每个 `DirEntry` 仍可能失败，
+/// 🔴 **逐条目的错误也保留**：`read_dir` 成功之后每个条目仍可能失败，
 /// 而 `.flatten()` 会把它们静默丢掉（`memory/sources.rs` 曾经就是）。
-/// 返回 `Vec<io::Result<DirEntry>>` 让调用方**看得见**每一条。
+/// 返回 `Vec<Result<EntryFacts, ProbeError>>` 让调用方**看得见**每一条。
 #[allow(clippy::disallowed_methods)]
 pub fn read_dir_entries(
     path: &Path,
     anchor_root: Option<&Path>,
-) -> Probed<Vec<std::io::Result<std::fs::DirEntry>>> {
+) -> Probed<Vec<Result<EntryFacts, ProbeError>>> {
     match std::fs::read_dir(path) {
-        Ok(it) => Probed::Found(it.collect()),
+        Ok(it) => Probed::Found(
+            it.map(|e| match e {
+                Ok(entry) => Ok(EntryFacts {
+                    file_name: entry.file_name(),
+                    path: entry.path(),
+                    kind: match entry.file_type() {
+                        Ok(t) if t.is_file() => Probed::Found(FileKind::File),
+                        Ok(t) if t.is_dir() => Probed::Found(FileKind::Dir),
+                        Ok(_) => Probed::Found(FileKind::Other),
+                        Err(err) => Probed::Unknown(ProbeError::new(&entry.path(), err)),
+                    },
+                }),
+                Err(err) => Err(ProbeError::new(path, err)),
+            })
+            .collect(),
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             namespace_confirms_absence(path, &anchor(anchor_root)).map(|_| Vec::new())
         }
@@ -424,18 +442,27 @@ pub fn read_dir_entries(
     }
 }
 
-/// 打开文件用于随机读（`scan.rs` 的 ranged read）—— 三态。
+/// 读文件的 `[start, end)` 字节区间 —— 三态。
+///
+/// 🔴 **不再交出 `File`**（五轮评审 P2）。上一版是 `open_read -> Probed<File>`，
+/// 而 `File` 逃出边界之后 `f.metadata()` / `f.set_permissions()` 又是新的 def-path。
+/// seek + read 整个放在边界内，边界外只拿到字节。
 #[allow(clippy::disallowed_methods)]
-pub fn open_read(path: &Path, anchor_root: Option<&Path>) -> Probed<std::fs::File> {
-    match std::fs::File::open(path) {
-        Ok(f) => Probed::Found(f),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match namespace_confirms_absence(path, &anchor(anchor_root)) {
-                Probed::Absent => Probed::Absent,
-                Probed::Unknown(e) => Probed::Unknown(e),
-                Probed::Found(_) => Probed::Absent,
-            }
-        }
+pub fn read_range(path: &Path, start: u64, end: u64) -> Probed<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probed::Absent,
+        Err(e) => return Probed::Unknown(ProbeError::new(path, e)),
+    };
+    let mut go = || -> std::io::Result<Vec<u8>> {
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    };
+    match go() {
+        Ok(buf) => Probed::Found(buf),
         Err(e) => Probed::Unknown(ProbeError::new(path, e)),
     }
 }
@@ -652,24 +679,24 @@ mod tests {
             "锚点可达时，叶子的缺失必须仍是事实 —— 否则没装 CLI 的用户永久带假故障"
         );
 
-        // 🔴 **根不见了、但父目录在 ⇒ 事实**（四轮评审 P1）。
-        // 「只装了 Codex，从来没有 `~/.claude`」是完全正常的配置；把它判成不可达，
-        // QuotaBar 就**永不 prune local**，已删除的会话/用量/成本永久残留。
+        // 🔴 **根不见了 ⇒ 仍是 `Absent`**（五轮评审 P1）。
+        //
+        // 「只装了 Codex、从来没有 `~/.claude`」是完全正常的配置；判成不可达会让
+        // QuotaBar **永不 prune local**。而「卷卸载」在路径语法层与它不可区分
+        // （Unix 卸载后挂载点目录还在），所以这里**不猜** —— 真答案要靠持久化的
+        // 卷/设备身份（task #15）。两条都断言，钉住「不猜」这个决定本身。
         let never_installed = tmp.join("gone");
         assert_eq!(
             LocalBackend::rooted_at(&never_installed).probe(&leaf, d),
             Probed::Absent,
-            "根不存在但父目录在 = 那个 CLI 没装，是事实 —— 判成不可达会让 prune 永久停摆"
+            "根不存在 = 那个 CLI 没装（或卷卸载，此层不可区分）—— 判成不可达会让 prune 永久停摆"
         );
-
-        // 根与父目录**都**不见了（= 卷被卸载的签名）⇒ 说不出叶子在不在。
-        let unmounted = tmp.join("vanished-volume").join("dot-claude");
-        assert!(
-            matches!(
-                LocalBackend::rooted_at(&unmounted).probe(&unmounted.join("projects"), d),
-                Probed::Unknown(_)
-            ),
-            "来源根与父目录都不可达却报了「确认不存在」—— prune 会据此删数据"
+        let deep_missing = tmp.join("vanished-volume").join("dot-claude");
+        assert_eq!(
+            LocalBackend::rooted_at(&deep_missing).probe(&deep_missing.join("projects"), d),
+            Probed::Absent,
+            "根与父目录都不在，同样不许升级成 Unknown —— 那正是 `.config` 未建立时\
+             永久阻断 prune 的形状"
         );
 
         // 🔴 同一条路径，`unanchored()` 看不出异常 —— 这正是 Unix 上的那个洞，

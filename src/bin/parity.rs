@@ -1,3 +1,13 @@
+// 🔴 **本诊断工具不在文件系统边界内**（五轮评审 P2）。
+//
+// 它与 `src-tauri/examples/**` 同类：一次性对照 diff 工具，读的是冻结基线 NDJSON，
+// 失败会当场退非零，不会 prune 掉用户的会话。归另一条闸（诊断探针）。
+//
+// ⚠️ 它长期**根本没被 clippy 编译过** —— `required-features = ["parity"]`，而闸只跑
+// `--features store`。这一行连同 verify/CI 里补上的 `--features store,parity`，
+// 一起让「SessionVault 全部受保护」这句话变成真的（此前它不真）。
+#![allow(clippy::disallowed_methods)]
+
 //! `parity` —— P2 影子并跑 diff 工具（见 `docs/parity-contract.md`）。
 //!
 //! 比对 **QuotaBar `cache.db` 的 `usage_facts`**（冻结基线 NDJSON）与 **SessionVault

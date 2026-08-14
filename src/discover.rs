@@ -509,17 +509,19 @@ fn collect_files_into(
             *failed = true;
             continue;
         };
-        // `path.is_dir()` 把错误吞成 false —— 用 `file_type()` 才分得开
-        // 「不是目录」和「问不到它是什么」。
-        let is_dir = match entry.file_type() {
-            Ok(t) => t.is_dir(),
-            Err(e) => {
-                log::warn!(target: tag::DISCOVER, "file_type failed: {:?} err={e}", entry.path());
+        // 类型判定由 `EntryFacts` 在边界内取好 —— 「不是目录」与「问不到它是什么」
+        // 仍然分得开，而 `DirEntry` 不再逃出边界（五轮评审 P2）。
+        let is_dir = match entry.kind {
+            crate::probe::Probed::Found(crate::probe::FileKind::Dir) => true,
+            crate::probe::Probed::Found(_) => false,
+            crate::probe::Probed::Absent => continue,
+            crate::probe::Probed::Unknown(e) => {
+                log::warn!(target: tag::DISCOVER, "file_type failed: {e}");
                 *failed = true;
                 continue;
             }
         };
-        let path = entry.path();
+        let path = entry.path;
         if is_dir {
             if recursive {
                 collect_files_into(&path, recursive, suffix, out, failed);
