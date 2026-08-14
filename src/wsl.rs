@@ -372,14 +372,29 @@ pub fn is_windows_drive_device(device: &str) -> bool {
     }
 }
 
-#[cfg(windows)]
-pub fn find_project_root(
-    distro: &str,
-    abs_path: &str,
-    deadline: crate::deadline::Deadline,
-) -> Result<Option<(String, String)>, String> {
+/// 归属脚本的构造 —— **抽出来是为了能被测到**。
+///
+/// 内联在 `find_project_root` 里时，「marker 列表是不是真的来自 `MARKERS`」
+/// 只能靠读代码确认，而那正是它上一版硬抄一份、无人发现的原因。
+fn find_project_root_script(abs_path: &str) -> String {
     let esc = shell_escape(abs_path);
-    let script = format!(
+    // 🔴 **marker 列表由 `MARKERS` 生成，不再手抄。**
+    //
+    // 这里从前硬编码着 `Cargo.toml package.json pyproject.toml go.mod .hg` ——
+    // `project_root::MARKERS` 的一份副本。两份都活着的时候，往 `MARKERS` 里加一个
+    // 新 marker 不会有任何东西报错：本机路径认得它，WSL 里的同一个项目认不得，
+    // 症状是「同一个项目在 Windows 侧是一个根、在 WSL 侧不是」——而这正是本仓
+    // 刚为「同一个项目两个身份」付过代价的形状。
+    //
+    // `.git` 不在这一串里：它由下面**第一遍**单独走（优先级高于所有 marker，
+    // 且 `-e` 要覆盖子模块那种 `.git` 是文件的情形）。
+    let markers = crate::project_root::MARKERS
+        .iter()
+        .filter(|m| **m != ".git")
+        .map(|m| shell_escape(m))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
         r#"set -eu
 D="{esc}"
 [ -n "$D" ] || exit 7
@@ -393,10 +408,10 @@ while [ "$P" != "/" ] && [ -n "$P" ]; do
   fi
   P=$(dirname "$P")
 done
-# 第二遍：最近的构建 marker（顺序即优先级）
+# 第二遍：最近的构建 marker（顺序即优先级，列表由 `project_root::MARKERS` 生成）
 P="$D"
 while [ "$P" != "/" ] && [ -n "$P" ]; do
-  for M in Cargo.toml package.json pyproject.toml go.mod .hg; do
+  for M in {markers}; do
     if [ "$P" != "$HOME" ] && [ -e "$P/$M" ]; then
       printf 'marker:%s	%s
 ' "$M" "$P"
@@ -407,7 +422,16 @@ while [ "$P" != "/" ] && [ -n "$P" ]; do
 done
 exit 7
 "#
-    );
+    )
+}
+
+#[cfg(windows)]
+pub fn find_project_root(
+    distro: &str,
+    abs_path: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Option<(String, String)>, String> {
+    let script = find_project_root_script(abs_path);
     let out = run_bash_stdin(distro, &script, deadline)?;
     match out.status.code() {
         Some(0) => {
@@ -779,6 +803,45 @@ fn shell_escape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
+// 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
+#[allow(clippy::disallowed_methods)]
+mod marker_list_tests {
+    /// 🔴 **归属脚本的 marker 列表必须来自 `MARKERS`，不能是手抄的第二份。**
+    ///
+    /// 它曾硬编码着 `Cargo.toml package.json pyproject.toml go.mod .hg`。两份都活着
+    /// 的时候，往 `MARKERS` 里加一个新 marker **不会有任何东西报错** —— 本机路径
+    /// 认得它、WSL 里的同一个项目认不得，症状是「同一个项目在 Windows 侧是一个根、
+    /// 在 WSL 侧不是」。本仓刚为「同一个项目两个身份」付过一次代价。
+    ///
+    /// 判据按**内容**写，不按当下这八个的拼写 —— 否则下次加 marker 时它自己就成了
+    /// 第三份要维护的清单。
+    ///
+    /// ⚠️ 只在 Windows 上跑：脚本构造本身与平台无关，但它的宿主函数是
+    /// `#[cfg(windows)]` 的（`wsl.exe` 只在那儿）。
+    #[test]
+    #[cfg(windows)]
+    fn the_attribution_script_takes_its_markers_from_the_one_list() {
+        let script = super::find_project_root_script("/home/u/proj");
+        for m in crate::project_root::MARKERS {
+            if m == ".git" {
+                // `.git` 由第一遍单独走，且优先级高于所有 marker。
+                assert!(
+                    script.contains(r#"[ -e "$P/.git" ]"#),
+                    "第一遍必须单独探 .git（它全局优先于 marker）"
+                );
+                continue;
+            }
+            assert!(
+                script.contains(m),
+                "`MARKERS` 里的 {m:?} 没进 WSL 归属脚本 —— \
+                 同一个项目会在 Windows 侧是根、在 WSL 侧不是，而不会有任何东西报错"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

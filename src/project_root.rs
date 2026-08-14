@@ -10,13 +10,37 @@ use serde::{Deserialize, Serialize};
 use crate::pathnorm::{self, HostPlatform};
 
 /// 工程根标记文件（命中即视为工程根；顺序即优先级展示，实际取最近祖先）。
-pub const MARKERS: [&str; 6] = [
+///
+/// 🔴 **这是唯一的清单。** `wsl.rs::find_project_root` 的 shell 脚本从这里生成 ——
+/// 它曾硬抄一份，而两份都活着的时候往这里加一个 marker 不会有任何东西报错：
+/// 本机路径认得它、WSL 里的同一个项目认不得，症状是「同一个项目在 Windows 侧是
+/// 一个根、在 WSL 侧不是」。`.git` 由两处的**第一遍**单独走（全局优先于 marker），
+/// 所以两处都把它从 marker 那一遍滤掉。
+///
+/// 🔴 **`CLAUDE.md` / `AGENTS.md` 在列，理由和其它六个不同**（2026-08-14）。
+///
+/// 前六个是**开发者产物**。一个用 Claude Code 写作、记笔记、整理数据的人一个都
+/// 不会命中 ⇒ 他的**全部**用量都进不了项目页。实测本机就有这一族
+/// （`Dropbox\工作笔记`、`Documents\Codex\…`）：19,553 事件 / 50 会话。
+///
+/// 而 agent 指令文件是个**强信号且几乎不会误判**：用户亲手为那个文件夹写过说明，
+/// 等于已经说过「这是我的一个工作区」。它还有两个 QuotaBar 侧声明比不了的性质
+/// —— **跟着文件夹走**（换机器、重装都在），**别的工具也看得见**。
+///
+/// ⚠️ 它治标不治本：只用 Claude Code 写小说、一个 `.md` 都没写过的用户仍然什么都
+/// 没有。根治是让用户显式声明（`RootSource::Configured`）+ 项目页诚实地分出
+/// 「其它文件夹」一档，见 MASTER_PLAN 的 A/C 两项。
+///
+/// ⚠️ **别加 `README.md`**：到处都是，会把每一个子目录都变成「项目」。
+pub const MARKERS: [&str; 8] = [
     ".git",
     "Cargo.toml",
     "package.json",
     "pyproject.toml",
     "go.mod",
     ".hg",
+    "CLAUDE.md",
+    "AGENTS.md",
 ];
 
 /// 工程根解析结果。
