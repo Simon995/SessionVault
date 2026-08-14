@@ -1358,6 +1358,19 @@ impl TotalStore {
     /// 2. 每个 `(来源, project_root)` **本进程至多问一次盘**（`identity_seen`）。
     /// 3. 🔴 **失败绝不影响摄取**：身份是**加法**能力，它坏了不该让事件写不进总库。
     ///    所以本函数不返回 `Result` —— 调用点连忽略错误的机会都不需要有。
+    /// 把一条「问过了」从 `identity_seen` 里撤回。
+    ///
+    /// 🔴 **「问过了」这个缓存只该记住终态。** `identity_seen` 是**先记后算**的
+    /// （避免一个读不到的项目让它名下每个文件都去试一次盘），代价是任何在计算中途
+    /// 退出的分支都必须把它撤回 —— 否则那不是「至多问一次盘」，是「永远不再问」。
+    /// 现在有两个这样的分支（探不到 `.git`、读不了 config），且都在同一个函数里，
+    /// 所以收成一个函数：下一个人加第三个分支时，撤回这件事有名字可用。
+    fn forget_identity_probe(&self, key: &(String, String, String)) {
+        if let Ok(mut seen) = self.identity_seen.lock() {
+            seen.remove(key);
+        }
+    }
+
     fn record_project_identity(&self, events: &[RawEvent]) {
         let Some(ev) = events.first() else { return };
         let Some(root) = ev.project_root.as_deref().filter(|r| !r.is_empty()) else {
@@ -1394,15 +1407,27 @@ impl TotalStore {
                     target: crate::logging::tag::SQLITE,
                     "project identity probe failed, will retry: {e}"
                 );
-                if let Ok(mut seen) = self.identity_seen.lock() {
-                    seen.remove(&key);
-                }
+                self.forget_identity_probe(&key);
                 return;
             }
         };
-        let cid = crate::identity::canonical_repo_id(&git_root);
+        // 🔴 读 config 也可能「没问成」（三轮评审 P2-1）：从前 `canonical_repo_id`
+        // 返回 `String`，把它压成 `path:` 兜底身份，而下一行正好把 `path:` 丢掉 ——
+        // 于是一次瞬时故障与「这个仓真的没配 origin」结果完全相同，且因为**先记后算**
+        // 再也不会重试。撤回缓存，下轮重来。
+        let cid = match crate::identity::canonical_repo_id(&git_root) {
+            Ok(cid) => cid,
+            Err(e) => {
+                log::debug!(
+                    target: crate::logging::tag::SQLITE,
+                    "project identity config unreadable, will retry: {e}"
+                );
+                self.forget_identity_probe(&key);
+                return;
+            }
+        };
         if !cid.starts_with("git:") {
-            return; // 约束 1：不写 `path:` 兜底行
+            return; // 约束 1：不写 `path:` 兜底行（这是**确认**没有 remote 的情形）
         }
 
         let now = now_unix_millis();
