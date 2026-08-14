@@ -86,7 +86,8 @@ pub fn list_distros(deadline: crate::deadline::Deadline) -> Result<Vec<String>, 
 }
 
 #[cfg(not(windows))]
-pub fn list_distros() -> Result<Vec<String>, String> {
+pub fn list_distros(deadline: crate::deadline::Deadline) -> Result<Vec<String>, String> {
+    let _ = deadline;
     Ok(Vec::new())
 }
 
@@ -451,6 +452,7 @@ pub fn find_project_root(
     }
 }
 
+#[cfg(windows)]
 pub fn stat(
     distro: &str,
     abs_path: &str,
@@ -549,26 +551,65 @@ pub enum PathKind {
     Other,
 }
 
+// 🔴 **非 Windows 的桩曾经是「第二份签名」，而开发机永远不编译它**
+// （2026-08-14 CI 实测：`stat` 的真实现丢了 `#[cfg(windows)]` ⇒ 与桩重复定义；
+// `list_distros` / `find_project_root` 的桩少了 `deadline` 参数 —— 三处都是加参数时
+// 只改了看得见的那一半）。这与本仓反复栽的「两份实现只跑一份」同族，只是这次
+// **那一份连编译都没编译过**。
+//
+// 现在桩由 `stub_on_non_windows!` 生成：**签名只写一次**，真实现与桩共用同一行 ——
+// 漂移在类型上表达不出来。要加参数就得改那一行，两边同时跟着走。
 #[cfg(not(windows))]
-pub fn stat(_distro: &str, _abs_path: &str) -> Result<Option<(u64, i64)>, String> {
-    Err("wsl.exe access is only available on Windows builds".to_string())
+macro_rules! stub_on_non_windows {
+    ($( $(#[$m:meta])* pub fn $name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> $ret:ty ; )+) => {
+        $(
+            $(#[$m])*
+            pub fn $name($($arg : $ty),*) -> $ret {
+                $( let _ = $arg; )*
+                Err("wsl.exe access is only available on Windows builds".to_string())
+            }
+        )+
+    };
 }
 
 #[cfg(not(windows))]
-pub fn stat_kind(
-    _distro: &str,
-    _abs_path: &str,
-    _deadline: crate::deadline::Deadline,
-) -> Result<Option<PathKind>, String> {
-    Err("wsl.exe access is only available on Windows builds".to_string())
-}
+stub_on_non_windows! {
+    pub fn stat(
+        distro: &str,
+        abs_path: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Option<(u64, i64)>, String>;
 
-#[cfg(not(windows))]
-pub fn find_project_root(
-    _distro: &str,
-    _abs_path: &str,
-) -> Result<Option<(String, String)>, String> {
-    Err("wsl.exe access is only available on Windows builds".to_string())
+    pub fn stat_kind(
+        distro: &str,
+        abs_path: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Option<PathKind>, String>;
+
+    pub fn find_project_root(
+        distro: &str,
+        abs_path: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Option<(String, String)>, String>;
+
+    pub fn read_range(
+        distro: &str,
+        abs_path: &str,
+        start: u64,
+        end: u64,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Vec<u8>, String>;
+
+    pub fn read_file_at(
+        distro: &str,
+        abs_path: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Option<String>, String>;
+
+    pub fn existing_files(
+        distro: &str,
+        paths: &[String],
+    ) -> Result<std::collections::HashSet<String>, String>;
 }
 
 /// 读发行版内绝对路径文件的字节区间 `[start, end)`（对应本地 `read_range`/`Seek`）。
@@ -609,16 +650,6 @@ pub fn read_range(
         ));
     }
     Ok(out.stdout)
-}
-
-#[cfg(not(windows))]
-pub fn read_range(
-    _distro: &str,
-    _abs_path: &str,
-    _start: u64,
-    _end: u64,
-) -> Result<Vec<u8>, String> {
-    Err("wsl.exe access is only available on Windows builds".to_string())
 }
 
 /// 读发行版内**绝对路径**文件的全文。`Ok(None)` = 文件不存在（exit 7 哨兵），
@@ -669,15 +700,6 @@ pub fn read_file_at(
     }
 }
 
-#[cfg(not(windows))]
-pub fn read_file_at(
-    _distro: &str,
-    _abs_path: &str,
-    _deadline: crate::deadline::Deadline,
-) -> Result<Option<String>, String> {
-    Err("wsl.exe access is only available on Windows builds".to_string())
-}
-
 /// 一次 WSL 进程批量探测多条绝对路径，避免最新快照查询为每个文件各 spawn
 /// 一个 `wsl.exe`。返回实际存在的原始路径集合。
 #[cfg(windows)]
@@ -701,14 +723,6 @@ pub fn existing_files(
         ));
     }
     Ok(parse_nul_paths(&output.stdout).into_iter().collect())
-}
-
-#[cfg(not(windows))]
-pub fn existing_files(
-    _distro: &str,
-    _paths: &[String],
-) -> Result<std::collections::HashSet<String>, String> {
-    Err("wsl.exe access is only available on Windows builds".to_string())
 }
 
 /// 在 Windows 上给 spawn 打 `CREATE_NO_WINDOW`，避免 GUI 宿主弹出闪烁的控制台窗口。
@@ -790,7 +804,8 @@ fn parse_nul_paths(bytes: &[u8]) -> Vec<String> {
 
 /// 为嵌入双引号 bash 串转义 segment：只转义在双引号内仍生效的四个字符（`\ " $ ` `）。
 /// 输入是本 crate 自己的常量/已发现路径，非不可信粘贴，故防御性足够。
-#[cfg(any(windows, test))]
+// 纯字符串变换 —— **不能** gate 到 windows：`find_project_root_script`（无 cfg，
+// 为了可测而抽出）在 Linux 构建里也要用它。
 fn shell_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
