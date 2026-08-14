@@ -311,6 +311,19 @@ enum Out<'a> {
         /// 别名管「同一条路径的不同写法」，这个管「不同路径上的同一个 repo」
         /// （Windows 一份 checkout + WSL 一份）。见 `store::ProjectRootRow::canonical_id`。
         canonical_id: Option<String>,
+        /// 这个根在 Claude 侧**可能**的 `projects/<enc>` 目录名（每种写法各一个）。
+        ///
+        /// 🔴 **给出来，消费方就不必解码。** 解码要探盘消歧（`-` 既可能是分隔符
+        /// 也可能是名字的一部分），而编码是纯字符串变换 —— 把问题倒过来之后，
+        /// 「哪个目录属于哪个项目」变成一次**存在性检查**。TumeFlow 曾自己实现
+        /// 解码，与 Rust 那份漂开过（2026-08-14 实测）。
+        claude_project_dirs: Vec<String>,
+        /// 宿主**能打开**的那个写法；`null` = 给不出。
+        ///
+        /// 🔴 规范形 `wsl:<d>:/…` 是标识符不是路径；裸 Linux 路径在 Windows 上会被
+        /// 当成当前盘的相对路径（**打开错的东西**，比报错更坏）。所以这里宁可给
+        /// `null` 也不拿它们冒充。
+        host_path: Option<String>,
     },
     /// `roots` 的收尾摘要。
     ///
@@ -1268,6 +1281,15 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
             last_seen_ms: r.last_seen_ms,
             aliases: r.aliases.clone(),
             canonical_id: r.canonical_id.clone(),
+            claude_project_dirs: session_vault::project_dir::claude_project_dirs(
+                &r.root_path,
+                &r.aliases,
+            ),
+            host_path: session_vault::project_dir::host_openable_form(
+                &r.root_path,
+                &r.aliases,
+                session_vault::pathnorm::HostPlatform::current(),
+            ),
         });
     }
     emit(&Out::RootsSummary {
