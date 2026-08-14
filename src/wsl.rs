@@ -463,8 +463,79 @@ pub fn stat(
     }
 }
 
+/// 发行版内一条路径上**有什么东西**。
+///
+/// 🔴 **与 [`stat`] 的分工是「问什么」，不是「怎么问」。** 那个问 `[ -f ]` ——
+/// 它要的是 mtime/size，而这两样只对普通文件有意义。拿它去答「这里有没有目录」，
+/// **每一个目录都会被报成「不存在」**：`WslBackend` 的文档从第一天就写着这条边界
+/// （「要问『这里有没有目录』的调用方必须先扩访问桥」），本函数就是它说的那次扩。
+///
+/// `[ -L ]` 那一支不能省：一个**断掉的**符号链接下 `[ -e ]` 为假，而那条路径上
+/// 确实有东西。把它报成「没有」，就又造了一个「没问成长得像这里是空的」。
+///
+/// 退出码即三态：`0` = 有（stdout 是 `dir` / `file` / `other`），`7` = 确认没有，
+/// 其余 = 没问成。**「没问成」绝不折进「没有」。**
+#[cfg(windows)]
+pub fn stat_kind(
+    distro: &str,
+    abs_path: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Option<PathKind>, String> {
+    let esc = shell_escape(abs_path);
+    let script = format!(
+        "set -eu\nF=\"{esc}\"\n\
+         if [ -d \"$F\" ]; then printf 'dir\\n'\n\
+         elif [ -f \"$F\" ]; then printf 'file\\n'\n\
+         elif [ -e \"$F\" ] || [ -L \"$F\" ]; then printf 'other\\n'\n\
+         else exit 7\n\
+         fi\n"
+    );
+    let out = run_bash_stdin(distro, &script, deadline)?;
+    match out.status.code() {
+        Some(0) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            match text.trim() {
+                "dir" => Ok(Some(PathKind::Dir)),
+                "file" => Ok(Some(PathKind::File)),
+                "other" => Ok(Some(PathKind::Other)),
+                // 认不出来的输出不是「没有」—— 脚本被谁改坏了也是「没问成」。
+                other => Err(format!(
+                    "wsl stat_kind {distro}:{abs_path} bad output: {other:?}"
+                )),
+            }
+        }
+        Some(7) => Ok(None),
+        Some(code) => Err(format!(
+            "wsl stat_kind {distro}:{abs_path} exited {code}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        None => Err(format!(
+            "wsl stat_kind {distro}:{abs_path} terminated by signal"
+        )),
+    }
+}
+
+/// [`stat_kind`] 的答案。**不是** `probe::FileKind` —— 本模块在它下面一层
+/// （`probe.rs` 调用 `wsl.rs`，反向依赖会成环），翻译由 `probe.rs` 做。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Dir,
+    File,
+    /// 符号链接（含指向宿主看不见处的、以及断掉的）、设备文件、FIFO……
+    Other,
+}
+
 #[cfg(not(windows))]
 pub fn stat(_distro: &str, _abs_path: &str) -> Result<Option<(u64, i64)>, String> {
+    Err("wsl.exe access is only available on Windows builds".to_string())
+}
+
+#[cfg(not(windows))]
+pub fn stat_kind(
+    _distro: &str,
+    _abs_path: &str,
+    _deadline: crate::deadline::Deadline,
+) -> Result<Option<PathKind>, String> {
     Err("wsl.exe access is only available on Windows builds".to_string())
 }
 

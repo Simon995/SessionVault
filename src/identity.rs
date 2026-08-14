@@ -282,25 +282,53 @@ pub fn normalize_remote(url: &str) -> Option<String> {
 /// 而同一个仓的 Windows checkout 有 `git:…`，**两份 checkout 因此永远不同身份**。
 /// 记忆库里的直接后果：QuotaBar 被拆成 37 条 + 24 条，各持一半互相看不见。
 ///
-/// ⚠️ **UNC 换算这条路走不通**，量过才知道：把规范形换成
-/// `\\wsl.localhost\<distro>\…` 之后，本进程里 `metadata(base)` 返回
-/// 「既不是文件也不是目录」，而它**底下每一项**都是 `os error 267`
-/// （连 `read_dir` 也是）—— 整棵子树进不去。同一条路径 Git Bash 的 `ls` 却能列，
-/// 所以这不是「路径不对」，是**进程之间行为不同**（本仓那条「在 A 环境量到的值
-/// 不能给 B 环境结案」）。访问桥不受这个影响：`wsl.exe` 在发行版**内部**读。
+/// ⚠️ **UNC 换算对这个根走不通**：换成 `\\wsl.localhost\<distro>\…` 之后，
+/// `metadata(base)` 返回「既不是文件也不是目录」，底下每一项都是 `os error 267`
+/// （连 `read_dir` 也是）。
+///
+/// 🔴 **我最初把它解释成「进程之间行为不同」，那是错的**（2026-08-14 当天更正）。
+/// 真相是这个特定的根是一个**符号链接**：
+/// `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
+/// 链接指向 WSL 内部的挂载点，宿主沿 9P 跟不进去。**同一台机器上其它 WSL 项目
+/// （EyeVLM、corneal-staining-grading…）走 UNC 一直是好的** —— 所以「UNC 对 WSL
+/// 不可用」这个结论过宽，照它去设计会白白付掉每次探测一个 `wsl.exe` 的代价
+/// （实测一次往返 ≈1.5 秒）。真正成立的判据是**「这条路径归谁管」**：归发行版管的
+/// 内容，宿主答不上来时就该问它 —— 见 `probe::WslUncBackend` 的取舍。
+///
+/// 访问桥不受影响：`wsl.exe` 在发行版**内部**读，链接在那一侧是正常的。
 pub fn repo_id_for_root(
     root: &str,
     deadline: Deadline,
-) -> Result<String, crate::probe::ProbeError> {
+) -> Result<RepoIdentity, crate::probe::ProbeError> {
     let Some((distro, linux_path)) = crate::pathnorm::split_canonical_wsl(root) else {
         // 本机路径：老路不变。
         return match find_git_root(Path::new(root)) {
-            GitRoot::Found(p) => canonical_repo_id(&p),
-            GitRoot::Absent => Ok(format!("path:{root}")),
+            GitRoot::Found(p) => Ok(RepoIdentity {
+                id: canonical_repo_id(&p)?,
+                repo_root: Some(p.to_string_lossy().into_owned()),
+            }),
+            GitRoot::Absent => Ok(RepoIdentity {
+                id: format!("path:{root}"),
+                repo_root: None,
+            }),
             GitRoot::Unknown(e) => Err(e),
         };
     };
     wsl_repo_id(distro, linux_path, root, deadline)
+}
+
+/// [`repo_id_for_root`] 的答案。
+///
+/// 🔴 **`repo_root` 不能由调用方从 `id` 反推。** 它想知道的是「我给的这条路径
+/// 本身就是仓库根吗」（别名分组挑代表要用），而 `path:` 前缀同时盖住「这里没有
+/// `.git`」和「有 `.git` 但里面没有 origin」两种情况 —— 反推在后一种上就错了。
+/// 判据只有本模块知道，所以由本模块说出来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoIdentity {
+    /// `git:<host>/<path>`（读到了 origin）或 `path:<root>`（读明白了，没有）。
+    pub id: String,
+    /// 身份所依据的仓库根。`None` = 这条链上没有可用的 `.git`。
+    pub repo_root: Option<String>,
 }
 
 /// 经 `wsl.exe` 在发行版内部读 `.git/config`。
@@ -312,9 +340,17 @@ fn wsl_repo_id(
     linux_path: &str,
     original_root: &str,
     deadline: Deadline,
-) -> Result<String, crate::probe::ProbeError> {
+) -> Result<RepoIdentity, crate::probe::ProbeError> {
     let base = linux_path.trim_end_matches('/');
     let err = |m: String| crate::probe::ProbeError::new(Path::new(original_root), m);
+    // 「这条链上没有可用的 `.git`」的统一出口 —— 三个返回点从前各写一遍
+    // `Ok(format!("path:{original_root}"))`，现在多了一个 `repo_root` 字段要一起给对。
+    let no_git = || {
+        Ok(RepoIdentity {
+            id: format!("path:{original_root}"),
+            repo_root: None,
+        })
+    };
 
     // `.git` 是目录时 config 就在下面；是文件时（worktree / submodule）它是
     // `gitdir: <path>` 指针 —— 与本机那条同一套规则，只是换了访问方式。
@@ -327,14 +363,14 @@ fn wsl_repo_id(
                 .map_err(|e| err(format!("wsl read .git: {e}")))?;
             let Some(p) = pointer else {
                 // 探明白了：这个根下没有 `.git` —— 事实，不是没问成。
-                return Ok(format!("path:{original_root}"));
+                return no_git();
             };
             let Some(rel) = p
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("gitdir:"))
                 .map(str::trim)
             else {
-                return Ok(format!("path:{original_root}"));
+                return no_git();
             };
             let gitdir = if rel.starts_with('/') {
                 rel.to_string()
@@ -345,14 +381,23 @@ fn wsl_repo_id(
                 .map_err(|e| err(format!("wsl read gitdir config: {e}")))?
             {
                 Some(t) => t,
-                None => return Ok(format!("path:{original_root}")),
+                None => return no_git(),
             }
         }
     };
     match parse_origin_url(&text).and_then(|u| normalize_remote(&u)) {
-        Some(norm) => Ok(format!("git:{norm}")),
-        // 读到了、里面没有 origin —— 事实。
-        None => Ok(format!("path:{original_root}")),
+        Some(norm) => Ok(RepoIdentity {
+            id: format!("git:{norm}"),
+            // 读到 config 就说明 `.git` 在这一层 —— 本函数**不上溯**（见上方注释），
+            // 所以「仓库根」就是调用方给的那个根，原样奉还它给的写法。
+            repo_root: Some(original_root.to_string()),
+        }),
+        // 读到了、里面没有 origin —— 事实。**但 `.git` 确实在这里**，所以
+        // `repo_root` 不是 `None`：那两件事分别是「有没有身份」和「根在哪」。
+        None => Ok(RepoIdentity {
+            id: format!("path:{original_root}"),
+            repo_root: Some(original_root.to_string()),
+        }),
     }
 }
 
@@ -622,10 +667,11 @@ mod tests {
     fn a_local_path_still_resolves_on_the_local_fs() {
         let root = scratch("local-still-local");
         seed_repo(&root, Some("git@github.com:o/r.git"));
-        assert_eq!(
-            repo_id_for_root(&root.to_string_lossy(), Deadline::unbounded()).unwrap(),
-            "git:github.com/o/r"
-        );
+        let got = repo_id_for_root(&root.to_string_lossy(), Deadline::unbounded()).unwrap();
+        assert_eq!(got.id, "git:github.com/o/r");
+        // 🔴 `repo_root` 也要钉：它是别名分组挑代表的依据，而调用方**不能**从 `id`
+        // 反推（`path:` 同时盖住「没有 .git」和「有 .git 但没 origin」）。
+        assert_eq!(got.repo_root.as_deref(), Some(&*root.to_string_lossy()));
         std::fs::remove_dir_all(&root).ok();
     }
 

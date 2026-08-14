@@ -499,33 +499,153 @@ pub fn set_permissions(path: &Path, perm: std::fs::Permissions) -> std::io::Resu
 }
 
 /// 某个 WSL 发行版内的路径，经访问桥探测。
+///
+/// 🔴 **为什么要它，而不是让 `LocalBackend` 去问 `\\wsl.localhost\…`**：宿主侧
+/// 那条 UNC 路对**大多数**目录确实答得上来，于是这个后端看起来可有可无 ——
+/// 直到路上出现一个**符号链接**。实测
+/// `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`：
+/// 链接的目标是 WSL 内部的挂载点，宿主沿 9P 跟不进去，`metadata` 返回「既不是
+/// 文件也不是目录」⇒ 调用方（`decode_project_dir`）读成**「这个项目不存在」**。
+/// 后果是同一个目录的项目记忆分裂成互不可见的两半，而界面上一切正常。
+///
+/// 判据因此不是「UNC 通不通」，是**「这条路径归谁管」** —— 归发行版管的，就该问它。
 #[derive(Debug, Clone)]
 pub struct WslBackend {
     pub distro: String,
+    /// 宿主侧的 UNC 前缀（`\\wsl.localhost\<distro>`）。非空时 [`probe`] 收到的
+    /// 路径按它剥掉、`\` 换 `/`，还原成发行版内部的绝对路径再问桥。
+    ///
+    /// 空 = 调用方**已经**用发行版内部写法寻址（`discover.rs` 就是）。
+    ///
+    /// [`probe`]: ProbeBackend::probe
+    prefix: String,
 }
 
 impl WslBackend {
+    /// 调用方用发行版内部的绝对路径寻址（`/home/u/x`）。
     pub fn new(distro: impl Into<String>) -> Self {
         Self {
             distro: distro.into(),
+            prefix: String::new(),
         }
+    }
+
+    /// 调用方用宿主的 UNC 写法寻址（`\\wsl.localhost\<distro>\home\u\x`）。
+    ///
+    /// 同一条路径的两种写法 —— `pathnorm` 早就把这件事建模了，所以翻译放在这里，
+    /// 调用方一行不用改。
+    pub fn under_host_prefix(distro: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            distro: distro.into(),
+            prefix: prefix.into(),
+        }
+    }
+
+    /// 宿主写法 → 发行版内部绝对路径。`None` = 这条路径**不在**声明的前缀下，
+    /// 本后端答不了它。
+    fn to_linux(&self, path: &Path) -> Option<String> {
+        let s = path.to_string_lossy();
+        if self.prefix.is_empty() {
+            return Some(s.into_owned());
+        }
+        // Windows 路径大小写不敏感，而前缀来自配置、路径来自拼接 —— 两者大小写
+        // 不一致是可预期的，不该因此答不出来。
+        //
+        // 前缀是 ASCII（`\\wsl.localhost\<distro>`），所以匹配成立时 `prefix.len()`
+        // 必然落在字符边界上，切片不会 panic。
+        if !s
+            .to_ascii_lowercase()
+            .starts_with(&self.prefix.to_ascii_lowercase())
+        {
+            return None;
+        }
+        let linux = s[self.prefix.len()..].replace('\\', "/");
+        Some(if linux.starts_with('/') {
+            linux
+        } else {
+            format!("/{linux}")
+        })
     }
 }
 
 impl ProbeBackend for WslBackend {
-    /// `wsl::stat` 已经是三态的（`Ok(Some)` / `Ok(None)` / `Err`），这里只做翻译。
-    ///
-    /// 🔴 **边界：访问桥问的是 `[ -f ]`，只认「普通文件」。** 于是一个**目录**会
-    /// 落到 `Ok(None)` ⇒ 本函数报 [`Probed::Absent`]。对今天唯一的 WSL 调用方
-    /// （`discover.rs` 找 `CLAUDE.md` / `AGENTS.md`）这是忠实的；但**要问「这里有没有
-    /// 目录」的调用方必须先扩访问桥**，不能直接用这个 backend —— 否则拿到的是一个
-    /// 看起来权威的错答案，而那比说不出来更糟。
+    /// `wsl::stat_kind` 已经是三态的（`Ok(Some)` / `Ok(None)` / `Err`），这里只做翻译。
     fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind> {
-        let linux_path = path.to_string_lossy();
-        match crate::wsl::stat(&self.distro, &linux_path, deadline) {
-            Ok(Some(_)) => Probed::Found(FileKind::File),
+        // 🔴 **答不了 ≠ 这里没有。** 前缀对不上说明调用方拿错了命名空间；
+        // 报 `Absent` 会让它据此删数据 —— 那正是本类型存在的理由的反面。
+        let Some(linux_path) = self.to_linux(path) else {
+            return Probed::Unknown(ProbeError::new(
+                path,
+                format!(
+                    "not under this backend's declared WSL prefix {:?} (distro {})",
+                    self.prefix, self.distro
+                ),
+            ));
+        };
+        match crate::wsl::stat_kind(&self.distro, &linux_path, deadline) {
+            Ok(Some(crate::wsl::PathKind::Dir)) => Probed::Found(FileKind::Dir),
+            Ok(Some(crate::wsl::PathKind::File)) => Probed::Found(FileKind::File),
+            Ok(Some(crate::wsl::PathKind::Other)) => Probed::Found(FileKind::Other),
             Ok(None) => Probed::Absent,
             Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+        }
+    }
+}
+
+/// 宿主 UNC 探测，**只在一个答案上**回落到发行版权威。
+///
+/// 🔴 **兜底只针对 [`FileKind::Other`]。** 宿主对发行版内的路径不是万能的，但也
+/// 不是全无用处：只要父目录可遍历，`Dir` / `File` / `Absent` 都是事实。唯一不可信的
+/// 是「有东西，但既不是文件也不是目录」—— 它几乎总是一个**宿主跟不进去的符号链接**，
+/// 而链接的另一头完全可能是目录。实测
+/// `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`：宿主沿
+/// 9P 跟不进那个挂载点，`metadata` 返回既非文件也非目录，`decode_project_dir` 于是
+/// 读成**「这个项目不存在」**，同一个目录的项目记忆分裂成互不可见的 37 + 24 两半。
+///
+/// 🔴 **为什么不干脆全走桥**：每次探测都要起一个 `wsl.exe`，实测一次往返 ≈1.5 秒，
+/// 而 `decode_project_dir` 对一条四段路径要问 10 个候选 —— 全走桥是「7 个项目
+/// 30 秒的界面卡顿」，兜底是「**每个符号链接一次**」。这个取舍成立的前提正是上一段
+/// 那句话：宿主给的另外三种答案是事实，不需要复核。前提若变（比如将来要探
+/// 宿主根本挂不上的发行版），这里就该整体换成 [`WslBackend`]。
+pub struct WslUncBackend {
+    host: Box<dyn ProbeBackend>,
+    authority: Box<dyn ProbeBackend>,
+}
+
+impl WslUncBackend {
+    /// `prefix` 是 ADR-033 的 `fs_prefix`（`\\wsl.localhost\<distro>`）。
+    pub fn new(distro: impl Into<String>, prefix: impl Into<String>) -> Self {
+        Self {
+            host: Box::new(LocalBackend::unanchored()),
+            authority: Box::new(WslBackend::under_host_prefix(distro, prefix)),
+        }
+    }
+
+    /// 两侧都注入 —— **组合逻辑本身要可测**。
+    ///
+    /// 🔴 只测一个「宿主答案够不够用」的纯谓词是**假护栏**：把 `probe` 的调用点改回
+    /// 无条件信任宿主，那种测试照样全绿（本仓判例：断言 `transport_error` 返回什么，
+    /// 而调用点改回裸 `format!` 依然通过）。判据必须打在真正跑的那条路上。
+    pub fn with_backends(host: Box<dyn ProbeBackend>, authority: Box<dyn ProbeBackend>) -> Self {
+        Self { host, authority }
+    }
+}
+
+impl ProbeBackend for WslUncBackend {
+    fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind> {
+        match self.host.probe(path, deadline) {
+            // 符号链接**本身**：宿主看到「有东西，但既不是文件也不是目录」。
+            Probed::Found(FileKind::Other) => self.authority.probe(path, deadline),
+            // 符号链接**下面**的路径：宿主给 `ERROR_DIRECTORY`（raw 267）⇒ `Unknown`。
+            // 🔴 这一支是补上去的 —— 只兜 `Other` 时，解码修好了，紧接着
+            // `find_git_root` 探 `<项目>/.git` 照样报「探不动」。**同一个符号链接，
+            // 两种症状**：踩在它身上是 `Other`，穿过它是 `Unknown`。
+            //
+            // 兜 `Unknown` 不违反上面「另外三种答案是事实」那句话：`Unknown` 本来就
+            // 不是答案。代价也可控 —— 宿主对发行版内的路径极少答不出来，答不出来时
+            // 本就该问权威。
+            Probed::Unknown(_) => self.authority.probe(path, deadline),
+            other => other,
         }
     }
 }
@@ -724,6 +844,128 @@ mod tests {
             ),
             "不可达的 UNC 主机被判成「确认不存在」"
         );
+    }
+
+    // ── WSL：宿主写法 → 发行版内部路径 ────────────────────────────────────
+
+    const PREFIX: &str = r"\\wsl.localhost\Ubuntu-22.04";
+
+    #[test]
+    fn a_host_unc_path_becomes_the_in_distro_absolute_path() {
+        let b = WslBackend::under_host_prefix("Ubuntu-22.04", PREFIX);
+        assert_eq!(
+            b.to_linux(Path::new(&format!(
+                r"{PREFIX}\home\simon\workspace\QuotaBar"
+            ))),
+            Some("/home/simon/workspace/QuotaBar".to_string())
+        );
+        // 前缀本身 ⇒ 发行版根。
+        assert_eq!(b.to_linux(Path::new(PREFIX)), Some("/".to_string()));
+    }
+
+    /// Windows 路径大小写不敏感，而前缀来自配置、路径来自拼接。
+    #[test]
+    fn the_prefix_match_ignores_case() {
+        let b = WslBackend::under_host_prefix("Ubuntu-22.04", PREFIX);
+        assert_eq!(
+            b.to_linux(Path::new(r"\\WSL.LOCALHOST\ubuntu-22.04\home\u")),
+            Some("/home/u".to_string())
+        );
+    }
+
+    /// 🔴 **答不了 ≠ 这里没有。** 前缀对不上说明调用方拿错了命名空间 ——
+    /// 报 `Absent` 会让它据此删数据。
+    ///
+    /// ⚠️ **`Unknown` 本身不足以当判据**（变异时发现）：把「对不上就原样放行」写进
+    /// `to_linux`，路径会被原样送进 `wsl.exe`，那边找不到也报 `Unknown` ——
+    /// 断言照样绿，而实际白 spawn 了一个进程。所以判据是**错误说的是哪件事**。
+    #[test]
+    fn a_path_outside_the_prefix_is_unknown_not_absent() {
+        let b = WslBackend::under_host_prefix("Ubuntu-22.04", PREFIX);
+        assert_eq!(b.to_linux(Path::new(r"C:\Users\u\proj")), None);
+        match b.probe(Path::new(r"C:\Users\u\proj"), Deadline::unbounded()) {
+            Probed::Unknown(e) => assert!(
+                e.to_string()
+                    .contains("not under this backend's declared WSL prefix"),
+                "必须是「命名空间不对」而不是「问了发行版、它说没有」。实际：{e}"
+            ),
+            other => panic!("前缀对不上必须报 Unknown，实际：{other:?}"),
+        }
+    }
+
+    /// 空前缀 = 调用方已经用发行版内部写法寻址（`discover.rs` 就是）。
+    #[test]
+    fn an_empty_prefix_passes_the_path_through() {
+        let b = WslBackend::new("Ubuntu-22.04");
+        assert_eq!(
+            b.to_linux(Path::new("/home/u/x")),
+            Some("/home/u/x".to_string())
+        );
+    }
+
+    // ── WslUncBackend：只在两种答案上回落到权威 ────────────────────────────
+
+    struct Fixed(Probed<FileKind>);
+    impl ProbeBackend for Fixed {
+        fn probe(&self, _p: &Path, _d: Deadline) -> Probed<FileKind> {
+            self.0.clone()
+        }
+    }
+
+    fn composed(host: Probed<FileKind>) -> Probed<FileKind> {
+        WslUncBackend::with_backends(
+            Box::new(Fixed(host)),
+            // 权威答「目录」—— 与宿主给的任何一种答案都不同，所以「问没问权威」
+            // 在结果里看得出来。
+            Box::new(Fixed(Probed::Found(FileKind::Dir))),
+        )
+        .probe(
+            Path::new(r"\\wsl.localhost\D\home\u\p"),
+            Deadline::unbounded(),
+        )
+    }
+
+    /// 🔴 **符号链接本身**：宿主说「有东西，但既不是文件也不是目录」。
+    ///
+    /// 实测 `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
+    /// 宿主沿 9P 跟不进那个挂载点。把这个答案当「不是目录」处理，`decode_project_dir`
+    /// 就报「这个项目不存在」，同一个目录的记忆分裂成互不可见的两半。
+    #[test]
+    fn an_unfollowable_link_asks_the_authority() {
+        assert_eq!(
+            composed(Probed::Found(FileKind::Other)),
+            Probed::Found(FileKind::Dir)
+        );
+    }
+
+    /// 🔴 **符号链接下面的路径**：宿主给 `ERROR_DIRECTORY`（raw 267）⇒ `Unknown`。
+    ///
+    /// 同一个链接，两种症状：踩在它身上是 `Other`，穿过它是 `Unknown`。只兜前者时，
+    /// 解码刚修好，紧接着 `find_git_root` 探 `<项目>/.git` 照样报「探不动」。
+    #[test]
+    fn a_failed_host_answer_asks_the_authority() {
+        let e = ProbeError::new(Path::new("/p"), "os error 267");
+        assert_eq!(composed(Probed::Unknown(e)), Probed::Found(FileKind::Dir));
+    }
+
+    /// 🔴 **反向：宿主答得上来的三种，不许再问权威。**
+    ///
+    /// 少了这一条，「无脑全走桥」的实现照样让上面两条通过 —— 而那是每次探测一个
+    /// `wsl.exe`（实测一次往返 ≈1.5 秒），解码一条四段路径要问 10 个候选。
+    #[test]
+    fn the_host_is_trusted_when_it_can_answer() {
+        for host in [
+            Probed::Found(FileKind::Dir),
+            Probed::Found(FileKind::File),
+            Probed::Absent,
+        ] {
+            let authority_would_say = Probed::Found(FileKind::Dir);
+            let got = composed(host.clone());
+            assert_eq!(got, host, "宿主答得上来时不该改写它的答案");
+            // `Found(Dir)` 那一格上两者恰好相同，说明不了「没问权威」—— 用
+            // `File`/`Absent` 那两格承担判据，这里只是把意图写出来。
+            let _ = authority_would_say;
+        }
     }
 
     /// `map` 不许改变三态结构 —— 它是唯一的组合子，折叠状态的便利方法一个都不给。

@@ -1419,7 +1419,7 @@ impl TotalStore {
             root,
             crate::deadline::Deadline::after(std::time::Duration::from_secs(10)),
         ) {
-            Ok(cid) => cid,
+            Ok(identity) => identity.id,
             Err(e) => {
                 log::debug!(
                     target: crate::logging::tag::SQLITE,

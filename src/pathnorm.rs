@@ -72,6 +72,22 @@ pub fn canonical_wsl_unc(path: &str) -> Option<String> {
     Some(format!("wsl:{distro}:/{linux_path}"))
 }
 
+/// UNC 形 WSL **前缀** → 发行版名（`\\wsl.localhost\Ubuntu-22.04` → `Ubuntu-22.04`）。
+///
+/// 与 [`canonical_wsl_unc`] 的区别是**尾巴可以为空**：那个吃的是一条完整路径
+/// （`\\wsl.localhost\<distro>\home\u\x`，尾巴为空时返回 `None`），这个吃的是
+/// ADR-033 的 `fs_prefix` —— 它本身就止于发行版名。分成两个函数而不是放宽那一个：
+/// 「这是不是一条 WSL 路径」与「这个前缀属于哪个发行版」是两个问题，让前者对空尾巴
+/// 说 `Some` 会把 `\\wsl.localhost\Ubuntu` 报成一条合法路径。
+pub fn wsl_distro_of_unc_prefix(prefix: &str) -> Option<String> {
+    let normalized = prefix.replace('\\', "/");
+    let rest = normalized
+        .strip_prefix("//wsl.localhost/")
+        .or_else(|| normalized.strip_prefix("//wsl$/"))?;
+    let distro = rest.split('/').next()?;
+    (!distro.is_empty()).then(|| distro.to_string())
+}
+
 /// 解析规范形 `wsl:<distro>:/abs` → `(distro, linux_path)`；非规范形返回 `None`。
 ///
 /// `linux_path` 保证以 `/` 开头。本函数**不**吃 UNC（那是 [`canonical_wsl_unc`] 的活）。
@@ -105,6 +121,43 @@ pub fn canonical_wsl_to_unc(path: &str) -> Option<String> {
 #[allow(clippy::disallowed_methods)]
 mod unc_round_trip_tests {
     use super::*;
+
+    #[test]
+    fn a_bare_unc_prefix_yields_its_distro() {
+        assert_eq!(
+            wsl_distro_of_unc_prefix(r"\\wsl.localhost\Ubuntu-22.04").as_deref(),
+            Some("Ubuntu-22.04")
+        );
+        // 老写法与正斜杠都认（宽进严出）。
+        assert_eq!(
+            wsl_distro_of_unc_prefix(r"\\wsl$\Debian").as_deref(),
+            Some("Debian")
+        );
+        assert_eq!(
+            wsl_distro_of_unc_prefix("//wsl.localhost/Ubuntu").as_deref(),
+            Some("Ubuntu")
+        );
+        // 带尾巴也认 —— 调用方给的是 `fs_prefix`，但多给一截不该翻脸。
+        assert_eq!(
+            wsl_distro_of_unc_prefix(r"\\wsl.localhost\Ubuntu\home\u").as_deref(),
+            Some("Ubuntu")
+        );
+    }
+
+    /// 🔴 **非 WSL 的东西一律 `None`** —— 它决定 `probe_backend_for` 走不走访问桥，
+    /// 误报会让每个本机项目去 spawn 一个 `wsl.exe`。
+    #[test]
+    fn anything_that_is_not_a_wsl_prefix_is_declined() {
+        for s in [
+            "",
+            r"C:\Users\u",
+            r"\\server\share",
+            r"\\wsl.localhost\",
+            "wsl:Ubuntu:/home/u", // 规范形不是 UNC —— 那是 split_canonical_wsl 的活
+        ] {
+            assert_eq!(wsl_distro_of_unc_prefix(s), None, "误认了 {s:?}");
+        }
+    }
 
     /// 🔴 **两个方向必须真的互为逆**，否则「同一个根的两种写法」会在某一侧多出一个
     /// 身份 —— 而那正是这对函数存在的理由。
