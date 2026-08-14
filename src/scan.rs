@@ -126,7 +126,11 @@ fn scan_snapshot_file(
         ..Default::default()
     };
     let read = match &source.source_location {
-        SourceLocation::Local => std::fs::read(&source.path).map_err(|e| e.to_string()),
+        SourceLocation::Local => match crate::probe::read_bytes(&source.path, None) {
+            crate::probe::Probed::Found(v) => Ok(v),
+            crate::probe::Probed::Absent => Err("snapshot file disappeared".to_string()),
+            crate::probe::Probed::Unknown(e) => Err(e.to_string()),
+        },
         SourceLocation::Wsl(distro) => crate::wsl::read_file_at(
             distro,
             &source.path.to_string_lossy(),
@@ -565,7 +569,19 @@ fn observe(
 
 /// 读文件 `[start, end)` 字节区间。
 fn read_range(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
+    // 经 probe 而不是裸 `File::open` —— 后者正是四轮评审点名的绕过写法，而它当时
+    // 就在这一行。ranged read 的失败要往上抛，所以三态在这里折成 `io::Result`：
+    // 折叠写在**一处**、且是在已经分好类之后，与调用点各自折叠不是一回事。
+    let mut f = match crate::probe::open_read(path, None) {
+        crate::probe::Probed::Found(f) => f,
+        crate::probe::Probed::Absent => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "file is gone",
+            ))
+        }
+        crate::probe::Probed::Unknown(e) => return Err(std::io::Error::other(e.to_string())),
+    };
     f.seek(SeekFrom::Start(start))?;
     let len = (end - start) as usize;
     let mut buf = vec![0u8; len];

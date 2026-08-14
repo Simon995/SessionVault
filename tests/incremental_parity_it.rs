@@ -1,3 +1,6 @@
+//! 集成测试造 fixture 要直接碰盘 —— 边界管的是生产行为。
+#![allow(clippy::disallowed_methods)]
+
 //! 增量保真离线验证（env-gated 实机）。
 //!
 //! 证明 `parse_lines`「分块带状态续解」与「整文件一次解」**逐字段一致**——这正是 QuotaBar

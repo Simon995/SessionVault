@@ -492,14 +492,14 @@ fn collect_files_into(
     out: &mut Vec<PathBuf>,
     failed: &mut bool,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            // NotFound = 「这里确实没有」；其余（权限、IO、句柄耗尽）= 「没问成」。
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!(target: tag::DISCOVER, "read_dir failed: {} err={e}", dir.display());
-                *failed = true;
-            }
+    // NotFound = 「这里确实没有」；其余（权限、IO、句柄耗尽）= 「没问成」——
+    // 判据现在由 `probe::read_dir_entries` 统一给，这里只做决定。
+    let entries = match crate::probe::read_dir_entries(dir, None) {
+        crate::probe::Probed::Found(e) => e,
+        crate::probe::Probed::Absent => return,
+        crate::probe::Probed::Unknown(e) => {
+            log::warn!(target: tag::DISCOVER, "read_dir failed: {e}");
+            *failed = true;
             return;
         }
     };
@@ -531,6 +531,9 @@ fn collect_files_into(
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
+// 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
+#[allow(clippy::disallowed_methods)]
 mod tests {
 
     /// 🔴 本地遍历失败也必须报出来（评审 [P2]）—— `read_dir` / 目录项 / `file_type`

@@ -1,3 +1,6 @@
+//! 集成测试造 fixture 要直接碰盘 —— 边界管的是生产行为。
+#![allow(clippy::disallowed_methods)]
+
 //! `svault roots` 的真实进程验收（#40 步 1）。
 //!
 //! # 为什么单元测试不够

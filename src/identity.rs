@@ -111,9 +111,10 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBu
         Probed::Found(FileKind::Dir) => Probed::Found(dot_git.join("config")),
         Probed::Found(_) => {
             // `.git` 文件：`gitdir: <path>`（可相对 git_root）。
-            let text = match std::fs::read_to_string(&dot_git) {
-                Ok(t) => t,
-                Err(e) => return Probed::Unknown(crate::probe::ProbeError::new(&dot_git, e)),
+            let text = match crate::probe::read_text(&dot_git, None) {
+                Probed::Found(t) => t,
+                Probed::Absent => return Probed::Absent,
+                Probed::Unknown(e) => return Probed::Unknown(e),
             };
             let Some(rel) = text
                 .lines()
@@ -134,8 +135,8 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBu
             // linked worktree：真正的 config 在 commondir 里。
             let commondir = gitdir.join("commondir");
             match backend.probe(&commondir, d) {
-                Probed::Found(_) => match std::fs::read_to_string(&commondir) {
-                    Ok(c) => {
+                Probed::Found(_) => match crate::probe::read_text(&commondir, None) {
+                    Probed::Found(c) => {
                         let c = c.trim();
                         let common = {
                             let p = Path::new(c);
@@ -147,7 +148,8 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBu
                         };
                         Probed::Found(common.join("config"))
                     }
-                    Err(e) => Probed::Unknown(crate::probe::ProbeError::new(&commondir, e)),
+                    Probed::Absent => Probed::Absent,
+                    Probed::Unknown(e) => Probed::Unknown(e),
                 },
                 // 没有 commondir ⇒ submodule 形态，config 就在 gitdir 里。
                 Probed::Absent => Probed::Found(gitdir.join("config")),
@@ -184,9 +186,10 @@ pub fn read_origin_url_with(git_root: &Path, backend: &dyn ProbeBackend) -> Prob
         Probed::Absent => return Probed::Absent,
         Probed::Unknown(e) => return Probed::Unknown(e),
     }
-    let text = match std::fs::read_to_string(&config) {
-        Ok(t) => t,
-        Err(e) => return Probed::Unknown(crate::probe::ProbeError::new(&config, e)),
+    let text = match crate::probe::read_text(&config, None) {
+        Probed::Found(t) => t,
+        Probed::Absent => return Probed::Absent,
+        Probed::Unknown(e) => return Probed::Unknown(e),
     };
     match parse_origin_url(&text) {
         Some(url) => Probed::Found(url),
@@ -285,6 +288,9 @@ pub fn canonical_repo_id_with(
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
+// 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

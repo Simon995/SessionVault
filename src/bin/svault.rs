@@ -729,9 +729,13 @@ fn open_total_store(
 
 #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
 fn run_fixture_append(event_file: PathBuf, store_path: PathBuf) -> i32 {
-    let bytes = match std::fs::read(&event_file) {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    let bytes = match session_vault::probe::read_bytes(&event_file, None) {
+        session_vault::probe::Probed::Found(bytes) => bytes,
+        session_vault::probe::Probed::Absent => {
+            log::error!(target: tag::CLI, "synthetic fixture not found: {}", event_file.display());
+            return 1;
+        }
+        session_vault::probe::Probed::Unknown(e) => {
             log::error!(target: tag::CLI, "read synthetic fixture failed: {e}");
             return 1;
         }
@@ -936,11 +940,14 @@ fn resolve_state_path(arg: Option<PathBuf>) -> Option<PathBuf> {
 
 /// 读状态文件 → 游标表。不存在或损坏 → 空表（发警告，不崩）。
 fn load_cursors(path: &std::path::Path) -> HashMap<String, Cursor> {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
-        Err(e) => {
-            log::warn!(target: tag::CLI, "read state failed (starting empty): path={} err={e}", path.display());
+    let bytes = match session_vault::probe::read_bytes(path, None) {
+        session_vault::probe::Probed::Found(b) => b,
+        // 没有状态文件 = 第一次跑，是事实。
+        session_vault::probe::Probed::Absent => return HashMap::new(),
+        // 读不成也退回空表（游标丢了只是重扫一遍，不丢数据），但要留一行 ——
+        // 「第一次跑」与「读不了」在结果上一样，在日志里必须分得开。
+        session_vault::probe::Probed::Unknown(e) => {
+            log::warn!(target: tag::CLI, "read state failed (starting empty): {e}");
             return HashMap::new();
         }
     };
@@ -956,13 +963,13 @@ fn load_cursors(path: &std::path::Path) -> HashMap<String, Cursor> {
 /// 原子写状态文件：先写 `.tmp` 再 rename，避免半写损坏。
 fn save_cursors(path: &std::path::Path, cursors: &HashMap<String, Cursor>) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        session_vault::probe::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec_pretty(cursors)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, path)?;
+    session_vault::probe::write_bytes(&tmp, &json)?;
+    session_vault::probe::rename(&tmp, path)?;
     Ok(())
 }
 

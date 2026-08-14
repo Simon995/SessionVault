@@ -728,7 +728,7 @@ impl TotalStore {
     /// keychain 中没有对应密钥则硬失败，绝不生成新钥匙覆盖并造成静默数据丢失。
     pub fn open(path: &Path) -> StoreResult<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::probe::create_dir_all(parent)?;
             restrict_permissions(parent, 0o700);
         }
         let encrypted_store = store_has_encrypted_rows(path)?;
@@ -745,7 +745,7 @@ impl TotalStore {
     /// 使用宿主提供的密钥打开数据库。适用于测试和不由默认 OS keychain 管理密钥的嵌入方。
     pub fn open_with_key(path: &Path, key: StoreKey) -> StoreResult<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::probe::create_dir_all(parent)?;
             restrict_permissions(parent, 0o700);
         }
         let conn = Connection::open(path)?;
@@ -2958,7 +2958,7 @@ fn store_has_encrypted_rows(path: &Path) -> StoreResult<bool> {
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+    if let Err(e) = crate::probe::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
         log::warn!(
             target: crate::logging::tag::SQLITE,
             "set permissions {mode:o} on {} failed: {e}",
@@ -5649,6 +5649,9 @@ mod tests {
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
+// 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
+#[allow(clippy::disallowed_methods)]
 mod project_identity_tests {
     use super::*;
     use crate::rawevent::{

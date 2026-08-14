@@ -201,20 +201,46 @@ fn namespace_confirms_absence(path: &Path, anchor: &Anchor) -> Probed<FileKind> 
     // 锚点由调用方给：只有它可达，其下的缺失才算事实。这一支能看见卷卸载 ——
     // 语法根那一支看不见（Unix 上永远是 `/`）。
     if let Anchor::Under(root) = anchor {
-        // 锚点自己就是被探的那条路径时，没有更上层可核。
-        if root == path {
-            return Probed::Unknown(ProbeError::new(
-                path,
-                "the source root itself is gone; cannot tell whether it was removed or unmounted",
-            ));
+        match std::fs::metadata(root) {
+            // 根在 ⇒ 叶子的缺失是事实。
+            Ok(_) if root != path => return Probed::Absent,
+            Ok(_) => {}
+            // 🔴 **根自己不见了，还不足以定案**（四轮评审 P1）。
+            //
+            // 上一版在这里直接报 `Unknown`，而 `claude_config_dir()` /
+            // `codex_config_dir()` **目录不存在也返回 `Some(~/.claude)`** ——
+            // 于是「只装了 Codex、从来没有 `~/.claude`」这个**完全正常的配置**
+            // 被判成 local 不可达，QuotaBar 因此**永不 prune local**，
+            // 已删除的 Codex 会话 / 用量 / 成本永久残留。
+            // 方向与它要修的那个 bug **正好相反**：修的是误删，造出的是永不删。
+            //
+            // 分开这两种状态**不需要持久化状态**，只要再上溯一层：
+            // - 父目录在（`~` 在、`~/.claude` 没有）⇒ 那个 CLI 没装，**是事实**；
+            // - 父目录也不见了（`/mnt/work` 整个没了）⇒ 命名空间掉了，**没问成**。
+            //
+            // 只上溯**一层**，不是一路走到 `/` —— 走到 `/` 又会回到「Unix 上恒可达」
+            // 那个洞里。一层就够分开这两种，且可解释。
+            Err(_) => {
+                let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) else {
+                    return Probed::Unknown(ProbeError::new(
+                        path,
+                        "source root is gone and has no parent to check against",
+                    ));
+                };
+                return match std::fs::metadata(parent) {
+                    Ok(_) => Probed::Absent,
+                    Err(e) => Probed::Unknown(ProbeError::new(
+                        path,
+                        format!(
+                            "source root {} and its parent are both unreachable: {e}",
+                            root.display()
+                        ),
+                    )),
+                };
+            }
         }
-        return match std::fs::metadata(root) {
-            Ok(_) => Probed::Absent,
-            Err(e) => Probed::Unknown(ProbeError::new(
-                path,
-                format!("source root {} is not reachable: {e}", root.display()),
-            )),
-        };
+        // 锚点自己就是被探的那条路径，且它在 —— 交回上面的常规判定。
+        return Probed::Absent;
     }
 
     let Some(root) = path.ancestors().last() else {
@@ -332,6 +358,117 @@ impl LocalBackend {
             Err(e) => Probed::Unknown(ProbeError::new(path, e)),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 文件系统访问的其余部分 —— **边界要么是模块要么不是**（四轮评审 P2）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 上一版只禁存在性 API，于是 `File::open(p).is_ok()` / `read_dir(p).is_ok()` /
+// `fs::read(p).is_ok()` 照样把「没问成」折叠成「不存在」—— 而 `scan.rs` 里**当时
+// 就已经有**一处 `File::open`，不是假想。
+//
+// 现在整个 `std::fs` 只许出现在本文件。下面按**折叠风险**分两组：
+//
+// - **观测**（读内容、列目录）：失败必须能与「空/没有」分开，所以返回 `Probed`。
+// - **变更**（建目录、写、改名、改权限）：失败本来就会响亮地报出来，**透传 `Result`**，
+//   不假装它有三态。
+//
+// ⚠️ 为什么变更也要收进来：留「只有观测才禁」这个例外，下一个人就得自己判断
+// 「我这个算观测还是变更」—— 而那正是例外的成本，它把判断权还回了每一个调用点。
+// 本轮四条 findings 里有两条就是从上一个例外长出来的。
+
+/// 读文件全部字节 —— 三态。
+///
+/// 🔴 读失败不是「空文件」。`Absent` 才是「那里没有」，且同样要过命名空间那一关。
+#[allow(clippy::disallowed_methods)]
+pub fn read_bytes(path: &Path, anchor_root: Option<&Path>) -> Probed<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(v) => Probed::Found(v),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            namespace_confirms_absence(path, &anchor(anchor_root)).map(|_| Vec::new())
+        }
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
+/// 读文件为 UTF-8 文本 —— 三态。非法 UTF-8 归 `Unknown`：它是「读到了但看不懂」，
+/// 与「那里没有」是两件事。
+#[allow(clippy::disallowed_methods)]
+pub fn read_text(path: &Path, anchor_root: Option<&Path>) -> Probed<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Probed::Found(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            namespace_confirms_absence(path, &anchor(anchor_root)).map(|_| String::new())
+        }
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
+/// 列目录 —— 三态。
+///
+/// 🔴 **逐条目的错误也保留**：`read_dir` 成功之后每个 `DirEntry` 仍可能失败，
+/// 而 `.flatten()` 会把它们静默丢掉（`memory/sources.rs` 曾经就是）。
+/// 返回 `Vec<io::Result<DirEntry>>` 让调用方**看得见**每一条。
+#[allow(clippy::disallowed_methods)]
+pub fn read_dir_entries(
+    path: &Path,
+    anchor_root: Option<&Path>,
+) -> Probed<Vec<std::io::Result<std::fs::DirEntry>>> {
+    match std::fs::read_dir(path) {
+        Ok(it) => Probed::Found(it.collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            namespace_confirms_absence(path, &anchor(anchor_root)).map(|_| Vec::new())
+        }
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
+/// 打开文件用于随机读（`scan.rs` 的 ranged read）—— 三态。
+#[allow(clippy::disallowed_methods)]
+pub fn open_read(path: &Path, anchor_root: Option<&Path>) -> Probed<std::fs::File> {
+    match std::fs::File::open(path) {
+        Ok(f) => Probed::Found(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match namespace_confirms_absence(path, &anchor(anchor_root)) {
+                Probed::Absent => Probed::Absent,
+                Probed::Unknown(e) => Probed::Unknown(e),
+                Probed::Found(_) => Probed::Absent,
+            }
+        }
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
+fn anchor(root: Option<&Path>) -> Anchor {
+    match root {
+        Some(r) => Anchor::Under(r.to_path_buf()),
+        None => Anchor::None,
+    }
+}
+
+/// 建目录（含父级）。**变更操作，透传 `Result`** —— 见本节开头。
+#[allow(clippy::disallowed_methods)]
+pub fn create_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
+}
+
+/// 写文件。**变更操作，透传 `Result`**。
+#[allow(clippy::disallowed_methods)]
+pub fn write_bytes(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    std::fs::write(path, contents)
+}
+
+/// 改名。**变更操作，透传 `Result`**。
+#[allow(clippy::disallowed_methods)]
+pub fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// 改权限。**变更操作，透传 `Result`**。
+#[allow(clippy::disallowed_methods)]
+pub fn set_permissions(path: &Path, perm: std::fs::Permissions) -> std::io::Result<()> {
+    std::fs::set_permissions(path, perm)
 }
 
 /// 某个 WSL 发行版内的路径，经访问桥探测。
@@ -515,14 +652,24 @@ mod tests {
             "锚点可达时，叶子的缺失必须仍是事实 —— 否则没装 CLI 的用户永久带假故障"
         );
 
-        // 锚点整个不见了（= 卷被卸载的签名）⇒ 说不出叶子在不在。
-        let vanished_anchor = tmp.join("gone");
+        // 🔴 **根不见了、但父目录在 ⇒ 事实**（四轮评审 P1）。
+        // 「只装了 Codex，从来没有 `~/.claude`」是完全正常的配置；把它判成不可达，
+        // QuotaBar 就**永不 prune local**，已删除的会话/用量/成本永久残留。
+        let never_installed = tmp.join("gone");
+        assert_eq!(
+            LocalBackend::rooted_at(&never_installed).probe(&leaf, d),
+            Probed::Absent,
+            "根不存在但父目录在 = 那个 CLI 没装，是事实 —— 判成不可达会让 prune 永久停摆"
+        );
+
+        // 根与父目录**都**不见了（= 卷被卸载的签名）⇒ 说不出叶子在不在。
+        let unmounted = tmp.join("vanished-volume").join("dot-claude");
         assert!(
             matches!(
-                LocalBackend::rooted_at(&vanished_anchor).probe(&leaf, d),
+                LocalBackend::rooted_at(&unmounted).probe(&unmounted.join("projects"), d),
                 Probed::Unknown(_)
             ),
-            "来源根不可达却报了「确认不存在」—— prune 会据此删数据"
+            "来源根与父目录都不可达却报了「确认不存在」—— prune 会据此删数据"
         );
 
         // 🔴 同一条路径，`unanchored()` 看不出异常 —— 这正是 Unix 上的那个洞，

@@ -9,14 +9,53 @@
 # 这就是「编译器已经守住的事，不要再用正则守一遍」在本仓的第二次兑现
 # （第一次是 `CommitPlan` 的字段私有）。
 #
-# 唯一允许点：`src/probe.rs`（`#[allow]` 就写在那几行上，看得见）。
+# 🔴 **禁的是整个 `std::fs` 模块面，不是「我被咬过的那几个」**（四轮评审 P2）。
+#
+# 上一版只列 8 个存在性 API，于是 `File::open(p).is_ok()` / `read_dir(p).is_ok()` /
+# `fs::read(p).is_ok()` 照样把「没问成」折叠成「不存在」—— 而 `scan.rs` 里**当时就
+# 已经有**一处 `File::open`。补几个再停下来，就是第三次重复同一个错误。
+#
+# ⚠️ **这仍然是一份清单，但性质不同**：`std::fs` 的公开 API 是一个**封闭且稳定**的
+# 集合（std 定义的，不会因为有人换个写法而变多）。枚举它 = 禁掉这个模块；
+# 而上一版枚举的是**语法形状**，那是无穷的。区别不在「有没有清单」，
+# 在「清单穷不穷得尽」。
+#
+# 唯一允许点：`src/probe.rs`（`#[allow]` 写在那几行上，看得见）+ 测试模块。
 disallowed-methods = [
-  { path = "std::fs::metadata", reason = "存在性探测收口到 probe.rs：用 ProbeBackend::probe / LocalBackend::stat" },
+  # ── 观测：折叠风险在这里 ─────────────────────────────────────────
+  { path = "std::fs::metadata", reason = "走 probe：ProbeBackend::probe / LocalBackend::stat" },
   { path = "std::fs::symlink_metadata", reason = "同上" },
-  { path = "std::path::Path::metadata", reason = "同上 —— 它不含 `fs::`，正则闸曾整条放行" },
-  { path = "std::path::Path::symlink_metadata", reason = "同上" },
-  { path = "std::path::Path::exists", reason = "把访问失败折叠成 false；用 ProbeBackend::probe" },
+  { path = "std::fs::read", reason = "走 probe::read_bytes —— 读失败不能变成「空文件」" },
+  { path = "std::fs::read_to_string", reason = "走 probe::read_text —— 同上" },
+  { path = "std::fs::read_dir", reason = "走 probe::read_dir_entries —— 列不出来不是「这里没有文件」" },
+  { path = "std::fs::read_link", reason = "走 probe" },
+  { path = "std::fs::canonicalize", reason = "走 probe" },
+  { path = "std::fs::File::open", reason = "走 probe::open_read —— 评审点名的绕过，scan.rs 当时就有一处" },
+  { path = "std::fs::OpenOptions::open", reason = "同上" },
+  # ── `Path` 上的同族（不含 `fs::`，正则闸曾整条放行）───────────────
+  { path = "std::path::Path::metadata", reason = "走 probe" },
+  { path = "std::path::Path::symlink_metadata", reason = "走 probe" },
+  { path = "std::path::Path::exists", reason = "把访问失败折叠成 false" },
   { path = "std::path::Path::try_exists", reason = "未挂载盘符上返回 Ok(false)，同样答不出「没问成」" },
-  { path = "std::path::Path::is_file", reason = "把访问失败折叠成 false；用 Probed::Found(FileKind::File)" },
-  { path = "std::path::Path::is_dir", reason = "把访问失败折叠成 false；用 Probed::Found(FileKind::Dir)" },
+  { path = "std::path::Path::is_file", reason = "把访问失败折叠成 false" },
+  { path = "std::path::Path::is_dir", reason = "把访问失败折叠成 false" },
+  { path = "std::path::Path::read_dir", reason = "走 probe::read_dir_entries" },
+  { path = "std::path::Path::canonicalize", reason = "走 probe" },
+  { path = "std::path::Path::read_link", reason = "走 probe" },
+  # ── 变更：失败会响亮地报出来，没有折叠风险 ───────────────────────
+  #
+  # 仍然禁，是因为**边界要么是模块要么不是**。留「观测才禁」这个例外，下一个人就得
+  # 判断「我这个算观测还是变更」—— 而那正是例外的成本：它把判断权还给了每一个调用点。
+  { path = "std::fs::write", reason = "走 probe::write_bytes（透传 Result）" },
+  { path = "std::fs::create_dir", reason = "走 probe::create_dir_all" },
+  { path = "std::fs::create_dir_all", reason = "走 probe::create_dir_all" },
+  { path = "std::fs::rename", reason = "走 probe::rename" },
+  { path = "std::fs::copy", reason = "走 probe" },
+  { path = "std::fs::hard_link", reason = "走 probe" },
+  { path = "std::fs::remove_file", reason = "走 probe" },
+  { path = "std::fs::remove_dir", reason = "走 probe" },
+  { path = "std::fs::remove_dir_all", reason = "走 probe" },
+  { path = "std::fs::set_permissions", reason = "走 probe::set_permissions" },
+  { path = "std::fs::File::create", reason = "走 probe" },
+  { path = "std::fs::File::create_new", reason = "走 probe" },
 ]

@@ -873,6 +873,9 @@ fn record_skip(out: &mut ParseOut, path: &str, idx: usize, e: &serde_json::Error
 }
 
 #[cfg(test)]
+// 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
+// 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
