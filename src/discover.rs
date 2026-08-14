@@ -64,14 +64,62 @@ pub fn discover_snapshots(deadline: crate::deadline::Deadline) -> Result<Vec<Sou
     Ok(discover_by_mode(false, SourceMode::SnapshotFile, deadline)?.sources)
 }
 
+/// 宿主这一侧怎么探这个项目根 —— **路径与「谁能回答它」绑在一起**。
+///
+/// 🔴 上一版是裸的 `probe_path: Option<PathBuf>`，文档写着「宿主可访问探测路径」。
+/// 对 `\\wsl.localhost\…` 上一条**穿过符号链接**的路，那句话是假的：宿主沿 9P
+/// 跟不进去 ⇒ `Probed::Unknown` ⇒ 三态**忠实地**报「没问成」—— 于是得到一个
+/// **恒真**的假故障，而读日志的人（包括写下这段的我）会以为那是环境的事实。
+/// 实测（2026-08-14）让 WSL 侧 21 KB 的 `CLAUDE.md` 永久进不了 Class-B，
+/// 并连带让 3 个注册根拿不到 `canonical_id`（身份扫描骑在同一个探测上）。
+///
+/// **一般化：收口了「怎么解读答案」，不等于收口了「该问谁」。** `probe::classify`
+/// 统一的是前者；后者是 `ProbeBackend` 的选择，此前散在每个调用点，而选错时
+/// 没有任何东西会报错。把前缀做成**变体的一部分**，是为了让「给了 UNC 路径却
+/// 没说谁能回答」这个组合**根本写不出来** —— 同 `IdentityResolution::Pending`
+/// 不携带值、`Probed` 不提供 `is_found() -> bool`。
+#[derive(Debug, Clone)]
+pub enum HostProbe {
+    /// 宿主自己就能回答。**锚定到项目根**：只有根可达时，其下的 `NotFound` 才算
+    /// 「这个文件确实没有」；卷被卸载时报 `Unknown`（三轮评审 P1）。
+    Native(PathBuf),
+    /// 路径在发行版内部，宿主只答得了一部分 —— 其余问访问桥。
+    /// `prefix` 是 ADR-033 的 `fs_prefix`（`\\wsl.localhost\<distro>`），
+    /// `distro` 由它派生并在构造时定下，免得两者漂开。
+    WslUnc {
+        path: PathBuf,
+        distro: String,
+        prefix: String,
+    },
+}
+
+impl HostProbe {
+    /// 由 ADR-033 的 `fs_prefix` 决定该问谁 —— **「该问谁」的唯一实现**。
+    ///
+    /// 空前缀 = 本机命名空间；WSL UNC 前缀 = 发行版内部。其余非空前缀
+    /// （普通 SMB 共享等）落 `Native` 是对的：宿主**确实**读得了它们，
+    /// 需要访问桥的只有 WSL 这一种。
+    pub fn for_root(path: impl Into<PathBuf>, fs_prefix: &str) -> Self {
+        match crate::pathnorm::wsl_distro_of_unc_prefix(fs_prefix) {
+            Some(distro) => Self::WslUnc {
+                path: path.into(),
+                distro,
+                prefix: fs_prefix.to_string(),
+            },
+            None => Self::Native(path.into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectSnapshotRoot {
     pub source_location: SourceLocation,
     /// 在来源文件系统命名空间中的可读路径（WSL 时为 POSIX 路径）。
     pub path: PathBuf,
-    /// 可选的宿主可访问探测路径（如 Windows 的 WSL UNC）。只用于 `is_file`，
+    /// 可选的宿主侧探测方式。只用于探「指令文件在不在」，
     /// RawEvent 仍记录 `path` 的来源命名空间路径。
-    pub probe_path: Option<PathBuf>,
+    /// 缺席 ⇒ 本地走 `path` 自己、WSL 走访问桥。
+    pub host_probe: Option<HostProbe>,
     /// 宿主已经归一的项目身份/物理路径，原样携带给下游。
     pub project_root: String,
 }
@@ -90,9 +138,25 @@ pub struct ProjectSnapshotRoot {
 /// `DiscoveryOutcome`、`Probe::None` vs `Probe::Failed`）在又一层的重演。
 pub struct ProjectSnapshotOutcome {
     pub sources: Vec<SourceRef>,
-    /// 探测失败的项目根（`project_root` 原样）。调用方**不得**把它读作
-    /// 「这个项目没有指令文件」。
-    pub unreachable: Vec<String>,
+    /// 探测失败的项目根。调用方**不得**把它读作「这个项目没有指令文件」。
+    pub unreachable: Vec<UnreachableProject>,
+}
+
+/// 一个没问成的项目根 —— **带上原因**。
+///
+/// 🔴 上一版是裸的 `Vec<String>`（只有 `project_root`），于是 QuotaBar 的日志只能说
+/// 「could not be enumerated」而说不出**谁**答不上来。2026-08-14 排查那两个
+/// `\\wsl.localhost\…\QuotaBar` 时，我必须去读代码才知道是「宿主后端跟不进符号链接」
+/// 而不是「WSL 挂了」—— 而这条路径每轮都在跑，也就是说这个信息**一直缺着**。
+///
+/// 它同时是本次修复**唯一可正向断言的支点**：修好前后 `Failed` 的**结果**完全相同
+/// （都进 `unreachable`），差别只在**是谁给出的那个失败**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreachableProject {
+    /// 原样的 `project_root`。调用方按它去重、并据此**不 prune** 这个根。
+    pub project_root: String,
+    /// 第一条没问成的原因（后续候选不覆盖它 —— 先到的那条最接近根因）。
+    pub reason: String,
 }
 
 /// 一次文件探测的三态。`NotFound` 是**事实**（那里确实没有），其余 IO 错误是
@@ -101,24 +165,43 @@ pub struct ProjectSnapshotOutcome {
 enum FileProbe {
     Present,
     Absent,
-    Failed,
+    /// 带上**是谁、因为什么**答不上来 —— 见 [`UnreachableProject::reason`]。
+    Failed(String),
 }
 
 /// ⚠️ 这里从前自带一份 `match std::fs::metadata` —— 与 `discovery.rs`、
 /// `memory/sources.rs` 各一份，共四份手抄本。判据现在只在 `probe::classify` 里，
 /// 本函数只剩「我要的是**文件**」这个本地决定。
-/// 🔴 **锚定到项目根**（三轮评审 P1）：这条路径的结果会决定该项目的指令文件在不在，
-/// 而调用方据此**不 prune** 那个根。项目根所在的卷被卸载时，锚点探不到 ⇒ `Failed` ⇒
-/// 进 `unreachable`。用语法根锚在 Unix 上等于没锚（`/` 永远可达）。
-fn probe_host_file(path: &std::path::Path, anchor: &std::path::Path) -> FileProbe {
-    match crate::probe::LocalBackend::rooted_at(anchor)
-        .probe(path, crate::deadline::Deadline::unbounded())
-    {
+///
+/// 🔴 **后端由 [`HostProbe`] 决定，不再写死 `LocalBackend`。** 写死那一版对
+/// `\\wsl.localhost\…` 上穿过符号链接的路给出**恒真**的「没问成」——
+/// 三态纪律满分、文案一字不差，而答案是错的（见 `HostProbe` 的文档）。
+///
+/// 🔴 **预算要透传。** WSL 那一格会 spawn `wsl.exe`，而
+/// 「外部进程的等待必须有上限、上限取自整轮预算」是本仓栽过四次的判据。
+/// 从前这里写的是 `Deadline::unbounded()` —— 对本地 `stat` 无妨，对访问桥就是
+/// 那第五次。
+fn probe_host_file(probe: &HostProbe, rel: &str, deadline: crate::deadline::Deadline) -> FileProbe {
+    let (target, backend): (PathBuf, Box<dyn crate::probe::ProbeBackend>) = match probe {
+        HostProbe::Native(base) => (
+            base.join(rel),
+            Box::new(crate::probe::LocalBackend::rooted_at(base)),
+        ),
+        HostProbe::WslUnc {
+            path,
+            distro,
+            prefix,
+        } => (
+            path.join(rel),
+            Box::new(crate::probe::WslUncBackend::new(distro, prefix)),
+        ),
+    };
+    match backend.probe(&target, deadline) {
         crate::probe::Probed::Found(crate::probe::FileKind::File) => FileProbe::Present,
         // 存在但不是文件（目录 / 断掉的符号链）—— 那个**文件**确实没有，是事实。
         crate::probe::Probed::Found(_) => FileProbe::Absent,
         crate::probe::Probed::Absent => FileProbe::Absent,
-        crate::probe::Probed::Unknown(_) => FileProbe::Failed,
+        crate::probe::Probed::Unknown(e) => FileProbe::Failed(e.to_string()),
     }
 }
 
@@ -127,7 +210,7 @@ pub fn discover_project_snapshots(
     deadline: crate::deadline::Deadline,
 ) -> ProjectSnapshotOutcome {
     let mut out = Vec::new();
-    let mut unreachable: Vec<String> = Vec::new();
+    let mut unreachable: Vec<UnreachableProject> = Vec::new();
     for root in roots {
         for (source_type, rel) in [
             (SourceType::ClaudeCode, "CLAUDE.md"),
@@ -142,18 +225,24 @@ pub fn discover_project_snapshots(
                     rel.replace('\\', "/")
                 )),
             };
-            let seen = match (&root.source_location, root.probe_path.as_ref()) {
-                // 锚点 = 这次探测所属的**项目根**（`probe_path` 是它在宿主上的可打开
-                // 形式，WSL 项目走 UNC）。它不可达 ⇒ 报 `Failed` 而不是「这个项目
-                // 没写过 CLAUDE.md」。
-                (_, Some(base)) => probe_host_file(&base.join(rel), &base),
-                (SourceLocation::Local, None) => probe_host_file(&path, &root.path),
+            let seen = match (&root.source_location, root.host_probe.as_ref()) {
+                // 锚点 = 这次探测所属的**项目根**。它不可达 ⇒ 报 `Failed` 而不是
+                // 「这个项目没写过 CLAUDE.md」。
+                //
+                // 🔴 这一支对 Local 与 Wsl **一视同仁**，而那正是缺陷所在的地方：
+                // WSL 根给的是 UNC 形式，从前被无条件送进宿主后端。现在「该问谁」
+                // 由 `HostProbe` 自己带着（`HostProbe::for_root` 是唯一构造点），
+                // 所以这里可以继续一视同仁 —— 差别在类型里，不在这个 `match` 里。
+                (_, Some(probe)) => probe_host_file(probe, rel, deadline),
+                (SourceLocation::Local, None) => {
+                    probe_host_file(&HostProbe::Native(root.path.clone()), rel, deadline)
+                }
                 (SourceLocation::Wsl(distro), None) => {
                     match crate::wsl::stat(distro, &path.to_string_lossy(), deadline) {
                         Ok(Some(_)) => FileProbe::Present,
                         Ok(None) => FileProbe::Absent,
                         // 问不到那台 VM —— 不是「这个项目没有 CLAUDE.md」。
-                        Err(_) => FileProbe::Failed,
+                        Err(e) => FileProbe::Failed(format!("wsl stat {distro}: {e}")),
                     }
                 }
             };
@@ -167,11 +256,18 @@ pub fn discover_project_snapshots(
                     artifact_kind: Some("instruction".to_string()),
                 }),
                 FileProbe::Absent => {}
-                FileProbe::Failed => {
+                FileProbe::Failed(reason) => {
                     // 按**根**记账：一个根下三个候选，任一没问成就说不出
-                    // 「这个项目的指令文件是哪些」。
-                    if !unreachable.contains(&root.project_root) {
-                        unreachable.push(root.project_root.clone());
+                    // 「这个项目的指令文件是哪些」。**先到的原因不被后来的覆盖**
+                    // —— 它最接近根因（后两个候选多半是同一个原因的回声）。
+                    if !unreachable
+                        .iter()
+                        .any(|u: &UnreachableProject| u.project_root == root.project_root)
+                    {
+                        unreachable.push(UnreachableProject {
+                            project_root: root.project_root.clone(),
+                            reason,
+                        });
                     }
                 }
             }
@@ -596,7 +692,9 @@ mod tests {
         );
     }
 
-    use super::{collect_artifact_files, discover_project_snapshots, ProjectSnapshotRoot};
+    use super::{
+        collect_artifact_files, discover_project_snapshots, HostProbe, ProjectSnapshotRoot,
+    };
     use crate::rawevent::SourceLocation;
 
     #[test]
@@ -631,7 +729,7 @@ mod tests {
         let roots = [ProjectSnapshotRoot {
             source_location: SourceLocation::Wsl("Ubuntu-22.04".into()),
             path: "/home/u/project".into(),
-            probe_path: Some(probe.clone()),
+            host_probe: Some(HostProbe::for_root(probe.clone(), "")),
             project_root: r"\\wsl.localhost\Ubuntu-22.04\home\u\project".into(),
         }];
         let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
@@ -669,7 +767,7 @@ mod tests {
             source_location: SourceLocation::Wsl("svault-no-such-distro-9c1f".into()),
             // 没有 `probe_path` ⇒ 走 WSL 那一支，也就是被测的那条。
             path: "/home/u/project".into(),
-            probe_path: None,
+            host_probe: None,
             project_root: "wsl:svault-no-such-distro-9c1f:/home/u/project".into(),
         }];
         let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
@@ -679,10 +777,92 @@ mod tests {
             "问不到就不该产出来源 —— 那会凭空造一个读不了的文件"
         );
         assert_eq!(
-            found.unreachable,
+            found
+                .unreachable
+                .iter()
+                .map(|u| u.project_root.clone())
+                .collect::<Vec<_>>(),
             vec!["wsl:svault-no-such-distro-9c1f:/home/u/project".to_string()],
             "🔴 但它必须**说出来**：空列表 + 空 unreachable 读作「这个项目没有指令文件」"
         );
+    }
+
+    /// 🔴 **WSL 根必须问访问桥，不能只问宿主**（2026-08-14，同一判据第 8 次）。
+    ///
+    /// 缺陷形状：`probe_host_file` 写死 `LocalBackend`，而 WSL 根的 `probe_path` 是
+    /// `\\wsl.localhost\…`。宿主沿 9P **跟不进符号链接** ⇒ `Unknown` ⇒ 三态**忠实地**
+    /// 报「没问成」—— 一个**恒真**的假故障。实测让 WSL 侧 21 KB 的 `CLAUDE.md`
+    /// 永久进不了 Class-B，并连带让 3 个注册根拿不到 `canonical_id`。
+    ///
+    /// 🔴 **判据只能打在「原因」上。** 修好前后这个根都进 `unreachable` ——
+    /// **结果一模一样**，差别只在**是谁**给出那个失败。所以断言的是错误串里
+    /// 那句只有 [`probe::WslBackend`] 说得出的话；把后端改回 `LocalBackend`，
+    /// 它给的是宿主的 IO 错误，那句话不在，测试当场红。
+    /// （同「断言『不是 X』证明不了『是 Y』」——这里是正向断言在场。）
+    ///
+    /// **不 spawn `wsl.exe`**：路径里的 NUL 让宿主那一跳返回 `InvalidInput`
+    /// （⇒ `Unknown` ⇒ 回落访问桥），而桥发现路径不在自己声明的前缀下，
+    /// 在发系统调用**之前**就返回。瞬时、跨平台、无外部依赖。
+    #[test]
+    fn a_wsl_root_is_probed_through_the_access_bridge_not_the_host_alone() {
+        const PREFIX: &str = r"\\wsl.localhost\svault-bridge-probe-7ab2";
+        let roots = [ProjectSnapshotRoot {
+            source_location: SourceLocation::Wsl("svault-bridge-probe-7ab2".into()),
+            path: "/home/u/project".into(),
+            // 故意让路径**不在** PREFIX 之下：宿主那一跳因 NUL 报 `Unknown`，
+            // 回落到桥之后由前缀不匹配当场定案 —— 全程零 `wsl.exe`。
+            host_probe: Some(HostProbe::for_root("/tmp/svault-bridge\u{0}x", PREFIX)),
+            project_root: "wsl:svault-bridge-probe-7ab2:/home/u/project".into(),
+        }];
+        let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
+
+        assert!(
+            found.sources.is_empty(),
+            "问不到就不该产出来源：{:?}",
+            found.sources
+        );
+        let reported = found
+            .unreachable
+            .iter()
+            .find(|u| u.project_root == "wsl:svault-bridge-probe-7ab2:/home/u/project")
+            .expect("没问成必须报出来 —— 空 unreachable 读作「这个项目没有指令文件」");
+        assert!(
+            reported.reason.contains("declared WSL prefix"),
+            "🔴 这个失败是**宿主**给的，说明 WSL 根又被送进了纯宿主后端 —— \
+             只有访问桥说得出「not under this backend's declared WSL prefix」。\
+             实际拿到：{}",
+            reported.reason
+        );
+    }
+
+    /// `HostProbe` 是「该问谁」的唯一实现 —— 两种命名空间各走各的。
+    ///
+    /// ⚠️ 这条**单独不足以**守住上面那个缺陷（纯函数测试钉的是映射，说不了调用点
+    /// 有没有用它 —— 本仓判例：断言 `transport_error` 返回什么，而调用点改回裸
+    /// `format!` 照样绿）。它只钉「分派规则本身没退化」。
+    #[test]
+    fn host_probe_routes_wsl_prefixes_to_the_bridge_and_everything_else_to_the_host() {
+        assert!(matches!(
+            HostProbe::for_root("/tmp/x", ""),
+            HostProbe::Native(_)
+        ));
+        // 普通 SMB 共享：宿主**确实**读得了，不该白付一次 `wsl.exe`。
+        assert!(matches!(
+            HostProbe::for_root(r"\\fileserver\share\proj", r"\\fileserver\share"),
+            HostProbe::Native(_)
+        ));
+        match HostProbe::for_root(
+            r"\\wsl.localhost\Ubuntu-22.04\home\u\p",
+            r"\\wsl.localhost\Ubuntu-22.04",
+        ) {
+            HostProbe::WslUnc { distro, .. } => assert_eq!(distro, "Ubuntu-22.04"),
+            other => panic!("WSL UNC 前缀必须走桥，实际：{other:?}"),
+        }
+        // `\\wsl$\` 是同一个命名空间的旧拼写。
+        match HostProbe::for_root(r"\\wsl$\Debian\home\u\p", r"\\wsl$\Debian") {
+            HostProbe::WslUnc { distro, .. } => assert_eq!(distro, "Debian"),
+            other => panic!("`\\\\wsl$\\` 也是 WSL，实际：{other:?}"),
+        }
     }
 
     /// 同一条判据的**本机**那一半。
@@ -699,14 +879,18 @@ mod tests {
         let roots = [ProjectSnapshotRoot {
             source_location: SourceLocation::Local,
             path: std::path::PathBuf::from("/tmp/svault-probe-err\u{0}x"),
-            probe_path: None,
+            host_probe: None,
             project_root: "/tmp/svault-probe-err".into(),
         }];
         let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
 
         assert!(found.sources.is_empty(), "问不成就不产出来源");
         assert_eq!(
-            found.unreachable,
+            found
+                .unreachable
+                .iter()
+                .map(|u| u.project_root.clone())
+                .collect::<Vec<_>>(),
             vec!["/tmp/svault-probe-err".to_string()],
             "🔴 本机 IO 错误同样是「没问成」—— 只有 NotFound 才是「确实没有」"
         );
@@ -730,7 +914,7 @@ mod tests {
         let roots = [ProjectSnapshotRoot {
             source_location: SourceLocation::Local,
             path: dir.clone(),
-            probe_path: None,
+            host_probe: None,
             project_root: dir.to_string_lossy().into_owned(),
         }];
         let found = discover_project_snapshots(&roots, crate::deadline::Deadline::unbounded());
