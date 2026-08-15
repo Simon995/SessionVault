@@ -1475,7 +1475,20 @@ impl TotalStore {
     ///
     /// `deadline` 是**整轮**预算：耗尽后剩下的根这一轮不问，`identity_seen` 里也不
     /// 留记录 ⇒ 下一轮自然重试。
-    pub fn sweep_registered_root_identities(&self, deadline: Deadline) -> IdentitySweep {
+    /// 🔴 **`default_distro` / `mounts` 是这一轮的运行期事实，由调用方给。**
+    ///
+    /// 身份解析的形态分派（`pathnorm::reach_of`）要它们才认得出裸 Linux 路径与
+    /// `/mnt/<drive>/…` —— 少了它们，这两族在 Windows 上会被当成本机相对路径，
+    /// stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被丢弃（实测 20 个根里 3 个）。
+    ///
+    /// **不在本函数里自己去问**：那会在每轮多起两次 `wsl.exe`，而调用方的发现阶段
+    /// 刚刚问过。同一轮用同一份事实，也免得两处答案不一致。
+    pub fn sweep_registered_root_identities(
+        &self,
+        default_distro: Option<&str>,
+        mounts: &crate::pathnorm::DriveMounts,
+        deadline: Deadline,
+    ) -> IdentitySweep {
         let mut sweep = IdentitySweep::default();
         let roots: Vec<String> = {
             let Ok(conn) = self.conn.lock() else {
@@ -1505,7 +1518,7 @@ impl TotalStore {
                 sweep.skipped_out_of_budget += 1;
                 continue;
             }
-            match self.record_identity_for_root(&root, deadline) {
+            match self.record_identity_for_root(&root, default_distro, mounts, deadline) {
                 IdentityOutcome::AlreadyProbed => sweep.already_probed += 1,
                 IdentityOutcome::Recorded => sweep.recorded += 1,
                 IdentityOutcome::NoRemote => sweep.no_remote += 1,
@@ -1518,7 +1531,13 @@ impl TotalStore {
     /// 一个根的身份 —— [`sweep_registered_root_identities`] 的单步。
     ///
     /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
-    fn record_identity_for_root(&self, root: &str, deadline: Deadline) -> IdentityOutcome {
+    fn record_identity_for_root(
+        &self,
+        root: &str,
+        default_distro: Option<&str>,
+        mounts: &crate::pathnorm::DriveMounts,
+        deadline: Deadline,
+    ) -> IdentityOutcome {
         if root.is_empty() {
             return IdentityOutcome::NoRemote;
         }
@@ -1546,7 +1565,7 @@ impl TotalStore {
         // 三态各有各的处置：`Unknown` 是「本轮没问成」，它**已经**被上面的
         // `identity_seen` 记成「问过了」，所以必须撤回 —— 否则一次瞬时故障让这个
         // 项目在本进程内永远算不出身份。
-        let cid = match crate::identity::repo_id_for_root(root, deadline) {
+        let cid = match crate::identity::repo_id_for_root(root, default_distro, mounts, deadline) {
             Ok(identity) => identity.id,
             Err(e) => {
                 log::debug!(
@@ -5858,7 +5877,7 @@ mod project_identity_tests {
         //
         // 生产里登记根的是归属；这里复述那一步，再跑一轮扫描。
         store.register_project_root(&root_str, crate::attribution::RootSource::Git);
-        store.sweep_registered_root_identities(Deadline::unbounded());
+        store.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
     }
 
     /// 🔴 **身份行没落库，就不配保留「问过了」**（三轮评审 P2）。
@@ -5943,7 +5962,7 @@ mod project_identity_tests {
             "前提：扫描之前本来就没有身份行"
         );
 
-        let sweep = st.sweep_registered_root_identities(Deadline::unbounded());
+        let sweep = st.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
         assert_eq!(sweep.registered, 1);
         assert_eq!(sweep.recorded, 1, "注册表里的根必须被问到");
         assert_eq!(
@@ -5953,7 +5972,7 @@ mod project_identity_tests {
         );
 
         // 第二轮不再重复问盘，但也不该把已有的行弄丢。
-        let again = st.sweep_registered_root_identities(Deadline::unbounded());
+        let again = st.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
         assert_eq!(
             (again.recorded, again.already_probed),
             (0, 1),
@@ -5969,8 +5988,11 @@ mod project_identity_tests {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("/w/a", RootSource::Git);
         st.register_project_root("/w/b", RootSource::Git);
-        let sweep = st
-            .sweep_registered_root_identities(Deadline::after(std::time::Duration::from_millis(0)));
+        let sweep = st.sweep_registered_root_identities(
+            None,
+            &Vec::new(),
+            Deadline::after(std::time::Duration::from_millis(0)),
+        );
         assert_eq!(sweep.registered, 2);
         assert_eq!(
             sweep.skipped_out_of_budget, 2,

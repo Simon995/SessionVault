@@ -298,23 +298,49 @@ pub fn normalize_remote(url: &str) -> Option<String> {
 /// 访问桥不受影响：`wsl.exe` 在发行版**内部**读，链接在那一侧是正常的。
 pub fn repo_id_for_root(
     root: &str,
+    default_distro: Option<&str>,
+    mounts: &crate::pathnorm::DriveMounts,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
-    let Some((distro, linux_path)) = crate::pathnorm::split_canonical_wsl(root) else {
-        // 本机路径：老路不变。
-        return match find_git_root(Path::new(root)) {
-            GitRoot::Found(p) => Ok(RepoIdentity {
-                id: canonical_repo_id(&p)?,
-                repo_root: Some(p.to_string_lossy().into_owned()),
-            }),
-            GitRoot::Absent => Ok(RepoIdentity {
-                id: format!("path:{root}"),
-                repo_root: None,
-            }),
-            GitRoot::Unknown(e) => Err(e),
-        };
-    };
-    wsl_repo_id(distro, linux_path, root, deadline)
+    // 🔴 **形态分派收口到 `pathnorm::reach_of`**（2026-08-15）。
+    //
+    // 这里从前只认两种形态（规范形 / 其余），于是**裸 Linux 路径与 `/mnt/<drive>/…`
+    // 全落进本机分支** —— 在 Windows 上前者是当前盘的相对路径、后者同理，
+    // stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `store::note_project_identity` 丢弃。
+    //
+    // 而 `discovery::probe_path` 认**四种**形态。同一条「这条路径归谁管」的判据
+    // 有两份实现、答不同的问题、于是分别演化 —— 本仓当天已因此栽过四次。
+    // 现在形态只判一次，两个调用点各自决定拿到形态后做什么。
+    match crate::pathnorm::reach_of(
+        root,
+        default_distro,
+        mounts,
+        crate::pathnorm::HostPlatform::current(),
+    ) {
+        crate::pathnorm::RootReach::Wsl { distro, linux } => {
+            wsl_repo_id(&distro, &linux, root, deadline)
+        }
+        // 🔴 **`Unknown` 是「没问成」，不是「没有身份」。** 报 `Err` 让调用方撤回
+        // 「问过了」缓存、下一轮重试；落 `path:` 会把一个暂时的不确定变成终态。
+        crate::pathnorm::RootReach::Unknown(why) => {
+            Err(crate::probe::ProbeError::new(Path::new(root), why))
+        }
+        crate::pathnorm::RootReach::Local(host_path) => {
+            match find_git_root(Path::new(&host_path)) {
+                GitRoot::Found(p) => Ok(RepoIdentity {
+                    id: canonical_repo_id(&p)?,
+                    repo_root: Some(p.to_string_lossy().into_owned()),
+                }),
+                GitRoot::Absent => Ok(RepoIdentity {
+                    // ⚠️ `path:` 用**原样的 root**，不是换算后的宿主形式 ——
+                    // 它是给人看的标识，要能对回注册表里那一行。
+                    id: format!("path:{root}"),
+                    repo_root: None,
+                }),
+                GitRoot::Unknown(e) => Err(e),
+            }
+        }
+    }
 }
 
 /// [`repo_id_for_root`] 的答案。
@@ -649,6 +675,8 @@ mod tests {
     fn a_canonical_wsl_root_goes_through_the_bridge_not_the_local_fs() {
         let err = repo_id_for_root(
             "wsl:NoSuchDistro_quotabar_xyz:/home/u/proj",
+            None,
+            &Vec::new(),
             Deadline::after(std::time::Duration::from_secs(20)),
         )
         .expect_err("不存在的发行版必须报「没问成」，不能给出一个身份");
@@ -667,7 +695,13 @@ mod tests {
     fn a_local_path_still_resolves_on_the_local_fs() {
         let root = scratch("local-still-local");
         seed_repo(&root, Some("git@github.com:o/r.git"));
-        let got = repo_id_for_root(&root.to_string_lossy(), Deadline::unbounded()).unwrap();
+        let got = repo_id_for_root(
+            &root.to_string_lossy(),
+            None,
+            &Vec::new(),
+            Deadline::unbounded(),
+        )
+        .unwrap();
         assert_eq!(got.id, "git:github.com/o/r");
         // 🔴 `repo_root` 也要钉：它是别名分组挑代表的依据，而调用方**不能**从 `id`
         // 反推（`path:` 同时盖住「没有 .git」和「有 .git 但没 origin」）。

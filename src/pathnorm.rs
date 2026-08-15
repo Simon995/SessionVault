@@ -248,6 +248,80 @@ pub fn mnt_to_windows(path: &str, mounts: &DriveMounts) -> Option<String> {
     None
 }
 
+/// 一条根路径**该问谁** —— 形态分派的唯一实现。
+///
+/// 🔴 收成一处的理由与 `HostProbe`（「该问谁」）同源：这套判据此前有**两份**，
+/// 而它们答的是不同的问题、于是分别演化：
+/// - `discovery::probe_path`（「项目根在哪」）认四种形态：规范形 / UNC / 裸 Linux /
+///   `/mnt/<drive>`；
+/// - `identity::repo_id_for_root`（「这个仓的身份是什么」）只认**两种**（规范形 /
+///   本机），**裸 Linux 与 `/mnt/…` 全落进本机分支**。
+///
+/// 后果实测（2026-08-15）：20 个注册根里 3 个拿不到 `canonical_id`，而它们正是这两族
+/// —— 在 Windows 上 `/home/simon/…` 是当前盘的相对路径、`/mnt/c/…` 同理，
+/// stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `note_project_identity` 丢弃。
+/// 而同一个目录的规范形那行**有**身份 ⇒ 同一份记忆按写法落进不同的桶。
+///
+/// **不合并两个调用点**（它们答不同的问题），只把「形态」这一步收成一处。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootReach {
+    /// 宿主自己就能 stat（本机路径，或 `/mnt/<drive>/…` 换算后的宿主形式）。
+    Local(String),
+    /// 归发行版管，要经访问桥。
+    Wsl { distro: String, linux: String },
+    /// 知道它在别处，但**问不出该问谁**（裸 Linux 而 distro 不明、
+    /// `/mnt/…` 而挂载表拿不到）。
+    ///
+    /// 🔴 **这不是「本机路径」**。落回本机会把 `/home/u/x` 当成当前盘的相对路径 ——
+    /// 要么探不到（被按「确认无根」缓存 24 小时），要么误中真实存在的 `\home\u\x`。
+    Unknown(String),
+}
+
+/// 判定一条根路径该问谁。`host` 是宿主平台（Unix 上裸绝对路径就是本机路径）。
+pub fn reach_of(
+    path: &str,
+    default_distro: Option<&str>,
+    mounts: &DriveMounts,
+    host: HostPlatform,
+) -> RootReach {
+    let p = path.trim();
+    if let Some((distro, linux)) = split_canonical_wsl(p) {
+        return RootReach::Wsl {
+            distro: distro.to_string(),
+            linux: linux.to_string(),
+        };
+    }
+    if let Some(canonical) = canonical_wsl_unc(p) {
+        if let Some((distro, linux)) = split_canonical_wsl(&canonical) {
+            return RootReach::Wsl {
+                distro: distro.to_string(),
+                linux: linux.to_string(),
+            };
+        }
+    }
+    if host == HostPlatform::Windows && is_bare_linux_path(p) {
+        return match default_distro {
+            Some(d) => RootReach::Wsl {
+                distro: d.to_string(),
+                linux: p.to_string(),
+            },
+            None => RootReach::Unknown(format!("bare linux path with no known distro: {p}")),
+        };
+    }
+    if host == HostPlatform::Windows && is_windows_drive_mount(p) {
+        // 换算走**实测的挂载表**，不按「`/mnt/<单字母>` 就是盘符」猜 —— 那在
+        // `automount.root` 改过、配置改了没重启、以及 `/mnt/data` 这类普通挂载
+        // 三种情况下都是错的，而猜错会把身份安到别的项目上。
+        return match mnt_to_windows(p, mounts) {
+            Some(win) => RootReach::Local(win),
+            None => RootReach::Unknown(format!(
+                "no drive mount covers {p} (mount table unavailable or this is a plain Linux mount)"
+            )),
+        };
+    }
+    RootReach::Local(p.to_string())
+}
+
 /// 裸 Linux 绝对路径（`/home`、`/root`…），且不是挂载的 Windows 盘。
 ///
 /// 「归属」由 [`HostPlatform`] 决定，本函数只判「形状」，不判归属。
@@ -481,5 +555,103 @@ mod tests {
                 "local"
             );
         }
+    }
+
+    // ── 形态分派：一条根路径该问谁（2026-08-15）────────────────────────────
+
+    fn mnt_c() -> DriveMounts {
+        vec![("/mnt/c".into(), r"C:\".into())]
+    }
+
+    /// 🔴 **裸 Linux 与 `/mnt/…` 不是本机路径。**
+    ///
+    /// 这两族此前在 `identity::repo_id_for_root` 里落进本机分支 —— 在 Windows 上
+    /// `/home/u/x` 是**当前盘的相对路径**，stat 不到 `.git/config` ⇒ 落 `path:` id
+    /// ⇒ 被 `store::note_project_identity` 丢弃。实测 20 个注册根里 3 个因此没有
+    /// `canonical_id`，而同一个目录的规范形那行**有** ⇒ 同一份记忆按写法落进不同的桶。
+    #[test]
+    fn a_bare_linux_root_belongs_to_the_distro_not_to_the_host() {
+        let m = mnt_c();
+        assert_eq!(
+            reach_of("/home/u/proj", Some("Ubuntu"), &m, HostPlatform::Windows),
+            RootReach::Wsl {
+                distro: "Ubuntu".into(),
+                linux: "/home/u/proj".into()
+            }
+        );
+        // Unix 宿主上，裸绝对路径就是本机路径 —— 不该被打 WSL 标。
+        assert_eq!(
+            reach_of("/home/u/proj", Some("Ubuntu"), &m, HostPlatform::Unix),
+            RootReach::Local("/home/u/proj".into())
+        );
+    }
+
+    /// 🔴 **不知道该问谁 ≠ 本机路径。** 落回本机会把 `/home/u/x` 当成当前盘的相对
+    /// 路径：要么探不到（被按「确认无根」缓存 24 小时），要么**误中**真实存在的
+    /// `\home\u\x`。必须是第三态。
+    #[test]
+    fn a_bare_linux_root_with_no_known_distro_is_unknown_not_local() {
+        match reach_of("/home/u/proj", None, &mnt_c(), HostPlatform::Windows) {
+            RootReach::Unknown(why) => assert!(why.contains("no known distro"), "{why}"),
+            other => panic!("distro 不明必须报 Unknown，实际：{other:?}"),
+        }
+    }
+
+    /// `/mnt/<drive>/…` 换算成宿主形式 —— **零 `wsl.exe`**，本机直接 stat。
+    #[test]
+    fn a_mounted_windows_drive_is_reached_through_the_host_path() {
+        assert_eq!(
+            reach_of(
+                "/mnt/c/Users/u/proj",
+                Some("Ubuntu"),
+                &mnt_c(),
+                HostPlatform::Windows
+            ),
+            RootReach::Local(r"C:\Users\u\proj".into())
+        );
+    }
+
+    /// 🔴 **换算不出来也是「没问成」。** 挂载表拿不到时落回本机同样会误中当前盘上的
+    /// `\mnt\…`。
+    #[test]
+    fn a_mount_no_table_covers_is_unknown_not_local() {
+        match reach_of(
+            "/mnt/d/x",
+            Some("Ubuntu"),
+            &Vec::new(),
+            HostPlatform::Windows,
+        ) {
+            RootReach::Unknown(why) => assert!(why.contains("no drive mount"), "{why}"),
+            other => panic!("挂载表覆盖不到必须报 Unknown，实际：{other:?}"),
+        }
+    }
+
+    /// 规范形与 UNC 都归发行版；Windows 盘符路径归本机。
+    #[test]
+    fn canonical_and_unc_go_to_the_distro_while_drive_paths_stay_local() {
+        let m = mnt_c();
+        assert_eq!(
+            reach_of("wsl:Ubuntu:/home/u/p", None, &m, HostPlatform::Windows),
+            RootReach::Wsl {
+                distro: "Ubuntu".into(),
+                linux: "/home/u/p".into()
+            }
+        );
+        assert_eq!(
+            reach_of(
+                r"\\wsl.localhost\Debian\home\u\p",
+                None,
+                &m,
+                HostPlatform::Windows
+            ),
+            RootReach::Wsl {
+                distro: "Debian".into(),
+                linux: "/home/u/p".into()
+            }
+        );
+        assert_eq!(
+            reach_of(r"C:\Users\u\p", None, &m, HostPlatform::Windows),
+            RootReach::Local(r"C:\Users\u\p".into())
+        );
     }
 }

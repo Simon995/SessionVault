@@ -284,25 +284,28 @@ pub fn probe_path(
     mounts: &DriveMounts,
     deadline: crate::deadline::Deadline,
 ) -> Probe {
-    if let Some((distro, linux)) = pathnorm::split_canonical_wsl(path) {
-        return probe_wsl(distro, linux, true, deadline);
-    }
-    if let Some(canonical) = pathnorm::canonical_wsl_unc(path) {
-        if let Some((distro, linux)) = pathnorm::split_canonical_wsl(&canonical) {
-            // UNC 输入：总库里 UNC 与规范形是同一族（`canonical_wsl_unc` 已经把
-            // 前者归一到后者），所以用规范形登记。
-            return probe_wsl(distro, linux, true, deadline);
-        }
-    }
-    // Windows 宿主上的裸 Linux 路径（`/home/…`）：本机 stat 会去错盘，
-    // 只有知道 distro 才问得动 —— 但**结果要保持裸形式**。
-    if cfg!(windows) && pathnorm::is_bare_linux_path(path) {
-        return match default_distro {
-            Some(d) => probe_wsl(d, path, false, deadline),
-            None => Probe::Failed {
-                reason: format!("bare linux path with no known distro: {path}"),
-            },
-        };
+    // 🔴 **形态判定收口到 `pathnorm::reach_of`**（2026-08-15）—— 同一条判据从前在
+    // 这里和 `identity::repo_id_for_root` 各有一份，而后者只认两种形态，于是裸 Linux
+    // 与 `/mnt/…` 的根拿不到 `canonical_id`（实测 20 个根里 3 个）。
+    //
+    // ⚠️ **形态相同 ≠ 处置相同**：本函数答「项目根在哪」，那边答「这个仓的身份是
+    // 什么」。所以只共用形态，各自决定拿到形态后做什么 —— 尤其是**结果的形式**
+    // （见下面 `canonical_form` 的说明），那是本函数独有的关注点。
+    let reach = pathnorm::reach_of(
+        path,
+        default_distro,
+        mounts,
+        if cfg!(windows) {
+            pathnorm::HostPlatform::Windows
+        } else {
+            pathnorm::HostPlatform::Unix
+        },
+    );
+    if let pathnorm::RootReach::Wsl { distro, linux } = &reach {
+        // 结果的形式跟随**输入**：规范形 / UNC 的输入拿规范形的根，裸 Linux 输入
+        // 拿裸 Linux 的根。归属是纯字符串匹配，**登记什么形式就只认什么形式**。
+        let canonical_form = !pathnorm::is_bare_linux_path(path);
+        return probe_wsl(distro, linux, canonical_form, deadline);
     }
     // 🔴 `/mnt/<drive>/…`：WSL 里访问 Windows 盘。**本机能 stat 它对应的盘符路径**，
     // 所以换算过去探测，比走访问桥便宜得多（零 `wsl.exe` 调用）。
@@ -321,17 +324,18 @@ pub fn probe_path(
     //
     // 与本 ADR 的主线同一条：`Probe::None`（问了、没有）与 `Probe::Failed`（没问成）
     // 必须分开 —— 这里属于后者，退避该按「暂时故障」的那档走。
-    if cfg!(windows) && pathnorm::is_windows_drive_mount(path) {
-        return match probe_mnt_with(path, mounts, probe_local) {
-            Some(p) => p,
-            None => Probe::Failed {
-                reason: format!(
-                    "no drive mount covers {path} (mount table unavailable or this is a plain Linux mount)"
-                ),
-            },
-        };
+    match reach {
+        // `/mnt/<drive>/…` 已由 `reach_of` 换算成宿主形式；本机路径原样。
+        // 🔴 **探到的根按宿主形式返回，不转回 `/mnt/…`** —— 见 `probe_mnt_with` 的说明。
+        pathnorm::RootReach::Local(host_path) => probe_local(&host_path),
+        // 🔴 **换算不出来是「没问成」，不是「没有根」**（评审 [P2]）。
+        // `None` 会被调用方按「确认无根」缓存 24 小时，一次 WSL 超时就让这一族
+        // 路径整天归不到根；而落回 `probe_local` 更糟 —— `/mnt/d/…` 在 Windows 上是
+        // 当前盘根的相对路径，可能**误中**真实存在的 `\mnt\…`。
+        pathnorm::RootReach::Unknown(reason) => Probe::Failed { reason },
+        // 上面已 `return`。
+        pathnorm::RootReach::Wsl { .. } => unreachable!("handled above"),
     }
-    probe_local(path)
 }
 
 /// `/mnt/…` 分支的可测形态 —— **探测器显式注入**。
