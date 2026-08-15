@@ -145,6 +145,20 @@ enum Command {
         #[arg(long, default_value = "60")]
         timeout_secs: u64,
     },
+    /// 打印本机总库的默认路径 —— 就这一件事。
+    ///
+    /// 为什么需要它：消费方**不能自己推这个路径**。它是
+    /// `dirs_next::data_local_dir()/svault/total_store.db`，而 Python 对
+    /// 「data_local_dir」的理解与 Rust 的 `dirs_next` 不一致 —— 各推各的就是又一处
+    /// 跨语言「必须推出同一个值」的接缝（ADR-045 那个 `<user>` 标签是它的判例）。
+    ///
+    /// 多数命令不需要它：不传 `--store` 时它们各自默认到同一个地方。需要它的是
+    /// **必须显式指名**的那些 —— 比如不可逆的擦除，它的确认框应当告诉用户
+    /// 「这还会从哪个库里删」。
+    ///
+    /// ⚠️ 只回答「默认在哪」，**不保证那儿有文件**。存不存在是另一个问题，
+    /// 由调用方自己探 —— 在这里替它探，等于把两个答案压进一个出口。
+    StorePath,
     /// 投影替换的变更流（ADR-044 决定 6）。
     ///
     /// 只读「当前投影」不足以让消费者收敛：一次重投影把 `{A,B}` 换成 `{A}` 之后，
@@ -260,6 +274,8 @@ enum Out<'a> {
     },
     /// scan 产出的一条归一化事件（TumeFlow 依赖的事件流契约）。
     Event { event: &'a RawEvent },
+    /// `store-path` 的唯一一行：本机总库的默认路径。
+    StorePath { path: &'a str },
     /// `memory-roots` 的一行：一个 agent home 对 + 宿主到它的前缀。
     MemoryRoot {
         location: &'a str,
@@ -446,6 +462,7 @@ fn main() {
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
         Command::Roots { store } => run_roots(store),
+        Command::StorePath => run_store_path(),
         Command::MemoryRoots {
             userprofile,
             timeout_secs,
@@ -1289,6 +1306,23 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
 /// 不必自己再发现一遍项目 —— 而一个「成功但空」的输出会让它读作「这台机器上没有
 /// 项目」，然后**心安理得地回退到自己那套发现**，正好把这个命令要消除的第二份
 /// 实现重新请回来。空列表只有一个合法含义：读到了，注册表里确实没有根。
+fn run_store_path() -> i32 {
+    match resolve_store_path(None) {
+        Some(p) => {
+            emit(&Out::StorePath {
+                path: &p.to_string_lossy(),
+            });
+            0
+        }
+        // 🔴 推不出来是「说不出来」，不是「在当前目录」。给一个兜底路径会让调用方
+        // 拿着一个看起来正常的错答案去删东西。
+        None => {
+            log::error!(target: tag::CLI, "no data_local_dir on this platform");
+            1
+        }
+    }
+}
+
 fn run_memory_roots(userprofile: Option<String>, timeout_secs: u64) -> i32 {
     let profile = userprofile.or_else(|| std::env::var("USERPROFILE").ok());
     let enumeration = session_vault::memory_roots::enumerate(
