@@ -124,6 +124,27 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 这台机器上有哪些**记忆根**（`~/.claude` + `~/.codex` 对），含每个 WSL 发行版。
+    ///
+    /// 与 `roots` 是两件事，别混：`roots` 回答「**事件被归因到**哪些项目根」（读总库）；
+    /// 本命令回答「**agent 的记忆装在哪些 home 里**」（探这台机器）。前者是历史，
+    /// 后者是现状，两者的集合可以完全不同。
+    ///
+    /// 存在的理由：这条规则此前只在 QuotaBar 里有一份，TumeFlow 够不到，于是它在
+    /// 拿不到宿主传参时**回落到自己那一个 local 根** —— 「这台机器只有本机根」与
+    /// 「宿主没告诉我」在调用点长得一模一样，WSL 里的记忆被静默漏掉。
+    ///
+    /// 🔴 **输出含 `unreachable` 行，消费方不得把它读作「那里没有根」。**
+    /// 一个卡住的 WSL 与一台没装 WSL 的机器**必须**能被分开 —— 上游那份是
+    /// `list_distros().unwrap_or_default()`，两者返回完全相同的东西。
+    MemoryRoots {
+        /// 覆盖 `%USERPROFILE%`（测试用；不传则读环境变量）。
+        #[arg(long)]
+        userprofile: Option<String>,
+        /// 整轮预算上限（秒）。每次 `wsl.exe` 调用从中扣，耗尽即不再发起。
+        #[arg(long, default_value = "60")]
+        timeout_secs: u64,
+    },
     /// 投影替换的变更流（ADR-044 决定 6）。
     ///
     /// 只读「当前投影」不足以让消费者收敛：一次重投影把 `{A,B}` 换成 `{A}` 之后，
@@ -239,6 +260,21 @@ enum Out<'a> {
     },
     /// scan 产出的一条归一化事件（TumeFlow 依赖的事件流契约）。
     Event { event: &'a RawEvent },
+    /// `memory-roots` 的一行：一个 agent home 对 + 宿主到它的前缀。
+    MemoryRoot {
+        location: &'a str,
+        claude_home: &'a str,
+        codex_home: &'a str,
+        fs_prefix: &'a str,
+    },
+    /// 🔴 某个位置**没问成** —— 消费方不得把它读作「那里没有根」。
+    ///
+    /// 与根走同一个流是有意的：分成两个流（或只往 stderr 记一句）等于赌消费方会去
+    /// 看另一处，而它多半不会 —— 本仓已有判例（sidecar 的写盘失败挪进 `daemon.log`
+    /// 之后，宿主再没读过那行，坏了三天没人知道）。
+    MemoryRootUnreachable { location: &'a str, reason: &'a str },
+    /// `memory-roots` 收尾摘要。**`unreachable > 0` 时 `roots` 是一份不完整的答案。**
+    MemoryRootsSummary { roots: usize, unreachable: usize },
     SourceReport {
         report: &'a session_vault::report::SourceReport,
     },
@@ -410,6 +446,10 @@ fn main() {
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
         Command::Roots { store } => run_roots(store),
+        Command::MemoryRoots {
+            userprofile,
+            timeout_secs,
+        } => run_memory_roots(userprofile, timeout_secs),
         #[cfg(feature = "store")]
         Command::Changes {
             since_seq,
@@ -1249,6 +1289,35 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
 /// 不必自己再发现一遍项目 —— 而一个「成功但空」的输出会让它读作「这台机器上没有
 /// 项目」，然后**心安理得地回退到自己那套发现**，正好把这个命令要消除的第二份
 /// 实现重新请回来。空列表只有一个合法含义：读到了，注册表里确实没有根。
+fn run_memory_roots(userprofile: Option<String>, timeout_secs: u64) -> i32 {
+    let profile = userprofile.or_else(|| std::env::var("USERPROFILE").ok());
+    let enumeration = session_vault::memory_roots::enumerate(
+        profile.as_deref(),
+        session_vault::deadline::Deadline::after(std::time::Duration::from_secs(timeout_secs)),
+    );
+    for r in &enumeration.roots {
+        emit(&Out::MemoryRoot {
+            location: &r.location,
+            claude_home: &r.claude_home,
+            codex_home: &r.codex_home,
+            fs_prefix: &r.fs_prefix,
+        });
+    }
+    for u in &enumeration.unreachable {
+        emit(&Out::MemoryRootUnreachable {
+            location: &u.location,
+            reason: &u.reason,
+        });
+    }
+    emit(&Out::MemoryRootsSummary {
+        roots: enumeration.roots.len(),
+        unreachable: enumeration.unreachable.len(),
+    });
+    // 🔴 退出码 0 **即使有 unreachable**：那不是本命令的失败，它诚实地报告了。
+    // 非零会让调用方走「命令挂了」那条路，把一份有效的部分答案整个丢掉。
+    0
+}
+
 #[cfg(feature = "store")]
 fn run_roots(store_arg: Option<PathBuf>) -> i32 {
     let Some(store_path) = resolve_store_path(store_arg) else {

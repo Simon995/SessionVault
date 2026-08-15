@@ -15,6 +15,7 @@ pub mod discover;
 pub mod discovery;
 pub mod identity;
 pub mod logging;
+pub mod memory_roots;
 pub mod observation;
 pub mod parser;
 pub mod pathnorm;

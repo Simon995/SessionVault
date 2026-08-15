@@ -223,6 +223,38 @@ pub fn list_jsonl_under_home(
     list_files_under_home(distro, rel_subpath, ".jsonl", deadline)
 }
 
+/// 发行版内的 `$HOME`（POSIX 形式，如 `/home/simon`）。
+///
+/// 本模块其它函数都是「在 `$HOME` 下做点什么」，从不需要那个值本身。这一个需要：
+/// 调用方要用它拼出宿主可达的 UNC 路径 `\\wsl.localhost\<distro>\home\simon`，
+/// 而那条路**不再起 `wsl.exe`**（走 9P 共享），是每次读都省一次进程的关键。
+///
+/// 🔴 **`Err` 是「没问成」，不是「这个发行版没有 HOME」。** 两者的处置完全不同：
+/// 前者意味着该发行版**本轮的答案不作数**（调用方必须报出去，见 `roots::enumerate`），
+/// 后者不可能发生。返回 `Result` 而不是 `Option` 就是为了让这件事在类型上说得出口 ——
+/// 上游 QuotaBar 那份曾是 `Option`，于是「WSL 卡住」与「没这个发行版」在调用点长得一样。
+#[cfg(windows)]
+pub fn home_of(distro: &str, deadline: crate::deadline::Deadline) -> Result<String, String> {
+    // `printf` 而不是 `echo`：后者对以 `-` 开头的值会当成选项。
+    // 不用 `$HOME` 之外的任何变量 —— 本模块头部记着 wsl.exe 传参会篡改 `$`。
+    let output = run_bash_stdin(distro, "set -eu\nprintf '%s' \"$HOME\"\n", deadline)?;
+    if !output.status.success() {
+        return Err(format!(
+            "wsl.exe -d {distro} $HOME exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if home.is_empty() || !home.starts_with('/') {
+        // 空串是那个已知失败模式（`$HOME` 在某些调用形式下会变空），不是一个合法答案。
+        return Err(format!(
+            "wsl.exe -d {distro} returned a non-POSIX $HOME: {home:?}"
+        ));
+    }
+    Ok(home)
+}
+
 /// 递归列出 `$HOME/<rel_subpath>` 下指定后缀的普通文件。后缀来自内置 catalog，
 /// 统一走 `find -print0`，保留空格和非 ASCII 路径。
 #[cfg(windows)]
@@ -574,6 +606,11 @@ macro_rules! stub_on_non_windows {
 
 #[cfg(not(windows))]
 stub_on_non_windows! {
+    pub fn home_of(
+        distro: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<String, String>;
+
     pub fn stat(
         distro: &str,
         abs_path: &str,
