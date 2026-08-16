@@ -110,6 +110,22 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 枚举本机的 Class-B 状态制品（CLAUDE.md / AGENTS.md / 项目 memory）并把它们
+    /// 的快照同步进总库 —— **写入侧的对外出口**。
+    ///
+    /// 🔴 没有这个口的时候，同步只能经 `TotalStore::sync_snapshots` 这个 Rust 库
+    /// API，于是**只有能直链 crate 的消费者做得到**（实际上只有 QuotaBar）。后果：
+    /// 「记忆的证据层什么时候刷新」被绑在「那个宿主有没有在跑」上 —— 只装
+    /// TumeChat 的用户永远刷不到，而界面上什么都不会说。
+    ///
+    /// ⚠️ 输出里的 `unreachable` **不是**「那里没有素材」。一个权限拒绝或停掉的
+    /// WSL 发行版会让整个位置问不成，而 `sync_snapshots` 把「本轮没出现的来源」
+    /// 当作已消失处理 —— 调用方必须据此决定要不要信任这一轮。
+    #[cfg(feature = "store")]
+    SyncSnapshots {
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 总库记下的项目根（ADR-050 注册表）—— **项目身份的唯一对外出口**。
     ///
     /// 没有这个口的时候，只有能直链 Rust crate 的消费者拿得到注册表，走 CLI 的那些
@@ -291,6 +307,24 @@ enum Out<'a> {
     MemoryRootUnreachable { location: &'a str, reason: &'a str },
     /// `memory-roots` 收尾摘要。**`unreachable > 0` 时 `roots` 是一份不完整的答案。**
     MemoryRootsSummary { roots: usize, unreachable: usize },
+    /// 一次 Class-B 同步的结果。**`unreachable` 与「没有素材」是两件事**，
+    /// 所以它是独立字段而不是「更短的 sources 列表」。
+    SyncSnapshotsSummary {
+        /// 这一轮**枚举到**的来源数。
+        sources: usize,
+        /// 内容变了、写进新一版快照的来源数。
+        changed: u64,
+        /// 内容没变、跳过的。
+        unchanged: u64,
+        /// 🔴 **读失败的来源** —— 与 `unreachable` 不同：那个是「位置/项目根问不成」，
+        /// 这个是「文件在，但读它炸了」。两者都不是「没有素材」。
+        failed: u64,
+        /// 写进总库的事件条数。
+        appended: u64,
+        unreachable: usize,
+    },
+    /// 没问成的那些，逐条报出来 —— 一个只给计数的摘要说不出「是哪个位置」。
+    SyncUnreachable { reason: &'a str },
     SourceReport {
         report: &'a session_vault::report::SourceReport,
     },
@@ -461,6 +495,8 @@ fn main() {
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
+        Command::SyncSnapshots { store } => run_sync_snapshots(store),
+        #[cfg(feature = "store")]
         Command::Roots { store } => run_roots(store),
         Command::StorePath => run_store_path(),
         Command::MemoryRoots {
@@ -489,6 +525,48 @@ fn main() {
 }
 
 #[cfg(feature = "store")]
+/// 枚举 Class-B 来源并同步进总库。
+///
+/// 判据与 `run_snapshots`（读侧）一致：**先把「没问成」说出来，再报数字**。
+/// 一份漂亮的 `inserted` 配着三个没问成的位置，与一份同样漂亮的、什么都没漏的，
+/// 在只看数字时长得一模一样。
+#[cfg(feature = "store")]
+fn run_sync_snapshots(store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    let found = session_vault::class_b::enumerate();
+    for reason in &found.unreachable {
+        emit(&Out::SyncUnreachable { reason });
+    }
+    // ⚠️ 库那侧建库是幂等的，这里**不**要求库已存在：第一次同步就该能把库建起来，
+    // 否则「装完还没扫过」会变成一个需要另一个程序先跑一遍的死结。
+    let store = match open_total_store(&store_path) {
+        Ok(store) => store,
+        Err(e) => {
+            log::error!(target: tag::CLI, "snapshot store open failed: {e}");
+            return 2;
+        }
+    };
+    let stats = match store.sync_snapshots(&found.sources) {
+        Ok(stats) => stats,
+        Err(e) => {
+            log::error!(target: tag::CLI, "snapshot sync failed: {e}");
+            return 2;
+        }
+    };
+    emit(&Out::SyncSnapshotsSummary {
+        sources: found.sources.len(),
+        changed: stats.changed,
+        unchanged: stats.unchanged,
+        failed: stats.failed,
+        appended: stats.appended,
+        unreachable: found.unreachable.len(),
+    });
+    0
+}
+
 fn run_snapshots(store_arg: Option<PathBuf>) -> i32 {
     let Some(store_path) = resolve_store_path(store_arg) else {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");

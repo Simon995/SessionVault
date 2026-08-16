@@ -1,0 +1,287 @@
+//! Class-B（状态制品）快照来源的枚举 —— **2026-08-16 从 QuotaBar 搬过来的**。
+//!
+//! Class-B 是「工具的指令/记忆文件」：`CLAUDE.md` / `AGENTS.md` /
+//! `~/.claude/projects/<enc>/memory/*.md` 之类。与 Class-A（会话转录）相对。
+//!
+//! ## 为什么住在这里
+//!
+//! 这段编排从前在 QuotaBar 的 `memory/sources.rs`，而**它用到的每一个原语本来
+//! 就在 SessionVault**：根枚举（[`crate::memory_roots`]）、项目目录名解码
+//! （[`crate::project_dir`]）、「该问谁」（[`crate::discover::HostProbe`]）、
+//! 快照发现（[`crate::discover_snapshots`]）。宿主只是在外面把它们拼起来 ——
+//! 而那份「拼法」正是证据层自己的知识。
+//!
+//! 后果是具体的：**Python 侧够不着它**。TumeFlow 要读 Class-B 快照，得先有人
+//! 把它们同步进总库，而同步要 `TotalStore::sync_snapshots` 这个 Rust 库 API。
+//! 于是「记忆的证据层什么时候刷新」被绑在了「QuotaBar 有没有在跑」上 ——
+//! 只装 TumeChat 的用户永远刷不到。搬过来之后 `svault sync-snapshots` 就是出口。
+//!
+//! ## 三态贯穿始终
+//!
+//! 🔴 **`unreachable` 与「那里没有素材」是两件事**，而这条链上每一层都能把前者
+//! 折叠成后者：`read_dir` 失败 `continue`、逐项错误 `flatten()` 吞掉、整次发现
+//! 失败 `unwrap_or_default()`。任何一处折叠，下游看到的都只是「这个位置没有快照」
+//! —— 与「那里确实没有 CLAUDE.md」无从分辨，而后果是**一个项目的指令文件静默
+//! 不进蒸馏，界面上什么都不会说**。
+//!
+//! ⚠️ `NotFound` **是**事实：这个位置压根没装 Claude ⇒ 没有 `projects/` 目录。
+//! 报成不可达会让每个只装了一半工具链的用户永久带着一个假故障。
+
+use std::path::{Path, PathBuf};
+
+use crate::deadline::Deadline;
+use crate::discover::{HostProbe, ProjectSnapshotRoot, SourceRef};
+use crate::probe::{self, Probed};
+use crate::project_dir::{decode_project_dir, DecodedProject};
+use crate::{SourceLocation, SourceType};
+
+/// 枚举结果。**两半都要**：只给 `sources` 的调用方无法区分「没有」与「没问成」。
+#[derive(Debug, Default)]
+pub struct ClassBSources {
+    pub sources: Vec<SourceRef>,
+    /// 没问成的位置或项目根。调用方**不得**读作「这里没有 CLAUDE.md / 记忆」。
+    pub unreachable: Vec<String>,
+}
+
+/// 探测项目根的上限。
+///
+/// 一个停掉的 WSL 发行版会让 UNC 探测挂很久，而这条路径要遍历**每个**项目根。
+/// 没有上限时一次枚举可以跑到天荒地老，而调用方（同步任务）只会看起来卡住。
+fn probe_deadline() -> Deadline {
+    Deadline::after(std::time::Duration::from_secs(20))
+}
+
+#[derive(Clone)]
+struct SnapshotProject {
+    encoded: String,
+    location: SourceLocation,
+    read_path: PathBuf,
+    /// 宿主侧怎么探这个项目根 —— **含「该问谁」**，不只是一条路径。
+    /// 在枚举时就定下来，因为 `fs_prefix` 只有这里有。
+    host_probe: HostProbe,
+    project_root: String,
+}
+
+/// PHYSICAL 路径 → 该 root **会话内**记录的形式。
+///
+/// 一个 WSL 会话把自己的 cwd 记成 Linux 路径（`/home/u/proj`），而宿主看见的是
+/// UNC 物理路径（`\\wsl.localhost\<distro>\home\u\proj`）。两种写法指同一个项目，
+/// 而**它们之间的换算只有握着 `fs_prefix` 的这一层做得了**。
+///
+/// `None` = 换算不适用：本地 root（前缀为空，会话路径本就是物理路径），或者这个
+/// 物理路径根本不在该 root 下。**不猜** —— 猜错会把一个项目的记忆挂到另一个项目上。
+pub fn in_session_path(physical: &str, fs_prefix: &str) -> Option<String> {
+    if fs_prefix.is_empty() {
+        return None;
+    }
+    let norm = |s: &str| s.replace('\\', "/");
+    let (p, prefix) = (norm(physical), norm(fs_prefix));
+    let rest = p.strip_prefix(&prefix)?;
+    let rest = rest.trim_start_matches('/');
+    Some(format!("/{rest}"))
+}
+
+fn source_location(location: &str) -> SourceLocation {
+    location
+        .strip_prefix("wsl-")
+        .map(|distro| SourceLocation::Wsl(distro.to_string()))
+        .unwrap_or(SourceLocation::Local)
+}
+
+/// Claude 的 project identity：`…/projects/<enc>/memory/…` 里的 `<enc>` 对应哪个
+/// 真实项目根。SessionVault 只**携带**这个身份，不跨系统计算它。
+fn attach_project_identities(sources: &mut [SourceRef], projects: &[SnapshotProject]) {
+    for source in sources {
+        if source.source_type != SourceType::ClaudeCode {
+            continue;
+        }
+        let normalized = source.path.to_string_lossy().replace('\\', "/");
+        let Some((_, rest)) = normalized.split_once("/projects/") else {
+            continue;
+        };
+        let Some((encoded, _)) = rest.split_once("/memory/") else {
+            continue;
+        };
+        if let Some(project) = projects
+            .iter()
+            .find(|p| p.encoded == encoded && p.location == source.source_location)
+        {
+            source.project_root = Some(project.project_root.clone());
+        }
+    }
+}
+
+/// 枚举本机能看到的全部 Class-B 快照来源（本机 + 每个 WSL 发行版）。
+pub fn enumerate() -> ClassBSources {
+    // 根枚举与项目探测共用同一个上限：一个停掉的发行版会在两处都挂住，
+    // 而两个独立的上限意味着最坏情况是它们之和。
+    let found = crate::memory_roots::enumerate(None, probe_deadline());
+    // 🔴 根本身就没数全时，**先把这件事带上**。此前这条路径拿到的是一个更短的
+    // 根列表，而下游只会看到「这个位置没有快照」—— 与「那里确实没有」无从分辨。
+    let mut unreachable: Vec<String> = found
+        .unreachable
+        .iter()
+        .map(|u| format!("{} (root enumeration): {}", u.location, u.reason))
+        .collect();
+
+    let mut projects: Vec<SnapshotProject> = Vec::new();
+    for root in &found.roots {
+        let location = source_location(&root.location);
+        let projects_dir = Path::new(&root.claude_home).join("projects");
+        // 🔴 **`NotFound` 是事实，其余每一种 IO 错误都是「没问成」。**
+        let entries = match probe::read_dir_entries(&projects_dir, None) {
+            Probed::Found(entries) => entries,
+            Probed::Absent => continue,
+            Probed::Unknown(e) => {
+                unreachable.push(e.to_string());
+                continue;
+            }
+        };
+        for entry in entries {
+            // 逐项失败同样是「没问成」—— `flatten()` 会把它变成「这一项不存在」。
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    unreachable.push(format!("{}: {e}", projects_dir.display()));
+                    continue;
+                }
+            };
+            let Some(encoded) = entry.file_name.to_str().map(str::to_string) else {
+                continue;
+            };
+            let project_root = match decode_project_dir(&encoded, &root.fs_prefix) {
+                DecodedProject::Found(p) => p,
+                DecodedProject::Absent => continue,
+                DecodedProject::Unresolvable(why) => {
+                    unreachable.push(why);
+                    continue;
+                }
+            };
+            let read_path = PathBuf::from(
+                in_session_path(&project_root, &root.fs_prefix)
+                    .unwrap_or_else(|| project_root.clone()),
+            );
+            projects.push(SnapshotProject {
+                encoded,
+                location: location.clone(),
+                read_path,
+                // 🔴 **在这里就把「该问谁」定下来** —— `fs_prefix` 正好在作用域里，
+                // 而下游拿不到它。从前只传一条路径，WSL 根的 UNC 形式于是被无条件
+                // 送进宿主后端；宿主沿 9P 跟不进符号链接 ⇒ 恒真的「没问成」。
+                host_probe: HostProbe::for_root(&project_root, &root.fs_prefix),
+                project_root,
+            });
+        }
+    }
+
+    // 整次快照发现失败 ⇒ **不是**「一个快照来源都没有」。
+    let mut sources = match crate::discover_snapshots() {
+        Ok(found) => found,
+        Err(e) => {
+            unreachable.push(format!("snapshot discovery failed: {e}"));
+            Vec::new()
+        }
+    };
+    attach_project_identities(&mut sources, &projects);
+
+    let project_roots: Vec<_> = projects
+        .iter()
+        .map(|p| ProjectSnapshotRoot {
+            source_location: p.location.clone(),
+            path: p.read_path.clone(),
+            host_probe: Some(p.host_probe.clone()),
+            project_root: p.project_root.clone(),
+        })
+        .collect();
+    // 🔴 **「探测失败」不许长成「这个项目没写过 CLAUDE.md」**：两者压成同一个
+    // 「不在列表里」的后果是一个项目的指令文件静默不进蒸馏。
+    let probed = crate::discover_project_snapshots(&project_roots, probe_deadline());
+    unreachable.extend(
+        probed
+            .unreachable
+            .iter()
+            .map(|u| format!("{} ({})", u.project_root, u.reason)),
+    );
+    sources.extend(probed.sources);
+
+    sources.sort_by(|a, b| {
+        a.source_location
+            .as_key()
+            .cmp(&b.source_location.as_key())
+            .then(a.path.cmp(&b.path))
+    });
+    sources.dedup_by(|a, b| {
+        a.source_type == b.source_type && a.source_location == b.source_location && a.path == b.path
+    });
+    ClassBSources {
+        sources,
+        unreachable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_session_path_declines_rather_than_guessing() {
+        // 本地根：会话路径本就是物理路径，没有换算可做。
+        assert_eq!(in_session_path("C:/x/proj", ""), None);
+        // 物理路径不在这个根下 ⇒ **不猜**。猜错会把记忆挂到另一个项目上。
+        assert_eq!(
+            in_session_path("C:/x/proj", r"\\wsl.localhost\Ubuntu"),
+            None
+        );
+        // 正常换算：UNC 物理形 → 发行版内部的 POSIX 形。
+        assert_eq!(
+            in_session_path(
+                r"\\wsl.localhost\Ubuntu\home\u\proj",
+                r"\\wsl.localhost\Ubuntu"
+            ),
+            Some("/home/u/proj".to_string())
+        );
+    }
+
+    #[test]
+    fn source_location_reads_the_root_tag() {
+        assert_eq!(source_location("local"), SourceLocation::Local);
+        assert_eq!(
+            source_location("wsl-Ubuntu-22.04"),
+            SourceLocation::Wsl("Ubuntu-22.04".into())
+        );
+    }
+
+    #[test]
+    fn identity_is_attached_only_to_the_matching_root_and_location() {
+        // 🔴 `encoded` 相同但**位置不同**不许互相认领 —— 本机与 WSL 里可以有
+        // 同名的编码目录，认错的后果是一个项目的记忆挂到另一台机器的项目上。
+        let projects = vec![SnapshotProject {
+            encoded: "C--x-proj".into(),
+            location: SourceLocation::Local,
+            read_path: PathBuf::from("C:/x/proj"),
+            host_probe: HostProbe::for_root("C:/x/proj", ""),
+            project_root: "C:/x/proj".into(),
+        }];
+        let mut sources = vec![
+            SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Local,
+                source_mode: crate::SourceMode::SnapshotFile,
+                path: PathBuf::from("C:/u/.claude/projects/C--x-proj/memory/MEMORY.md"),
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            },
+            SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Wsl("Ubuntu".into()),
+                source_mode: crate::SourceMode::SnapshotFile,
+                path: PathBuf::from("/home/u/.claude/projects/C--x-proj/memory/MEMORY.md"),
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            },
+        ];
+        attach_project_identities(&mut sources, &projects);
+        assert_eq!(sources[0].project_root.as_deref(), Some("C:/x/proj"));
+        assert_eq!(sources[1].project_root, None, "位置不同不许认领");
+    }
+}

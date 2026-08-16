@@ -9,6 +9,9 @@
 
 pub mod attribution;
 pub mod catalog;
+/// Class-B（状态制品）快照来源的枚举 —— 2026-08-16 从 QuotaBar 搬来，
+/// 因为它用到的每个原语本来就在这里，宿主只是在外面拼。
+pub mod class_b;
 pub mod cursor;
 pub mod deadline;
 pub mod discover;
