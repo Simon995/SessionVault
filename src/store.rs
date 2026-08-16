@@ -24,7 +24,7 @@ use serde::Serialize;
 use crate::cursor::{Cursor, ScanStatus};
 use crate::deadline::Deadline;
 use crate::discover::SourceRef;
-use crate::probe::ProbeBackend;
+use crate::probe::{ProbeBackend, Probed};
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
 use crate::store_crypto::{
     create_os_key, data_key_id, is_envelope, load_os_key, new_data_key_id, CryptoError,
@@ -791,6 +791,38 @@ impl TotalStore {
         let conn = Connection::open(path)?;
         restrict_permissions(path, 0o600);
         Self::from_conn(conn, key)
+    }
+
+    /// **只读地**打开一个已存在的总库 —— 不存在就说不存在，**绝不建**。
+    ///
+    /// 🔴 [`Self::open`] 的签名**说不出「不存在」**：它 `create_dir_all` + 让 SQLite
+    /// 建文件 + 必要时 `create_os_key()`。也就是说「我只想读一下」的调用方一旦直接
+    /// 用它，就会**凭空给用户造一个空库和一把 OS 密钥，而且不报错**。
+    ///
+    /// 后果不是理论上的：QuotaBar 的 `known_project_identities` 为此在调用点自己
+    /// 先探一次，并在注释里写明「探测在这里不是为了决定有没有身份，而是为了不让
+    /// `TotalStore::open` 顺手建一个空库」—— **一条本该由 API 消化掉的知识外泄到了
+    /// 消费者身上**，而忘了探不会编译失败，只会安静地建库。
+    ///
+    /// 三态照 [`Probed`] 的既有语义：`Absent` 是事实（这台机器还没建过总库，常态）；
+    /// `Unknown` 是**没问成**（权限/句柄/UNC/密钥），调用方不得把它当成「没有」。
+    ///
+    /// ⚠️ 想要「不在就建」的仍然用 [`Self::open`] —— 写入方（扫描器、同步器）本来
+    /// 就该建。这里加的是**读**的那一半，不是替换。
+    pub fn open_existing(path: &Path) -> Probed<Self> {
+        // 存在性探测走 `probe.rs`，不裸调 `std::fs::metadata` —— 那条边界由
+        // `clippy::disallowed_methods` + `verify-agents-md.mjs` 守着，而它在这次
+        // 改动里**当场抓到了我**：第一版就是裸调 metadata。
+        match crate::probe::LocalBackend::unanchored().probe(path, Deadline::unbounded()) {
+            Probed::Found(_) => {}
+            Probed::Absent => return Probed::Absent,
+            Probed::Unknown(e) => return Probed::Unknown(e),
+        }
+        match Self::open(path) {
+            Ok(store) => Probed::Found(store),
+            // 文件在、却打不开 —— 密钥缺失 / 库损坏 / 权限。这**不是**「没有总库」。
+            Err(e) => Probed::Unknown(crate::probe::ProbeError::new(path, e)),
+        }
     }
 
     /// 使用宿主提供的密钥打开数据库。适用于测试和不由默认 OS keychain 管理密钥的嵌入方。
@@ -6537,5 +6569,51 @@ mod project_identity_tests {
             attribute(Some("/w/future/x"), &st.project_root_registry(&Vec::new())).root(),
             Some("/w/future")
         );
+    }
+
+    /// 🔴 **只读打开不许留下任何痕迹。**
+    ///
+    /// `open` 会 `create_dir_all` + 让 SQLite 建文件 + 必要时 `create_os_key()`，
+    /// 所以一个「我只想读一下」的调用方用错入口，就会**凭空给用户造一个空库和
+    /// 一把 OS 密钥，而且不报错**。QuotaBar 为此在调用点自己先探一次 ——
+    /// 一条本该由 API 消化掉的知识外泄到了消费者身上。
+    ///
+    /// 判据是**正向的**：既要 `Absent`，也要**目录和文件都还不存在**。只断言
+    /// 返回值等于没测到副作用 —— 而副作用才是这个 API 存在的理由。
+    #[test]
+    fn open_existing_never_creates_anything() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-open-existing-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join("nested").join("total_store.db");
+        assert!(!dir.exists(), "前置：这个目录必须还不存在");
+
+        assert!(matches!(TotalStore::open_existing(&path), Probed::Absent));
+
+        assert!(!path.exists(), "只读打开不许建文件");
+        assert!(
+            !dir.exists(),
+            "只读打开不许建目录（`open` 会 create_dir_all）"
+        );
+    }
+
+    /// 反面：库真的在，就要拿到它 —— 一个恒 `Absent` 的实现同样能通过上一条。
+    #[test]
+    fn open_existing_returns_the_store_when_it_is_there() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-open-existing-ok-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        // 先用写入口建出来 —— 这正是 `open` 该做而 `open_existing` 不该做的事。
+        drop(TotalStore::open(&path).unwrap());
+        assert!(path.exists());
+
+        assert!(matches!(TotalStore::open_existing(&path), Probed::Found(_)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
