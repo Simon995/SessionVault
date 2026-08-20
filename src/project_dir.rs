@@ -228,8 +228,24 @@ pub fn host_openable_form(
         if crate::pathnorm::split_canonical_wsl(p).is_some() {
             return false;
         }
-        // 裸 Linux 路径只在 Unix 宿主上是本机路径。
-        if crate::pathnorm::is_bare_linux_path(p) {
+        // 🔴 **POSIX 绝对路径只在 Unix 宿主上是本机路径 —— `/mnt/<drive>/…` 也一样。**
+        //
+        // 这里从前用的是 `is_bare_linux_path`，而它**明确把 `/mnt/…` 排除在外**
+        // （`!is_windows_drive_mount`）。那个排除是为**另一个问题**写的：
+        // `normalize_cwd` 规则 4 不该给 `/mnt/…` 打 `wsl:<distro>:` 标，因为它指的
+        // 是 Windows 盘、不住在发行版里。**对「宿主能不能打开它」，那个排除是错的**
+        // —— 在 Windows 上 `/mnt/c/Users/…` 同样会被当成**当前盘的相对路径**，
+        // 正是本函数文档警告的「打开了错的东西，比报错更坏」。
+        //
+        // 实测（2026-08-20）：`/mnt/c/Users/user/workspace/QuotaBar` 因此拿到了
+        // 非空 `host_path`，`memory.list` 于是多出两个打不开的落点
+        // （`/mnt/c/…/QuotaBar\CLAUDE.md`），而同一个仓的 Windows checkout
+        // **已经**有正确的落点了。
+        //
+        // ⚠️ **不在这里做挂载表换算**（`/mnt/c/…` → `C:\…`）。那要 `DriveMounts`，
+        // 而挂载表取不到时**不能**落回本机探测 —— AGENTS.md 已记：那会「要么探不到、
+        // 要么误中真实存在的 `\mnt\…`」。给不出就说给不出。
+        if p.starts_with('/') {
             return host == crate::pathnorm::HostPlatform::Unix;
         }
         true
@@ -457,6 +473,32 @@ mod encode_tests {
         assert_eq!(
             host_openable_form("/home/u/p", &[], HostPlatform::Unix),
             Some("/home/u/p".to_string())
+        );
+    }
+
+    /// 🔴 **`/mnt/<drive>/…` 也一样打不开 —— 这一半此前漏了。**
+    ///
+    /// 上一版用 `is_bare_linux_path`，而它**明确排除** `/mnt/…`
+    /// （`!is_windows_drive_mount`）。那个排除是为**另一个问题**写的：
+    /// `normalize_cwd` 不该给 `/mnt/…` 打 `wsl:<distro>:` 标（它指的是 Windows 盘，
+    /// 不住在发行版里）。**对「宿主能不能打开它」，那个排除是错的。**
+    ///
+    /// 实测（2026-08-20）：`/mnt/c/Users/user/workspace/QuotaBar` 因此拿到非空
+    /// `host_path`，TumeFlow 的 `memory.list` 多出两个打不开的落点，而同一个仓的
+    /// Windows checkout **已经**有正确落点了。
+    ///
+    /// ⚠️ 两条方向都断言：少了 Unix 那半，一个恒 `None` 的实现照样让本条通过。
+    #[test]
+    fn a_mounted_windows_drive_path_is_not_host_openable_on_windows() {
+        assert_eq!(
+            host_openable_form("/mnt/c/Users/u/p", &[], HostPlatform::Windows),
+            None,
+            "在 Windows 上它是当前盘的相对路径 —— 打开错的东西比报错更坏"
+        );
+        assert_eq!(
+            host_openable_form("/mnt/c/Users/u/p", &[], HostPlatform::Unix),
+            Some("/mnt/c/Users/u/p".to_string()),
+            "Unix 宿主上它就是本机路径"
         );
     }
 
