@@ -50,9 +50,9 @@ CREATE INDEX IF NOT EXISTS idx_identity_cid  ON project_identity(canonical_id);
 
 身份变更有两种，它们看起来一模一样，后果完全相反：
 
-| 发生了什么                       | 正确处理                     |
-| -------------------------------- | ---------------------------- |
-| 同一个仓改了 remote / 仓库迁移了 | 新旧身份指同一个项目，可合并 |
+| 发生了什么                                 | 正确处理                         |
+| ------------------------------------------ | -------------------------------- |
+| 同一个仓改了 remote / 仓库迁移了           | 新旧身份指同一个项目，可合并     |
 | **路径被另一个仓复用**（删了重建、换项目） | 新旧身份是**两个**项目，绝不能合 |
 
 第二种一点也不罕见（`~/workspace/proj` 删掉重新 clone 别的东西）。latest-wins 会把
@@ -109,3 +109,89 @@ packfile，**代价远超本模块「只读 `.git/config`」的定位**。
    默认查询返回新的那条。
 4. 无 remote 的仓 ⇒ **不写任何行**（不写 `path:` 兜底）。
 5. `.git/config` 不可读（UNC 回环等）⇒ 不写行、不报错、计数可见。
+
+---
+
+## 🔴 P3：`read_text` 上 `ProbeBackend` trait —— 「本机对、WSL 不对」在类型上表达不出来
+
+> 状态：**计划中**（2026-08-20 定）
+> 起因：本机 20 个项目根里有 **1 个** `canonical_id` 为空，实测追到两份实现漂移
+
+### 缺陷
+
+出问题的那个根是
+`wsl:<distro>:/home/<user>/workspace/<repo>/.claude/worktrees/<wt-name>`
+—— 一个 **Claude Code 的 linked worktree**。而它的主仓
+`git:<host>/<owner>/<repo>` 是**另一行** ⇒
+同一个仓的记忆分裂成两组。
+
+**根因不是「没实现 worktree」** —— `identity.rs::git_config_path` 早就实现了，
+还有一条专门的测试 `a_linked_worktree_resolves_the_shared_config`。
+
+**根因是身份解析有两份实现，而 WSL 那份少一步**：
+
+| 步骤                         | 本机 `git_config_path` | WSL `wsl_repo_id` |
+| ---------------------------- | ---------------------- | ----------------- |
+| `.git` 是目录 → `config`     | ✅                     | ✅                |
+| `.git` 是文件 → 解 `gitdir:` | ✅                     | ✅                |
+| **再解 `commondir`**         | ✅                     | 🔴 **没有**       |
+
+linked worktree 的 `<gitdir>/` 里**没有 `config`**（它在 `commondir` 指向的主仓
+`.git` 里）⇒ 读到 `None` ⇒ `no_git()` ⇒ `path:` 身份 ⇒ 被
+`store::note_project_identity` 丢弃（那张表只收 `git:` 行）。
+
+🔴 **而 `wsl_repo_id` 的注释写着「与本机那条同一套规则，只是换了访问方式」。**
+那是一句**不成立的声明** —— 本仓判例：「把没被遵守的纪律写成既成事实，比不写更糟」。
+它也是「归属层做对了不等于发现层做对了」的**镜像版**：这次是本机做对了、WSL 没做。
+
+### 为什么会漂：`ProbeBackend` 只抽象了一半
+
+```rust
+pub trait ProbeBackend {
+    fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind>;
+}
+```
+
+**只有探测。** 而 `read_text` 是个直接走 `std::fs` 的**自由函数**。于是
+`git_config_path` 能用任意后端**探测**、却只能用本机文件系统**读取** ——
+`wsl_repo_id` 因此不得不自己拼路径、自己读文件，**第二份实现就是这么长出来的**。
+
+**这是结构性的：只补 `commondir` 那一步，等于在两份实现里各补一次，
+下一个后端还会漏第三次。**
+
+### 处置
+
+**层 1 · 正确性**：`git_config_path` 那三步就是 git 自己的定义（等价于
+`git rev-parse --git-common-dir`）。一条规则**同时正确**覆盖三种形态，
+**不需要任何 `if worktree then …` 的特判**：
+
+| 形态                | `commondir` | config 在哪               | 结果                |
+| ------------------- | ----------- | ------------------------- | ------------------- |
+| 普通仓              | —           | `.git/config`             | 自己的身份 ✅       |
+| **linked worktree** | **有**      | 主仓 `.git/config`        | **与主仓同身份** ✅ |
+| **submodule**       | **无**      | `.git/modules/<n>/config` | **自己的身份** ✅   |
+
+**层 2 · 收口**：把 `read_text` 提上 `ProbeBackend`。之后 `wsl_repo_id` 收成一行
+`git_config_path(root, &WslBackend::…)`。
+
+✅ **可行性已核**（2026-08-20）：`WslBackend::to_linux` 已经把路径转换做完了
+（Windows `\` → `/`、前缀剥离、**答不了时报 `Unknown` 而非 `Absent`**）。
+三个后端的读取都是现成的：
+
+| 后端            | `read_text`                                               |
+| --------------- | --------------------------------------------------------- |
+| `LocalBackend`  | 现有自由函数（含 `namespace_confirms_absence` 与 anchor） |
+| `WslBackend`    | `to_linux()` → `wsl::read_file_at`                        |
+| `WslUncBackend` | 与 `probe` 同构：宿主先读，`Unknown` 才回落权威           |
+
+⚠️ **`read_text` 的 anchor 语义不能丢**：`LocalBackend` 那份对 `NotFound` 会再核一次
+命名空间根（未挂载的盘符与「文件确实没有」在系统层逐位相同）。上 trait 时
+anchor 跟着 backend 走 —— 这正是它本来就该在的地方。
+
+### 判据（三条，缺一不可）
+
+1. `canonical_id` 为空的根数 = **0**
+2. 该仓 `canonical_id` 那一组从 **x1 → x2**
+   ⚠️ 只断言 ① 不够 —— 一个把 worktree 归到**错误**仓的实现同样能让 ① 变 0
+3. 🔴 **变异**：删掉 `git_config_path` 里的 `commondir` 那一步，
+   **WSL 与本机两侧的测试必须同时红**。只有一侧红 = 层 2 没做成，仍是两份实现
