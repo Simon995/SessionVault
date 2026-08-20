@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 
 use crate::cursor::{Cursor, ScanStatus};
@@ -841,9 +841,35 @@ impl TotalStore {
         Self::from_conn(Connection::open_in_memory()?, StoreKey::generate())
     }
 
+    /// 开一个**写**事务 —— `BEGIN IMMEDIATE`，不是 rusqlite 默认的 `DEFERRED`。
+    ///
+    /// 🔴 DEFERRED 先拿读锁，写第一行时才升级成写锁。两个写者同时走到升级那一步
+    /// 就是**死锁**，而 SQLite 对它会**立刻**返回 `SQLITE_BUSY` —— `busy_timeout`
+    /// 管不了这一种（继续等只会互相等下去，所以 SQLite 干脆不等）。
+    ///
+    /// IMMEDIATE 一开始就拿写锁：排队变成「等」而不是「撞」，`busy_timeout` 这才
+    /// 真正生效。**两者缺一不可**，所以规则放在同一处，让调用点没得选。
+    fn write_tx(conn: &mut Connection) -> StoreResult<rusqlite::Transaction<'_>> {
+        Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+    }
+
     fn from_conn(conn: Connection, key: StoreKey) -> StoreResult<Self> {
         // WAL 让读不挡写（QuotaBar 常驻写、未来 TumeFlow 并发读）。
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // 🔴 **两个写者时，缺的不是「锁」，是「等」。**
+        //
+        // WAL 已经保证同一时刻只有一个写者，且写不挡读 —— 原子性 SQLite 自己管。
+        // 但 `busy_timeout` 默认是 **0**：第二个写者**立刻**拿到 `SQLITE_BUSY`
+        // 而不是稍等一下。于是「TumeFlow 也开始扫会话」（QuotaBar task #44）会
+        // 变成随机失败，而失败点离原因很远。
+        //
+        // ⚠️ **在这里加一把自己的文件锁是错的方向** —— 那会与 SQLite 自己的锁
+        // 各管一半，而两套锁的边界不重合时没有任何东西会报错（本仓判例：
+        // 「编译器已经守住的事，不要再用正则守一遍」的同族）。
+        //
+        // 30 秒：一次 `apply_projection` 的写事务是毫秒级，30 秒足够穿过任何正常
+        // 的排队；真的等满说明对面卡住了，那时报 `BUSY` 才是**信息**而不是噪声。
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         // 🔴 WAL 文件默认**停在历史最高水位**（`journal_size_limit = -1`），checkpoint 只
@@ -982,7 +1008,7 @@ impl TotalStore {
         if identity_has_observer {
             // 整个重写包在一个事务里 —— 与 `raw_events` 那次迁移同一条理由：
             // 中途夭折会留下一个空的新表加一个藏着数据的旧表，而下次启动看不出区别。
-            let tx = conn.transaction()?;
+            let tx = Self::write_tx(&mut conn)?;
             tx.execute_batch(&format!(
                 r#"
                 DROP INDEX IF EXISTS idx_identity_root;
@@ -1069,7 +1095,7 @@ impl TotalStore {
             // 搬完再逐行 `UPDATE` 是又一遍整表重写 —— 这一列不参与唯一键、也不参与
             // 排序以外的任何判断，放进 SELECT 是纯粹的白拿。
             let generation_expr = if has_generation { "generation" } else { "0" };
-            let tx = conn.transaction()?;
+            let tx = Self::write_tx(&mut conn)?;
             tx.execute_batch(&format!(
                 r#"
                 DROP INDEX IF EXISTS idx_raw_events_session;
@@ -1139,7 +1165,7 @@ impl TotalStore {
             } else {
                 "0, 0, 1"
             };
-            let tx = conn.transaction()?;
+            let tx = Self::write_tx(&mut conn)?;
             let recovered = tx.execute(
                 &format!(
                     r#"INSERT OR IGNORE INTO raw_events
@@ -1316,7 +1342,7 @@ impl TotalStore {
             "migrating {} total-store rows to per-group encrypted envelopes",
             legacy_rows.len()
         );
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         {
             let mut update =
                 tx.prepare("UPDATE raw_events SET event_json = ?1 WHERE offset = ?2")?;
@@ -2098,7 +2124,7 @@ impl TotalStore {
 
         let head = head_of(&conn, &source_type, &source_location, &source_path)?;
         let (source_revision, projection_revision) = projection.target_revisions(head);
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         // token 记账与事件写入**同一事务** —— 分开写就会造出「token 记了但事件没写」
         // （下轮短路返回一个从未存在的头）或反之（崩溃重放又开一代）的窗口。
         if let Some(token) = batch.token.as_ref() {
@@ -2465,7 +2491,7 @@ impl TotalStore {
     /// `dry_run` 时只统计不删，供 CLI 先给人看一眼。
     pub fn gc_superseded_projections(&self, dry_run: bool) -> StoreResult<GcStats> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         // 候选：台账里 origin='reparse'、且不是当前头指向的那一份。
         const CANDIDATES: &str = r#"
             SELECT p.source_type, p.source_location, p.source_path,
@@ -3018,7 +3044,7 @@ impl TotalStore {
             )));
         }
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let tx = Self::write_tx(&mut conn)?;
         tx.execute(
             "INSERT OR REPLACE INTO tombstones (scope, key, tombstoned_at) VALUES (?1, ?2, ?3)",
             params![scope.as_str(), key, now_unix_secs()],
@@ -3283,7 +3309,7 @@ mod tests {
     use super::*;
     use crate::rawevent::{Actor, SourceLocation, TimeConfidence, TokenUsage, SCHEMA_VERSION};
 
-    fn mk_event(seq: u64, session: &str, content: Option<&str>) -> RawEvent {
+    pub(super) fn mk_event(seq: u64, session: &str, content: Option<&str>) -> RawEvent {
         RawEvent {
             schema_version: SCHEMA_VERSION,
             source_type: SourceType::ClaudeCode,
@@ -6601,6 +6627,169 @@ mod project_identity_tests {
             !dir.exists(),
             "只读打开不许建目录（`open` 会 create_dir_all）"
         );
+    }
+
+    /// 🔴 **两个写者同时写同一个落盘的总库 —— 都要成功。**
+    ///
+    /// 这是 QuotaBar task #44 的前置：让 TumeFlow 也扫会话之后，总库就有**两个**
+    /// 写者（宿主的常驻扫描 + 引擎的按需同步）。
+    ///
+    /// ⚠️ **缺的从来不是「锁」** —— WAL 已经保证同一时刻只有一个写者。缺的是两样：
+    ///
+    /// | | 没有它会怎样 |
+    /// | --- | --- |
+    /// | `busy_timeout`（默认 **0**）| 第二个写者**立刻**拿到 `SQLITE_BUSY`，而不是稍等 |
+    /// | `BEGIN IMMEDIATE`（默认 DEFERRED）| 两个写者各拿读锁再升级 ⇒ 死锁，**而 `busy_timeout` 管不了这一种** |
+    ///
+    /// 所以两条必须同时在。本测试对**任一条**缺失都会红 —— 变异验证过。
+    ///
+    /// ⚠️ 用两个**线程 + 两个独立连接**（不是同一个 `TotalStore`）：同一个实例
+    /// 内部有 `Mutex<Connection>`，那把锁会替 SQLite 挡掉一切争用，
+    /// **于是测的是那把 Mutex，不是并发写**。判据要打真正的那条路。
+    #[test]
+    fn two_independent_writers_on_one_store_both_succeed() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-concurrent-writers-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        // 两个连接必须用**同一把**密钥 —— `open()` 会各建各的 OS key。
+        let key = StoreKey::from_bytes([7u8; 32]);
+        drop(TotalStore::open_with_key(&path, key).unwrap());
+
+        // 🔴 **必须制造真正的争用** —— 第一版是 2 线程 × 8 次微小写入，它们天然
+        // 错开，于是把 `busy_timeout` 和 `IMMEDIATE` **各去掉一条**测试都照样绿
+        // （实测）。一条不会红的护栏比没有护栏更糟。
+        //
+        // 三样一起才够：① 屏障让所有线程同一刻起跑；② 线程数 > 2；
+        // ③ 每次写**一批**（写锁被按住的时间足够长到重叠）。
+        const WRITERS: u64 = 4;
+        const ROUNDS: u64 = 25;
+        const BATCH: u64 = 40;
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(WRITERS as usize));
+
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let p = path.clone();
+            let gate = gate.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = TotalStore::open_with_key(&p, StoreKey::from_bytes([7u8; 32]))
+                    .map_err(|e| format!("writer {w} open: {e}"))?;
+                gate.wait();
+                for r in 0..ROUNDS {
+                    let evs: Vec<_> = (0..BATCH)
+                        .map(|i| {
+                            let mut ev = super::tests::mk_event(
+                                w * 1_000_000 + r * 1_000 + i,
+                                &format!("s{w}"),
+                                Some("x"),
+                            );
+                            ev.source_path = format!("/w/f{w}.jsonl");
+                            ev
+                        })
+                        .collect();
+                    store
+                        .append_events(&evs, Projection::Append)
+                        .map_err(|e| format!("writer {w} round {r}: {e}"))?;
+                }
+                Ok::<(), String>(())
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer panicked").expect("并发写不该失败");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 🔴 **`gc` 在事务里「先读后写」—— 那才是 DEFERRED 的危险所在。**
+    ///
+    /// 上一条测的是 `append_events`，它进事务后**第一条就是写** —— DEFERRED 在
+    /// 那一刻等价于 IMMEDIATE，所以把 `IMMEDIATE` 变异掉它照样绿（实测）。
+    /// **测试打错了函数，不是护栏没用。**
+    ///
+    /// `gc_superseded_projections` 不一样（`store.rs` 里 `tx.prepare(CANDIDATES)` 与
+    /// 逐候选的 `tx.query_row`，写在 `if !dry_run` 里）：BEGIN → SELECT 拿读快照 →
+    /// 别的写者提交 → 本事务再写 ⇒ SQLite 返回 `SQLITE_BUSY_SNAPSHOT`，
+    /// **而 `busy_timeout` 对这一种无能为力**（快照已经旧了，等下去也不会变新）。
+    /// `BEGIN IMMEDIATE` 一开始就拿写锁，根本不会出现「快照过期」。
+    #[test]
+    fn a_read_then_write_transaction_survives_a_concurrent_committer() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-gc-vs-writer-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("total_store.db");
+        let key = || StoreKey::from_bytes([9u8; 32]);
+
+        // 🔴 **两个连接都先开好，再种数据。** 先种再重开会在 `open_with_key` 里
+        // 撞 `QueryReturnedNoRows`（裸 SQL 绕过了正常写入口，重开时的一致性查询
+        // 落空）—— 那是 fixture 的问题，不是被测行为，别让它冒充失败。
+        let gc_store = TotalStore::open_with_key(&path, key()).unwrap();
+        let writer_store = TotalStore::open_with_key(&path, key()).unwrap();
+
+        // 造一批「被取代的投影」，让 gc 的读阶段有活干（每个候选一次 COUNT 查询）。
+        {
+            let conn = gc_store.conn.lock().unwrap();
+            for i in 0..300 {
+                let p = format!("/p/rolled{i}.jsonl");
+                conn.execute_batch(&format!(
+                    r#"
+                    INSERT INTO projections (source_type, source_location, source_path,
+                        source_revision, projection_revision, parser_revision, origin, created_at)
+                    VALUES ('claude_code','local','{p}',1,0,1,'append',0);
+                    INSERT INTO raw_events (ingested_at, schema_version, source_type,
+                        source_location, source_path, source_session_id, seq, source_revision,
+                        projection_revision, aad_version, event_type, occurred_at,
+                        occurred_at_unix_ms, project_root, event_json)
+                    VALUES (0,1,'claude_code','local','{p}','s',0,1,0,1,
+                            'message',NULL,NULL,NULL,'sv2:head');
+
+                    INSERT INTO projections (source_type, source_location, source_path,
+                        source_revision, projection_revision, parser_revision, origin, created_at)
+                    VALUES ('claude_code','local','{p}',0,7,1,'reparse',0);
+                    INSERT INTO raw_events (ingested_at, schema_version, source_type,
+                        source_location, source_path, source_session_id, seq, source_revision,
+                        projection_revision, aad_version, event_type, occurred_at,
+                        occurred_at_unix_ms, project_root, event_json)
+                    VALUES (0,1,'claude_code','local','{p}','s',0,0,7,1,
+                            'message',NULL,NULL,NULL,'sv2:superseded');
+                    "#
+                ))
+                .unwrap();
+            }
+        }
+
+        // 另一条线程在 gc 读阶段持续提交 —— 这正是让 DEFERRED 的读快照过期的那件事。
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let store = writer_store;
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut ev = super::tests::mk_event(n, "noise", Some("x"));
+                    ev.source_path = "/w/noise.jsonl".to_string();
+                    // 失败不算数：本测试判的是 **gc 那一侧**能不能活下来。
+                    let _ = store.append_events(&[ev], Projection::Append);
+                    n += 1;
+                }
+            })
+        };
+
+        let got = gc_store.gc_superseded_projections(false);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        committer.join().unwrap();
+
+        let stats = got.expect("先读后写的事务不该被并发提交挤掉");
+        assert!(
+            stats.projections > 0,
+            "前提：确实有候选，否则事务里根本不写"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 反面：库真的在，就要拿到它 —— 一个恒 `Absent` 的实现同样能通过上一条。
