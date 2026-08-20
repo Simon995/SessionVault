@@ -67,12 +67,17 @@ pub enum GitRoot {
 /// 于是上溯到 `/w/proj` 命中，可 `sub` 很可能本来就有 `.git`。报 `Unknown` 走重试，
 /// 错误归属只会安静地留在库里。
 pub fn find_git_root(start: &Path) -> GitRoot {
-    find_git_root_with(start, &crate::probe::LocalBackend::unanchored())
+    // ⚠️ 本机 stat 本来就不宣称硬超时（见 `LocalBackend::probe`），所以这个便捷
+    // 包装用 `unbounded` 是**忠实**的，不是省事。走桥的调用方必须自己给上限。
+    find_git_root_with(
+        start,
+        &crate::probe::LocalBackend::unanchored(),
+        Deadline::unbounded(),
+    )
 }
 
 /// [`find_git_root`] 的可测形态 —— **backend 注入**（「探测失败」在本机造不出来）。
-pub fn find_git_root_with(start: &Path, backend: &dyn ProbeBackend) -> GitRoot {
-    let d = Deadline::unbounded();
+pub fn find_git_root_with(start: &Path, backend: &dyn ProbeBackend, d: Deadline) -> GitRoot {
     match backend.probe(start, d) {
         Probed::Found(_) => {}
         Probed::Absent => return GitRoot::Absent,
@@ -104,14 +109,37 @@ pub fn find_git_root_with(start: &Path, backend: &dyn ProbeBackend) -> GitRoot {
 ///
 /// linked worktree 的 config 在 **commondir**（`<gitdir>/commondir` 指向主仓的
 /// `.git`）；submodule 的 config 就在 `<gitdir>/config`。两种都覆盖。
-fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBuf> {
+/// 解一个 git 内部引用（`.git` 文件的 `gitdir:`、`<gitdir>/commondir`）：
+/// 绝对就原样用，相对就挂到 `base` 下。
+///
+/// 🔴 **不能用 `Path::is_absolute()`** —— 那是**宿主平台**的语义，而本模块处理的
+/// 路径可能属于**别的命名空间**（经访问桥寻址的发行版内部路径）。
+/// Windows 上 `/home/u/x`.is_absolute() 是 **false**，于是
+/// `base.join("/home/u/x")` 会**拼接**成 `base\/home/u/x` 而不是替换 ——
+/// 而 git 为 linked worktree 写进 `.git` 的正是**绝对**路径
+/// （`gitdir: /home/u/repo/.git/worktrees/wt`）。
+///
+/// ⚠️ **`..` 不在这里解**：`commondir` 几乎总是 `../..`，而**真实的 FS 与发行版都在
+/// OS 层解它** —— 本机 `metadata` 解，`bash`/`stat` 也解。在这里自己解一遍，
+/// 就是第二份 path 语义实现（还会在符号链接上给出与 OS 不同的答案）。
+fn join_git_ref(base: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    // POSIX 绝对（`/…`）与宿主绝对（`C:\…` / UNC）都算 —— 判据是「它自带根」，
+    // 不是「当前平台认不认它」。
+    if p.is_absolute() || raw.starts_with('/') {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend, d: Deadline) -> Probed<PathBuf> {
     let dot_git = git_root.join(".git");
-    let d = Deadline::unbounded();
     match backend.probe(&dot_git, d) {
         Probed::Found(FileKind::Dir) => Probed::Found(dot_git.join("config")),
         Probed::Found(_) => {
             // `.git` 文件：`gitdir: <path>`（可相对 git_root）。
-            let text = match crate::probe::read_text(&dot_git, None) {
+            let text = match backend.read_text(&dot_git, d) {
                 Probed::Found(t) => t,
                 Probed::Absent => return Probed::Absent,
                 Probed::Unknown(e) => return Probed::Unknown(e),
@@ -124,28 +152,14 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBu
                 // 是文件但不是 gitdir 指针 —— 探明白了，这里没有可读的 git 配置。
                 return Probed::Absent;
             };
-            let gitdir = {
-                let p = Path::new(rel);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    git_root.join(p)
-                }
-            };
+            let gitdir = join_git_ref(git_root, rel);
             // linked worktree：真正的 config 在 commondir 里。
             let commondir = gitdir.join("commondir");
             match backend.probe(&commondir, d) {
-                Probed::Found(_) => match crate::probe::read_text(&commondir, None) {
+                Probed::Found(_) => match backend.read_text(&commondir, d) {
                     Probed::Found(c) => {
                         let c = c.trim();
-                        let common = {
-                            let p = Path::new(c);
-                            if p.is_absolute() {
-                                p.to_path_buf()
-                            } else {
-                                gitdir.join(p)
-                            }
-                        };
+                        let common = join_git_ref(&gitdir, c);
                         Probed::Found(common.join("config"))
                     }
                     Probed::Absent => Probed::Absent,
@@ -170,36 +184,66 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<PathBu
 /// 稳定身份。这是 [`find_git_root`] 那次三态化只做了一半 —— stat 阶段分开了，
 /// 紧接着的读取阶段又合上了。
 pub fn read_origin_url(git_root: &Path) -> Probed<String> {
-    read_origin_url_with(git_root, &crate::probe::LocalBackend::unanchored())
+    read_origin_url_with(
+        git_root,
+        &crate::probe::LocalBackend::unanchored(),
+        Deadline::unbounded(),
+    )
 }
 
 /// [`read_origin_url`] 的可测形态 —— backend 注入。
-pub fn read_origin_url_with(git_root: &Path, backend: &dyn ProbeBackend) -> Probed<String> {
-    let config = match git_config_path(git_root, backend) {
+pub fn read_origin_url_with(
+    git_root: &Path,
+    backend: &dyn ProbeBackend,
+    d: Deadline,
+) -> Probed<String> {
+    let config = match git_config_path(git_root, backend, d) {
         Probed::Found(p) => p,
         Probed::Absent => return Probed::Absent,
         Probed::Unknown(e) => return Probed::Unknown(e),
     };
+    read_origin_from_config(&config, backend, d)
+}
+
+/// 从**已定位的** config 文件读 origin —— [`read_origin_url_with`] 的后半段。
+///
+/// 🔴 **拆出来是因为 `Probed<String>` 的 `Absent` 装了两个意思**：
+/// 「这条链上没有可用的 `.git`」与「读到了 config、里面没有 origin」。
+/// 本机唯一的消费者（`canonical_repo_id_with`）把两者都映射成 `path:`，所以不在乎；
+/// 而 [`wsl_repo_id`] 要靠这个区别决定 `repo_root` 是 `Some` 还是 `None`。
+///
+/// 让它自己再写一遍下面这段（尤其那个 fail-safe）就是第二份实现 —— 那正是本轮
+/// 要消除的东西。
+fn read_origin_from_config(
+    config: &Path,
+    backend: &dyn ProbeBackend,
+    d: Deadline,
+) -> Probed<String> {
     // 先探再读：`NotFound` 是「没有 config」（事实），其余是「没问成」。
-    match backend.probe(&config, Deadline::unbounded()) {
+    match backend.probe(config, d) {
         Probed::Found(_) => {}
         Probed::Absent => return Probed::Absent,
         Probed::Unknown(e) => return Probed::Unknown(e),
     }
     // 🔴 **判决链中途不许换事实来源**（五轮评审 P2）。
     //
-    // 上一行刚用 `backend` 确认 config **在**，这里却用全局 `probe::read_text` 去读 ——
-    // 两个来源不一致时（注入后端说远端可达而本机读不到、或文件正好在两步之间消失），
-    // 读到的 `NotFound` 会被降级成 `Absent` ⇒ `canonical_repo_id_with` 给出**终态**
-    // `path:`，而 `identity_seen` 从此不再重试。实测：让注入后端全答 `Found`、真实
-    // config 不存在，得到的是 `Ok("path:…")` 而不是 `Unknown`。
+    // 上一行刚用 `backend` 确认 config **在**，从前这里却用全局 `probe::read_text`
+    // 去读 —— 两个来源不一致时（注入后端说远端可达而本机读不到、或文件正好在两步
+    // 之间消失），读到的 `NotFound` 会被降级成 `Absent` ⇒ `canonical_repo_id_with`
+    // 给出**终态** `path:`，而 `identity_seen` 从此不再重试。
     //
-    // 「刚确认存在、紧接着读不到」**不是「这个仓没配 origin」** —— 它是「没问成」。
-    let text = match crate::probe::read_text(&config, None) {
+    // ✅ **2026-08-20 起读取也走 `backend`**（`read_text` 已上 `ProbeBackend`）。
+    // ⚠️ **下面那个 fail-safe 保留**，它现在防的是另一件事：同一个 backend
+    // 「刚说在、紧接着读不到」。那**仍然不是「这个仓没配 origin」** —— 是「没问成」。
+    //
+    // 🔴 从前的处置是**只在这一个调用点**补这个 fail-safe，而根因（trait 只抽象了
+    // 探测）没动 —— 于是它在 `git_config_path` 复发两次、在 `wsl_repo_id` 变成
+    // 第二份实现。**修类型，不修反例。**
+    let text = match backend.read_text(config, d) {
         Probed::Found(t) => t,
         Probed::Absent => {
             return Probed::Unknown(crate::probe::ProbeError::new(
-                &config,
+                config,
                 "config was confirmed present by the probe backend but could not be read \
                  (source of truth switched mid-decision)",
             ))
@@ -357,73 +401,82 @@ pub struct RepoIdentity {
     pub repo_root: Option<String>,
 }
 
-/// 经 `wsl.exe` 在发行版内部读 `.git/config`。
+/// 经访问桥在发行版内部解析身份 —— **与本机走同一套规则、同一份实现**。
+///
+/// 🔴 **本函数从前是第二份实现，而且漏了一步。** 它自己拼路径、自己调
+/// `wsl::read_file_at`，做了「`.git` 是目录 → 是文件则解 `gitdir:`」两步，
+/// **没有第三步 `commondir`**。而 linked worktree 的 `<gitdir>/` 里**没有 config**
+/// —— 它在 `commondir` 指向的主仓 `.git` 里。后果是确定性的：
+/// **每一个 WSL 里的 linked worktree 永远退回 `path:` 身份**，而
+/// `store::note_project_identity` 只写 `git:` 行 ⇒ 同一个仓的记忆分裂成两组。
+///
+/// ⚠️ 它当时的注释写着「与本机那条同一套规则，只是换了访问方式」——
+/// **那是一句不成立的声明**。现在它成立了，因为规则只剩一份。
 ///
 /// 只向上找**一层**（`<root>/.git`）而不是整条祖先链：调用方给的已经是注册表判定的
 /// 项目根，再上溯等于替它重做一遍归属 —— 而归属只有一个权威（ADR-050）。
+/// 这条性质由 [`git_config_path`]（它本来就不上溯）天然保证。
 fn wsl_repo_id(
     distro: &str,
     linux_path: &str,
     original_root: &str,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
+    // 发行版内部绝对路径寻址 —— 与调用方手上的 `linux_path` 同一种写法。
+    let backend = crate::probe::WslBackend::new(distro);
+    wsl_repo_id_with(linux_path, original_root, &backend, deadline)
+}
+
+/// [`wsl_repo_id`] 的可测形态 —— **后端注入**。
+///
+/// 🔴 **没有它，「两份实现收成一份」就只是一句声明**：本机那条 worktree 测试红不红，
+/// 说不出 WSL 那条走的是不是同一段代码。而本仓判例反复说的正是这个 ——
+/// 「纯函数的测试钉的是映射，永远说不了输入的来路」。
+///
+/// 用注入后端还有一个现实理由：真实 WSL 里造一个 linked worktree 才能测，
+/// 那就把一条**语义**测试绑在了机器状态上。
+fn wsl_repo_id_with(
+    linux_path: &str,
+    original_root: &str,
+    backend: &dyn ProbeBackend,
+    deadline: Deadline,
+) -> Result<RepoIdentity, crate::probe::ProbeError> {
     let base = linux_path.trim_end_matches('/');
-    let err = |m: String| crate::probe::ProbeError::new(Path::new(original_root), m);
-    // 「这条链上没有可用的 `.git`」的统一出口 —— 三个返回点从前各写一遍
-    // `Ok(format!("path:{original_root}"))`，现在多了一个 `repo_root` 字段要一起给对。
-    let no_git = || {
-        Ok(RepoIdentity {
-            id: format!("path:{original_root}"),
-            repo_root: None,
-        })
+    let root = Path::new(base);
+
+    // 🔴 **两步分开，是因为它们回答两个问题**：`git_config_path` 的 `Absent`
+    // 是「这条链上没有可用的 `.git`」（⇒ `repo_root: None`），而
+    // `read_origin_from_config` 的 `Absent` 是「读到了、里面没有 origin」
+    // （⇒ `repo_root: Some`，根确实在这里）。压成一个三态就说不出这个区别。
+    let config = match git_config_path(root, backend, deadline) {
+        Probed::Found(p) => p,
+        // 探明白了：这个根下没有可用的 `.git` —— 事实，不是没问成。
+        Probed::Absent => {
+            return Ok(RepoIdentity {
+                id: format!("path:{original_root}"),
+                repo_root: None,
+            })
+        }
+        Probed::Unknown(e) => return Err(e),
     };
 
-    // `.git` 是目录时 config 就在下面；是文件时（worktree / submodule）它是
-    // `gitdir: <path>` 指针 —— 与本机那条同一套规则，只是换了访问方式。
-    let direct = crate::wsl::read_file_at(distro, &format!("{base}/.git/config"), deadline)
-        .map_err(|e| err(format!("wsl read .git/config: {e}")))?;
-    let text = match direct {
-        Some(t) => t,
-        None => {
-            let pointer = crate::wsl::read_file_at(distro, &format!("{base}/.git"), deadline)
-                .map_err(|e| err(format!("wsl read .git: {e}")))?;
-            let Some(p) = pointer else {
-                // 探明白了：这个根下没有 `.git` —— 事实，不是没问成。
-                return no_git();
-            };
-            let Some(rel) = p
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("gitdir:"))
-                .map(str::trim)
-            else {
-                return no_git();
-            };
-            let gitdir = if rel.starts_with('/') {
-                rel.to_string()
-            } else {
-                format!("{base}/{rel}")
-            };
-            match crate::wsl::read_file_at(distro, &format!("{gitdir}/config"), deadline)
-                .map_err(|e| err(format!("wsl read gitdir config: {e}")))?
-            {
-                Some(t) => t,
-                None => return no_git(),
-            }
-        }
-    };
-    match parse_origin_url(&text).and_then(|u| normalize_remote(&u)) {
-        Some(norm) => Ok(RepoIdentity {
-            id: format!("git:{norm}"),
-            // 读到 config 就说明 `.git` 在这一层 —— 本函数**不上溯**（见上方注释），
-            // 所以「仓库根」就是调用方给的那个根，原样奉还它给的写法。
-            repo_root: Some(original_root.to_string()),
+    // 走到这里 `.git` 就在这一层 —— 无论有没有 origin，`repo_root` 都是 `Some`。
+    // 「有没有身份」和「根在哪」是两件事。
+    let has_root = Some(original_root.to_string());
+    match read_origin_from_config(&config, backend, deadline) {
+        Probed::Found(url) => Ok(RepoIdentity {
+            // 规范化不出来（空串 / 畸形）也是**读到了** —— 与本机那条对齐。
+            id: match normalize_remote(&url) {
+                Some(norm) => format!("git:{norm}"),
+                None => format!("path:{original_root}"),
+            },
+            repo_root: has_root,
         }),
-        // 读到了、里面没有 origin —— 事实。**但 `.git` 确实在这里**，所以
-        // `repo_root` 不是 `None`：那两件事分别是「有没有身份」和「根在哪」。
-        None => Ok(RepoIdentity {
+        Probed::Absent => Ok(RepoIdentity {
             id: format!("path:{original_root}"),
-            repo_root: Some(original_root.to_string()),
+            repo_root: has_root,
         }),
+        Probed::Unknown(e) => Err(e),
     }
 }
 
@@ -435,15 +488,20 @@ fn wsl_repo_id(
 /// `store::note_project_identity` 丢弃 ⇒ 后者被当成前者时，一次瞬时故障就变成
 /// 「这个项目没有跨 checkout 身份」，且因为**先记后算**再也不会重试。
 pub fn canonical_repo_id(git_root: &Path) -> Result<String, crate::probe::ProbeError> {
-    canonical_repo_id_with(git_root, &crate::probe::LocalBackend::unanchored())
+    canonical_repo_id_with(
+        git_root,
+        &crate::probe::LocalBackend::unanchored(),
+        Deadline::unbounded(),
+    )
 }
 
 /// [`canonical_repo_id`] 的可测形态 —— backend 注入。
 pub fn canonical_repo_id_with(
     git_root: &Path,
     backend: &dyn ProbeBackend,
+    d: Deadline,
 ) -> Result<String, crate::probe::ProbeError> {
-    match read_origin_url_with(git_root, backend) {
+    match read_origin_url_with(git_root, backend, d) {
         Probed::Found(url) => match normalize_remote(&url) {
             Some(norm) => Ok(format!("git:{norm}")),
             // url 在那儿但规范化不出来（空串 / 畸形）—— 读到了，是事实。
@@ -642,14 +700,18 @@ mod tests {
                     Probed::Absent
                 }
             }
+            /// 本 fixture **只答探测**。读到这里说明测试的形状变了 —— 见 `ProbeBackend::read_text`。
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                panic!("{p:?}: this fixture only answers probes; a read here means the test changed shape")
+            }
         }
         let root = Path::new("/w/proj");
         assert!(matches!(
-            read_origin_url_with(root, &ConfigDenied),
+            read_origin_url_with(root, &ConfigDenied, Deadline::unbounded()),
             Probed::Unknown(_)
         ));
         assert!(
-            canonical_repo_id_with(root, &ConfigDenied).is_err(),
+            canonical_repo_id_with(root, &ConfigDenied, Deadline::unbounded()).is_err(),
             "读不了 config 却给出了一个 path: 身份 —— store 会丢弃它且永不重试"
         );
     }
@@ -669,7 +731,14 @@ mod tests {
     /// 🔴 **判据必须能把两条路分开，而这一点我第一版写错了。** 第一版断言
     /// `msg.contains("wsl")` —— 而**被探的路径本身就含 `wsl:`**，于是取消分派、
     /// 全走本机 FS 的变异**照样全绿**。观测量选错，护栏就是装饰。
-    /// 现在断言桥自己的前缀 `wsl read`，那是本机那条路产不出来的。
+    /// 现在断言桥自己的操作名前缀，那是本机那条路产不出来的。
+    ///
+    /// ⚠️ **2026-08-20 改过一次字面量，而那不是护栏失灵，恰恰是它在工作。**
+    /// `wsl_repo_id` 收口到 `git_config_path` 之后，入桥的第一站从
+    /// `read_file_at`（`wsl read …`）变成了 `stat_kind`（`wsl stat_kind …`）——
+    /// **判据没变（走没走桥），变的是从哪个门进去。** 所以两个前缀都认。
+    /// 🔴 仍然**不许**放宽成 `contains("wsl")`：被探的路径本身就含 `wsl:`，
+    /// 那样写的话「取消分派、全走本机 FS」的变异照样全绿（本测试第一版的原错）。
     #[test]
     #[cfg(windows)]
     fn a_canonical_wsl_root_goes_through_the_bridge_not_the_local_fs() {
@@ -682,8 +751,106 @@ mod tests {
         .expect_err("不存在的发行版必须报「没问成」，不能给出一个身份");
         let msg = err.to_string();
         assert!(
-            msg.contains("wsl read"),
-            "错误应带访问桥自己的前缀；走本机 FS 时这里会是 InvalidFilename。实际：{msg}"
+            msg.contains("wsl stat_kind") || msg.contains("wsl read"),
+            "错误应带访问桥自己的操作名；走本机 FS 时这里会是 InvalidFilename。实际：{msg}"
+        );
+    }
+
+    /// 🔴 **WSL 侧的 linked worktree —— 层 2 的判据。**
+    ///
+    /// 本机那条（`a_linked_worktree_resolves_the_shared_config`）钉的是
+    /// `git_config_path` 的三步规则；**这一条钉的是 WSL 那条路走的是同一段代码**。
+    ///
+    /// 从前 `wsl_repo_id` 自己拼路径读文件，只做了「目录 → `gitdir:`」两步、
+    /// **没有 `commondir`** ⇒ 每一个 WSL 里的 linked worktree 永远退回 `path:` 身份，
+    /// 而 `store::note_project_identity` 只写 `git:` 行 ⇒ 同一个仓的记忆分裂成两组。
+    /// 实测：本机 20 个项目根里有 1 个 `canonical_id` 为空，就是它。
+    ///
+    /// ⚠️ **变异判据**：删掉 `git_config_path` 里的 `commondir` 那一步，
+    /// **本条与本机那条必须同时红**。只有一侧红 = 收口没做成，仍是两份实现。
+    #[test]
+    fn a_wsl_linked_worktree_resolves_the_shared_config_through_the_same_rule() {
+        // 站在访问桥的位置：路径 → (类型, 内容)。
+        // ⚠️ 查表前归一分隔符 —— 调用方用 `Path::join`，它在 Windows 上产出 `\`，
+        // 而真实的 `WslBackend::to_linux` 也正是在这一步把它换回 `/`。
+        struct FakeDistro(std::collections::HashMap<String, (FileKind, Option<String>)>);
+        impl FakeDistro {
+            /// 归一分隔符 **并解 `..`** —— 真实的 FS 与发行版都在 OS 层做这两件事
+            /// （`commondir` 几乎总是 `../..`）。不做的话这个替身就不忠实，
+            /// 会把一个**能跑通**的生产路径判成失败。
+            fn key(p: &Path) -> String {
+                let flat = p.to_string_lossy().replace('\\', "/");
+                let mut out: Vec<&str> = Vec::new();
+                for seg in flat.split('/') {
+                    match seg {
+                        ".." => {
+                            out.pop();
+                        }
+                        "." => {}
+                        _ => out.push(seg),
+                    }
+                }
+                out.join("/")
+            }
+        }
+        impl ProbeBackend for FakeDistro {
+            fn probe(&self, p: &Path, _d: Deadline) -> Probed<FileKind> {
+                match self.0.get(&Self::key(p)) {
+                    Some((k, _)) => Probed::Found(*k),
+                    None => Probed::Absent,
+                }
+            }
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                match self.0.get(&Self::key(p)) {
+                    Some((_, Some(t))) => Probed::Found(t.clone()),
+                    // 存在但不是可读文本（目录）—— 与真实桥一致：不是「没有」。
+                    Some((_, None)) => Probed::Unknown(crate::probe::ProbeError::new(
+                        p,
+                        "fixture: not a readable file",
+                    )),
+                    None => Probed::Absent,
+                }
+            }
+        }
+
+        let mut fs = std::collections::HashMap::new();
+        // worktree 本体：`.git` 是**文件**，内容是 gitdir 指针（相对写法，git 常见）
+        fs.insert(
+            "/home/u/repo/.claude/worktrees/wt/.git".to_string(),
+            (
+                FileKind::File,
+                Some("gitdir: /home/u/repo/.git/worktrees/wt\n".to_string()),
+            ),
+        );
+        // 🔴 worktree 的 gitdir 里**没有 config** —— 这正是旧实现踩空的地方
+        fs.insert(
+            "/home/u/repo/.git/worktrees/wt/commondir".to_string(),
+            (FileKind::File, Some("../..\n".to_string())),
+        );
+        // 主仓的 config：真正的 origin 在这里
+        fs.insert(
+            "/home/u/repo/.git/config".to_string(),
+            (
+                FileKind::File,
+                Some("[remote \"origin\"]\n\turl = git@example.com:o/r.git\n".to_string()),
+            ),
+        );
+
+        let got = wsl_repo_id_with(
+            "/home/u/repo/.claude/worktrees/wt",
+            "wsl:D:/home/u/repo/.claude/worktrees/wt",
+            &FakeDistro(fs),
+            Deadline::unbounded(),
+        )
+        .expect("布局完整时不该报「没问成」");
+
+        assert_eq!(
+            got.id, "git:example.com/o/r",
+            "WSL 里的 worktree 必须解到**主仓**的身份 —— 那是它与主仓同属一个仓的唯一依据"
+        );
+        assert!(
+            got.repo_root.is_some(),
+            "`.git` 确实在这一层 —— 「有没有身份」和「根在哪」是两件事"
         );
     }
 
@@ -724,9 +891,13 @@ mod tests {
             fn probe(&self, p: &Path, _d: Deadline) -> Probed<crate::probe::FileKind> {
                 Probed::Unknown(crate::probe::ProbeError::new(p, "permission denied"))
             }
+            /// 本 fixture **只答探测**。读到这里说明测试的形状变了 —— 见 `ProbeBackend::read_text`。
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                panic!("{p:?}: this fixture only answers probes; a read here means the test changed shape")
+            }
         }
         assert!(matches!(
-            find_git_root_with(Path::new("/w/proj/sub"), &Failing),
+            find_git_root_with(Path::new("/w/proj/sub"), &Failing, Deadline::unbounded()),
             GitRoot::Unknown(_)
         ));
 
@@ -741,9 +912,17 @@ mod tests {
                     Probed::Found(crate::probe::FileKind::Dir)
                 }
             }
+            /// 本 fixture **只答探测**。读到这里说明测试的形状变了 —— 见 `ProbeBackend::read_text`。
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                panic!("{p:?}: this fixture only answers probes; a read here means the test changed shape")
+            }
         }
         assert!(matches!(
-            find_git_root_with(Path::new("/w/proj/sub"), &StartOkThenFailing),
+            find_git_root_with(
+                Path::new("/w/proj/sub"),
+                &StartOkThenFailing,
+                Deadline::unbounded()
+            ),
             GitRoot::Unknown(_)
         ));
     }

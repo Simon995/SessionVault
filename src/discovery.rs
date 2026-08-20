@@ -383,6 +383,17 @@ mod tests {
         ) -> crate::probe::Probed<crate::probe::FileKind> {
             (self.0)(path)
         }
+
+        /// 本 fixture **只答探测**。读到这里说明测试的形状变了 —— 见 `ProbeBackend::read_text`。
+        fn read_text(
+            &self,
+            p: &Path,
+            _d: crate::deadline::Deadline,
+        ) -> crate::probe::Probed<String> {
+            panic!(
+                "{p:?}: this fixture only answers probes; a read here means the test changed shape"
+            )
+        }
     }
 
     #[test]

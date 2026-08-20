@@ -114,6 +114,29 @@ pub enum FileKind {
 /// 的边界闸守着。
 pub trait ProbeBackend {
     fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind>;
+
+    /// 读文件为 UTF-8 文本 —— 三态，**且与 [`Self::probe`] 是同一个事实来源**。
+    ///
+    /// 🔴 **它在 trait 上，是因为不在 trait 上时同一个缺陷复发了三次。**
+    ///
+    /// 从前 trait 只有 `probe`，而读取是个直接走 `std::fs` 的自由函数。于是一个拿了
+    /// backend 的函数只能用它**探测**、却只能用本机文件系统**读取**：
+    ///
+    /// | 调用点 | 后果 |
+    /// | --- | --- |
+    /// | `identity::read_origin_url_with` | 已被发现（「判决链中途不许换事实来源」），处置是**在这一个调用点**补 fail-safe |
+    /// | `identity::git_config_path` ×2 | **同一形状，没有那个 fail-safe** |
+    /// | `identity::wsl_repo_id` | 干脆自己拼路径读文件 ⇒ **第二份实现，且漏了 `commondir` 那一步** |
+    ///
+    /// 最后一项的实测后果：每一个 WSL 里的 linked worktree 永远拿不到
+    /// `canonical_id`，同一个仓的记忆分裂成两组。
+    ///
+    /// **根因写对了，处置却是按反例补控制流** —— 于是同一根因在相邻路径反复复发。
+    /// 把读取提上 trait 之后，「探测用 A、读取用 B」在类型上表达不出来。
+    ///
+    /// 语义与 [`read_text`] 一致：`Absent` = 那里没有（且过了命名空间那一关）；
+    /// 非法 UTF-8 归 `Unknown`（读到了但看不懂，与「没有」是两件事）。
+    fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String>;
 }
 
 /// 🔴 **判据的唯一实现。**
@@ -299,6 +322,23 @@ impl ProbeBackend for LocalBackend {
             // [`namespace_confirms_absence`]。
             Probed::Absent => namespace_confirms_absence(path, &self.anchor),
             verdict => verdict,
+        }
+    }
+
+    /// ⚠️ **anchor 跟着 backend 走** —— 这正是它本来就该在的地方。自由函数
+    /// [`read_text`] 要调用方**再传一次** `anchor_root`，而调用方手上已经有一个
+    /// 带 anchor 的 backend 了：两处各说一次，就有两处可以说得不一样。
+    #[allow(clippy::disallowed_methods)] // ← 唯一允许点之一（见 clippy.toml）
+    fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String> {
+        if deadline.expired() {
+            return Probed::Unknown(ProbeError::new(path, "round budget exhausted before read"));
+        }
+        match std::fs::read_to_string(path) {
+            Ok(t) => Probed::Found(t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                namespace_confirms_absence(path, &self.anchor).map(|_| String::new())
+            }
+            Err(e) => Probed::Unknown(ProbeError::new(path, e)),
         }
     }
 }
@@ -545,8 +585,14 @@ impl WslBackend {
     /// 本后端答不了它。
     fn to_linux(&self, path: &Path) -> Option<String> {
         let s = path.to_string_lossy();
+        // 🔴 **无论走哪一支都要归一分隔符。** 调用方用 `Path::join` 拼路径，而它在
+        // Windows 上产出 `\` —— `/home/u/x` join `.git` 得到 `/home/u/x\.git`，
+        // 原样送进发行版就是一个不存在的文件名。本后端的**输出契约是 Linux 路径**，
+        // 归一是它自己的责任，不该让每个调用方记得先换。
+        // ⚠️ 代价：Linux 文件名里合法的 `\` 会被误换。实践中本仓的路径全部来自
+        // git / agent 目录，不含反斜杠文件名；而不归一则整条路根本用不了。
         if self.prefix.is_empty() {
-            return Some(s.into_owned());
+            return Some(s.replace('\\', "/"));
         }
         // Windows 路径大小写不敏感，而前缀来自配置、路径来自拼接 —— 两者大小写
         // 不一致是可预期的，不该因此答不出来。
@@ -586,6 +632,29 @@ impl ProbeBackend for WslBackend {
             Ok(Some(crate::wsl::PathKind::Dir)) => Probed::Found(FileKind::Dir),
             Ok(Some(crate::wsl::PathKind::File)) => Probed::Found(FileKind::File),
             Ok(Some(crate::wsl::PathKind::Other)) => Probed::Found(FileKind::Other),
+            Ok(None) => Probed::Absent,
+            Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+        }
+    }
+
+    /// 经访问桥在发行版**内部**读 —— `wsl::read_file_at` 本来就是三态
+    /// （`Ok(Some)` / `Ok(None)` / `Err`），这里只做翻译。
+    ///
+    /// ⚠️ **没有 `namespace_confirms_absence` 那一步，也不需要**：桥的
+    /// `Ok(None)` 已经是发行版自己说的「没有」，而发行版能应答本身就证明了
+    /// 命名空间可达 —— 桥不通时它给的是 `Err`。
+    fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String> {
+        let Some(linux_path) = self.to_linux(path) else {
+            return Probed::Unknown(ProbeError::new(
+                path,
+                format!(
+                    "not under this backend's declared WSL prefix {:?} (distro {})",
+                    self.prefix, self.distro
+                ),
+            ));
+        };
+        match crate::wsl::read_file_at(&self.distro, &linux_path, deadline) {
+            Ok(Some(t)) => Probed::Found(t),
             Ok(None) => Probed::Absent,
             Err(e) => Probed::Unknown(ProbeError::new(path, e)),
         }
@@ -645,6 +714,18 @@ impl ProbeBackend for WslUncBackend {
             // 不是答案。代价也可控 —— 宿主对发行版内的路径极少答不出来，答不出来时
             // 本就该问权威。
             Probed::Unknown(_) => self.authority.probe(path, deadline),
+            other => other,
+        }
+    }
+
+    /// **与 [`Self::probe`] 同构**：宿主答不上来（`Unknown`）才回落权威。
+    ///
+    /// ⚠️ 读取比探测少一支 —— 没有 `FileKind::Other` 的对应物（读一个符号链接，
+    /// 宿主要么读到内容、要么给错误）。**保持两个方法的回落条件一致**，
+    /// 否则「探测说在、读取说不在」会重新造出这个类型要消除的那种不一致。
+    fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String> {
+        match self.host.read_text(path, deadline) {
+            Probed::Unknown(_) => self.authority.read_text(path, deadline),
             other => other,
         }
     }
@@ -908,6 +989,25 @@ mod tests {
     struct Fixed(Probed<FileKind>);
     impl ProbeBackend for Fixed {
         fn probe(&self, _p: &Path, _d: Deadline) -> Probed<FileKind> {
+            self.0.clone()
+        }
+        /// 本后端只为测 `probe` 的组合逻辑而存在 —— 读取用 [`FixedText`]。
+        ///
+        /// 🔴 **panic 而不是 `Unknown`**：返回 `Unknown` 会让一条断言「结果是
+        /// `Unknown`」的测试在探测那一步被改坏之后照样通过 —— 读取那一步替它
+        /// 产出了同一个值。那是假护栏。
+        fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+            panic!("{p:?}: Fixed only answers probes; a read here means the test changed shape")
+        }
+    }
+
+    /// 读取侧的对照后端 —— 与 [`Fixed`] 分开，免得一个桩同时决定两件事。
+    struct FixedText(Probed<String>);
+    impl ProbeBackend for FixedText {
+        fn probe(&self, _p: &Path, _d: Deadline) -> Probed<FileKind> {
+            Probed::Found(FileKind::File)
+        }
+        fn read_text(&self, _p: &Path, _d: Deadline) -> Probed<String> {
             self.0.clone()
         }
     }

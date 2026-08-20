@@ -322,6 +322,10 @@ mod tests {
             fn probe(&self, p: &Path, _d: Deadline) -> Probed<FileKind> {
                 (self.0)(p)
             }
+            /// 本 fixture **只答探测**。读到这里说明测试的形状变了 —— 见 `ProbeBackend::read_text`。
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                panic!("{p:?}: this fixture only answers probes; a read here means the test changed shape")
+            }
         }
 
         assert_eq!(
