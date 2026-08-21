@@ -259,7 +259,7 @@ pub fn mnt_to_windows(path: &str, mounts: &DriveMounts) -> Option<String> {
 ///
 /// 后果实测（2026-08-15）：20 个注册根里 3 个拿不到 `canonical_id`，而它们正是这两族
 /// —— 在 Windows 上 `/home/simon/…` 是当前盘的相对路径、`/mnt/c/…` 同理，
-/// stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `note_project_identity` 丢弃。
+/// stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `record_identity_for_root` 丢弃。
 /// 而同一个目录的规范形那行**有**身份 ⇒ 同一份记忆按写法落进不同的桶。
 ///
 /// **不合并两个调用点**（它们答不同的问题），只把「形态」这一步收成一处。
@@ -567,7 +567,7 @@ mod tests {
     ///
     /// 这两族此前在 `identity::repo_id_for_root` 里落进本机分支 —— 在 Windows 上
     /// `/home/u/x` 是**当前盘的相对路径**，stat 不到 `.git/config` ⇒ 落 `path:` id
-    /// ⇒ 被 `store::note_project_identity` 丢弃。实测 20 个注册根里 3 个因此没有
+    /// ⇒ 被 `store::record_identity_for_root` 丢弃。实测 20 个注册根里 3 个因此没有
     /// `canonical_id`，而同一个目录的规范形那行**有** ⇒ 同一份记忆按写法落进不同的桶。
     #[test]
     fn a_bare_linux_root_belongs_to_the_distro_not_to_the_host() {

@@ -410,6 +410,17 @@ enum Out<'a> {
         /// 当成当前盘的相对路径（**打开错的东西**，比报错更坏）。所以这里宁可给
         /// `null` 也不拿它们冒充。
         host_path: Option<String>,
+        /// 身份探测的结论 —— 回答 `canonical_id` 为 `null` 时**为什么**没有。
+        ///
+        /// `not_probed`（还没扫到，**等**）／`resolved`（问到了）／
+        /// `no_identity`（**确认**不属于任何仓，**接受**）／
+        /// `unresolved`（**没问成**，**重试**，且**绝不据此做删除类决定**）。
+        ///
+        /// 🔴 上面那三个 `null` 从前长得一模一样（本机 20 个根：1 个是「确认没有」、
+        /// 3 个是「没问成」）—— 见 `store::IdentityVerdict`。
+        identity_verdict: &'a str,
+        /// 判决的理由；`resolved` / `not_probed` 没有。
+        identity_detail: Option<String>,
     },
     /// `roots` 的收尾摘要。
     ///
@@ -1471,6 +1482,10 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
                 &r.aliases,
                 session_vault::pathnorm::HostPlatform::current(),
             ),
+            // 拼写取自 `IdentityVerdict::as_str` —— 与库里 `outcome` 列同一份，
+            // 在这里再写一遍 `match` 就是第二份实现（本仓当天刚为此栽过两次）。
+            identity_verdict: r.identity_verdict.as_str(),
+            identity_detail: r.identity_verdict.why().map(str::to_string),
         });
     }
     emit(&Out::RootsSummary {

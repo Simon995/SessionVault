@@ -303,10 +303,26 @@ pub struct ProjectRootRow {
     /// （同一个 checkout 换个写法，`.git` 还是那个）。消费方要把同一个项目聚成一组，
     /// **两样都得有**。
     ///
-    /// `None` 的两种含义调用方通常不必区分（没扫到过 / 扫到时就没有 git remote），
-    /// 都表示「说不出它的跨系统身份」—— 而那是诚实的答案，见
-    /// [`TotalStore::project_identity`]。
+    /// 🔴 **这里从前写着「`None` 的两种含义调用方通常不必区分（没扫到过 / 扫到时
+    /// 就没有 git remote），都表示『说不出它的跨系统身份』—— 而那是诚实的答案」。
+    /// 那句话有两处不成立**（2026-08-21 实测，task #56）：
+    ///
+    /// 1. **不是两种，是三种** —— 漏掉了「**没问成**」（本机 20 个根里占 3 个：
+    ///    裸 POSIX ×2 + `/mnt/c/…` ×1，在 Windows 上根本没有命名空间）。
+    /// 2. 「没问成」**不是**诚实的答案。它与「确认没有」的下游处置相反：一个该
+    ///    重试且**绝不能触发删除**，另一个该被接受、别再算。
+    ///
+    /// 这正是本仓反复记的那条 —— **把没被遵守的纪律写成既成事实，比不写更糟**：
+    /// 这段注释让压平看起来是**有意的、安全的**，于是没人去查。
+    ///
+    /// 区别现在由 [`Self::identity_verdict`] 说出来。
     pub canonical_id: Option<String>,
+    /// 身份**探测的结论** —— 回答 `canonical_id` 为 `None` 时**为什么**没有。
+    ///
+    /// 🔴 **它与 `canonical_id` 不是同一个事实的两种说法。** 身份行活过 checkout
+    /// 被删（那是 `project_identity` 存在的全部理由），而判决说的是**最后一次探测**
+    /// 的结果 —— 「有身份 + 本轮没问成」是一个真实且有用的状态。
+    pub identity_verdict: IdentityVerdict,
 }
 
 /// 一个根路径的其它等价写法。
@@ -562,16 +578,120 @@ CREATE INDEX IF NOT EXISTS idx_identity_cid ON project_identity(canonical_id);
 ///
 /// 🔴 **四态，不是 `bool`/`Option`。** 「问过了没变」「刚记上」「确认没有 remote」
 /// 「没问成」对调用方是四种不同的处置，压成两态就又造一个「没问成长得像没有」。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 🔴 **而它此前只活在这一轮扫描的内存里**（2026-08-21，task #56）——
+/// 只有 `Recorded` 会留下痕迹（`project_identity` 的一行），另外两个算完就没了。
+/// 于是 `svault roots` 的 `canonical_id: null` 同时是三件事，见
+/// [`IdentityVerdict`]。现在每一次探测的结论都落 `project_identity_probe`。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum IdentityOutcome {
     /// 本进程已经问过这个根（终态缓存命中）。
     AlreadyProbed,
     /// 身份行已落库。
     Recorded,
     /// **确认**这个根没有可用的 remote —— 事实，不写 `path:` 兜底行（约束 1）。
-    NoRemote,
+    /// 带上是哪一种：没有 `.git`，还是有 `.git` 但里面没 origin。
+    NoRemote(&'static str),
     /// **没问成**：探测失败 / 拿不到锁 / 写失败。缓存已撤回，下一轮重试。
-    Unresolved,
+    Unresolved(String),
+}
+
+/// 一个根的身份**探测结论** —— [`ProjectRootRow::identity_verdict`] 的取值。
+///
+/// # 为什么需要它（2026-08-21 实测，task #56）
+///
+/// 本机 20 个注册根现算身份，`repo_id_for_root` 给出三种答案：
+///
+/// | 返回 | 数量 | 真实情况 | 下游该做什么 |
+/// | --- | --- | --- | --- |
+/// | `Ok("git:…")` | 16 | 有身份 | 用它 |
+/// | `Ok("path:…")` | 1 | **探明白了**，不属于任何仓 | **接受**，别再算 |
+/// | `Err(_)` | 3 | **没问成**（裸 POSIX ×2 + `/mnt/c/…` ×1，在 Windows 上没有命名空间） | **重试**，且**绝不据此做删除类决定** |
+///
+/// 而 `project_identity` 表**只存 `git:` 行**（`record_identity_for_root` 的约束 1，
+/// 理由仍然成立：`path:` id 不跨 checkout 稳定，记下来会让「查得到身份」变成一句
+/// 不能信的话）。**于是后两种在报告里都渲染成 `canonical_id: null`**，第三种
+/// 「还没扫到」也一样 —— 三个不同的事实、三种不同的处置，一个值。
+///
+/// 🔴 **类型本来就分得开**（`Result<RepoIdentity, ProbeError>`，`path:` vs `Err`），
+/// 是**注册表这一层**把它压平的。这与本仓反复记的那条同一个判据、只是层不同：
+/// `Probe::{Seen,Absent,Unreachable}`、`Probed<T>` 故意不给 `is_found()`、
+/// 「降级要降到说不出来，不是降到另一个答案」。
+///
+/// # 为什么没有 `Option`
+///
+/// 「还没扫到」是 [`Self::NotProbed`] 这个**变体**，不是 `None`。一个
+/// `Option<IdentityVerdict>` 会立刻长出 `.unwrap_or(NoIdentity)` 之类的调用点，
+/// 而那正是把「没问成」挤进「没有」的那一步。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityVerdict {
+    /// 判决表里没有这个根 —— **还没扫到**。等下一轮，别据此下任何结论。
+    ///
+    /// ⚠️ 也包括「这个库是 task #56 之前建的」：那时根本没有这张表。
+    NotProbed,
+    /// 问到了 —— 身份在 [`ProjectRootRow::canonical_id`] 里。
+    ///
+    /// ⚠️ 它与 `canonical_id` **不是同一个事实的两种说法**：身份行活过 checkout
+    /// 被删（那是这张表存在的全部理由），而判决说的是**最后一次探测**的结果。
+    /// 「有身份 + 本轮没问成」是一个真实且有用的状态。
+    Resolved,
+    /// **确认**这个根说不出跨系统身份。**接受**，别再算。
+    NoIdentity {
+        /// 哪一种：没有 `.git`，还是有 `.git` 但里面没 origin。
+        why: String,
+    },
+    /// **没问成**（命名空间够不着 / 桥不通 / 权限 / 写库失败）。
+    /// **重试**，且**绝不据此做删除类决定**。
+    Unresolved {
+        /// 探测报回来的原话 —— 「没问成」和「没问成：wsl.exe 超时」不是一回事。
+        why: String,
+    },
+}
+
+impl IdentityVerdict {
+    /// 线上取值。**`project_identity_probe.outcome` 与 `svault roots` 共用这一份拼写**
+    /// —— 两处各写一份必然漂开，而漂开时只表现为消费方看见一个不认识的值。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotProbed => "not_probed",
+            Self::Resolved => "resolved",
+            Self::NoIdentity { .. } => "no_identity",
+            Self::Unresolved { .. } => "unresolved",
+        }
+    }
+
+    /// 判决的理由；`resolved` / `not_probed` 没有理由可说。
+    pub fn why(&self) -> Option<&str> {
+        match self {
+            Self::NoIdentity { why } | Self::Unresolved { why } => Some(why.as_str()),
+            // 🔴 **不用 `_` 兜底**：将来加一个「问到一半」之类的变体时，
+            // 这里要**编译不过**，而不是静默给出 `None`。
+            Self::NotProbed | Self::Resolved => None,
+        }
+    }
+
+    /// 从库里读回来。
+    ///
+    /// 🔴 **不认识的 outcome 读作 [`Self::Unresolved`]，不是 [`Self::NotProbed`]。**
+    /// 一个未来版本写下的新变体意味着「那一侧知道点什么而我读不懂」——
+    /// 报成「还没扫到」是**编造**，报成「没问成」至少方向是对的（重试、别删）。
+    fn from_row(outcome: &str, detail: Option<String>) -> Self {
+        // detail 为 NULL 只可能来自手工写的行（本模块每次都写）。回显 outcome
+        // 会得到「no_identity: no_identity」这种同义反复 —— 说清楚它没有理由更好。
+        let why = || {
+            detail
+                .clone()
+                .unwrap_or_else(|| "(no detail recorded)".to_string())
+        };
+        match outcome {
+            "resolved" => Self::Resolved,
+            "no_identity" => Self::NoIdentity { why: why() },
+            "unresolved" => Self::Unresolved { why: why() },
+            other => Self::Unresolved {
+                why: format!("unrecognized verdict from a newer writer: {other}"),
+            },
+        }
+    }
 }
 
 /// 一轮 [`TotalStore::sweep_registered_root_identities`] 的统计。
@@ -966,6 +1086,28 @@ impl TotalStore {
             CREATE TABLE IF NOT EXISTS project_root_probe (
                 path          TEXT PRIMARY KEY,
                 outcome       TEXT NOT NULL,   -- 'none' | 'unreachable'
+                last_probe_ms INTEGER NOT NULL
+            );
+
+            -- 身份探测的**结论**（task #56）。与上面那张是同一个形状、不同的问题：
+            --
+            --   project_root_probe      这条路径**是不是**项目根（归属的输入）
+            --   project_identity_probe  这个根的**身份问出来没有**（报告的输入）
+            --
+            -- 🔴 **与 `project_identity` 分开**，理由和 `project_root_registry`
+            -- 与它分开是同一条：那张表有一条刻意的约束（**只写 `git:` 行**），
+            -- 而「确认没有身份」「没问成」恰恰是**没有** `git:` 的那些。塞进去就得
+            -- 造一个假的 canonical_id，那会污染 `all_project_identities()`。
+            --
+            -- 主键是**根**、一行、后写覆盖：判决问的是「**最后一次**探测怎么样」，
+            -- 与 `project_identity` 刻意保留多行（仓库迁移 vs 路径被复用，两者
+            -- 看起来一样而后果相反）是两种不同的时间语义。
+            CREATE TABLE IF NOT EXISTS project_identity_probe (
+                project_root  TEXT PRIMARY KEY,
+                -- 'resolved' | 'no_identity' | 'unresolved'（`IdentityVerdict::as_str`）
+                outcome       TEXT NOT NULL,
+                -- 为什么 —— 「没问成」和「没问成：桥超时」不是一回事。
+                detail        TEXT,
                 last_probe_ms INTEGER NOT NULL
             );
             "#,
@@ -1579,14 +1721,23 @@ impl TotalStore {
             match self.record_identity_for_root(&root, default_distro, mounts, deadline) {
                 IdentityOutcome::AlreadyProbed => sweep.already_probed += 1,
                 IdentityOutcome::Recorded => sweep.recorded += 1,
-                IdentityOutcome::NoRemote => sweep.no_remote += 1,
-                IdentityOutcome::Unresolved => sweep.unresolved += 1,
+                IdentityOutcome::NoRemote(_) => sweep.no_remote += 1,
+                IdentityOutcome::Unresolved(_) => sweep.unresolved += 1,
             }
         }
         sweep
     }
 
     /// 一个根的身份 —— [`sweep_registered_root_identities`] 的单步。
+    ///
+    /// 🔴 **两件事，分开做**（task #56）：`probe_identity_for_root` 算出结论，
+    /// 这里把结论**落库**。从前只有「问到了」留得下痕迹，另外两种算完就没了 ——
+    /// 于是报告只能说 `null`，而 `null` 同时是「确认没有」「没问成」「还没扫到」。
+    ///
+    /// ⚠️ **判决没落库就不配保留「问过了」** —— 与身份行同一条纪律（见
+    /// `probe_identity_for_root` 里那三个 `forget_identity_probe`）。理由也同一个：
+    /// `identity_seen` 是**先记后算**的，任何中途退出都必须撤回，否则一次瞬时故障
+    /// 让这个根在本进程内再也不被问起。
     ///
     /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
     fn record_identity_for_root(
@@ -1596,12 +1747,71 @@ impl TotalStore {
         mounts: &crate::pathnorm::DriveMounts,
         deadline: Deadline,
     ) -> IdentityOutcome {
+        let outcome = self.probe_identity_for_root(root, default_distro, mounts, deadline);
+        let verdict = match &outcome {
+            // 缓存命中 ⇒ 本进程这一轮之前已经落过判决，不重复写。
+            //
+            // ⚠️ 写成 `if matches!(…) { return }` + 后面一个 `unreachable!()` 也能跑，
+            // 但那是**断言**这一格不会发生；直接在这里 `return`，那一格就不存在。
+            IdentityOutcome::AlreadyProbed => return outcome,
+            IdentityOutcome::Recorded => IdentityVerdict::Resolved,
+            IdentityOutcome::NoRemote(why) => IdentityVerdict::NoIdentity {
+                why: (*why).to_string(),
+            },
+            IdentityOutcome::Unresolved(why) => IdentityVerdict::Unresolved { why: why.clone() },
+        };
+        if !self.note_identity_verdict(root, &verdict) {
+            self.forget_identity_probe(root);
+            return IdentityOutcome::Unresolved("identity verdict write failed".to_string());
+        }
+        outcome
+    }
+
+    /// 落一条判决 —— **返回是否落成**。
+    ///
+    /// 两态是对的：这里只有「写进去了」和「没写进去」，没有第三种。
+    /// （对比 [`IdentityVerdict`] 本身 —— 那里两态就装不下。）
+    #[must_use]
+    fn note_identity_verdict(&self, root: &str, verdict: &IdentityVerdict) -> bool {
+        let now = now_unix_millis();
+        let Ok(conn) = self.conn.lock() else {
+            return false;
+        };
+        match conn.execute(
+            "INSERT INTO project_identity_probe
+                 (project_root, outcome, detail, last_probe_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_root)
+             DO UPDATE SET outcome = ?2, detail = ?3, last_probe_ms = ?4",
+            rusqlite::params![root, verdict.as_str(), verdict.why(), now],
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                log::debug!(
+                    target: crate::logging::tag::SQLITE,
+                    "identity verdict insert failed, will retry: root={root} err={e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// 算一个根的身份，**不管报告** —— [`record_identity_for_root`] 的内核。
+    ///
+    /// [`record_identity_for_root`]: TotalStore::record_identity_for_root
+    fn probe_identity_for_root(
+        &self,
+        root: &str,
+        default_distro: Option<&str>,
+        mounts: &crate::pathnorm::DriveMounts,
+        deadline: Deadline,
+    ) -> IdentityOutcome {
         if root.is_empty() {
-            return IdentityOutcome::NoRemote;
+            return IdentityOutcome::NoRemote("empty root path");
         }
         {
             let Ok(mut seen) = self.identity_seen.lock() else {
-                return IdentityOutcome::Unresolved;
+                return IdentityOutcome::Unresolved("identity_seen mutex poisoned".to_string());
             };
             // 🔴 **先记后算**：算不出来的（无 `.git`、UNC 回环读不到）也算「问过了」，
             // 否则一个读不到的项目每一轮扫描都要重付一次探测代价。
@@ -1623,22 +1833,31 @@ impl TotalStore {
         // 三态各有各的处置：`Unknown` 是「本轮没问成」，它**已经**被上面的
         // `identity_seen` 记成「问过了」，所以必须撤回 —— 否则一次瞬时故障让这个
         // 项目在本进程内永远算不出身份。
-        let cid = match crate::identity::repo_id_for_root(root, default_distro, mounts, deadline) {
-            Ok(identity) => identity.id,
-            Err(e) => {
-                log::debug!(
-                    target: crate::logging::tag::SQLITE,
-                    "project identity unresolved, will retry: {e}"
-                );
-                self.forget_identity_probe(root);
-                return IdentityOutcome::Unresolved;
-            }
-        };
-        if !cid.starts_with("git:") {
+        let identity =
+            match crate::identity::repo_id_for_root(root, default_distro, mounts, deadline) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    log::debug!(
+                        target: crate::logging::tag::SQLITE,
+                        "project identity unresolved, will retry: {e}"
+                    );
+                    self.forget_identity_probe(root);
+                    return IdentityOutcome::Unresolved(e.to_string());
+                }
+            };
+        if !identity.id.starts_with("git:") {
             // 约束 1：不写 `path:` 兜底行（这是**确认**没有 remote 的情形）。
             // 「问过了」保留 —— 它是终态，下一轮不必再问。
-            return IdentityOutcome::NoRemote;
+            //
+            // 🔴 **哪一种要说出来。** `RepoIdentity::repo_root` 分得开，而调用方
+            // 从 `path:` 前缀**反推不出来**（它同时盖住两种）—— 那正是它的文档
+            // 早就写下的理由，只是从前这里把整个 `RepoIdentity` 扔了。
+            return IdentityOutcome::NoRemote(match identity.repo_root {
+                Some(_) => "found a git root, but it has no usable origin remote",
+                None => "no .git anywhere on this path",
+            });
         }
+        let cid = identity.id;
 
         let now = now_unix_millis();
         // 🔴 **第三个失败出口**（三轮评审 P2）。前两个（探不到 `.git`、读不了 config）
@@ -1649,7 +1868,7 @@ impl TotalStore {
         // 判据统一成一句：**只有身份行确实落库，才配保留「问过了」。**
         let Ok(conn) = self.conn.lock() else {
             self.forget_identity_probe(root);
-            return IdentityOutcome::Unresolved;
+            return IdentityOutcome::Unresolved("total store mutex poisoned".to_string());
         };
         let written = conn.execute(
             "INSERT INTO project_identity
@@ -1665,7 +1884,7 @@ impl TotalStore {
                 "project identity insert failed, will retry: root={root} err={e}"
             );
             self.forget_identity_probe(root);
-            return IdentityOutcome::Unresolved;
+            return IdentityOutcome::Unresolved(format!("identity insert failed: {e}"));
         }
         IdentityOutcome::Recorded
     }
@@ -1976,6 +2195,40 @@ impl TotalStore {
                 identity_by_key.insert(crate::attribution::registry_key(&root, &Vec::new()), cid);
             }
         }
+        // 判决同一次持锁读进来 —— 与身份、与修订号同一个理由：分两次读，中间的
+        // 锁间隙足够一轮扫描挤进去，消费方于是拿到「新判决 + 旧身份」这种从未存在过
+        // 的组合。
+        //
+        // 🔴 **按 `registry_key` 匹配，理由与上面身份那段逐字相同**：两张表的路径
+        // 来自不同时刻，写法可能不同。字面比会让一个明明探测过的根报成「还没扫到」
+        // —— 而那是**看得见的**功能缺失（三态又塌回一态），却不会有任何东西报错。
+        let mut verdict_by_key: std::collections::HashMap<String, IdentityVerdict> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT project_root, outcome, detail FROM project_identity_probe \
+                       ORDER BY last_probe_ms ASC",
+                )
+                .map_err(|e| format!("prepare project_identity_probe failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| format!("query project_identity_probe failed: {e}"))?;
+            for row in rows {
+                let (root, outcome, detail) =
+                    row.map_err(|e| format!("decode project_identity_probe row failed: {e}"))?;
+                verdict_by_key.insert(
+                    crate::attribution::registry_key(&root, &Vec::new()),
+                    IdentityVerdict::from_row(&outcome, detail),
+                );
+            }
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT root_key, root_path, root_source, first_seen_ms, last_seen_ms \
@@ -1986,11 +2239,20 @@ impl TotalStore {
             .query_map([], |r| {
                 let root_path: String = r.get(1)?;
                 let key: String = r.get(0)?;
+                let by_path = crate::attribution::registry_key(&root_path, &Vec::new());
                 Ok(ProjectRootRow {
                     canonical_id: identity_by_key
-                        .get(&crate::attribution::registry_key(&root_path, &Vec::new()))
+                        .get(&by_path)
                         .or_else(|| identity_by_key.get(&key))
                         .cloned(),
+                    // 🔴 **表里没有这一行 ⇒ `NotProbed`，一个显式的变体。**
+                    // 这不是「用默认值兜底」：缺席在这里就是「还没扫到」，而
+                    // **查询失败走不到这里**（上面逐行 `?`，一行坏掉整份报告失败）。
+                    identity_verdict: verdict_by_key
+                        .get(&by_path)
+                        .or_else(|| verdict_by_key.get(&key))
+                        .cloned()
+                        .unwrap_or(IdentityVerdict::NotProbed),
                     root_key: key,
                     aliases: alias_forms_of(&root_path),
                     root_path,
@@ -6493,6 +6755,226 @@ mod project_identity_tests {
             Some("git:example.com/o/r"),
             "写法差异不该让身份丢掉"
         );
+    }
+
+    /// 🔴 **本任务（#56）的判据本身：三种「没有身份」在报告里必须看得出区别。**
+    ///
+    /// | 根 | `canonical_id` | 判决 | 下游 |
+    /// | --- | --- | --- | --- |
+    /// | 有 origin 的仓 | `git:…` | `resolved` | 用它 |
+    /// | 没有 `.git` 的目录 | `null` | `no_identity` | **接受**，别再算 |
+    /// | 桥够不着的根 | `null` | `unresolved` | **重试**，且**绝不据此删东西** |
+    /// | 登记了但没扫过 | `null` | `not_probed` | **等** |
+    ///
+    /// 后三行从前**一模一样**（三个 `null`）。实测本机 20 个根里，第二类 1 个、
+    /// 第三类 3 个 —— 而 #41/#42 两次误诊正是把它们读成了同一件事。
+    ///
+    /// ⚠️ **断言写成「四个值互不相同」而不是逐个比字面量**：后者在有人把
+    /// `no_identity` 改名时会红，而那不是缺陷；前者钉的是**能不能分辨**，
+    /// 那才是这条护栏存在的理由。逐个的字面量由下面 `as_str` 那条钉。
+    ///
+    /// ⚠️ `wsl:no-such-distro:/…` 在**两个平台上都**走不通（Windows 上
+    /// `WSL_E_DISTRO_NOT_FOUND`，非 Windows 上 `stub_on_non_windows!` 直接 `Err`）
+    /// —— 本仓「只在一个平台上编译的代码等于没有编译过」那条的测试侧对应物。
+    #[test]
+    fn the_three_ways_to_have_no_identity_are_told_apart() {
+        let dir = scratch("verdicts");
+        let with_origin = dir.join("WithOrigin");
+        let plain = dir.join("PlainDir");
+        std::fs::create_dir_all(&plain).unwrap();
+        seed_repo(&with_origin, Some("git@github.com:o/r.git"));
+        let unreachable = "wsl:no-such-distro-56:/home/u/p";
+
+        let st = TotalStore::open_in_memory().unwrap();
+        for p in [&with_origin, &plain] {
+            st.register_project_root(&p.to_string_lossy(), RootSource::Git);
+        }
+        st.register_project_root(unreachable, RootSource::Git);
+        let sweep = st.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
+        assert_eq!(
+            (sweep.recorded, sweep.no_remote, sweep.unresolved),
+            (1, 1, 1),
+            "前提：三个根各走一条路 —— 否则下面的断言在测别的东西"
+        );
+
+        // 第四种：登记在扫描**之后**，所以这一轮没问过它。
+        st.register_project_root("/w/never-swept-56", RootSource::Git);
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        let verdict_of = |needle: &str| {
+            roots
+                .iter()
+                .find(|r| r.root_path.contains(needle))
+                .unwrap_or_else(|| panic!("报告里没有 {needle}"))
+                .identity_verdict
+                .clone()
+        };
+        let resolved = verdict_of("WithOrigin");
+        let no_identity = verdict_of("PlainDir");
+        let unresolved_v = verdict_of("no-such-distro-56");
+        let not_probed = verdict_of("never-swept-56");
+
+        assert_eq!(resolved, IdentityVerdict::Resolved);
+        assert_eq!(not_probed, IdentityVerdict::NotProbed);
+        assert!(
+            matches!(no_identity, IdentityVerdict::NoIdentity { .. }),
+            "确认没有身份 —— 实得 {no_identity:?}"
+        );
+        assert!(
+            matches!(unresolved_v, IdentityVerdict::Unresolved { .. }),
+            "没问成 —— 实得 {unresolved_v:?}"
+        );
+
+        // 判据的正面表述：四个**都不相同**。
+        let wire = [&resolved, &no_identity, &unresolved_v, &not_probed]
+            .map(|v| v.as_str())
+            .to_vec();
+        let mut uniq = wire.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            4,
+            "四种情况必须给出四个不同的说法，实得 {wire:?}"
+        );
+
+        // 而 `canonical_id` 对后三种**一律是 `null`** —— 这正是从前唯一的信息量。
+        for needle in ["PlainDir", "no-such-distro-56", "never-swept-56"] {
+            let r = roots.iter().find(|r| r.root_path.contains(needle)).unwrap();
+            assert_eq!(r.canonical_id, None, "{needle} 本来就不该有身份");
+        }
+
+        // 「没问成」必须带上原话 —— 「没问成」和「没问成：桥不通」不是一回事。
+        assert!(
+            unresolved_v.why().is_some_and(|w| !w.is_empty()),
+            "没问成要说得出为什么"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 判决的线上拼写 —— `project_identity_probe.outcome` 与 `svault roots`
+    /// **共用这一份**。改动它就是改协议，消费方看见一个不认识的值不会报错、
+    /// 只会静默走 else 分支。
+    #[test]
+    fn the_verdict_wire_values_are_pinned() {
+        assert_eq!(IdentityVerdict::NotProbed.as_str(), "not_probed");
+        assert_eq!(IdentityVerdict::Resolved.as_str(), "resolved");
+        assert_eq!(
+            IdentityVerdict::NoIdentity { why: "x".into() }.as_str(),
+            "no_identity"
+        );
+        assert_eq!(
+            IdentityVerdict::Unresolved { why: "x".into() }.as_str(),
+            "unresolved"
+        );
+        // 🔴 未来版本写下的新值读作「没问成」，不是「还没扫到」——
+        // 后者是**编造**（我们明明看见有人探测过），前者至少方向对（重试、别删）。
+        assert!(matches!(
+            IdentityVerdict::from_row("something_new", None),
+            IdentityVerdict::Unresolved { .. }
+        ));
+    }
+
+    /// 🔴 **「有身份」与「本轮问到了」是两个事实，报告要能同时说。**
+    ///
+    /// `project_identity` 的行活过 checkout 被删（那是它存在的全部理由），
+    /// 而判决说的是**最后一次探测**。把两者绑成一个值，就会出现
+    /// 「桥今天不通 ⇒ 连历史身份也说不出来」或者反过来
+    /// 「历史身份还在 ⇒ 报告说今天问到了」—— 后者更坏，它是**编造**。
+    #[test]
+    fn a_known_identity_and_a_failed_probe_are_both_reported() {
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(r"D:\Work\Proj", RootSource::Git);
+        {
+            let conn = st.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO project_identity \
+                   (project_root, canonical_id, first_seen_ms, last_seen_ms) \
+                 VALUES ('d:/work/proj', 'git:example.com/o/r', 1, 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_identity_probe \
+                   (project_root, outcome, detail, last_probe_ms) \
+                 VALUES ('d:/work/proj', 'unresolved', 'bridge timed out', 3)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(
+            roots[0].canonical_id.as_deref(),
+            Some("git:example.com/o/r"),
+            "上一次问到的身份不该被这一次的失败抹掉"
+        );
+        assert_eq!(
+            roots[0].identity_verdict,
+            IdentityVerdict::Unresolved {
+                why: "bridge timed out".to_string()
+            },
+            "而这一次确实没问成，报告要说出来"
+        );
+    }
+
+    /// 🔴 **判决没落库，就不配保留「问过了」** —— 与
+    /// [`a_failed_identity_insert_is_retried_on_the_next_pass`] 同一条纪律的另一半。
+    ///
+    /// `identity_seen` 是**先记后算**的，所以每一个中途退出的分支都必须撤回。
+    /// 新增的判决写入是**第四个**这样的出口；漏掉它的后果与前三个一样：
+    /// 一次瞬时故障让这个根在本进程内**再也不被问起**，而报告永远说「还没扫到」。
+    ///
+    /// 用 trigger 精确阻断判决表的写入 —— 身份行照常落库，正是那个真实形状。
+    ///
+    /// [`a_failed_identity_insert_is_retried_on_the_next_pass`]: #method.a_failed_identity_insert_is_retried_on_the_next_pass
+    #[test]
+    fn a_failed_verdict_write_is_retried_on_the_next_pass() {
+        let dir = scratch("verdict-write-fails");
+        seed_repo(&dir, Some("git@github.com:o/vw.git"));
+        let root_str = dir.to_string_lossy().into_owned();
+
+        let st = TotalStore::open_in_memory().unwrap();
+        st.register_project_root(&root_str, RootSource::Git);
+        st.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER block_verdict BEFORE INSERT ON project_identity_probe
+                 BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .unwrap();
+
+        let first = st.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
+        assert_eq!(
+            (first.recorded, first.unresolved),
+            (0, 1),
+            "判决写不进去 ⇒ 这一轮不算数，要报成「没问成」"
+        );
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(
+            roots[0].identity_verdict,
+            IdentityVerdict::NotProbed,
+            "判决表里什么都没有 ⇒ 报告只能说「还没扫到」"
+        );
+
+        st.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER block_verdict;")
+            .unwrap();
+
+        // 🔴 第二轮：`identity_seen` 若没撤回，这里永远补不上。
+        let second = st.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
+        assert_eq!(
+            second.already_probed, 0,
+            "缓存没撤回 —— 这个根在本进程内再也不会被问起"
+        );
+        let (roots, _) = st.project_roots_report().unwrap();
+        assert_eq!(roots[0].identity_verdict, IdentityVerdict::Resolved);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 没记过身份 ⇒ `None`。**不是空串、不是拿 `root_path` 兜底** —— 一个不跨 checkout

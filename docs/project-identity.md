@@ -138,7 +138,7 @@ packfile，**代价远超本模块「只读 `.git/config`」的定位**。
 
 linked worktree 的 `<gitdir>/` 里**没有 `config`**（它在 `commondir` 指向的主仓
 `.git` 里）⇒ 读到 `None` ⇒ `no_git()` ⇒ `path:` 身份 ⇒ 被
-`store::note_project_identity` 丢弃（那张表只收 `git:` 行）。
+`store::record_identity_for_root` 丢弃（那张表只收 `git:` 行）。
 
 🔴 **而 `wsl_repo_id` 的注释写着「与本机那条同一套规则，只是换了访问方式」。**
 那是一句**不成立的声明** —— 本仓判例：「把没被遵守的纪律写成既成事实，比不写更糟」。
@@ -210,7 +210,7 @@ git worktree list          → 只有主仓一行
 
 worktree 的元数据早就没了（prune 过，或主仓被重新 clone），只剩一个带着**死
 `gitdir:` 指针**的壳。**`git` 自己都不认它** —— 所以本模块给出 `path:` 身份是
-**正确的**，`note_project_identity` 按设计丢弃它、`canonical_id` 保持为空
+**正确的**，`record_identity_for_root` 按设计丢弃它、`canonical_id` 保持为空
 **也是正确的**。
 
 ⚠️ **判据写错的根源是我假定了那个根是活的 worktree，而没先问 git。**
@@ -235,8 +235,83 @@ worktree 的元数据早就没了（prune 过，或主仓被重新 clone），�
 | -------------- | ---- | -------------------------------------------------------------------- |
 | `Ok("git:…")`  | 16   | 有身份                                                               |
 | `Ok("path:…")` | 1    | **探明白了，不属于任何仓**                                           |
-| `Err(_)`       | 3    | **没问成**（裸 POSIX ×2 + `/mnt/c/…` ×1，在 Windows 上没有命名空间） |
+| `Err(_)`       | 3    | **没问成**（裸 POSIX ×2 + `/mnt/<drive>/…` ×1）                     |
 
 而 `project_identity` 只存 `git:` 行 ⇒ `svault roots` 的 `canonical_id: null`
 **把这三件事压成一个**，而它们的下游动作完全不同（接受 / 重试 / 等）。
-**类型已经能区分，是注册表这一层压平的。** 见 QuotaBar task #56。
+**类型已经能区分，是注册表这一层压平的。**
+
+> 🔴 **那个 `Err(_) × 3` 是探针环境的产物，不是生产的事实**（2026-08-21 订正，
+> 见下一节）。别拿这一行去估影响面。
+
+## 🔴 P4：三种「没有身份」各自有个说法（task #56）
+
+### 判据
+
+**三种情况在 `svault roots` 的输出里看得出区别，不是三个 `null`。**
+
+| 真实情况         | 判决          | 下游该做什么                     |
+| ---------------- | ------------- | -------------------------------- |
+| 问到了           | `resolved`    | 用 `canonical_id`                |
+| 确认不属于任何仓 | `no_identity` | **接受**，别再算                 |
+| 没问成           | `unresolved`  | **重试**，且**绝不据此删除东西** |
+| 还没扫到         | `not_probed`  | 等                               |
+
+### 结构
+
+`IdentityOutcome` 本来就是四态，**只是它此前只活在一轮扫描的内存里** ——
+只有 `Recorded` 留得下痕迹（`project_identity` 的一行）。现在每次探测的结论
+都落 `project_identity_probe`（主键=根、一行、后写覆盖）。
+
+**为什么是新表而不是给 `project_identity` 加一列**：那张表有一条刻意的约束
+（**只写 `git:` 行**），而要记的恰恰是**没有** `git:` 的那些；塞进去就得造一个
+假的 `canonical_id`，那会污染 `all_project_identities()`。两张表的时间语义也不同
+——身份表**故意保留多行**（仓库迁移 vs 路径被复用，两者看起来一样而后果相反），
+判决问的是「**最后一次**探测怎么样」。
+
+⚠️ **判决与 `canonical_id` 不是同一个事实的两种说法。** 身份行活过 checkout 被删
+（那是身份表存在的全部理由），判决说的是最后一次探测 ——
+**「有身份 + 本轮没问成」是一个真实且有用的状态**，报告要能同时说。
+
+### 🔴 顺带订正：上一节那个「3 个没问成」是**探针环境的产物**
+
+端到端跑一轮（`identity_probe --store <总库副本>`，2026-08-21）：
+
+```
+sweep: registered: 20, recorded: 19, no_remote: 1, unresolved: 0
+---- 20 roots: {"no_identity": 1, "resolved": 19}
+```
+
+**`unresolved` 是 0，不是 3。** 那三个（裸 POSIX ×2 + `/mnt/<drive>/…` ×1）
+在生产里**全部解得出来**。差别只有一个：上一节那次是用**清单模式**跑的，
+而清单模式传的是 `None` + 空挂载表；生产（QuotaBar `session_index.rs`）从访问桥
+取 `default_distro` 与 `drive_mounts` 再传进来。不给这两个运行期事实，
+`pathnorm::reach_of` 只能报 `Unknown` —— 错误串自己就写着原话：
+
+```
+bare linux path with no known distro: /home/<user>/workspace/<proj>
+no drive mount covers /mnt/<drive>/… (mount table unavailable or this is a plain Linux mount)
+```
+
+**这是本仓「在 A 环境量到的值不能给 B 环境结案」的又一个实例**，而这次
+A 与 B 的差别不是进程、不是平台，是**同一个函数的两个实参**。
+教训具体化一点：**探针与生产的调用参数不同，量出来的就不是生产的数字** ——
+所以 `--store` 模式照抄了生产取那两个事实的三行，探针的文档里也写明了理由。
+
+### 那这条还值不值得做
+
+值得，但理由要说准：
+
+- ✅ **结构性的那一半是真的**：报告**物理上**说不出区别，四种情况一个 `null`。
+- ❌ **影响面被我说大了**：今天这台机器 `unresolved = 0`。
+- ⚠️ **而「今天是 0」不等于「不会有」**：WSL 卡死、权限拒绝、盘符掉线都会产生
+  `unresolved`，**而那正是 prune 类决定绝不能开火的时刻**。
+
+### 谁在读它（老实说）
+
+- ✅ `svault roots` 的两个新字段 —— **判据本身**，也是现在唯一的真消费者。
+- ⚠️ **prune 目前不读身份**（已 grep 确认）。别为它设计字段，那是「造一个没人读的
+  字段」；等真有那条路径时它已经有得问了。
+- ⚠️ **QuotaBar 项目表也还没读**。它今天用 `canonical_id` 做**合并**，`None` ⇒ 不合并
+  —— 那个行为与「为什么没有」无关，所以现在没有可修的缺陷。要显示「这个文件夹
+  不属于任何仓」vs「还没算出来」时再接，届时数据已经在。

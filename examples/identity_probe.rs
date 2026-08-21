@@ -7,12 +7,29 @@
 //! POSIX 形参数改写成 `C:/Program Files/Git/home/…` —— 实测第一版就是这么把三个
 //! 真实的根量成了不存在的路径。同「Git Bash 传参进 wsl.exe 会被篡改」那条判例。
 //!
-//! 用法：`cargo run --example identity_probe --features store -- <每行一个根的文件>`
+//! 用法：
+//! - `cargo run --example identity_probe --features store -- <每行一个根的文件>`
+//!   —— 现算规则，**不碰总库**。
+//! - `cargo run --example identity_probe --features store -- --store <总库副本>`
+//!   —— **端到端**：跑一轮身份扫描，再按 `svault roots` 的口径打印判决直方图。
+//!   那正是 task #56 的判据（三种「没有身份」看不看得出区别）。
+//!
+//! 🔴 **`--store` 必须给副本，不能给真库** —— 它会写（身份行 + 判决行）。
+//! 探针自己拦不住这件事：一个路径是不是副本，只有拿它的人知道。
 use session_vault::deadline::Deadline;
 use session_vault::probe::{LocalBackend, ProbeBackend, Probed};
 use std::time::Duration;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--store") {
+        let Some(path) = args.get(2) else {
+            eprintln!("用法: identity_probe --store <总库副本路径>");
+            std::process::exit(2);
+        };
+        probe_through_the_store(path);
+        return;
+    }
     let Some(list) = std::env::args().nth(1) else {
         eprintln!("用法: identity_probe <每行一个 project root 的文件>");
         std::process::exit(2);
@@ -42,4 +59,50 @@ fn main() {
             Err(e) => println!("UNKNOWN\t{e}\t{root}"),
         }
     }
+}
+
+/// 端到端：扫一轮 → 按报告的口径逐根打印判决。
+///
+/// 运行期事实（`default_distro` / `drive_mounts`）**照 QuotaBar 那三行取**
+/// —— 少了它们，裸 Linux 路径与 `/mnt/<drive>/…` 会因为别的原因判成「没问成」，
+/// 那时量到的数字说不了本轮改动的事。
+fn probe_through_the_store(path: &str) {
+    let d = Deadline::after(Duration::from_secs(300));
+    let store = match session_vault::store::TotalStore::open(std::path::Path::new(path)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("打不开总库副本 {path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let distro = session_vault::wsl::list_distros(d)
+        .ok()
+        .and_then(|ds| session_vault::wsl::default_distro(&ds));
+    let mounts = match distro.as_deref() {
+        Some(x) => session_vault::wsl::drive_mounts(x, d).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let sweep = store.sweep_registered_root_identities(distro.as_deref(), &mounts, d);
+    println!("sweep: {sweep:?}");
+
+    // 🔴 报告失败**当场退出**，不渲染成一个说得出口的数字（诊断探针的纪律）。
+    let (roots, _) = match store.project_roots_report() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("project_roots_report failed: {e}");
+            std::process::exit(2);
+        }
+    };
+    let mut hist = std::collections::BTreeMap::<&str, usize>::new();
+    for r in &roots {
+        *hist.entry(r.identity_verdict.as_str()).or_default() += 1;
+        println!(
+            "{}\t{}\t{}\t{}",
+            r.identity_verdict.as_str(),
+            r.canonical_id.as_deref().unwrap_or("-"),
+            r.identity_verdict.why().unwrap_or("-"),
+            r.root_path,
+        );
+    }
+    println!("---- {} roots: {hist:?}", roots.len());
 }

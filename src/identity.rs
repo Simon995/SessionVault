@@ -43,7 +43,7 @@ use crate::probe::{FileKind, ProbeBackend, Probed};
 /// 一次 git 根查找的结果 —— **三态**。
 ///
 /// 🔴 从前是 `Option<PathBuf>`，而两处 `.exists()` 把「没问成」折叠进了 `None`。
-/// 后果不是崩溃，是**静默**：`store.rs` 的 `note_project_identity` 拿到 `None` 就
+/// 后果不是崩溃，是**静默**：`store.rs` 的 `record_identity_for_root` 拿到 `None` 就
 /// `return`，且它**先记后算**（`identity_seen` 在计算前就插了 key）—— 于是一次
 /// 权限错误 / UNC 不通让这个项目在本进程生命周期内**永远**算不出 `git:` 身份，
 /// 没有别名组，跨 checkout 的 Class-A 证据在 project 作用域里蒸发。
@@ -104,7 +104,7 @@ pub fn find_git_root_with(start: &Path, backend: &dyn ProbeBackend, d: Deadline)
 /// 🔴 上一版固定读 `git_root/.git/config`，而 [`find_git_root`] **明确认可** `.git`
 /// 文件（子模块 / worktree 的注释就写在那里）。两处对同一个概念的理解不一致，
 /// 后果是确定性的、不是偶发的：**每一个 linked worktree 都永远退回 `path:` 身份**，
-/// 而 `store::note_project_identity` 只写 `git:` 前缀的行 ⇒ 这些项目**从来**没有过
+/// 而 `store::record_identity_for_root` 只写 `git:` 前缀的行 ⇒ 这些项目**从来**没有过
 /// 跨 checkout 身份。这正是本模块存在的理由，却在它自己的读取路径上失效了。
 ///
 /// linked worktree 的 config 在 **commondir**（`<gitdir>/commondir` 指向主仓的
@@ -179,7 +179,7 @@ fn git_config_path(git_root: &Path, backend: &dyn ProbeBackend, d: Deadline) -> 
 ///
 /// 🔴 上一版是 `Option<String>` + `.ok()?`，把「这个仓确实没配 origin」与
 /// 「config 这一刻读不了（权限 / UNC 不通 / 句柄耗尽）」压成同一个 `None`。
-/// 而 `store::note_project_identity` **先记后算**：拿到 `path:` 就直接 return，
+/// 而 `store::record_identity_for_root` **先记后算**：拿到 `path:` 就直接 return，
 /// 不撤销 `identity_seen` ⇒ 一次瞬时故障让该项目在**整个进程生命周期**内拿不到
 /// 稳定身份。这是 [`find_git_root`] 那次三态化只做了一半 —— stat 阶段分开了，
 /// 紧接着的读取阶段又合上了。
@@ -350,7 +350,7 @@ pub fn repo_id_for_root(
     //
     // 这里从前只认两种形态（规范形 / 其余），于是**裸 Linux 路径与 `/mnt/<drive>/…`
     // 全落进本机分支** —— 在 Windows 上前者是当前盘的相对路径、后者同理，
-    // stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `store::note_project_identity` 丢弃。
+    // stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `store::record_identity_for_root` 丢弃。
     //
     // 而 `discovery::probe_path` 认**四种**形态。同一条「这条路径归谁管」的判据
     // 有两份实现、答不同的问题、于是分别演化 —— 本仓当天已因此栽过四次。
@@ -408,7 +408,7 @@ pub struct RepoIdentity {
 /// **没有第三步 `commondir`**。而 linked worktree 的 `<gitdir>/` 里**没有 config**
 /// —— 它在 `commondir` 指向的主仓 `.git` 里。后果是确定性的：
 /// **每一个 WSL 里的 linked worktree 永远退回 `path:` 身份**，而
-/// `store::note_project_identity` 只写 `git:` 行 ⇒ 同一个仓的记忆分裂成两组。
+/// `store::record_identity_for_root` 只写 `git:` 行 ⇒ 同一个仓的记忆分裂成两组。
 ///
 /// ⚠️ 它当时的注释写着「与本机那条同一套规则，只是换了访问方式」——
 /// **那是一句不成立的声明**。现在它成立了，因为规则只剩一份。
@@ -485,7 +485,7 @@ fn wsl_repo_id_with(
 ///
 /// 🔴 返回 `Result` 而不是 `String`：「这个仓确实没有 origin」（⇒ `path:` 身份，是
 /// 忠实描述）与「这一刻读不到 config」是两件事，而 `path:` 身份会被
-/// `store::note_project_identity` 丢弃 ⇒ 后者被当成前者时，一次瞬时故障就变成
+/// `store::record_identity_for_root` 丢弃 ⇒ 后者被当成前者时，一次瞬时故障就变成
 /// 「这个项目没有跨 checkout 身份」，且因为**先记后算**再也不会重试。
 pub fn canonical_repo_id(git_root: &Path) -> Result<String, crate::probe::ProbeError> {
     canonical_repo_id_with(
@@ -639,7 +639,7 @@ mod tests {
     /// `find_git_root` 一直**明确认可** `.git` 文件（注释里点名了子模块 / worktree），
     /// 而 `read_origin_url` 固定读 `<root>/.git/config` —— 对 worktree 那不是目录。
     /// 后果是**确定性的**：每一个 linked worktree 永远退回 `path:` 身份，而
-    /// `note_project_identity` 只写 `git:` 行 ⇒ 这些项目**从来**没有过跨 checkout 身份。
+    /// `record_identity_for_root` 只写 `git:` 行 ⇒ 这些项目**从来**没有过跨 checkout 身份。
     /// 两处对「`.git` 是什么」的理解不一致，而只有一处写了注释。
     #[test]
     fn a_linked_worktree_resolves_the_shared_config() {
@@ -763,7 +763,7 @@ mod tests {
     ///
     /// 从前 `wsl_repo_id` 自己拼路径读文件，只做了「目录 → `gitdir:`」两步、
     /// **没有 `commondir`** ⇒ 每一个 WSL 里的 linked worktree 永远退回 `path:` 身份，
-    /// 而 `store::note_project_identity` 只写 `git:` 行 ⇒ 同一个仓的记忆分裂成两组。
+    /// 而 `store::record_identity_for_root` 只写 `git:` 行 ⇒ 同一个仓的记忆分裂成两组。
     /// 实测：本机 20 个项目根里有 1 个 `canonical_id` 为空，就是它。
     ///
     /// ⚠️ **变异判据**：删掉 `git_config_path` 里的 `commondir` 那一步，
@@ -879,7 +879,7 @@ mod tests {
     /// 🔴 **探测失败不是「这个项目没有 git 根」。**
     ///
     /// 两条边都钉：起点探不动、以及链上某一层探不动 —— 从前两处都是 `.exists()`，
-    /// 一次权限拒绝会让调用方（`store::note_project_identity`）当成 `Absent` 静默
+    /// 一次权限拒绝会让调用方（`store::record_identity_for_root`）当成 `Absent` 静默
     /// 放弃，而它**先记后算**，于是这个项目在本进程里再也不会被重试。
     ///
     /// ⚠️ 反向那条（真的没有 ⇒ `Absent`）由上面两条测试钉着 —— 少了它，一个
