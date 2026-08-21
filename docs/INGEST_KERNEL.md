@@ -449,13 +449,46 @@ ScanReport {
   再在 `if !dry_run` 里写）。规则收在 `store.rs::write_tx()`，**7 个写事务全走它**。
 
   ⚠️ **不要在这上面再套一把文件锁。** 那会与 SQLite 自己的锁各管一半，而两套锁的
-  边界不重合时**没有任何东西会报错**。⚠️ 也别把锁加在 `svault scan-all` 上 ——
-  **它根本不写总库**（吐 NDJSON 事件 + 存游标文件），写者是 `sync-snapshots` /
-  `erase` / 直连库的宿主。
+  边界不重合时**没有任何东西会报错**。**这条对 `scan-all --write-store` 同样成立。**
+
+  🔴 **订正（2026-08-21）**：上一版这里还写着「也别把锁加在 `svault scan-all` 上 ——
+  **它根本不写总库**」。`--write-store`（TumeFlow task #44）落地之后**那个理由过期了**
+  —— 而结论没变，只是它现在靠的是上面那条（锁归 SQLite），不再靠「它不写库」。
+  两者当时得出同一个答案，所以理由作废时没有任何东西会失败。
+  **凡是「这样做是安全的，因为 X」，都要在 X 变了的时候回来重读一遍。**
 
   判据由两条测试各自钉住，**变异互不重叠**：去掉 `busy_timeout` 只红
   `two_independent_writers…`；退回 `DEFERRED` 只红 `a_read_then_write…`。
   那正是「两者缺一不可」该有的证据形状。
+
+  写者现在有四个：`scan-all --write-store`（Class-A，见 §13.1.1）/
+  `sync-snapshots`（Class-B）/ `erase` / 直连库的宿主。
+
+#### 13.1.1 Class-A 的写入口：`svault scan-all --write-store`
+
+没有这个口的时候，把 `RawEvent` 写进总库**只能经 `TotalStore` 这个 Rust 库 API**，
+于是只有能直链 crate 的消费者做得到 —— 实际上只有 QuotaBar。后果不是「不方便」：
+它把「证据什么时候刷新」绑在「哪个宿主在跑」上，只装 TumeFlow + TumeChat 的机器上
+**总库没人写 ⇒ Class-A 恒为 0，而界面上什么都不说**。这与 `sync-snapshots`
+（Class-B 的写入口）是同一件事的另一半。
+
+```bash
+svault scan-all --write-store [--store <path>] [--state <path>]
+```
+
+| 事 | 怎么定的 |
+| --- | --- |
+| profile | 默认 `full`（§13.1「总库以 full 物化」）。**显式 `--profile metadata` 直接拒绝**：去重键 `(type, location, path, session_id, seq)` **不含正文**，metadata 事件的 seq 与 full 逐一相同 ⇒ 先写进去就把之后的正文永久挡在 `INSERT OR IGNORE` 外面，而总库 append-only、**不可逆** |
+| 投影模式 | 交给 `scan_plan::CommitPlan`，**不在 CLI 里重算**（见下） |
+| 事件流 | 带 `--write-store` 时**不再逐条吐 `event`**（一次全量是几个 GB 的 stdout，而写库的调用方本来就要从库里读）。观测走每来源一条 `store_write` / `store_held` / `store_write_failed` + 收尾 `summary` |
+| 只写 append-log | 快照来源**不由这条路写** —— Class-B 归 `sync-snapshots`（另一套枚举 + 另一套变更检测）。在这里再写一遍就是第二条 Class-B 写路径。摘要里报 `snapshot_sources`，因为「这轮写了 0 条快照」不该被读成「本机没有快照来源」 |
+| 退出码 | `0` 正常；`1` 起步就没跑成（参数/发现/开库）；`2` 游标没落盘；`3` 有来源没写进库（本轮**不完整**）。`held_sources` **不进退出码** —— 那不是失败，是计划里的一格 |
+
+🔴 **它走 `scan_append_log_observed`，不走 `scan_source`。** 后者是有损投影
+（`ScanStatus` 三个变体压掉了 `ParseQuality` 的四种含义），而写库要用的恰好是被压掉的
+那些：「文件消失」要整个跳过、「主动拒绝坏行」要冻游标、「降级到一个好行都没剩」
+不能整代替换。`scan_source` 还硬编码 `prior_fingerprint = None`，于是**同尺寸原地重写
+从来检不出来** —— CLI 把 `(hash, covered_len)` 存进自己的状态文件再传回去，那条路才通。
 
 - **版本**：一直跟随最新内核往前走，方便 QuotaBar 直接读用。
 - **正文**：以 `full` 物化（含正文）。QuotaBar 已放开"不读正文"限制（ADR-021），故总库可承载正文供两边使用。

@@ -4,3 +4,4 @@
 *.rs text eol=lf
 *.toml text eol=lf
 *.md text eol=lf
+*.py text eol=lf

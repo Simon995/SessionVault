@@ -117,7 +117,11 @@ impl Projection {
 
     /// 写进 `projections.origin` 的理由。**不是** `Debug` 输出：这个串是持久化的，
     /// 换个 derive 就会悄悄改掉库里的历史含义。
-    fn origin_key(self) -> &'static str {
+    ///
+    /// `pub` 是给 CLI 的：`scan-all --write-store` 要在 NDJSON 里报「这批落在哪种
+    /// 投影上」。让它复用**同一个**函数而不是另写一张映射表 —— 否则线上的词与库里
+    /// 记的理由会各自演化，而两者不一致时没有任何东西会报错。
+    pub fn origin_key(self) -> &'static str {
         match self {
             Projection::Append => "append",
             Projection::Rollback => "rollback",
@@ -2116,6 +2120,35 @@ impl TotalStore {
             reg.insert(&row.0, src);
         }
         reg
+    }
+
+    /// 这个来源在总库里**已经有当前投影了吗** —— [`crate::scan_plan::CommitPlan::plan`]
+    /// 的 `has_prior`。
+    ///
+    /// 🔴 **不能用 [`Self::current_head`] 代替。** 它对「一条记录都没有」和「第一代
+    /// `(0, 0)`」返回**同一个值**（`unwrap_or((0, 0))`），两者在返回类型上分不开。
+    /// 而这个判断决定 `Rollback` / `Reparse` 有没有意义：没有前代时它们会开一个
+    /// **没有前代可取代的空代**，而 `Rollback` 那一代按设计**永不自动回收**。
+    ///
+    /// 🔴 也**不能**拿调用方自己的游标/缓存里有没有这一条来代替。游标与投影是两套
+    /// 状态，一个在调用方手里、一个在库里，它们可以各自存在 —— `svault scan-all`
+    /// 第一次跑时手上一个游标都没有，而库里可能早已被常驻宿主写满了。
+    /// 拿游标当代理，那一轮就会把「其实有前代」判成「没有」。
+    pub fn has_projection(&self, source: &SourceKey) -> StoreResult<bool> {
+        let (type_key, location_key, path_str) = source.parts();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| StoreError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        Ok(conn
+            .query_row(
+                r#"SELECT 1 FROM current_head
+                    WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3"#,
+                params![type_key, location_key, path_str],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// 某个源文件的当前头 `(source_revision, projection_revision)`。

@@ -40,6 +40,13 @@ pub mod scan_plan;
 pub mod store;
 #[cfg(feature = "store")]
 mod store_crypto;
+/// 投影操作的稳定身份（ADR-051 I7）——跟着 `store` 一起门控。
+///
+/// 🔴 它 `use crate::store::SourceKey`，而 `store` 是门控的：不加这个门，**默认
+/// feature 下 `cargo check --lib` 直接编不过**（`unresolved import crate::store`）。
+/// 之所以一直没人撞到，是因为本仓的日常命令都带 `--features store` —— 默认那条路
+/// 没有任何闸在走。`token` 的全部使用点都在 `store.rs` 里，门控没有代价。
+#[cfg(feature = "store")]
 pub mod token;
 pub mod wsl;
 

@@ -9,23 +9,19 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use session_vault::catalog::Profile;
 use session_vault::cursor::Cursor;
 use session_vault::logging::tag;
 use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
-// 🔴 门必须是两个使用点的**并集**，一个都不能多、不能少：
-//   - `run_fixture_append`  → `all(feature = "acceptance-fixtures", debug_assertions)`
-//   - `mod tests`           → `all(test, feature = "store")`
+// 门就是 `feature = "store"`：`run_scan_all` 的 `--write-store` 路径（task #44）现在
+// 无条件用到 `Projection`，它在**所有** store 构建里都在。
 //
-// 只按前者开 ⇒ `--features store` 单独编译时测试模块缺 import（编译失败）；
-// 只按 `feature = "store"` 开 ⇒ 不带 acceptance-fixtures 的 bin 目标里它未被使用
-// （unused import 告警）。两种错法都只在**特定 feature 组合**下现形，与昨天那个漏改的
-// 调用点同源 —— feature 门后的代码不在默认闸的覆盖里，改它必须逐个组合编一遍。
-#[cfg(all(
-    feature = "store",
-    any(all(feature = "acceptance-fixtures", debug_assertions), test)
-))]
+// 📌 这里从前是三个使用点的**并集**（`run_fixture_append` / `mod tests` / 无），门写成
+// `all(store, any(acceptance-fixtures+debug, test))`。那种门每加一个使用点就要重算一次，
+// 而算错只在**特定 feature 组合**下现形（少了 ⇒ 某个组合编译失败；多了 ⇒ 另一个组合
+// unused import 告警）。使用点覆盖到整个 store feature 之后，那个精算就该退场。
+#[cfg(feature = "store")]
 use session_vault::store::Projection;
 use session_vault::SourceRef;
 
@@ -41,16 +37,42 @@ enum Command {
     /// 发现本机内置 provider 的来源清单（不读内容）。
     Discover,
     /// 一轮增量扫描。游标默认持久化到状态文件，跨运行续扫（真正增量）。
+    ///
+    /// 默认**只吐 NDJSON 事件流、不写总库**。带 `--write-store` 才写 —— 见该参数。
     ScanAll {
-        /// 扫描 profile。
-        #[arg(long, value_enum, default_value = "metadata")]
-        profile: ProfileArg,
+        /// 扫描 profile。**默认随 `--write-store` 变**：只吐流时 `metadata`，
+        /// 写总库时 `full`（总库按 §13.1 以 full 物化，含正文）。
+        #[arg(long, value_enum)]
+        profile: Option<ProfileArg>,
         /// 游标状态文件路径（覆盖默认 `<data_local_dir>/svault/cursors.json`）。
         #[arg(long)]
         state: Option<PathBuf>,
         /// 无状态：忽略且不写状态文件，每次从头全量扫（调试/一次性用）。
         #[arg(long)]
         stateless: bool,
+        /// 把扫到的事件**写进总库** —— Class-A 的写入口（TumeFlow task #44）。
+        ///
+        /// 🔴 **没有这个口的时候，写总库只能经 `TotalStore` 这个 Rust 库 API，
+        /// 于是只有能直链 crate 的消费者做得到（实际上只有 QuotaBar）。** 后果是
+        /// 「证据什么时候刷新」被绑在「哪个宿主在跑」上：只装 TumeFlow + TumeChat
+        /// 的机器上总库没人写 ⇒ Class-A 恒为 0，而界面上什么都不说。
+        /// 这与 `sync-snapshots`（Class-B 的写入口）是同一件事的另一半。
+        ///
+        /// ⚠️ 带上它之后**不再逐条吐 `event` 行**（一次全量是几个 GB 的 stdout，
+        /// 而写库的调用方本来就要从库里读）。观测走每来源一条 `store_write`
+        /// 加收尾的 `store_write_summary`，`source_report` 照常吐。
+        ///
+        /// ⚠️ **不为它加文件锁**：单写者由 SQLite 保证（`busy_timeout` +
+        /// `BEGIN IMMEDIATE`，见 `store.rs::write_tx`）。再套一把文件锁会与它
+        /// 各管一半，而两套锁的边界不重合时没有任何东西会报错（§13.1）。
+        #[cfg(feature = "store")]
+        #[arg(long)]
+        write_store: bool,
+        /// 总库路径（覆盖默认 `<data_local_dir>/svault/total_store.db`）。
+        /// 只在 `--write-store` 下有意义；也用于读项目根注册表（归属的唯一输入）。
+        #[cfg(feature = "store")]
+        #[arg(long)]
+        store: Option<PathBuf>,
     },
     /// 从不可变总库增量拉取 `--since` offset 之后的 `RawEvent`（NDJSON），供 TumeFlow
     /// 物化分库（P3-③ / §13.2）。**只读**总库（QuotaBar 是默认写者），游标由调用方持久化。
@@ -309,6 +331,10 @@ enum Out<'a> {
     MemoryRootsSummary { roots: usize, unreachable: usize },
     /// 一次 Class-B 同步的结果。**`unreachable` 与「没有素材」是两件事**，
     /// 所以它是独立字段而不是「更短的 sources 列表」。
+    ///
+    /// 与它的唯一构造点 `run_sync_snapshots` 同门 —— 不门控则不带 `store` 的构建里
+    /// 它是死变体（`dead_code` 告警）。
+    #[cfg(feature = "store")]
     SyncSnapshotsSummary {
         /// 这一轮**枚举到**的来源数。
         sources: usize,
@@ -324,6 +350,7 @@ enum Out<'a> {
         unreachable: usize,
     },
     /// 没问成的那些，逐条报出来 —— 一个只给计数的摘要说不出「是哪个位置」。
+    #[cfg(feature = "store")]
     SyncUnreachable { reason: &'a str },
     SourceReport {
         report: &'a session_vault::report::SourceReport,
@@ -334,6 +361,79 @@ enum Out<'a> {
         /// 游标状态是否成功落盘：`Some(true/false)`；`None` = stateless（未持久化）。
         /// `false` 时进程以非 0 退出——下游据此知道本轮增量游标**未推进**，需重试或预期重复。
         state_saved: Option<bool>,
+        /// 这一轮**打不打算**写总库（`--write-store`）。
+        ///
+        /// 🔴 与「写了 0 条」是两件事，所以它是独立字段而不是「`written_events` 恰为 0」。
+        /// 一个只报数字的摘要说不出「这轮压根没往库里写」—— 而那正是 Class-A 恒为 0
+        /// 时最需要先分清的一件事。
+        wrote_store: bool,
+        /// 真正写进库的事件条数。`null` = 这轮不写库（不是「写了 0 条」）。
+        written_events: Option<u64>,
+        /// 有几个来源没写进去。`> 0` 时本轮**不完整**且进程以 3 退出。
+        write_failures: Option<u64>,
+        /// 计划说「这一轮别写」的来源数：没读成 / 主动拒绝坏行 / 降级到零好行。
+        ///
+        /// 🔴 **与 `write_failures` 分开**：那是我们想写而没写成（要重试），
+        /// 这是我们**决定**不写（下轮自然重来）。压成一个数就没法判断该不该报警。
+        held_sources: Option<u64>,
+        /// 枚举到、但**不由这条路写**的快照来源数。
+        ///
+        /// Class-B 的写入口是 `sync-snapshots`（另一套枚举 + 另一套变更检测）。
+        /// 报出来是因为「这轮写了 0 条快照」不该被读成「本机没有快照来源」。
+        snapshot_sources: Option<u64>,
+        /// 🔴 项目根注册表是空的 ⇒ 本轮每条事件的 `project_root` 都是 `Unattributed`。
+        /// 它是个**说得出口但没用**的答案，与「这台机器上确实没有项目」长得一样，
+        /// 所以进摘要而不只是一行日志。
+        roots_empty: bool,
+    },
+    /// `scan-all --write-store`：一个来源的事件落库了。
+    ///
+    /// `mode` 与总库 `projections.origin` 记的理由是**同一个词**
+    /// （复用 `Projection::origin_key`），所以线上的 `mode` 可以直接和库里的台账对上。
+    #[cfg(feature = "store")]
+    StoreWrite {
+        source_path: &'a str,
+        /// `append` / `rollback` / `reparse`。
+        mode: &'static str,
+        /// `clean` / `degraded` / `poison_line` / `unknown` —— 与 QuotaBar 写进
+        /// `record_sync_outcome` 的**同一组串**（同一个 `QualityState::key`）。
+        quality: &'static str,
+        appended: u64,
+        /// 库里已有、被 `INSERT OR IGNORE` 跳过的 —— 与宿主并行扫同一批文件时这个数很大，
+        /// **那是正常的**（两个写者各自扫、去重收口），不是错误。
+        skipped_dup: u64,
+        /// 命中墓碑（用户删过）而被拒的 —— 与 `skipped_dup` 分开，两者处置完全不同。
+        skipped_erased: u64,
+        /// 头是否指向了新的 `(source_revision, projection_revision)`。
+        /// `false` + `mode != append` = 这次被 token 幂等短路了（同一次操作的重放）。
+        head_moved: bool,
+        superseded_removed: u64,
+        /// `[before, after]` = 新投影比被它取代的那份少了事件。此时旧投影**没删**。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loses_events: Option<[u64; 2]>,
+    },
+    /// 🔴 一个来源**没**写进库。它必须是独立的一行，而不是让 `store_write` 缺席 ——
+    /// 「没出现」在 NDJSON 里读作什么，取决于消费方记不记得去数，而它多半不会。
+    #[cfg(feature = "store")]
+    StoreWriteFailed {
+        source_path: &'a str,
+        reason: &'a str,
+    },
+    /// 计划说**这一轮不动这个来源的投影**（`CommitPlan` 给出 `StoreAction::Preserve`）。
+    ///
+    /// 三种情形共用这一行，靠 `quality` 分辨 —— 它们的处置对用户完全不同：
+    /// `unknown` = 没读成（等一等 / 查权限），`poison_line` = 读到了但我们主动拒绝
+    /// 这一批（去看那一行），`degraded` = 有坏行且**一个好行都没剩**（整代替换会
+    /// 用空的覆盖非空的，所以宁可不动）。
+    ///
+    /// 🔴 它**不是**失败，不进退出码：三种都会在下一轮从同一个偏移重来。
+    /// 报成失败会让常态运行里全是红叉，而红叉多了就没人看了。
+    #[cfg(feature = "store")]
+    StoreHeld {
+        source_path: &'a str,
+        quality: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
     },
     /// `pull` 产出的一条带 `offset` 的总库事件（P3-③）。`offset` 是消费者（TumeFlow）
     /// 持久化的**游标 token**：下次 `pull --since <offset>` 从此续拉。比 `Event` 多 `offset`，
@@ -479,11 +579,20 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Command::Discover => run_discover(),
+        #[cfg(feature = "store")]
         Command::ScanAll {
             profile,
             state,
             stateless,
-        } => run_scan_all(profile.into(), state, stateless),
+            write_store,
+            store,
+        } => run_scan_all(profile, state, stateless, write_store, store),
+        #[cfg(not(feature = "store"))]
+        Command::ScanAll {
+            profile,
+            state,
+            stateless,
+        } => run_scan_all(profile, state, stateless, false, None),
         #[cfg(feature = "store")]
         Command::Pull {
             since,
@@ -578,6 +687,7 @@ fn run_sync_snapshots(store_arg: Option<PathBuf>) -> i32 {
     0
 }
 
+#[cfg(feature = "store")]
 fn run_snapshots(store_arg: Option<PathBuf>) -> i32 {
     let Some(store_path) = resolve_store_path(store_arg) else {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
@@ -646,6 +756,13 @@ fn run_discover() -> i32 {
                 sources: sources.len(),
                 events: 0,
                 state_saved: None,
+                // `discover` 只枚举来源、不读内容、不写库，写库那几格都是「不适用」。
+                wrote_store: false,
+                written_events: None,
+                write_failures: None,
+                held_sources: None,
+                snapshot_sources: None,
+                roots_empty: false,
             });
             0
         }
@@ -656,7 +773,331 @@ fn run_discover() -> i32 {
     }
 }
 
-fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -> i32 {
+/// `scan-all` 的 profile 决议：默认随 `--write-store` 变，而**显式的 `metadata`
+/// 与写库互斥**——那是一次拒绝，不是一次降级。
+///
+/// 🔴 互斥的理由是去重键。总库的唯一键是
+/// `(source_type, source_location, source_path, source_session_id, seq)`
+/// ——**不含正文**（§13 / `SYSTEM_DESIGN` §9.4）。`Profile::Metadata` 产出的事件
+/// `content` 恒为 `None`，而 seq 与 `Full` 逐一相同。于是先写进去一轮 metadata，
+/// 之后同一批 `Full` 事件会被 `INSERT OR IGNORE` **全部当成重复丢弃**，且不报错：
+/// 症状是「会话在库里、条数也对、就是永远没有正文」。
+///
+/// 而总库是 **append-only、永不删**（§13.1），所以这一步**不可逆** ——
+/// 唯一的补救是给那些文件开一代新投影，而调用方根本不会知道要去补。
+/// 「写下去看起来成功」正是要防的那种失败，因此宁可在参数这一层就拒绝。
+fn resolve_scan_profile(profile: Option<ProfileArg>, write_store: bool) -> Result<Profile, String> {
+    match (profile, write_store) {
+        (Some(ProfileArg::Metadata), true) => Err(
+            "--write-store 要求 --profile full：总库的去重键不含正文，metadata 事件的 seq \
+             与 full 逐一相同 ⇒ 先写进去就会把之后的正文永久挡在 INSERT OR IGNORE 外面。\
+             去掉 --profile 即可（写库时默认就是 full）"
+                .to_string(),
+        ),
+        (Some(p), _) => Ok(p.into()),
+        // 写库按 §13.1「总库以 full 物化（含正文）」；只吐流时保持原默认 metadata。
+        (None, true) => Ok(Profile::Full),
+        (None, false) => Ok(Profile::Metadata),
+    }
+}
+
+/// 一个来源扫完之后手上的东西。
+///
+/// 🔴 **append-log 保留完整观察，不先降级成 `ScanResult`。** `ScanStatus` 三个变体
+/// 压掉了四种含义，而写库要用的恰好是被压掉的那些：「文件消失」要整个跳过、
+/// 「主动拒绝坏行」要冻游标、「降级到一个好行都没有」不能整代替换。
+/// `scan.rs` 自己的注释写着「**新消费方走 `scan_append_log_observed`**」——
+/// `--write-store` 就是新消费方，而且是写库的那一种。
+///
+/// ⚠️ 其余形态**没有「观察」这个概念**，不能硬凑：快照的失败态是「无效 UTF-8」，
+/// 塞进 `Unavailable` 会让「内容无效」伪装成「读不到」。
+///
+/// ⚠️ 事件只存一份（观察是 move 进来的）。`AppendLogObservation` 的注释立过这条：
+/// events 存两份会让「改了一份忘了另一份」成为可能。
+enum Scanned {
+    Observed(session_vault::observation::AppendLogObservation),
+    Projected {
+        events: Vec<RawEvent>,
+        cursor_out: Cursor,
+    },
+}
+
+impl Scanned {
+    fn events(&self) -> &[RawEvent] {
+        match self {
+            Self::Observed(o) => &o.events,
+            Self::Projected { events, .. } => events,
+        }
+    }
+
+    /// 本轮**全读**时算出的源指纹。
+    ///
+    /// `None` = 这一轮是增量、没读全文，**算不出** —— 不是「内容没变」。
+    /// 下一轮把它传回去（`prior_fingerprint`）才认得出「同尺寸原地重写」：
+    /// 那种改动 `size` 与 `mtime` 都可能一字不变。
+    fn fingerprint(&self) -> Option<&session_vault::observation::SourceFingerprint> {
+        match self {
+            Self::Observed(o) => o.source_fingerprint.as_ref(),
+            Self::Projected { .. } => None,
+        }
+    }
+}
+
+/// 这个来源欠不欠一次重投影（解析器版本变了 ⇒ 同一份字节现在能读出别的东西）。
+///
+/// 🔴 判据是「**记下过**一个不同的版本」。`recorded == None` 必须是 `false`：
+/// 没有记录 = 这条路还没写过库（旧格式状态文件，或第一次带 `--write-store` 跑）。
+/// 那时不该声称欠账 —— `CommitPlan` 会因 `has_prior` 落到 `Append`，靠 seq 把库里
+/// 已有的（宿主写的那份）原样跳过。谎称欠账则会开一个新投影版本并**把宿主写的那份
+/// 删掉**（`Reparse` 的旧投影按定义可回收），而调用方只会看到一份漂亮的统计。
+///
+/// ⚠️ 只有写库那条路谈得上重投影：不写库时我们不动总库，没有「哪一代」这回事。
+fn owes_reprojection(write_store: bool, recorded: Option<u32>, current: u32) -> bool {
+    write_store && recorded.is_some_and(|rev| rev != current)
+}
+
+/// 本轮**为什么**扫这个来源 —— 它同时决定「读多少」与「怎么写」，所以只算一次。
+///
+/// CLI 这侧只可能有两条理由。`FORCE` / `ATTRIBUTION_STALE` / `SYNC_DEBT` 是宿主才有的
+/// 概念（用户点刷新、注册表长新根、两个物化层的欠账），这里表达不出来也不该假装有。
+///
+/// 🔴 **`INITIAL` 的判据是「库里没有前代」，不是「本地没有游标」。** 这一位的含义是
+/// 「这个来源要整代重建」，而那是**库**的事：
+///
+/// | 手上有游标 | 库里有前代 | 判 | 为什么 |
+/// | --- | --- | --- | --- |
+/// | 否 | 是 | 不是首次 | 宿主已经写过了，我们只是第一次跑 —— 续读即可，靠 seq 去重 |
+/// | 是 | 否 | **是首次** | 两层不一致（此前只吐流地跑过，或库被重建过）⇒ **必须从 0 读**，否则游标之前的事件永远漏在库外，而摘要只显示「本轮 0 条新增」 |
+///
+/// `has_prior == None` = 这一轮不写库，谈不上「哪一代」⇒ 没有任何理由。
+#[cfg(feature = "store")]
+fn scan_reasons(
+    parser_stale: bool,
+    has_prior: Option<bool>,
+) -> session_vault::scan_plan::ScanReasons {
+    use session_vault::scan_plan::ScanReasons;
+    let mut r = ScanReasons::NONE;
+    if has_prior == Some(false) {
+        r |= ScanReasons::INITIAL;
+    }
+    if parser_stale {
+        r |= ScanReasons::PARSER_STALE;
+    }
+    r
+}
+
+/// 本轮扫完之后，这个来源的状态该记成什么。
+///
+/// 三个字段各带一条判据，**每一条错了都不会报错，只会在很久以后变成坏数据**：
+///
+/// - `cursor`：照记（即便本轮无新增也写回，刷新 size/mtime）。
+/// - `parser_revision`：🔴 **只有真的写过库才记。** 它的含义是「这个来源**在库里的
+///   投影**是哪个解析器产出的」。不写库的运行记上它，日后第一次 `--write-store`
+///   会误判成「不欠重投影」，于是新解析器的结果永远进不去（同 seq 被去重丢弃）。
+/// - `fingerprint`：🔴 **增量轮次要保留上一版，不能覆盖成 `None`。** 指纹只在全读时
+///   算得出（`scan.rs`：「全读才算得出整份内容的指纹」），覆盖成 `None` 等于每做一次
+///   增量就把「上一版内容是什么」忘掉一次 —— 而下一次全读正需要它来认出
+///   「同尺寸原地重写」，那种改动 size 与 mtime 都可能一字不变。
+fn next_state(scanned: Scanned, prev: Option<&SourceState>, write_store: bool) -> SourceState {
+    let fingerprint = scanned
+        .fingerprint()
+        .map(|f| StoredFingerprint {
+            hash: f.as_str().to_string(),
+            covered_len: f.covered_len(),
+        })
+        .or_else(|| prev.and_then(|p| p.fingerprint.clone()));
+    SourceState {
+        parser_revision: write_store.then_some(session_vault::PARSER_REVISION),
+        fingerprint,
+        cursor: match scanned {
+            Scanned::Observed(o) => o.cursor,
+            Scanned::Projected { cursor_out, .. } => cursor_out,
+        },
+    }
+}
+
+/// 扫一个来源。**append-log 走权威入口并带上一版指纹**，其余走既有的 `scan_source`。
+fn scan_one(
+    s: &SourceRef,
+    cursor_in: Option<Cursor>,
+    prior_fingerprint: Option<session_vault::observation::SourceFingerprint>,
+    profile: Profile,
+    roots: std::sync::Arc<session_vault::attribution::RootRegistry>,
+) -> (Scanned, session_vault::report::SourceReport) {
+    match s.source_mode {
+        SourceMode::AppendLog => {
+            let (obs, report) = session_vault::scan::scan_append_log_observed(
+                s,
+                cursor_in,
+                prior_fingerprint,
+                profile,
+                roots,
+                session_vault::deadline::Deadline::unbounded(),
+            );
+            (Scanned::Observed(obs), report)
+        }
+        _ => {
+            let res = session_vault::scan(s, cursor_in, profile, roots);
+            (
+                Scanned::Projected {
+                    events: res.events,
+                    cursor_out: res.cursor_out,
+                },
+                res.report,
+            )
+        }
+    }
+}
+
+/// 写总库时的句柄：库 + 归属修订号。
+///
+/// `attribution_revision` 一轮只读一次：它是 [`ProjectionToken`] 的一个分量，
+/// 而同一轮扫描里的所有来源本就该用同一份注册表算归属。逐来源重读会让同一轮里
+/// 前后两个来源拿到不同的修订号 —— 两次内容相同的操作因此算出不同的 token。
+///
+/// [`ProjectionToken`]: session_vault::token::ProjectionToken
+#[cfg(feature = "store")]
+struct ScanWriter {
+    store: session_vault::TotalStore,
+    attribution_revision: i64,
+}
+
+/// 一个来源这一轮在总库上发生了什么。
+#[cfg(feature = "store")]
+#[derive(Debug)]
+enum Committed {
+    /// 计划说**这一轮什么都别写**（读失败 / 主动拒绝坏行 / 降级到零好行）。
+    /// 游标一并冻住 —— 这三种都要下轮从同一个偏移重来。
+    Preserved,
+    Wrote {
+        mode: Projection,
+        stats: session_vault::store::ProjectionStats,
+    },
+}
+
+/// 来源在总库里的身份键。
+#[cfg(feature = "store")]
+fn source_key_of(source: &SourceRef) -> session_vault::store::SourceKey {
+    session_vault::store::SourceKey {
+        source_type: source.source_type,
+        source_location: source.source_location.clone(),
+        source_path: source.path.display().to_string(),
+    }
+}
+
+#[cfg(feature = "store")]
+impl ScanWriter {
+    /// 总库里**已经有这个来源的投影了吗**。
+    ///
+    /// 🔴 **在扫之前问，因为它决定这一轮读多少。** 状态文件里有游标、而库里没有投影
+    /// ⇒ 两层不一致（此前只吐流地跑过、或库被重建过）。那时从游标处续读，
+    /// **游标之前的那些事件永远不会再被扫到**，而摘要只会显示「本轮 0 条新增」——
+    /// 与「确实没有新会话」逐字相同。这正是 #44 要治的病本身，不能在修它的路上重造一个。
+    ///
+    /// 🔴 **不拿本地游标当代理**：两者是两套状态，一个在调用方手里、一个在库里。
+    /// 第一次带 `--write-store` 跑时手上一个游标都没有，而库里可能早已被常驻宿主写满。
+    fn has_prior(&self, source: &SourceRef) -> Result<bool, String> {
+        self.store
+            .has_projection(&source_key_of(source))
+            .map_err(|e| format!("has_projection failed: {e}"))
+    }
+
+    /// 按 [`CommitPlan`] 把一个来源本轮的观察落进总库。
+    ///
+    /// 🔴 **四个决定不在这里重算，一律问 `CommitPlan`。** 它在 QuotaBar 那边被 780 条
+    /// 测试逼出过两格（`degraded_and_empty` 那格是「用空的替换非空的」，`has_prior`
+    /// 那格是「开一个没有前代可取代的空代」），照抄一份必然漂 —— 而漂开之后
+    /// **两个写者对同一份字节做出不同的投影决定，且没有任何东西会报错**。
+    /// 2026-08-21 它已从 QuotaBar 移进本仓，正是为了这件事。
+    ///
+    /// [`CommitPlan`]: session_vault::scan_plan::CommitPlan
+    fn commit(
+        &self,
+        source: &SourceRef,
+        obs: &session_vault::observation::AppendLogObservation,
+        reasons: session_vault::scan_plan::ScanReasons,
+        has_prior: bool,
+    ) -> Result<(Committed, session_vault::scan_plan::CommitPlan), String> {
+        use session_vault::scan_plan::{CommitPlan, StoreAction};
+
+        let source_key = source_key_of(source);
+        let plan = CommitPlan::plan(obs, reasons, has_prior);
+
+        let mode = match plan.store() {
+            StoreAction::Preserve => return Ok((Committed::Preserved, plan)),
+            StoreAction::Project(mode) => mode,
+        };
+
+        // 🔴 `Reparse` / `Rollback` 要取代**一整代**，所以它们必须配一次全读。
+        //
+        // 拿增量的尾巴去「取代」，会把这个文件的当前投影换成只剩尾巴的那一份 ——
+        // 前面的事件当场从库里消失，而统计看起来完全正常（appended 有数、
+        // head_moved 为真）。`source_fingerprint.is_some()` **等价于**本轮 start==0
+        // （`scan.rs`：「全读才算得出整份内容的指纹」），所以它是这件事的正向判据，
+        // 不是又一个需要人去维护的 bool。
+        if mode != Projection::Append && obs.source_fingerprint.is_none() {
+            return Err(format!(
+                "refusing to {} on an incremental read (no full-file fingerprint) — \
+                 replacing a generation with only the tail would drop everything before it",
+                mode.origin_key()
+            ));
+        }
+
+        // 🔴 `Append` 不传 token（靠 seq 去重，重放天然幂等）；**开新代的两种一律要传**，
+        // 否则一次崩溃重放就多留一代，而 `Rollback` 那代按设计永不自动回收（ADR-051 I7）。
+        let token = match mode {
+            Projection::Append => None,
+            Projection::Rollback | Projection::Reparse => {
+                Some(session_vault::token::ProjectionToken::new(
+                    &source_key,
+                    obs.source_fingerprint.as_ref().map(|f| f.as_str()),
+                    session_vault::PARSER_REVISION,
+                    self.attribution_revision,
+                    // 全读 ⇒ 字节范围从 0 起。上面刚断言过这一点。
+                    (0, obs.cursor.safe_offset),
+                ))
+            }
+        };
+        self.store
+            .apply_projection(session_vault::store::FileProjectionBatch {
+                source: source_key,
+                parser_revision: Some(session_vault::PARSER_REVISION),
+                mode,
+                token,
+                events: obs.events.clone(),
+            })
+            .map(|stats| (Committed::Wrote { mode, stats }, plan))
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn run_scan_all(
+    profile_arg: Option<ProfileArg>,
+    state_arg: Option<PathBuf>,
+    stateless: bool,
+    write_store: bool,
+    store_arg: Option<PathBuf>,
+) -> i32 {
+    let profile = match resolve_scan_profile(profile_arg, write_store) {
+        Ok(p) => p,
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            return 1;
+        }
+    };
+
+    // 🔴 **先开库，再扫。** 反过来的话，一轮几分钟的全量扫描跑完才发现库打不开 ——
+    // 那一轮的读全白做，而且游标没推进，下一轮还得重来。
+    #[cfg(feature = "store")]
+    let writer = if write_store {
+        match open_scan_writer(store_arg.clone()) {
+            Ok(w) => Some(w),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+
     let sources = match session_vault::discover() {
         Ok(s) => s,
         Err(e) => {
@@ -665,13 +1106,13 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
         }
     };
 
-    // 状态：source_key → Cursor。stateless 时为空 map 且不落盘（每次全量）。
+    // 状态：source_key → 游标 + 产出它的解析器版本 + 上一版源指纹。stateless 时为空 map。
     let state_path = if stateless {
         None
     } else {
         resolve_state_path(state_arg)
     };
-    let mut cursors: HashMap<String, Cursor> = match &state_path {
+    let mut cursors: HashMap<String, SourceState> = match &state_path {
         Some(p) => load_cursors(p),
         None => HashMap::new(),
     };
@@ -679,29 +1120,229 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
     // 归属的唯一输入。读不出来就是空注册表 ⇒ 一致地 `Unattributed`，**不退回 cwd**。
     // 🔴 空表要说出来：一份静默为空的注册表会让整轮扫描的 `project_root` 全成兜底值，
     // 而那与「本机确实一个项目根都没发现」在输出里长得一模一样。
-    let roots = std::sync::Arc::new(project_roots());
-    if roots.is_empty() {
+    let roots = std::sync::Arc::new(project_roots(store_arg));
+    let roots_empty = roots.is_empty();
+    if roots_empty {
         log::warn!(
             target: tag::CLI,
             "project root registry is empty — every path will be Unattributed"
         );
+        // 🔴 写库时这句更重：**归属会跟着事件一起落库**，不再只是流里的一个字段。
+        //
+        // 它可恢复（注册表补齐后开一代 `Reparse` 重算），但没人会知道要去补 ——
+        // 所以它进摘要（`roots_empty`），而不只是一行日志。
+        //
+        // ⚠️ 本机之所以不空，是因为**注册表只有 QuotaBar 在写**
+        // （`session_index.rs::discover_project_roots`）。只装 TumeFlow 的机器上它恒空。
+        // 那是 #44 的另一半，本轮不做，见 TumeFlow `docs/BACKLOG.md`。
+        if write_store {
+            log::warn!(
+                target: tag::CLI,
+                "…and these events are being written to the total store — \
+                 attribution will need a Reparse once the registry is populated"
+            );
+        }
     }
 
     let mut total_events = 0u64;
+    // 不带 `store` feature 编译时 `--write-store` 这个参数根本不存在，计数器恒为 0。
+    // 用 `cfg_attr` 精确关掉那一个组合的 lint，而不是无条件 `allow` —— 后者会连
+    // store 构建里真正的「写了但没人读」也一起盖住。
+    #[cfg_attr(not(feature = "store"), allow(unused_mut))]
+    let mut written_events = 0u64;
+    #[cfg_attr(not(feature = "store"), allow(unused_mut))]
+    let mut write_failures = 0u64;
+    #[cfg_attr(not(feature = "store"), allow(unused_mut))]
+    let mut held_sources = 0u64;
+    #[cfg_attr(not(feature = "store"), allow(unused_mut))]
+    let mut snapshot_sources = 0u64;
+
     for s in &sources {
         let key = source_key(s);
-        let cursor_in = cursors.get(&key).cloned();
-        let res = session_vault::scan(s, cursor_in, profile, roots.clone());
-        total_events += res.report.events_emitted;
-        // 先逐条吐事件（NDJSON 事件流，TumeFlow 据此消费），再吐该来源的报告。
-        for ev in &res.events {
-            emit(&Out::Event { event: ev });
+        let prev = cursors.get(&key).cloned();
+
+        // 🔴 **写库时先问库：这个来源有没有前代 —— 在扫之前问，因为它决定读多少。**
+        //
+        // 问不出来就**整个跳过这个来源**（游标不推，下轮重来），不猜。猜 `false`
+        // 会让下面走全读 + `Append`，看起来无害，但那是拿一次探测失败换一轮全量重读；
+        // 猜 `true` 更糟：库里其实没有前代时，续读会把游标之前的事件永久漏在库外。
+        #[cfg(feature = "store")]
+        let has_prior = match writer.as_ref() {
+            None => None,
+            Some(w) => match w.has_prior(s) {
+                Ok(v) => Some(v),
+                Err(why) => {
+                    write_failures += 1;
+                    log::error!(target: tag::CLI, "cannot tell whether {key} has a prior projection: {why}");
+                    let path = s.path.display().to_string();
+                    // 这个来源**连扫都没扫**，所以没有 `source_report` 与它配对。
+                    // 报出来的理由要说清是哪一步失败的 —— 只贴一条 sqlite 错误，
+                    // 读的人会以为是写库时炸的，去查错的地方。
+                    let reason = format!("cannot tell whether it has a prior projection: {why}");
+                    emit(&Out::StoreWriteFailed {
+                        source_path: &path,
+                        reason: &reason,
+                    });
+                    continue;
+                }
+            },
+        };
+        #[cfg(not(feature = "store"))]
+        let has_prior: Option<bool> = None;
+
+        let parser_stale = owes_reprojection(
+            write_store,
+            prev.as_ref().and_then(|p| p.parser_revision),
+            session_vault::PARSER_REVISION,
+        );
+
+        if parser_stale {
+            log::info!(
+                target: tag::CLI,
+                "reprojecting {key}: state was parser rev {:?}, now {}",
+                prev.as_ref().and_then(|p| p.parser_revision),
+                session_vault::PARSER_REVISION
+            );
         }
-        emit(&Out::SourceReport {
-            report: &res.report,
+        if has_prior == Some(false) && prev.is_some() {
+            log::info!(
+                target: tag::CLI,
+                "backfilling {key}: state has a cursor but the store has no projection — reading from 0"
+            );
+        }
+        #[cfg(feature = "store")]
+        let reasons = scan_reasons(parser_stale, has_prior);
+
+        // 🔴 **「读多少」与「怎么写」用同一个 `reasons`。**
+        //
+        // `Reparse` 要取代**一整代**：拿增量的尾巴去取代，会把这个文件的当前投影换成
+        // 只剩尾巴的那一份。所以扫之前就得决定全读，而那个判断必须与 planner 用的是
+        // **同一个谓词** —— 各算一遍就是「两个真相源，一个加了条件另一个没有」，
+        // 正是 `ScanReasons::SYNC_DEBT` 的注释记下的那个缺陷。
+        // （`ScanWriter::commit` 里还有一道正向断言兜底：没有全文指纹就拒绝开新代。）
+        #[cfg(feature = "store")]
+        let full_read = reasons.wants_full_read() || reasons.wants_reparse();
+        #[cfg(not(feature = "store"))]
+        let full_read = false;
+
+        let cursor_in = if full_read {
+            None
+        } else {
+            prev.as_ref().map(|p| p.cursor.clone())
+        };
+
+        // 上一版全文指纹 —— 认「同尺寸原地重写」的唯一线索（`size`/`mtime` 都检不出）。
+        // 🔴 **不用 `cursor.content_hash` 代替**：它没有 `covered_len`，而少了覆盖长度，
+        // 一次纯追加就会被判成原地重写（`SourceFingerprint` 的注释记着那个缺陷）。
+        let prior_fingerprint = prev.as_ref().and_then(|p| p.fingerprint.as_ref()).map(|f| {
+            session_vault::observation::SourceFingerprint::from_stored(
+                f.hash.clone(),
+                f.covered_len,
+            )
         });
-        // 更新游标（即便本轮无新增也写回，刷新 size/mtime）。
-        cursors.insert(key, res.cursor_out);
+
+        let (scanned, report) = scan_one(s, cursor_in, prior_fingerprint, profile, roots.clone());
+        total_events += report.events_emitted;
+
+        // 不写库时逐条吐事件（TumeFlow 依赖的既有事件流契约）。
+        // 写库时**不吐** —— 一次全量是几个 GB 的 stdout，而写库的调用方要从库里读。
+        #[cfg(feature = "store")]
+        let streaming = writer.is_none();
+        #[cfg(not(feature = "store"))]
+        let streaming = true;
+        if streaming {
+            for ev in scanned.events() {
+                emit(&Out::Event { event: ev });
+            }
+        }
+        emit(&Out::SourceReport { report: &report });
+
+        // 写库。**只有计划说该写、且真的写成功了，才推进这个来源的游标** ——
+        // 反过来会把没落库的那段字节永久跳过：下一轮从新游标续读，那批事件再也
+        // 不会被扫到，而且没有任何报错。
+        #[cfg(feature = "store")]
+        let advance = match (writer.as_ref(), &scanned) {
+            (None, _) => true,
+            // 🔴 **快照来源不由这条路写。** Class-B 的写入口是 `sync-snapshots`
+            // （走 `class_b::enumerate()` + `TotalStore::sync_snapshots`，有自己的
+            // 变更检测）。在这里再写一遍就是第二条 Class-B 写路径，两条的枚举范围
+            // 与变更判据都不同 —— 正是「同一件事两份实现」那个形状。
+            // 它进摘要（`snapshot_sources`），因为「这轮写了 0 条快照」不该被读成
+            // 「本机没有快照来源」。
+            (Some(_), Scanned::Projected { .. }) => {
+                snapshot_sources += 1;
+                true
+            }
+            // `has_prior` 在扫之前就问过了（它决定了这一轮读多少），这里**复用同一个
+            // 答案**而不是再查一次：中间那次扫描可能长达几分钟，重查会让「决定读多少」
+            // 与「决定怎么写」用上两个不同代的库状态。
+            (Some(w), Scanned::Observed(obs)) => match w.commit(
+                s,
+                obs,
+                reasons,
+                has_prior.expect("writer 在场时 has_prior 必已问过（问不出来的那一格已 continue）"),
+            ) {
+                Ok((committed, plan)) => {
+                    let quality = plan.quality();
+                    match committed {
+                        Committed::Preserved => {
+                            held_sources += 1;
+                            // 🔴 「这一轮没写」必须有自己的一行，而不是让 `store_write`
+                            // 缺席 —— 缺席在 NDJSON 里读作什么，取决于消费方记不记得
+                            // 去数，而它多半不会。
+                            emit(&Out::StoreHeld {
+                                source_path: &report.source_path,
+                                quality: quality.key(),
+                                detail: quality.detail(),
+                            });
+                            // 三种 Preserve（没读成 / 主动拒绝坏行 / 降级到零好行）
+                            // 都要下轮从同一个偏移重来 —— 游标冻住。
+                            false
+                        }
+                        Committed::Wrote { mode, stats } => {
+                            written_events += stats.appended;
+                            if let Some((before, after)) = stats.loses_events {
+                                // 头照切（当前答案必须是最新那份解析），但旧投影不删 ——
+                                // 「新解析器合法地少产出」与「一次退化」在这个观测上一样。
+                                log::warn!(
+                                    target: tag::CLI,
+                                    "{key}: new projection has fewer events ({before} → {after}); \
+                                     the superseded one was kept"
+                                );
+                            }
+                            emit(&Out::StoreWrite {
+                                source_path: &report.source_path,
+                                mode: mode.origin_key(),
+                                quality: quality.key(),
+                                appended: stats.appended,
+                                skipped_dup: stats.skipped_dup,
+                                skipped_erased: stats.skipped_erased,
+                                head_moved: stats.head_moved,
+                                superseded_removed: stats.superseded_removed,
+                                loses_events: stats.loses_events.map(|(b, a)| [b, a]),
+                            });
+                            plan.cursor() == session_vault::scan_plan::CursorAction::Advance
+                        }
+                    }
+                }
+                Err(why) => {
+                    write_failures += 1;
+                    log::error!(target: tag::CLI, "store write failed for {key}: {why}");
+                    emit(&Out::StoreWriteFailed {
+                        source_path: &report.source_path,
+                        reason: &why,
+                    });
+                    false
+                }
+            },
+        };
+        #[cfg(not(feature = "store"))]
+        let advance = true;
+
+        if advance {
+            // 更新游标（即便本轮无新增也写回，刷新 size/mtime）。
+            cursors.insert(key, next_state(scanned, prev.as_ref(), write_store));
+        }
     }
 
     // 状态持久化结果：None=stateless；Some(true/false)=尝试落盘的成败。
@@ -723,15 +1364,63 @@ fn run_scan_all(profile: Profile, state_arg: Option<PathBuf>, stateless: bool) -
         sources: sources.len(),
         events: total_events,
         state_saved,
+        // 🔴 `wrote_store=false` 与「写了 0 条」是两件事，所以它是独立字段而不是
+        // 「`written_events` 恰好为 0」。一个只报数字的摘要说不出「这一轮压根没打算
+        // 写库」—— 而那正是 Class-A 恒为 0 时最需要先分清的一件事。
+        wrote_store: write_store,
+        written_events: write_store.then_some(written_events),
+        write_failures: write_store.then_some(write_failures),
+        // 计划说「这轮别写」的来源数（没读成 / 主动拒绝坏行 / 降级到零好行）。
+        // **与写失败分开**：那是我们想写而没写成，这是我们决定不写。
+        held_sources: write_store.then_some(held_sources),
+        // 枚举到但不由这条路写的快照来源数（Class-B 归 `sync-snapshots`）。
+        snapshot_sources: write_store.then_some(snapshot_sources),
+        roots_empty,
     });
 
-    // 游标保存失败 → 非 0 退出（码 2，区别于 discover 失败的 1）。否则调用方会把本轮
-    // 当成功，下轮因游标未推进而重复吐已消费事件——尤其权限/磁盘/rename 失败时极难发现。
+    // 退出码：0 正常；1 起步就没跑成（参数/发现/开库）；2 游标没落盘（下轮会重复）；
+    // 3 有来源没写进库（本轮**不完整**）。
+    //
+    // 🔴 3 必须与 0 分开：调用方据退出码决定要不要重试，而「扫完了但有几个没写进去」
+    // 与「扫完了」在数字上都可能是一份漂亮的摘要。
+    // ⚠️ `held_sources` **不进退出码**：那不是失败，是计划里的一格（坏行/读不到都会
+    // 下轮重来）。报成失败会让常态运行里全是红叉，而红叉多了就没人看了。
     if state_saved == Some(false) {
         2
+    } else if write_failures > 0 {
+        3
     } else {
         0
     }
+}
+
+/// 开写库句柄。**库不存在就建**——与 `sync-snapshots` 同一条判据：
+/// 「装完还没扫过」不该变成一个需要另一个程序先跑一遍的死结。
+///
+/// 失败返回该用的退出码（1 = 起步就没跑成）。
+#[cfg(feature = "store")]
+fn open_scan_writer(store_arg: Option<PathBuf>) -> Result<ScanWriter, i32> {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store to locate the total store");
+        return Err(1);
+    };
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store for write failed: path={} err={e}", store_path.display());
+            return Err(1);
+        }
+    };
+    let attribution_revision = store.attribution_revision();
+    log::info!(
+        target: tag::CLI,
+        "writing scan results to total store: path={} attribution_revision={attribution_revision}",
+        store_path.display()
+    );
+    Ok(ScanWriter {
+        store,
+        attribution_revision,
+    })
 }
 
 /// `pull`：从总库增量拉 `since` 之后的事件，流式吐 NDJSON，收尾报摘要。
@@ -984,11 +1673,15 @@ where
 
 /// 打开总库读项目根注册表；**任何一步拿不到就是空注册表**（一致地说不出来）。
 ///
-/// `scan-all` 没有 `--store` 参数（它是流式的、不写库），所以走默认路径。
+/// 📌 这里从前写着「`scan-all` 没有 `--store` 参数（它是流式的、不写库），所以走
+/// 默认路径」。`--write-store`（task #44）落地之后**那个理由过期了**：同一次运行会
+/// 往 `--store` 指的那个库里写，归属却从**另一个**库读 —— 两个库的注册表不同时，
+/// 写进去的 `project_root` 会来自一份与目标库无关的注册表，而且不报错。
+/// 所以路径必须透传。
 #[cfg(feature = "store")]
-fn project_roots() -> session_vault::attribution::RootRegistry {
+fn project_roots(store_arg: Option<PathBuf>) -> session_vault::attribution::RootRegistry {
     let empty = session_vault::attribution::RootRegistry::new;
-    let Some(p) = resolve_store_path(None) else {
+    let Some(p) = resolve_store_path(store_arg) else {
         return empty();
     };
     match total_store_present(&p) {
@@ -1019,7 +1712,7 @@ fn project_roots() -> session_vault::attribution::RootRegistry {
 /// `unattributed`，那是**真话**（这个构建确实无从知道项目根），但它对消费方几乎没用。
 /// 所以调用点会 `warn` 一行说出来 —— 见 `run_scan_all`。**要有归属就带 `--features store`。**
 #[cfg(not(feature = "store"))]
-fn project_roots() -> session_vault::attribution::RootRegistry {
+fn project_roots(_store_arg: Option<PathBuf>) -> session_vault::attribution::RootRegistry {
     session_vault::attribution::RootRegistry::new()
 }
 
@@ -1059,12 +1752,50 @@ fn bail_unless_store_present(path: &std::path::Path, missing_code: i32) -> Optio
 }
 
 /// （与 QuotaBar 写者 `main.rs` 同址）。无法确定数据目录时返回 `None`。
-#[cfg(feature = "store")]
+///
+/// 🔴 **不门控 `store`**：它是纯路径运算（`dirs_next`），一行 rusqlite 都不碰，
+/// 而 `store-path` 子命令**在所有构建里都存在**（它的整个用途就是「不打开库、
+/// 只说出库该在哪」）。门控它会让不带 feature 的构建直接编不过 —— 实测如此。
 fn resolve_store_path(arg: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = arg {
         return Some(p);
     }
     dirs_next::data_local_dir().map(|d| d.join("svault").join("total_store.db"))
+}
+
+/// 状态文件里的一条：游标 + **产出它的解析器版本**。
+///
+/// 🔴 `parser_revision` 放在这里而不是放进 `Cursor`，有一个硬约束：`Cursor` 是库的
+/// 公开类型，QuotaBar 用**结构体字面量**构造它（`svault_bridge.rs::row_to_cursor`），
+/// 给它加字段会直接让宿主编不过。而这个字段只有「写总库」这一条路用得上。
+///
+/// `#[serde(flatten)]` 让盘上形状与旧格式**逐字兼容**（旧文件就是一张
+/// `source_key → Cursor` 的表）：旧文件缺这个键 ⇒ `None` ⇒ 按「这条路还没写过库」
+/// 处理，见 `run_scan_all` 里的 `owes_reparse`。**换个不兼容的格式会让整机全量重扫
+/// 一遍**，而那次重扫看起来只是「今天特别慢」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceState {
+    #[serde(flatten)]
+    cursor: Cursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parser_revision: Option<u32>,
+    /// 上一次**全读**时算出的源指纹。认「同尺寸原地重写」的唯一线索。
+    ///
+    /// 🔴 **不能拿 `cursor.content_hash` 代替。** 「从哪里开始读」与「上一版内容是
+    /// 什么」是两件事，而 `cursor_in: None`（强制全读）同时抹掉了它们 ——
+    /// `scan.rs` 的注释逐字记着后果：「QuotaBar 的生产路径**永远**传不进上一版指纹，
+    /// 同尺寸原地重写从来没有被识别过」。存在游标之外，那条路才通。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<StoredFingerprint>,
+}
+
+/// 持久化形态的源指纹。**`(哈希, 覆盖长度)` 缺一不可** ——
+/// 只存哈希就退回「全读 N 字节 → 追加到 M → 再全读」时把一次纯追加判成原地重写，
+/// 于是总库开一代**按设计永不自动回收**的旧版本（见 `SourceFingerprint::covered_len`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredFingerprint {
+    hash: String,
+    covered_len: u64,
 }
 
 /// 来源的稳定身份键（跨运行定位游标）：`<type>|<location>|<path>`。
@@ -1098,7 +1829,7 @@ fn resolve_state_path(arg: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// 读状态文件 → 游标表。不存在或损坏 → 空表（发警告，不崩）。
-fn load_cursors(path: &std::path::Path) -> HashMap<String, Cursor> {
+fn load_cursors(path: &std::path::Path) -> HashMap<String, SourceState> {
     let bytes = match session_vault::probe::read_bytes(path, None) {
         session_vault::probe::Probed::Found(b) => b,
         // 没有状态文件 = 第一次跑，是事实。
@@ -1120,7 +1851,10 @@ fn load_cursors(path: &std::path::Path) -> HashMap<String, Cursor> {
 }
 
 /// 原子写状态文件：先写 `.tmp` 再 rename，避免半写损坏。
-fn save_cursors(path: &std::path::Path, cursors: &HashMap<String, Cursor>) -> std::io::Result<()> {
+fn save_cursors(
+    path: &std::path::Path,
+    cursors: &HashMap<String, SourceState>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         session_vault::probe::create_dir_all(parent)?;
     }
@@ -1345,6 +2079,530 @@ mod tests {
         assert_eq!(erased["deleted_events"], 3);
         assert_eq!(erased["keys_destroyed"], 2);
         assert_eq!(erased["tombstone_written"], true);
+    }
+
+    // ── task #44：`scan-all --write-store` ──────────────────────────────────
+
+    const SRC_PATH: &str = "/p/file.jsonl";
+
+    fn mk_source() -> SourceRef {
+        SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::AppendLog,
+            path: PathBuf::from(SRC_PATH),
+            project_root: None,
+            artifact_kind: None,
+        }
+    }
+
+    /// 造一次 append-log 观察。`fingerprint` 为 `Some` ⟺ 这一轮是**全读**
+    /// （`scan.rs`：「全读才算得出整份内容的指纹」）。
+    fn mk_obs(
+        change: session_vault::observation::SourceChange,
+        quality: session_vault::observation::ParseQuality,
+        events: Vec<RawEvent>,
+        full_read: bool,
+    ) -> session_vault::observation::AppendLogObservation {
+        session_vault::observation::AppendLogObservation {
+            source_change: change,
+            quality,
+            events,
+            cursor: Cursor::new_byte_offset(),
+            source_fingerprint: full_read
+                .then(|| session_vault::observation::SourceFingerprint::of(b"whole file")),
+        }
+    }
+
+    fn clean() -> session_vault::observation::ParseQuality {
+        session_vault::observation::ParseQuality::Clean {
+            deferred_tail_bytes: 0,
+        }
+    }
+
+    fn writer_over(store: session_vault::TotalStore) -> ScanWriter {
+        let attribution_revision = store.attribution_revision();
+        ScanWriter {
+            store,
+            attribution_revision,
+        }
+    }
+
+    #[test]
+    fn writing_the_store_defaults_to_full_but_an_explicit_metadata_is_refused() {
+        // 不写库：默认不变（既有调用方依赖它）。
+        assert_eq!(
+            resolve_scan_profile(None, false).unwrap(),
+            Profile::Metadata
+        );
+        // 写库：默认升到 full（§13.1「总库以 full 物化」），不必让调用方记住加参数。
+        assert_eq!(resolve_scan_profile(None, true).unwrap(), Profile::Full);
+        assert_eq!(
+            resolve_scan_profile(Some(ProfileArg::Full), true).unwrap(),
+            Profile::Full
+        );
+        // 🔴 显式的 metadata + 写库 = **拒绝**，不是降级成 full。
+        // 悄悄改掉调用方显式写下的参数，比报错更坏。
+        let err = resolve_scan_profile(Some(ProfileArg::Metadata), true).unwrap_err();
+        assert!(
+            err.contains("--profile full"),
+            "报错要说出该怎么改，实际：{err}"
+        );
+        // 不写库时 metadata 仍然合法。
+        assert_eq!(
+            resolve_scan_profile(Some(ProfileArg::Metadata), false).unwrap(),
+            Profile::Metadata
+        );
+    }
+
+    /// 🔴 **先证明上面那个守卫挡的是一件真事。**
+    ///
+    /// `resolve_scan_profile` 拒绝 `--write-store --profile metadata`，理由是
+    /// 「总库的去重键不含正文」。这条测试把那个理由**跑出来**：同一个 `seq` 先以
+    /// `content=None` 落库，再以带正文的形态落库 —— 正文进不去，`appended` 为 0，
+    /// **而且一个错都不报**。
+    ///
+    /// 没有它，守卫只是注释里的一句声明；有了它，那句声明是可执行的。
+    /// 而总库 append-only、永不删 ⇒ 这一步**不可逆**，所以只能在参数层拦。
+    #[test]
+    fn a_metadata_event_permanently_shadows_the_full_one_that_follows() {
+        let store = TotalStore::open_in_memory().unwrap();
+
+        let mut metadata_only = mk_event(0, "s1");
+        metadata_only.content = None;
+        store
+            .append_events(&[metadata_only], Projection::Append)
+            .unwrap();
+
+        // 同一个 (source, session, seq)，这次带正文 —— 唯一键完全相同。
+        let with_body = mk_event(0, "s1");
+        assert!(with_body.content.is_some());
+        let stats = store
+            .append_events(&[with_body], Projection::Append)
+            .unwrap();
+
+        assert_eq!(stats.appended, 0, "同 seq ⇒ INSERT OR IGNORE 全丢");
+        assert_eq!(stats.skipped_dup, 1);
+
+        let back = store.read_since(0, 10).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(
+            back[0].1.content, None,
+            "🔴 正文永远进不去了，而调用方只看到一份没有错误的统计"
+        );
+    }
+
+    /// 旧格式状态文件（一张 `source_key → Cursor` 的表）必须原样读得出来。
+    ///
+    /// 变异判据：去掉 `SourceState` 的 `#[serde(flatten)]`，这条必红 ——
+    /// 而它红的方式恰好是生产里最贵的那种：解析失败 ⇒ 空表 ⇒ **整机全量重扫一遍**，
+    /// 而那次重扫看起来只是「今天特别慢」。
+    #[test]
+    fn an_old_format_state_file_loads_and_claims_no_parser_revision() {
+        let key = "claude_code|local|/p/a.jsonl".to_string();
+        let mut cursor = Cursor::new_byte_offset();
+        cursor.safe_offset = 42;
+        cursor.size = 42;
+        cursor.next_seq = 7;
+        // 用**旧类型本身**序列化，而不是手写一段 JSON —— 手写的那份会跟着
+        // `Cursor` 改字段一起过期，然后这条测试就开始测一个不存在的旧格式。
+        let old: HashMap<String, Cursor> = [(key.clone(), cursor)].into_iter().collect();
+        let on_disk = serde_json::to_string(&old).unwrap();
+
+        let loaded: HashMap<String, SourceState> = serde_json::from_str(&on_disk).unwrap();
+        let st = &loaded[&key];
+        assert_eq!(st.cursor.safe_offset, 42);
+        assert_eq!(st.cursor.next_seq, 7);
+        // 🔴 旧文件说不出「库里那份是哪个解析器写的」⇒ `None`，**不是**「当前版本」。
+        // 记成当前版本，第一次 `--write-store` 就会误判成「不欠重投影」。
+        assert_eq!(st.parser_revision, None);
+        assert!(st.fingerprint.is_none());
+    }
+
+    #[test]
+    fn a_new_state_file_round_trips_cursor_revision_and_fingerprint() {
+        let key = "claude_code|local|/p/a.jsonl".to_string();
+        let mut cursor = Cursor::new_byte_offset();
+        cursor.safe_offset = 99;
+        let st = SourceState {
+            cursor,
+            parser_revision: Some(session_vault::PARSER_REVISION),
+            fingerprint: Some(StoredFingerprint {
+                hash: "sha256:abc".to_string(),
+                covered_len: 99,
+            }),
+        };
+        let round: HashMap<String, SourceState> = serde_json::from_str(
+            &serde_json::to_string(&[(key.clone(), st)].into_iter().collect::<HashMap<_, _>>())
+                .unwrap(),
+        )
+        .unwrap();
+        let back = &round[&key];
+        assert_eq!(back.cursor.safe_offset, 99);
+        assert_eq!(back.parser_revision, Some(session_vault::PARSER_REVISION));
+        // 🔴 覆盖长度必须一起活下来：只留哈希会让一次纯追加被判成原地重写。
+        let fp = back.fingerprint.as_ref().unwrap();
+        assert_eq!(fp.hash, "sha256:abc");
+        assert_eq!(fp.covered_len, 99);
+    }
+
+    /// 🔴 开新代（`Rollback` / `Reparse`）**必须配一次全读**。
+    ///
+    /// 拿增量的尾巴去「取代一整代」，会把这个文件的当前投影换成只剩尾巴的那一份 ——
+    /// 前面的事件当场从库里消失，而统计看起来完全正常。所以在写之前正向断言
+    /// 「手上有全文指纹」（⟺ 本轮 start==0），断不住就**拒绝**而不是照写。
+    #[test]
+    fn opening_a_new_generation_from_an_incremental_read_is_refused() {
+        use session_vault::observation::SourceChange;
+        let store = TotalStore::open_in_memory().unwrap();
+        // 先有一代，`has_prior` 才为真（否则 planner 会落到 Append，测不到这条）。
+        store
+            .append_events(&[mk_event(0, "s1")], Projection::Append)
+            .unwrap();
+        let w = writer_over(store);
+
+        let obs = mk_obs(
+            SourceChange::RollbackOrRewrite,
+            clean(),
+            vec![mk_event(1, "s1")],
+            false, // 增量：没有全文指纹
+        );
+        let err = w
+            .commit(
+                &mk_source(),
+                &obs,
+                session_vault::scan_plan::ScanReasons::NONE,
+                true,
+            )
+            .unwrap_err();
+        assert!(err.contains("rollback"), "要说出是哪种开新代，实际：{err}");
+        assert!(
+            err.contains("incremental"),
+            "要说出为什么不能写，实际：{err}"
+        );
+    }
+
+    /// 同样的观察，这一轮是全读 ⇒ 放行，并且**真的开了新的源版本**。
+    ///
+    /// 它是上一条的对照：没有它，上一条也可能只是「commit 恒失败」。
+    #[test]
+    fn the_same_rewrite_on_a_full_read_opens_a_new_source_revision() {
+        use session_vault::observation::SourceChange;
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(&[mk_event(0, "s1")], Projection::Append)
+            .unwrap();
+        let before = store
+            .current_head("claude_code", "local", SRC_PATH)
+            .unwrap();
+        let w = writer_over(store);
+
+        let obs = mk_obs(
+            SourceChange::RollbackOrRewrite,
+            clean(),
+            vec![mk_event(0, "s2")],
+            true, // 全读
+        );
+        let (committed, plan) = w
+            .commit(
+                &mk_source(),
+                &obs,
+                session_vault::scan_plan::ScanReasons::NONE,
+                true,
+            )
+            .unwrap();
+        match committed {
+            Committed::Wrote { mode, stats } => {
+                assert_eq!(mode, Projection::Rollback);
+                assert!(stats.head_moved);
+                // 源版本 +1、投影版本归零 —— 磁盘上那段字节已经不在了。
+                assert_eq!(
+                    (stats.source_revision, stats.projection_revision),
+                    (before.0 + 1, 0)
+                );
+                // `Rollback` 的旧代是那段内容的唯一副本，永不回收。
+                assert_eq!(stats.superseded_removed, 0);
+            }
+            Committed::Preserved => panic!("全读的重写该写进去"),
+        }
+        assert_eq!(
+            plan.cursor(),
+            session_vault::scan_plan::CursorAction::Advance
+        );
+    }
+
+    /// 🔴 第一次见到一个文件时，即使观察报了源变化也**没有旧代可回退** ——
+    /// 那时是 `Append`，不是 `Rollback`（`has_prior` 那一格）。
+    ///
+    /// `has_prior` 由**调用方在扫之前问总库**得出（`ScanWriter::has_prior`），
+    /// 因为它同时决定这一轮读多少 —— 见 `scan_reasons` 与
+    /// `has_projection_separates_no_rows_from_generation_zero`。
+    #[test]
+    fn a_rewrite_with_nothing_in_the_store_yet_is_just_an_append() {
+        use session_vault::observation::SourceChange;
+        let w = writer_over(TotalStore::open_in_memory().unwrap());
+        let obs = mk_obs(
+            SourceChange::RollbackOrRewrite,
+            clean(),
+            vec![mk_event(0, "s1")],
+            true,
+        );
+        let (committed, _) = w
+            .commit(
+                &mk_source(),
+                &obs,
+                session_vault::scan_plan::ScanReasons::INITIAL,
+                false,
+            )
+            .unwrap();
+        match committed {
+            Committed::Wrote { mode, stats } => {
+                assert_eq!(mode, Projection::Append, "没有前代可取代 ⇒ 追加");
+                assert_eq!(stats.appended, 1);
+                // 🔴 没开新代：`Rollback` 那一代按设计永不自动回收，凭空开一个
+                // 「没有前代可取代的空代」就是往总库里塞一件永远清不掉的垃圾。
+                assert_eq!((stats.source_revision, stats.projection_revision), (0, 0));
+            }
+            Committed::Preserved => panic!("首次写入该落库"),
+        }
+    }
+
+    /// 「没读成」不写、不推游标，而且**说得出是哪一种**。
+    ///
+    /// 三种 `Preserve` 共用一行输出，靠 `quality` 区分 —— 用户能做的事完全不同：
+    /// `unknown` 是等一等/查权限，`poison_line` 是去看那一行。
+    #[test]
+    fn an_unreadable_source_is_held_not_written_and_says_which_kind() {
+        use session_vault::observation::{ParseQuality, ScanFailure, SourceChange};
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .append_events(&[mk_event(0, "s1")], Projection::Append)
+            .unwrap();
+        let w = writer_over(store);
+
+        for (quality, want) in [
+            (
+                ParseQuality::Unavailable(ScanFailure::Stat("gone".into())),
+                "unknown",
+            ),
+            (
+                ParseQuality::Unavailable(ScanFailure::Read("io".into())),
+                "unknown",
+            ),
+            (
+                ParseQuality::RejectedPoisonLine(session_vault::observation::ParseDiagnostics {
+                    skipped_lines: 1,
+                    first_warning: Some("bad line 3".into()),
+                }),
+                "poison_line",
+            ),
+        ] {
+            let obs = mk_obs(SourceChange::Appended, quality, vec![], false);
+            let (committed, plan) = w
+                .commit(
+                    &mk_source(),
+                    &obs,
+                    session_vault::scan_plan::ScanReasons::NONE,
+                    true,
+                )
+                .unwrap();
+            assert!(
+                matches!(committed, Committed::Preserved),
+                "{want}: 读不成/主动拒绝都不该写库"
+            );
+            assert_eq!(plan.quality().key(), want, "要说得出是哪一种");
+            // 🔴 游标冻住 —— 推进会把这段字节永久跳过，而且不报错。
+            assert_eq!(
+                plan.cursor(),
+                session_vault::scan_plan::CursorAction::Freeze
+            );
+        }
+    }
+
+    /// 🔴 **「首次回填」的判据是「库里没有前代」，不是「本地没有游标」。**
+    ///
+    /// 漏掉这一条会重造 #44 本身：状态文件里有游标、库里却没有投影（此前只吐流地
+    /// 跑过，或库被删过/重建过）⇒ 从游标处续读 ⇒ **游标之前的事件永远不会再被扫到**，
+    /// 而摘要只显示「本轮 0 条新增」，与「确实没有新会话」逐字相同。
+    ///
+    /// 反向那一格同样要钉住：手上没游标但库里有前代（宿主写的）**不是**首次 ——
+    /// 判成首次就会对全机每个文件做一次没必要的全读。
+    #[test]
+    fn a_cursor_without_a_projection_counts_as_a_first_backfill() {
+        use session_vault::scan_plan::ScanReasons;
+        let full_read = |r: ScanReasons| r.wants_full_read() || r.wants_reparse();
+
+        // 游标在、库里空 ⇒ 首次回填 ⇒ 全读。
+        let r = scan_reasons(false, Some(false));
+        assert!(r.contains(ScanReasons::INITIAL));
+        assert!(full_read(r), "🔴 不全读就会把游标之前的事件永久漏在库外");
+
+        // 库里有前代 ⇒ 不是首次 ⇒ 增量（靠 seq 去重，重放幂等）。
+        let r = scan_reasons(false, Some(true));
+        assert!(r.is_empty());
+        assert!(!full_read(r), "库里有就别全读 —— 那是一次没必要的全机重读");
+
+        // 欠重投影 ⇒ 必须全读（`Reparse` 取代一整代，尾巴取代不了）。
+        let r = scan_reasons(true, Some(true));
+        assert!(r.contains(ScanReasons::PARSER_STALE));
+        assert!(full_read(r));
+
+        // 不写库 ⇒ 谈不上「哪一代」⇒ 没有任何理由，走增量。
+        let r = scan_reasons(false, None);
+        assert!(r.is_empty());
+        assert!(!full_read(r));
+    }
+
+    /// 🔴 **「没记过」不是「欠账」。**
+    ///
+    /// 第一次带 `--write-store` 跑时状态里没有解析器版本。把它当成欠账，就会开一个
+    /// 新投影版本并**删掉宿主已经写在库里的那一份**（`Reparse` 的旧投影按定义可回收），
+    /// 而调用方只会看到一份漂亮的统计。
+    #[test]
+    fn never_recorded_is_not_stale() {
+        assert!(
+            !owes_reprojection(true, None, 4),
+            "🔴 没记过 ⇒ 这条路还没写过库 ⇒ 该 Append，不该 Reparse"
+        );
+        assert!(
+            owes_reprojection(true, Some(3), 4),
+            "记过且不同 ⇒ 欠一次重投影"
+        );
+        assert!(!owes_reprojection(true, Some(4), 4), "记过且相同 ⇒ 不欠");
+        // 不写库就不动总库，没有「哪一代」这回事。
+        assert!(!owes_reprojection(false, Some(3), 4));
+    }
+
+    /// 🔴 增量轮次算不出指纹，那时必须**保留上一版**，不能覆盖成 `None`。
+    ///
+    /// 覆盖掉的后果不会当场报错：下一次全读时手上没有上一版内容，于是
+    /// 「同尺寸原地重写」认不出来 ⇒ 走 `Append` ⇒ 新内容按旧 seq 续写、
+    /// 撞上的被 `INSERT OR IGNORE` 丢掉。而 `size`/`mtime` 那一层对这种改动全盲。
+    #[test]
+    fn an_incremental_round_keeps_the_previous_fingerprint() {
+        let prev = SourceState {
+            cursor: Cursor::new_byte_offset(),
+            parser_revision: Some(session_vault::PARSER_REVISION),
+            fingerprint: Some(StoredFingerprint {
+                hash: "sha256:old".to_string(),
+                covered_len: 10,
+            }),
+        };
+        // 增量轮：`Projected` 与「没读全文的 Observed」都给不出指纹。
+        let incremental = Scanned::Projected {
+            events: vec![],
+            cursor_out: Cursor::new_byte_offset(),
+        };
+        let next = next_state(incremental, Some(&prev), true);
+        let fp = next
+            .fingerprint
+            .as_ref()
+            .expect("增量轮不该把上一版指纹忘掉");
+        assert_eq!(fp.hash, "sha256:old");
+        assert_eq!(fp.covered_len, 10);
+
+        // 全读轮：用本轮算出的那一版**覆盖**上一版（它才是最新的）。
+        let full = Scanned::Observed(mk_obs(
+            session_vault::observation::SourceChange::Appended,
+            clean(),
+            vec![],
+            true,
+        ));
+        let next = next_state(full, Some(&prev), true);
+        assert_ne!(next.fingerprint.as_ref().unwrap().hash, "sha256:old");
+    }
+
+    /// 🔴 **不写库的运行不记解析器版本。**
+    ///
+    /// 那个字段的含义是「这个来源**在库里的投影**是哪个解析器产出的」。只吐流的
+    /// 运行根本没动库，记上它就是一句假话 —— 而它会让日后第一次 `--write-store`
+    /// 误判成「不欠重投影」，于是新解析器的结果永远进不去（同 seq 被去重丢弃）。
+    #[test]
+    fn a_streaming_only_round_claims_no_parser_revision() {
+        let scanned = || Scanned::Projected {
+            events: vec![],
+            cursor_out: Cursor::new_byte_offset(),
+        };
+        assert_eq!(next_state(scanned(), None, false).parser_revision, None);
+        assert_eq!(
+            next_state(scanned(), None, true).parser_revision,
+            Some(session_vault::PARSER_REVISION)
+        );
+    }
+
+    /// 🔴 **写库这条路必须拿到完整观察。**
+    ///
+    /// `scan_one` 对 append-log 走 `scan_append_log_observed`（权威），对其余形态走
+    /// `scan_source`（有损投影）。这条分流写错的症状极难认：所有来源都会变成
+    /// `Projected`，于是 `--write-store` 全部落进「快照不由这条路写」那一格 ——
+    /// **一条都不写、一个错都不报**，摘要里只是 `written_events: 0`，
+    /// 而那与「本机确实没有新会话」长得一模一样。
+    ///
+    /// 用 `probe::` 而不是 `std::fs::` 造 fixture：本仓的 `clippy.toml` 禁的是整个
+    /// `std::fs` 模块面，测试虽可 `#[allow]`，但既然有现成的透传封装就不必开例外。
+    #[test]
+    fn scan_one_keeps_the_full_observation_for_append_log() {
+        let dir = std::env::temp_dir().join("svault-scan-one-dispatch");
+        session_vault::probe::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        session_vault::probe::write_bytes(&path, b"{\"type\":\"user\"}\n").unwrap();
+        let roots = || std::sync::Arc::new(session_vault::attribution::RootRegistry::new());
+
+        let src = SourceRef {
+            path: path.clone(),
+            ..mk_source()
+        };
+        let (scanned, _) = scan_one(&src, None, None, Profile::Full, roots());
+        assert!(
+            matches!(scanned, Scanned::Observed(_)),
+            "append-log 必须走观察入口 —— ScanStatus 压掉的四种含义正是写库要用的"
+        );
+        // 全读（`cursor_in = None`）⇒ 算得出全文指纹。下一轮把它传回去，
+        // 才认得出「同尺寸原地重写」——那种改动 size 与 mtime 都可能一字不变。
+        assert!(scanned.fingerprint().is_some(), "全读该算出指纹");
+
+        // 同一个文件、声明成快照形态 ⇒ 走有损投影那条（它没有「观察」这个概念：
+        // 快照的失败态是「无效 UTF-8」，塞进 `Unavailable` 会让「内容无效」
+        // 伪装成「读不到」）。
+        let snap = SourceRef {
+            source_mode: SourceMode::SnapshotFile,
+            ..src
+        };
+        let (scanned, _) = scan_one(&snap, None, None, Profile::Full, roots());
+        assert!(matches!(scanned, Scanned::Projected { .. }));
+        assert!(scanned.fingerprint().is_none(), "投影那条给不出指纹");
+    }
+
+    /// 「库里已经有这个来源的投影了吗」必须问库，而 `current_head` 答不了 ——
+    /// 它对「一条记录都没有」和「第一代 `(0,0)`」返回**同一个值**。
+    #[test]
+    fn has_projection_separates_no_rows_from_generation_zero() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let key = session_vault::store::SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: SRC_PATH.to_string(),
+        };
+        assert!(!store.has_projection(&key).unwrap());
+        assert_eq!(
+            store
+                .current_head("claude_code", "local", SRC_PATH)
+                .unwrap(),
+            (0, 0)
+        );
+
+        store
+            .append_events(&[mk_event(0, "s1")], Projection::Append)
+            .unwrap();
+
+        assert!(store.has_projection(&key).unwrap(), "现在有了");
+        // 🔴 而头**还是** (0,0) —— 这正是它当不了 `has_prior` 判据的原因。
+        assert_eq!(
+            store
+                .current_head("claude_code", "local", SRC_PATH)
+                .unwrap(),
+            (0, 0)
+        );
     }
 }
 
