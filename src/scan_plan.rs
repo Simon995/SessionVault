@@ -49,7 +49,100 @@
 //! `Reparse` 处理，等于允许把唯一副本当成「可再生的更差解析」回收掉。
 
 use crate::observation::{AppendLogObservation, ParseDiagnostics, ParseQuality, SourceChange};
-use crate::store::Projection;
+use crate::store::{Projection, SourceKey, StoreResult, TotalStore};
+
+/// 「总库里有没有这个来源的前代」这个问题的**三种答案**。
+///
+/// 只能匹配，不能拿来构造 [`PriorProjection`] —— 后者的字段是私有的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriorState {
+    /// 问过总库了：**有**前代。只有它允许开新代。
+    Present,
+    /// 问过总库了：**没有**前代。
+    Absent,
+    /// 🔴 **这一轮没有总库可问** —— 不是「没有前代」。
+    ///
+    /// 一个消费者可以整轮不写库（QuotaBar 的 `session_index.rs` 就有这样一轮：
+    /// `store.filter(|_| scan_ok)`），而那一轮它**仍然要**另外三个决定。
+    NoStore,
+}
+
+/// 总库里**有没有这个来源的前代** —— 一个**来自总库的答案**，不是一个 `bool`。
+///
+/// # 🔴 它存在的全部理由：不许拿游标当代理
+///
+/// 游标 / 缓存与投影是**两套状态**：一个在调用方手里、一个在库里，**它们可以各自
+/// 存在**。两个方向都错，而且错法相反：
+///
+/// | 情形 | 拿游标当代理会判成 | 后果 |
+/// | --- | --- | --- |
+/// | 手上没游标、库里有前代（宿主早写满了） | 「没有」 | 真实的回退被记成追加，两层从此不一致 |
+/// | 手上有游标、库里没有（库被删过/重建过） | 「有」 | 开一个**没有前代可取代的空代**，而 `Rollback` 那代按设计**永不自动回收** |
+///
+/// 这条判据以前只写在 [`TotalStore::has_projection`] 的注释里 —— 而**注释拦不住
+/// 调用方**：2026-08-21 实测，QuotaBar 传进来的正是 `cached.is_some()`
+/// （它自己 DB 里的一行）。所以判据搬进了类型：字段私有，构造入口只有两个 ——
+/// 要么[**问库**](Self::ask)，要么[**说自己没库可问**](Self::no_store)。
+///
+/// # 判据：那句话现在**写不出来**
+///
+/// 拿调用方自己的缓存拼一个答案 —— **编译不过**（元组字段私有）：
+///
+/// ```compile_fail
+/// use session_vault::scan_plan::{PriorProjection, PriorState};
+/// let cached: Option<u8> = None;
+/// // error[E0423]: cannot initialize a tuple struct which contains private fields
+/// let _ = PriorProjection(if cached.is_some() {
+///     PriorState::Present
+/// } else {
+///     PriorState::Absent
+/// });
+/// ```
+///
+/// ⚠️ **`compile_fail` 只要求「编不过」，任何编译错误都算通过** —— 一个拼写错误
+/// 会让它假绿，而假绿与「护栏有效」长得一模一样（本仓变异验证那条判据的又一形态）。
+/// 所以配一个必须**编得过**的对照，证明上面那条红的是私有字段、不是别的：
+///
+/// ```
+/// use session_vault::scan_plan::{PriorProjection, PriorState};
+/// let p = PriorProjection::no_store();
+/// assert_eq!(p.state(), PriorState::NoStore);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriorProjection(PriorState);
+
+impl PriorProjection {
+    /// 问总库 —— **`Present` / `Absent` 的唯一来源**。
+    pub fn ask(store: &TotalStore, source: &SourceKey) -> StoreResult<Self> {
+        Ok(Self(if store.has_projection(source)? {
+            PriorState::Present
+        } else {
+            PriorState::Absent
+        }))
+    }
+
+    /// 这一轮**没有总库可问**。
+    ///
+    /// ⚠️ **不是「没有前代」。** 两者在 `store` 那一维上的处置恰好相同（都落到
+    /// `Append` —— 不确定时不做不可逆的那一步），但含义不同；而且另外三个决定
+    /// **照常产出**，因为一个不写库的调用方仍然要 `index` / `cursor` / `sync`。
+    ///
+    /// 🔴 结论相同而含义不同，正是「决定说 A、实现是 B 却不会变红」那类漂移的
+    /// 温床 —— 所以它有自己的名字，而不是复用 `Absent`。
+    pub fn no_store() -> Self {
+        Self(PriorState::NoStore)
+    }
+
+    /// 读出是哪一种。**只能读，不能据此构造** —— 字段私有。
+    pub fn state(self) -> PriorState {
+        self.0
+    }
+
+    /// 确知有前代。只有它允许开新代（`Rollback` / `Reparse`）。
+    fn is_present(self) -> bool {
+        self.0 == PriorState::Present
+    }
+}
 
 /// 这一轮**为什么**要扫它 —— 由调度器给，**可以同时成立多个**。
 ///
@@ -211,10 +304,17 @@ pub struct CommitPlan {
 impl CommitPlan {
     /// 唯一构造入口（I1 的落地形式）。
     ///
-    /// `has_prior` = 总库里已经有这个来源的投影。**它决定 `Rollback` 是否有意义**：
-    /// 第一次见到一个文件时即使观察报了源变化（比如游标存在而投影不存在，两层
-    /// 本来就不一致），也没有旧代可回退 —— 那时是 `Append`，不是 `Rollback`。
-    pub fn plan(obs: &AppendLogObservation, reasons: ScanReasons, has_prior: bool) -> Self {
+    /// `prior` = 总库里有没有这个来源的投影。**它决定 `Rollback` / `Reparse` 是否
+    /// 有意义**：第一次见到一个文件时即使观察报了源变化（比如游标存在而投影不存在，
+    /// 两层本来就不一致），也没有旧代可回退 —— 那时是 `Append`。
+    ///
+    /// 🔴 **它是 [`PriorProjection`] 而不是 `bool`，理由写在那个类型上** ——
+    /// 一句话：`bool` 不携带出处，而「拿调用方自己的游标当代理」两个方向都会错。
+    ///
+    /// ⚠️ 它**只影响四个决定里的 `store` 那一个**。`index` / `cursor` / `sync`
+    /// 与它无关，所以 [`PriorProjection::no_store`]（整轮不写库）照常拿到完整的一份
+    /// 计划 —— 这与「四个决定必须一次算出、别按消费者只用得上其中两个拆开」一致。
+    pub fn plan(obs: &AppendLogObservation, reasons: ScanReasons, prior: PriorProjection) -> Self {
         // ── 先处理「这一批不能用」的两格：它们与原因无关 ──────────────
         //
         // 🔴 `Unavailable` 与 `RejectedPoisonLine` 都是全 Preserve + Freeze，但
@@ -281,6 +381,9 @@ impl CommitPlan {
         // 它是那段内容的唯一副本。当成 `Reparse` 处理等于允许把唯一副本当作
         // 「可再生的更差解析」回收掉。
         let rewritten = obs.source_change == SourceChange::RollbackOrRewrite;
+        // 🔴 **只有确知有前代才开新代。** `NoStore` 与 `Absent` 在这里落到同一处，
+        // 但那是因为「不确定时不做不可逆的那一步」，不是因为它们是一回事。
+        let has_prior = prior.is_present();
         let projection = if rewritten && has_prior {
             Projection::Rollback
         } else if reasons.wants_reparse() && has_prior {
@@ -388,6 +491,32 @@ mod tests {
         }
     }
 
+    /// 造一个**真的问过库**的 [`PriorProjection`]。
+    ///
+    /// 🔴 这里不能有捷径。`PriorProjection` 的整个意义就是「`Present`/`Absent` 只能
+    /// 来自总库」—— 给测试开一个 `PriorProjection::present_for_test()` 之类的后门，
+    /// 等于把刚立的那道闸自己拆了，而且是拆在**最容易被复制**的地方（下一个人会
+    /// 照着测试写生产代码）。所以这里老老实实开一个内存库。
+    fn prior(present: bool) -> PriorProjection {
+        let store = TotalStore::open_in_memory().unwrap();
+        if present {
+            store
+                .append_events(&[one_event()], Projection::Append)
+                .unwrap();
+        }
+        PriorProjection::ask(&store, &source_key()).unwrap()
+    }
+
+    /// 与 `one_event()` 同一个来源 —— 不一致的话 `ask` 会答 `Absent` 而测试静默变味。
+    fn source_key() -> SourceKey {
+        use crate::rawevent::{SourceLocation, SourceType};
+        SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/logs/a.jsonl".to_string(),
+        }
+    }
+
     fn obs_with_events(quality: ParseQuality, change: SourceChange) -> AppendLogObservation {
         let mut o = obs(quality, change);
         o.events = vec![one_event()];
@@ -407,7 +536,7 @@ mod tests {
         let p = CommitPlan::plan(
             &obs(clean(), SourceChange::Appended),
             ScanReasons::NONE,
-            true,
+            prior(true),
         );
         assert_eq!(p.index(), IndexAction::AppendFacts);
         assert_eq!(p.store(), StoreAction::Project(Projection::Append));
@@ -419,7 +548,7 @@ mod tests {
     #[test]
     fn a_forced_full_read_replaces_the_index_but_still_appends_to_the_store() {
         for r in [ScanReasons::FORCE, ScanReasons::INITIAL] {
-            let p = CommitPlan::plan(&obs(clean(), SourceChange::Appended), r, true);
+            let p = CommitPlan::plan(&obs(clean(), SourceChange::Appended), r, prior(true));
             assert_eq!(p.index(), IndexAction::ReplaceFile, "{r:?}");
             assert_eq!(p.store(), StoreAction::Project(Projection::Append), "{r:?}");
         }
@@ -428,7 +557,7 @@ mod tests {
     #[test]
     fn a_stale_parser_or_attribution_reparses() {
         for r in [ScanReasons::PARSER_STALE, ScanReasons::ATTRIBUTION_STALE] {
-            let p = CommitPlan::plan(&obs(clean(), SourceChange::Appended), r, true);
+            let p = CommitPlan::plan(&obs(clean(), SourceChange::Appended), r, prior(true));
             assert_eq!(p.index(), IndexAction::ReplaceFile, "{r:?}");
             assert_eq!(
                 p.store(),
@@ -449,7 +578,11 @@ mod tests {
             | ScanReasons::PARSER_STALE
             | ScanReasons::ATTRIBUTION_STALE;
         for r in [ScanReasons::NONE, ScanReasons::PARSER_STALE, every] {
-            let p = CommitPlan::plan(&obs(clean(), SourceChange::RollbackOrRewrite), r, true);
+            let p = CommitPlan::plan(
+                &obs(clean(), SourceChange::RollbackOrRewrite),
+                r,
+                prior(true),
+            );
             assert_eq!(
                 p.store(),
                 StoreAction::Project(Projection::Rollback),
@@ -465,9 +598,55 @@ mod tests {
         let p = CommitPlan::plan(
             &obs(clean(), SourceChange::RollbackOrRewrite),
             ScanReasons::NONE,
-            false,
+            prior(false),
         );
         assert_eq!(p.store(), StoreAction::Project(Projection::Append));
+    }
+
+    /// 🔴 **「这一轮没有总库可问」照样拿到完整的四个决定。**
+    ///
+    /// 一个消费者可以整轮不写库（QuotaBar 的 `session_index.rs:875`
+    /// `store.filter(|_| scan_ok)` 就是这一格），而那一轮它**仍然要**
+    /// `index` / `cursor` / `sync` —— 只有 `store` 那一维用不上。
+    ///
+    /// 这条也是 AGENTS.md「四个决定必须一次算出、别按消费者只用得上其中两个拆开」
+    /// 的执行面：`no_store()` 不是一个残缺的输入，是一个**完整**的答案。
+    #[test]
+    fn with_no_store_to_ask_the_other_three_decisions_still_come_out() {
+        let p = CommitPlan::plan(
+            &obs(clean(), SourceChange::Appended),
+            ScanReasons::FORCE,
+            PriorProjection::no_store(),
+        );
+        assert_eq!(p.index(), IndexAction::ReplaceFile, "索引照常判");
+        assert_eq!(p.cursor(), CursorAction::Advance, "游标照常判");
+        assert_eq!(p.sync(), SyncTransition::Advance, "同步照常判");
+        assert_eq!(p.quality(), &QualityState::Clean);
+    }
+
+    /// 🔴 **`NoStore` 与 `Absent` 在 `store` 那一维上处置相同，但不是一回事。**
+    ///
+    /// 相同是因为「不确定有没有前代时，不做不可逆的那一步」—— 都落到 `Append`。
+    /// 但**结论相同而含义不同，正是最容易漂的那种**（本仓刚在 ADR-006 上栽过一次：
+    /// 决定说 SQLite、实现是 JSON，两条路的结论都「够用」，于是没有任何东西变红）。
+    /// 所以它有自己的名字，且 `state()` 分得开。
+    #[test]
+    fn no_store_is_not_the_same_claim_as_absent() {
+        let rewritten = obs(clean(), SourceChange::RollbackOrRewrite);
+        let absent = CommitPlan::plan(&rewritten, ScanReasons::NONE, prior(false));
+        let unknown = CommitPlan::plan(&rewritten, ScanReasons::NONE, PriorProjection::no_store());
+
+        assert_eq!(absent.store(), unknown.store(), "处置相同：都不开新代");
+        assert_eq!(absent.store(), StoreAction::Project(Projection::Append));
+        // 而说法不同 —— 消费者要能分得开「问过了，没有」与「压根没库可问」。
+        assert_ne!(
+            PriorProjection::no_store().state(),
+            prior(false).state(),
+            "🔴 压成同一个之后，「没库」与「没前代」在日志里就一模一样了"
+        );
+        assert_eq!(PriorProjection::no_store().state(), PriorState::NoStore);
+        assert_eq!(prior(false).state(), PriorState::Absent);
+        assert_eq!(prior(true).state(), PriorState::Present);
     }
 
     /// 🔴 **承重规则：`Degraded` 整代替换，绝不与旧投影合并。**
@@ -480,7 +659,7 @@ mod tests {
             // **带好行**的降级 —— 这才是 `Degraded` 的正常情形（见下一条测试）。
             &obs_with_events(ParseQuality::Degraded(diag()), SourceChange::Appended),
             ScanReasons::NONE,
-            true,
+            prior(true),
         );
         assert_eq!(
             p.index(),
@@ -504,7 +683,7 @@ mod tests {
             &obs(ParseQuality::Degraded(diag()), SourceChange::Appended),
             // 连强制全读都不能让它抹掉旧数据。
             ScanReasons::FORCE | ScanReasons::ATTRIBUTION_STALE,
-            true,
+            prior(true),
         );
         assert_eq!(p.index(), IndexAction::Preserve, "别用空的替换非空的");
         assert_eq!(p.store(), StoreAction::Preserve);
@@ -525,7 +704,7 @@ mod tests {
         let p = CommitPlan::plan(
             &obs(clean(), SourceChange::Appended),
             ScanReasons::PARSER_STALE,
-            true,
+            prior(true),
         );
         assert_eq!(
             p.index(),
@@ -544,7 +723,7 @@ mod tests {
                 SourceChange::Appended,
             ),
             ScanReasons::NONE,
-            true,
+            prior(true),
         );
         assert_eq!(p.index(), IndexAction::Preserve);
         assert_eq!(p.store(), StoreAction::Preserve);
@@ -569,7 +748,7 @@ mod tests {
                 SourceChange::Appended,
             ),
             ScanReasons::FORCE,
-            true,
+            prior(true),
         );
         let rejected = CommitPlan::plan(
             &obs(
@@ -577,7 +756,7 @@ mod tests {
                 SourceChange::Appended,
             ),
             ScanReasons::NONE,
-            true,
+            prior(true),
         );
         assert_eq!(unavailable.cursor(), rejected.cursor());
         assert_eq!(unavailable.index(), rejected.index());
@@ -603,7 +782,7 @@ mod tests {
                     SourceChange::RollbackOrRewrite,
                 ),
                 r,
-                true,
+                prior(true),
             );
             assert_eq!(p.store(), StoreAction::Preserve, "reasons={r:?}");
             assert_eq!(p.index(), IndexAction::Preserve, "reasons={r:?}");
@@ -642,7 +821,7 @@ mod tests {
         for q in &qualities {
             for c in changes {
                 for r in reason_sets {
-                    for has_prior in [true, false] {
+                    for has_prior in [prior(true), prior(false)] {
                         let p = CommitPlan::plan(&obs(q.clone(), c), r, has_prior);
                         seen += 1;
                         match p.index() {

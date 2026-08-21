@@ -95,8 +95,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="first-backfill-not-detected",
         rel_path="src/bin/svault.rs",
-        old="    if has_prior == Some(false) {\n        r |= ScanReasons::INITIAL;",
-        new="    if false && has_prior == Some(false) {\n        r |= ScanReasons::INITIAL;",
+        old="    if prior.state() == PriorState::Absent {\n        r |= ScanReasons::INITIAL;",
+        new="    if false && prior.state() == PriorState::Absent {\n        r |= ScanReasons::INITIAL;",
         must_fail=["a_cursor_without_a_projection_counts_as_a_first_backfill"],
         why="游标在、库里空却不判首次 ⇒ 从游标处续读 ⇒ 游标之前的事件永久漏在库外（#44 本身的形状）",
     ),

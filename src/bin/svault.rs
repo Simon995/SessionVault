@@ -869,15 +869,18 @@ fn owes_reprojection(write_store: bool, recorded: Option<u32>, current: u32) -> 
 /// | 否 | 是 | 不是首次 | 宿主已经写过了，我们只是第一次跑 —— 续读即可，靠 seq 去重 |
 /// | 是 | 否 | **是首次** | 两层不一致（此前只吐流地跑过，或库被重建过）⇒ **必须从 0 读**，否则游标之前的事件永远漏在库外，而摘要只显示「本轮 0 条新增」 |
 ///
-/// `has_prior == None` = 这一轮不写库，谈不上「哪一代」⇒ 没有任何理由。
+/// `prior` 的三态由 [`PriorProjection`] 携带：`Absent` = 问过库、确实没有 ⇒ 首次回填；
+/// `NoStore` = 这一轮不写库，谈不上「哪一代」⇒ 没有任何理由。
+///
+/// [`PriorProjection`]: session_vault::scan_plan::PriorProjection
 #[cfg(feature = "store")]
 fn scan_reasons(
     parser_stale: bool,
-    has_prior: Option<bool>,
+    prior: session_vault::scan_plan::PriorProjection,
 ) -> session_vault::scan_plan::ScanReasons {
-    use session_vault::scan_plan::ScanReasons;
+    use session_vault::scan_plan::{PriorState, ScanReasons};
     let mut r = ScanReasons::NONE;
-    if has_prior == Some(false) {
+    if prior.state() == PriorState::Absent {
         r |= ScanReasons::INITIAL;
     }
     if parser_stale {
@@ -996,9 +999,16 @@ impl ScanWriter {
     ///
     /// 🔴 **不拿本地游标当代理**：两者是两套状态，一个在调用方手里、一个在库里。
     /// 第一次带 `--write-store` 跑时手上一个游标都没有，而库里可能早已被常驻宿主写满。
-    fn has_prior(&self, source: &SourceRef) -> Result<bool, String> {
-        self.store
-            .has_projection(&source_key_of(source))
+    ///
+    /// 这条判据现在由**类型**守着（[`PriorProjection`] 的字段私有、只有两个构造
+    /// 入口），而不是由这段注释守着 —— 注释拦不住调用方，实测已经证明过一次。
+    ///
+    /// [`PriorProjection`]: session_vault::scan_plan::PriorProjection
+    fn prior(
+        &self,
+        source: &SourceRef,
+    ) -> Result<session_vault::scan_plan::PriorProjection, String> {
+        session_vault::scan_plan::PriorProjection::ask(&self.store, &source_key_of(source))
             .map_err(|e| format!("has_projection failed: {e}"))
     }
 
@@ -1016,12 +1026,12 @@ impl ScanWriter {
         source: &SourceRef,
         obs: &session_vault::observation::AppendLogObservation,
         reasons: session_vault::scan_plan::ScanReasons,
-        has_prior: bool,
+        prior: session_vault::scan_plan::PriorProjection,
     ) -> Result<(Committed, session_vault::scan_plan::CommitPlan), String> {
         use session_vault::scan_plan::{CommitPlan, StoreAction};
 
         let source_key = source_key_of(source);
-        let plan = CommitPlan::plan(obs, reasons, has_prior);
+        let plan = CommitPlan::plan(obs, reasons, prior);
 
         let mode = match plan.store() {
             StoreAction::Preserve => return Ok((Committed::Preserved, plan)),
@@ -1167,10 +1177,13 @@ fn run_scan_all(
         // 会让下面走全读 + `Append`，看起来无害，但那是拿一次探测失败换一轮全量重读；
         // 猜 `true` 更糟：库里其实没有前代时，续读会把游标之前的事件永久漏在库外。
         #[cfg(feature = "store")]
-        let has_prior = match writer.as_ref() {
-            None => None,
-            Some(w) => match w.has_prior(s) {
-                Ok(v) => Some(v),
+        let prior = match writer.as_ref() {
+            // 🔴 **不写库这一轮说的是「没库可问」，不是「没有前代」。**
+            // 两者在投影那一维上处置相同，但含义不同 —— 而结论相同、含义不同
+            // 正是最容易漂的那种（`PriorProjection` 的注释记着理由）。
+            None => session_vault::scan_plan::PriorProjection::no_store(),
+            Some(w) => match w.prior(s) {
+                Ok(v) => v,
                 Err(why) => {
                     write_failures += 1;
                     log::error!(target: tag::CLI, "cannot tell whether {key} has a prior projection: {why}");
@@ -1187,9 +1200,6 @@ fn run_scan_all(
                 }
             },
         };
-        #[cfg(not(feature = "store"))]
-        let has_prior: Option<bool> = None;
-
         let parser_stale = owes_reprojection(
             write_store,
             prev.as_ref().and_then(|p| p.parser_revision),
@@ -1204,14 +1214,15 @@ fn run_scan_all(
                 session_vault::PARSER_REVISION
             );
         }
-        if has_prior == Some(false) && prev.is_some() {
+        #[cfg(feature = "store")]
+        if prior.state() == session_vault::scan_plan::PriorState::Absent && prev.is_some() {
             log::info!(
                 target: tag::CLI,
                 "backfilling {key}: state has a cursor but the store has no projection — reading from 0"
             );
         }
         #[cfg(feature = "store")]
-        let reasons = scan_reasons(parser_stale, has_prior);
+        let reasons = scan_reasons(parser_stale, prior);
 
         // 🔴 **「读多少」与「怎么写」用同一个 `reasons`。**
         //
@@ -1273,15 +1284,10 @@ fn run_scan_all(
                 snapshot_sources += 1;
                 true
             }
-            // `has_prior` 在扫之前就问过了（它决定了这一轮读多少），这里**复用同一个
+            // `prior` 在扫之前就问过了（它决定了这一轮读多少），这里**复用同一个
             // 答案**而不是再查一次：中间那次扫描可能长达几分钟，重查会让「决定读多少」
             // 与「决定怎么写」用上两个不同代的库状态。
-            (Some(w), Scanned::Observed(obs)) => match w.commit(
-                s,
-                obs,
-                reasons,
-                has_prior.expect("writer 在场时 has_prior 必已问过（问不出来的那一格已 continue）"),
-            ) {
+            (Some(w), Scanned::Observed(obs)) => match w.commit(s, obs, reasons, prior) {
                 Ok((committed, plan)) => {
                     let quality = plan.quality();
                     match committed {
@@ -2272,7 +2278,7 @@ mod tests {
                 &mk_source(),
                 &obs,
                 session_vault::scan_plan::ScanReasons::NONE,
-                true,
+                w.prior(&mk_source()).unwrap(),
             )
             .unwrap_err();
         assert!(err.contains("rollback"), "要说出是哪种开新代，实际：{err}");
@@ -2308,7 +2314,7 @@ mod tests {
                 &mk_source(),
                 &obs,
                 session_vault::scan_plan::ScanReasons::NONE,
-                true,
+                w.prior(&mk_source()).unwrap(),
             )
             .unwrap();
         match committed {
@@ -2352,7 +2358,7 @@ mod tests {
                 &mk_source(),
                 &obs,
                 session_vault::scan_plan::ScanReasons::INITIAL,
-                false,
+                w.prior(&mk_source()).unwrap(),
             )
             .unwrap();
         match committed {
@@ -2403,7 +2409,7 @@ mod tests {
                     &mk_source(),
                     &obs,
                     session_vault::scan_plan::ScanReasons::NONE,
-                    true,
+                    w.prior(&mk_source()).unwrap(),
                 )
                 .unwrap();
             assert!(
@@ -2429,27 +2435,40 @@ mod tests {
     /// 判成首次就会对全机每个文件做一次没必要的全读。
     #[test]
     fn a_cursor_without_a_projection_counts_as_a_first_backfill() {
-        use session_vault::scan_plan::ScanReasons;
+        use session_vault::scan_plan::{PriorProjection, ScanReasons};
         let full_read = |r: ScanReasons| r.wants_full_read() || r.wants_reparse();
+        // 🔴 `Present` / `Absent` **只能问库拿**（`PriorProjection` 字段私有），
+        // 所以这里也老老实实开内存库 —— 测试走的就是生产那条路。
+        let asked = |present: bool| {
+            let store = TotalStore::open_in_memory().unwrap();
+            if present {
+                store
+                    .append_events(&[mk_event(0, "s1")], Projection::Append)
+                    .unwrap();
+            }
+            let w = writer_over(store);
+            w.prior(&mk_source()).unwrap()
+        };
 
         // 游标在、库里空 ⇒ 首次回填 ⇒ 全读。
-        let r = scan_reasons(false, Some(false));
+        let r = scan_reasons(false, asked(false));
         assert!(r.contains(ScanReasons::INITIAL));
         assert!(full_read(r), "🔴 不全读就会把游标之前的事件永久漏在库外");
 
         // 库里有前代 ⇒ 不是首次 ⇒ 增量（靠 seq 去重，重放幂等）。
-        let r = scan_reasons(false, Some(true));
+        let r = scan_reasons(false, asked(true));
         assert!(r.is_empty());
         assert!(!full_read(r), "库里有就别全读 —— 那是一次没必要的全机重读");
 
         // 欠重投影 ⇒ 必须全读（`Reparse` 取代一整代，尾巴取代不了）。
-        let r = scan_reasons(true, Some(true));
+        let r = scan_reasons(true, asked(true));
         assert!(r.contains(ScanReasons::PARSER_STALE));
         assert!(full_read(r));
 
-        // 不写库 ⇒ 谈不上「哪一代」⇒ 没有任何理由，走增量。
-        let r = scan_reasons(false, None);
-        assert!(r.is_empty());
+        // 🔴 **不写库那一轮说的是「没库可问」，不是「没有前代」** —— 后者会被判成
+        // 首次回填而触发一次全机全读，而这一轮本来就不打算写任何东西。
+        let r = scan_reasons(false, PriorProjection::no_store());
+        assert!(r.is_empty(), "没库可问 ≠ 首次回填");
         assert!(!full_read(r));
     }
 
