@@ -29,6 +29,12 @@ pub mod project_root;
 pub mod rawevent;
 pub mod report;
 pub mod scan;
+/// 一次扫描提交的四个决定（ADR-051 §2）——`store` 门控（它答的是「总库怎么写」之一）。
+///
+/// 2026-08-21 从 QuotaBar 移入：它的依赖全是本仓类型，而现在有**两个**写者要问
+/// 同一组问题。理由写在模块头。
+#[cfg(feature = "store")]
+pub mod scan_plan;
 /// 不可变 RawEvent 总库（§13 / ADR-020）——`store` feature 门控（持久化组件，内核仍无状态）。
 #[cfg(feature = "store")]
 pub mod store;
