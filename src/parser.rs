@@ -197,6 +197,7 @@ pub fn parse_lines(
     match ctx.source_type {
         SourceType::ClaudeCode => parse_claude(ctx, lines, base_seq),
         SourceType::Codex => parse_codex(ctx, lines, base_seq, codex_state),
+        SourceType::Jsonl => parse_jsonl(ctx, lines, base_seq),
         // 其它 provider v0 未实装解析器：仅校验 JSON、计 skipped，状态透传。
         _ => {
             let mut out = ParseOut {
@@ -214,6 +215,122 @@ pub fn parse_lines(
             }
             out
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 通用 JSONL
+// ---------------------------------------------------------------------------
+
+/// 通用 JSONL append-log：**一行一条对话消息**。
+///
+/// 🔴 **它存在是为了让「外部投喂的对话」成为一个来源，而不是给谁开一个注入后门。**
+/// 摄取内核是纯函数 `(目录 + 配置 + 游标) → (事件 + 游标 + 报告)`，结构上不接受
+/// push；想让一段对话被摄取，正规做法是**把它写成一个来源文件**，再由常规扫描读它。
+/// 于是那段对话与任何 agent 会话走**逐字相同**的物化/去重/游标路径。
+///
+/// ⚠️ **不要为此把外部对话伪装成 Claude/Codex 的形状** —— 那样零改动就能跑，但事件
+/// 会带着错误的 `source_type`，即**对来源撒谎**。provenance 是下游一切判决的地基。
+///
+/// 行契约（缺字段就跳过该行，不猜）：
+///
+/// ```jsonc
+/// {"role": "user"|"assistant"|"system"|"tool", "content": "…",
+///  "timestamp": "2026-08-24T10:00:00Z",  // 可选，**ISO8601 字符串**（不收数字）
+///  "session_id": "…",                    // 可选，缺省取文件名（与 Claude 回退一致）
+///  "cwd": "…"}                           // 可选，参与项目归属
+/// ```
+fn parse_jsonl(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
+    let fallback = session_id_from_path(&ctx.source_path);
+    let mut out = ParseOut::default();
+    let mut seq = base_seq;
+    let mut cache: Option<(String, ProjectRoot)> = None;
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                record_skip(&mut out, &ctx.source_path, idx, &e);
+                continue;
+            }
+        };
+
+        // 🔴 认不出角色 / 没有正文的行**跳过**，不猜一个 actor。
+        // 「这一行不是对话消息」与「这是一条 actor 未知的消息」是两回事，
+        // 而后者会把非对话内容（心跳、元数据）当成人说过的话喂进下游记忆。
+        let Some(actor) = value
+            .get("role")
+            .and_then(Value::as_str)
+            .and_then(jsonl_actor)
+        else {
+            continue;
+        };
+        let Some(content) = value.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let mut slots = RecordSlots::new(line);
+        let session_id = value
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| fallback.clone());
+        let cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
+        let occurred_at = jsonl_timestamp(value.get("timestamp"));
+        let pr = resolve_cached(
+            &mut cache,
+            cwd.as_deref(),
+            ctx.host,
+            ctx.default_distro.as_deref(),
+            &ctx.roots,
+        );
+
+        let mut ev = ctx.event(
+            seq,
+            &session_id,
+            EventType::Message,
+            Some(actor),
+            occurred_at,
+            cwd,
+            pr.as_ref(),
+        );
+        if ctx.want_content() {
+            ev.content = Some(content.to_string());
+        }
+        ev.event_key = Some(slots.next(ev.event_type));
+        out.events.push(ev);
+        seq += 1;
+    }
+    out
+}
+
+/// `role` → [`Actor`]。**认不出就是认不出**，不落到某个默认值。
+fn jsonl_actor(role: &str) -> Option<Actor> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "user" | "human" => Some(Actor::User),
+        "assistant" | "ai" | "model" => Some(Actor::Assistant),
+        "system" => Some(Actor::System),
+        "tool" => Some(Actor::Tool),
+        _ => None,
+    }
+}
+
+/// `timestamp` → `occurred_at` 原始串。
+///
+/// **只接受字符串**（ISO8601）。数字形式的 unix 毫秒**不接受** —— 内核存的是原始串、
+/// 不做时间换算（§7：「v0 存原始串，归一到 UTC unix 秒是后续细化」），而为了一个
+/// provider 引入日期库，是把成本推给两个互不知情的消费者。**换算归写入方。**
+///
+/// 🔴 认不出时返回 `None` ⇒ `time_confidence=low` —— **不拿「现在」冒充它**
+/// （§11：`occurred_at` 缺失 / 不可信不得默认当现在）。
+fn jsonl_timestamp(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 
@@ -916,6 +1033,131 @@ mod tests {
     ///
     /// 断言用 `max`：实测样本里最常见的取值，且是 **Claude 独有**（Codex 只有
     /// low/medium/high/xhigh），所以任何「照抄 Codex 枚举」的实现都会在这里红。
+    // -----------------------------------------------------------------------
+    // 通用 JSONL（黄金 fixture，§11）
+    // -----------------------------------------------------------------------
+
+    fn jsonl_ctx(profile: Profile) -> ParseCtx {
+        ctx(SourceType::Jsonl, profile)
+    }
+
+    #[test]
+    fn a_conversation_line_becomes_a_message_event() {
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Full),
+            &[
+                r#"{"role":"user","content":"以后都用中文回复","timestamp":"2026-08-24T10:00:00Z"}"#,
+                r#"{"role":"assistant","content":"好的"}"#,
+            ],
+            0,
+            None,
+        );
+        assert_eq!(out.events.len(), 2);
+        assert_eq!(out.events[0].actor, Some(Actor::User));
+        assert_eq!(out.events[0].event_type, EventType::Message);
+        assert_eq!(out.events[0].content.as_deref(), Some("以后都用中文回复"));
+        assert_eq!(out.events[0].time_confidence, TimeConfidence::High);
+        assert_eq!(out.events[1].actor, Some(Actor::Assistant));
+        // 没有 timestamp ⇒ 说不出来，**不拿「现在」冒充**
+        assert_eq!(out.events[1].occurred_at, None);
+        assert_eq!(out.events[1].time_confidence, TimeConfidence::Low);
+    }
+
+    #[test]
+    fn an_unknown_role_is_skipped_not_guessed() {
+        // 🔴 「这一行不是对话消息」与「这是一条 actor 未知的消息」是两回事。
+        // 猜一个 actor 会把心跳/元数据当成人说过的话喂进下游记忆。
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Full),
+            &[
+                r#"{"role":"heartbeat","content":"ping"}"#,
+                r#"{"content":"没有 role"}"#,
+                r#"{"role":"user"}"#,
+                r#"{"role":"user","content":"这条才算"}"#,
+            ],
+            0,
+            None,
+        );
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].content.as_deref(), Some("这条才算"));
+    }
+
+    #[test]
+    fn a_numeric_timestamp_is_not_accepted() {
+        // 内核存原始串、不做时间换算（§7）。数字形式的 unix 毫秒由**写入方**转换 ——
+        // 为一个 provider 引入日期库，是把成本推给两个互不知情的消费者。
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Full),
+            &[r#"{"role":"user","content":"x","timestamp":1755000000000}"#],
+            0,
+            None,
+        );
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].occurred_at, None);
+        assert_eq!(out.events[0].time_confidence, TimeConfidence::Low);
+    }
+
+    #[test]
+    fn session_id_comes_from_the_line_then_the_file_name() {
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Full),
+            &[
+                r#"{"role":"user","content":"a","session_id":"s-explicit"}"#,
+                r#"{"role":"user","content":"b"}"#,
+            ],
+            0,
+            None,
+        );
+        assert_eq!(out.events[0].source_session_id, "s-explicit");
+        // 回退取文件名 —— 与 Claude 解析器同一条规则（`ctx` 用的是 abc-session.jsonl）
+        assert_eq!(out.events[1].source_session_id, "abc-session");
+    }
+
+    #[test]
+    fn metadata_profile_carries_no_content() {
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Metadata),
+            &[r#"{"role":"user","content":"秘密"}"#],
+            0,
+            None,
+        );
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(out.events[0].content, None);
+    }
+
+    #[test]
+    fn a_bad_json_line_is_recorded_as_a_skip() {
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Full),
+            &[
+                r#"{"role":"user","content":"好行"}"#,
+                "{ 坏行",
+                r#"{"role":"user","content":"又一好行"}"#,
+            ],
+            0,
+            None,
+        );
+        assert_eq!(out.events.len(), 2);
+        assert_eq!(out.skipped, 1, "坏行要计入 skipped，不能静默吞掉");
+    }
+
+    #[test]
+    fn every_event_carries_a_stable_event_key() {
+        // `seq` 只做排序、不是身份（§7）。凡是要活过解析器升级的引用都用 `EventKey`。
+        let out = parse_lines(
+            &jsonl_ctx(Profile::Full),
+            &[
+                r#"{"role":"user","content":"a"}"#,
+                r#"{"role":"user","content":"b"}"#,
+            ],
+            0,
+            None,
+        );
+        let keys: Vec<_> = out.events.iter().map(|e| e.event_key.clone()).collect();
+        assert!(keys.iter().all(Option::is_some));
+        assert_ne!(keys[0], keys[1], "两条不同记录的 key 不许相同");
+    }
+
     #[test]
     fn claude_usage_carries_top_level_effort() {
         let line = serde_json::json!({

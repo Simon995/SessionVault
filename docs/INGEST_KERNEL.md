@@ -141,9 +141,44 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | Cursor     | Windows `%APPDATA%\Cursor\User\...`；macOS `~/Library/Application Support/Cursor/User/...`；Linux `~/.config/Cursor/User/...` | VS Code fork，会话多在 `workspaceStorage/<hash>/state.vscdb`、`globalStorage`（SQLite），非 JSONL |
 | Gemini CLI | 候选 `~/.gemini/`（按平台展开）                                                                                               | 待验证文件结构                                                                                    |
-| 通用 JSONL | 用户手动指定路径                                                                                                              | 任意符合通用 schema 的 JSONL，走 `jsonl` 解析器                                                   |
+| ~~通用 JSONL~~ | —— | **已升 `experimental`，见 §3.5** |
 
 新增 provider 的标准流程见 §4。
+
+### 3.5 通用 JSONL（status: experimental）
+
+**把「外部投喂的对话」变成一个来源。** 用途是让本内核之外产生的对话（评测适配层、
+导入的历史记录等）走**与任何 agent 会话逐字相同**的摄取路径。
+
+| | |
+| --- | --- |
+| `source_type` | `jsonl` |
+| 根 | **只认 `$SVAULT_JSONL_DIR`，没有默认值** |
+| 产物 | `sessions/**/*.jsonl`，`append_log` + `byte_offset` |
+
+🔴 **没有默认根是刻意的，而且是它能进内置清单的全部理由。** 环境变量没设 ⇒
+`config_dir: None` ⇒ 发现器跳过并记 `no_config_dir` ⇒ **既有消费者的行为一个字节
+都不变**。由 `catalog::tests::the_generic_jsonl_provider_is_absent_without_its_env_var`
+钉着。
+
+**行契约**（一行一条对话消息；缺字段就跳过该行，**不猜**）：
+
+```jsonc
+{"role": "user"|"assistant"|"system"|"tool",   // 认不出 ⇒ 跳过，不落到默认 actor
+ "content": "…",                               // 缺 ⇒ 跳过
+ "timestamp": "2026-08-24T10:00:00Z",          // 可选，**ISO8601 字符串**
+ "session_id": "…",                            // 可选，缺省取文件名
+ "cwd": "…"}                                   // 可选，参与项目归属
+```
+
+⚠️ **`timestamp` 不收数字**（unix 毫秒）。内核存原始串、不做时间换算
+（§7：「v0 存原始串，归一到 UTC unix 秒是后续细化」），为一个 provider 引入日期库
+是把成本推给两个互不知情的消费者 —— **换算归写入方**。认不出 ⇒ `occurred_at: None`
+⇒ `time_confidence: low`，**不拿「现在」冒充**。
+
+🔴 **不要把外部对话伪装成 Claude / Codex 的形状塞进它们的根。** 那样零改动就能跑，
+但事件会带着错误的 `source_type` —— **对来源撒谎**，而 provenance 是下游一切判决的
+地基。这个 provider 存在就是为了让那条捷径没有必要。
 
 ## 4. Provider 可扩展性（声明式描述符）
 
