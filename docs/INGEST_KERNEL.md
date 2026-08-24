@@ -508,7 +508,7 @@ ScanReport {
 （Class-B 的写入口）是同一件事的另一半。
 
 ```bash
-svault scan-all --write-store [--store <path>] [--state <path>]
+svault scan-all --write-store [--store <path>] [--state <path>] [--only <type>]...
 ```
 
 | 事 | 怎么定的 |
@@ -518,6 +518,18 @@ svault scan-all --write-store [--store <path>] [--state <path>]
 | 事件流 | 带 `--write-store` 时**不再逐条吐 `event`**（一次全量是几个 GB 的 stdout，而写库的调用方本来就要从库里读）。观测走每来源一条 `store_write` / `store_held` / `store_write_failed` + 收尾 `summary` |
 | 只写 append-log | 快照来源**不由这条路写** —— Class-B 归 `sync-snapshots`（另一套枚举 + 另一套变更检测）。在这里再写一遍就是第二条 Class-B 写路径。摘要里报 `snapshot_sources`，因为「这轮写了 0 条快照」不该被读成「本机没有快照来源」 |
 | 退出码 | `0` 正常；`1` 起步就没跑成（参数/发现/开库）；`2` 游标没落盘；`3` 有来源没写进库（本轮**不完整**）。`held_sources` **不进退出码** —— 那不是失败，是计划里的一格 |
+| 范围 | `--only <source-type>`（可重复，取值同 `SourceType`）。**不给 = 扫全部**，既有行为逐字不变。过滤发生在**发现之后**（`retain_only`），因为只有那一处看得见全部发现路径的产物 |
+
+🔴 **`--only` 存在是因为「靠环境变量做隔离」不成立。** 调用方想把一轮扫描限制在
+自己的数据上时，最自然的做法是把各 provider 的根环境变量指到别处
+（`CLAUDE_CONFIG_DIR` / `CODEX_HOME`）。那**只覆盖宿主本机的根**，而 **WSL 发现是
+第三条路**，不受它们管。实测（2026-08-24，消费者侧）：两个变量都设对了，扫描照样
+把宿主真实的 WSL 会话（上千条事件）读进了本该只装评测数据的库。
+
+**一个只挡住两条路、而实际有三条的护栏，与没有护栏长得一模一样。** 所以过滤放在
+**发现之后**：那一处 WSL 来源与本机来源没有区别，隔离因此是**结构性**的，
+不依赖调用方枚举得全。过滤命中数走 `log::info`（`--only … kept N of M sources`）——
+一个静默过滤的扫描，「隔离生效」与「这台机器上什么都没有」长得一模一样。
 
 🔴 **它走 `scan_append_log_observed`，不走 `scan_source`。** 后者是有损投影
 （`ScanStatus` 三个变体压掉了 `ParseQuality` 的四种含义），而写库要用的恰好是被压掉的

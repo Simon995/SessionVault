@@ -50,6 +50,16 @@ enum Command {
         /// 无状态：忽略且不写状态文件，每次从头全量扫（调试/一次性用）。
         #[arg(long)]
         stateless: bool,
+        /// **只扫这几类来源**（可重复）。不给 = 扫全部（既有行为逐字不变）。
+        ///
+        /// 🔴 **它存在是因为「靠环境变量做隔离」不成立。** `CLAUDE_CONFIG_DIR` /
+        /// `CODEX_HOME` 只覆盖宿主本机的根，而 **WSL 发现是第三条路**，不受它们管。
+        /// 实测（2026-08-24）：一次本该只扫一个 JSONL 根的扫描，把宿主真实的 WSL
+        /// 会话（上千条事件）读进了目标库 —— 而调用方以为自己已经隔离好了。
+        ///
+        /// **一个只挡住两条路、而实际有三条的护栏，与没有护栏长得一模一样。**
+        #[arg(long, value_enum)]
+        only: Vec<SourceTypeArg>,
         /// 把扫到的事件**写进总库** —— Class-A 的写入口（TumeFlow task #44）。
         ///
         /// 🔴 **没有这个口的时候，写总库只能经 `TotalStore` 这个 Rust 库 API，
@@ -279,6 +289,28 @@ impl From<EraseScopeArg> for session_vault::TombstoneScope {
             EraseScopeArg::Session => Self::Session,
             EraseScopeArg::SourcePath => Self::SourcePath,
             EraseScopeArg::ProjectRoot => Self::ProjectRoot,
+        }
+    }
+}
+
+/// `--only` 的取值。与 [`SourceType`] 一一对应。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum SourceTypeArg {
+    ClaudeCode,
+    Codex,
+    Cursor,
+    Gemini,
+    Jsonl,
+}
+
+impl From<SourceTypeArg> for SourceType {
+    fn from(a: SourceTypeArg) -> Self {
+        match a {
+            SourceTypeArg::ClaudeCode => SourceType::ClaudeCode,
+            SourceTypeArg::Codex => SourceType::Codex,
+            SourceTypeArg::Cursor => SourceType::Cursor,
+            SourceTypeArg::Gemini => SourceType::Gemini,
+            SourceTypeArg::Jsonl => SourceType::Jsonl,
         }
     }
 }
@@ -584,15 +616,17 @@ fn main() {
             profile,
             state,
             stateless,
+            only,
             write_store,
             store,
-        } => run_scan_all(profile, state, stateless, write_store, store),
+        } => run_scan_all(profile, state, stateless, only, write_store, store),
         #[cfg(not(feature = "store"))]
         Command::ScanAll {
             profile,
             state,
             stateless,
-        } => run_scan_all(profile, state, stateless, false, None),
+            only,
+        } => run_scan_all(profile, state, stateless, only, false, None),
         #[cfg(feature = "store")]
         Command::Pull {
             since,
@@ -1081,10 +1115,37 @@ impl ScanWriter {
     }
 }
 
+/// 按 `--only` 过滤发现结果。`only` 为空 = 不过滤（既有行为逐字不变）。
+///
+/// 🔴 **过滤必须发生在发现之后**，因为只有这里看得见**全部**发现路径的产物：
+/// 宿主本机根、WSL 发行版、描述符各是一条，而调用方能设的环境变量只管得住其中两条。
+/// 把过滤前移到某条路径内部，就又造出一个「只挡住我想到的那几条」的护栏 ——
+/// 而**一个覆盖不全的检查，和没有检查长得一模一样**。
+fn retain_only(sources: Vec<SourceRef>, only: &[SourceTypeArg]) -> Vec<SourceRef> {
+    if only.is_empty() {
+        return sources;
+    }
+    let want: Vec<SourceType> = only.iter().copied().map(SourceType::from).collect();
+    let before = sources.len();
+    let kept: Vec<SourceRef> = sources
+        .into_iter()
+        .filter(|s| want.contains(&s.source_type))
+        .collect();
+    // **说出挡掉了多少。** 一个静默过滤的扫描，「隔离生效」与「机器上什么都没有」
+    // 长得一模一样 —— 而这两者需要完全不同的处理。
+    log::info!(
+        target: tag::CLI,
+        "--only {only:?} kept {} of {before} sources",
+        kept.len()
+    );
+    kept
+}
+
 fn run_scan_all(
     profile_arg: Option<ProfileArg>,
     state_arg: Option<PathBuf>,
     stateless: bool,
+    only: Vec<SourceTypeArg>,
     write_store: bool,
     store_arg: Option<PathBuf>,
 ) -> i32 {
@@ -1115,6 +1176,7 @@ fn run_scan_all(
             return 1;
         }
     };
+    let sources = retain_only(sources, &only);
 
     // 状态：source_key → 游标 + 产出它的解析器版本 + 上一版源指纹。stateless 时为空 map。
     let state_path = if stateless {
@@ -2907,5 +2969,72 @@ fn run_changes(since_seq: i64, limit: usize, store_arg: Option<PathBuf>) -> i32 
             log::error!(target: tag::CLI, "read_projection_changes failed: {e}");
             1
         }
+    }
+}
+
+/// `--only` 的过滤。**不挂 `feature = "store"`** —— 过滤与总库无关，
+/// 挂上去只会让它在默认 `cargo test` 里缺席。
+#[cfg(test)]
+mod only_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn src(t: SourceType, path: &str) -> SourceRef {
+        SourceRef {
+            source_type: t,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::AppendLog,
+            path: PathBuf::from(path),
+            project_root: None,
+            artifact_kind: None,
+        }
+    }
+
+    fn fixture() -> Vec<SourceRef> {
+        vec![
+            src(SourceType::ClaudeCode, "a.jsonl"),
+            src(SourceType::Jsonl, "b.jsonl"),
+            src(SourceType::Codex, "c.jsonl"),
+            src(SourceType::Jsonl, "d.jsonl"),
+        ]
+    }
+
+    #[test]
+    fn no_only_flag_changes_nothing() {
+        // 既有调用方一个字节都不受影响 —— 这是这条新参数可以默认关着的前提。
+        assert_eq!(retain_only(fixture(), &[]).len(), 4);
+    }
+
+    #[test]
+    fn only_keeps_exactly_the_requested_types() {
+        let kept = retain_only(fixture(), &[SourceTypeArg::Jsonl]);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|s| s.source_type == SourceType::Jsonl));
+    }
+
+    #[test]
+    fn only_accepts_more_than_one_type() {
+        let kept = retain_only(fixture(), &[SourceTypeArg::Jsonl, SourceTypeArg::Codex]);
+        assert_eq!(kept.len(), 3);
+        assert!(!kept.iter().any(|s| s.source_type == SourceType::ClaudeCode));
+    }
+
+    #[test]
+    fn a_wsl_source_is_filtered_out_like_any_other() {
+        // 🔴 这条是这个参数存在的**理由**：`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
+        // 够不到 WSL 里的根，于是「靠环境变量隔离」在那条路径上失效。过滤在发现
+        // 之后做，WSL 来源与本机来源在这里没有区别 —— 隔离因此是**结构性**的。
+        let mut sources = fixture();
+        let mut wsl = src(SourceType::Codex, "/home/u/.codex/x.jsonl");
+        wsl.source_location = SourceLocation::Wsl("Distro".into());
+        sources.push(wsl);
+        let kept = retain_only(sources, &[SourceTypeArg::Jsonl]);
+        assert_eq!(kept.len(), 2, "WSL 来源必须与本机来源一样被挡在外面");
+    }
+
+    #[test]
+    fn asking_for_a_type_that_is_absent_yields_nothing_not_everything() {
+        // 「过滤后为空」不许退化成「那就全都要」—— 那正是护栏最容易的死法。
+        assert!(retain_only(fixture(), &[SourceTypeArg::Cursor]).is_empty());
     }
 }
