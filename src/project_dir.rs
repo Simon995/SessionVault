@@ -19,9 +19,9 @@
 //!
 //! # 为什么必须探文件系统
 //!
-//! Claude 把 `/home/simon/workspace/QuotaBar` 编码成
-//! `-home-simon-workspace-QuotaBar`（分隔符 → `-`）。而路径成分本身可能含 `-`
-//! （`corneal-staining-grading`），所以**哪一种切分才对只能靠探真实目录**。
+//! Claude 把 `/home/<user>/workspace/QuotaBar` 编码成
+//! `-home-<user>-workspace-QuotaBar`（分隔符 → `-`）。而路径成分本身可能含 `-`
+//! （`image-grading`），所以**哪一种切分才对只能靠探真实目录**。
 //! 贪心取「最长的、真实存在的目录成分」，不是 `replace('-', "/")`。
 
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ pub fn decode_project_dir(enc: &str, base: &str) -> DecodedProject {
 ///
 /// 🔴 **WSL root 不能只问宿主。** 用 `LocalBackend` 问 `\\wsl.localhost\…` 对大多数
 /// 目录确实答得上来，于是这条一直没被发现 —— 直到路上出现一个**符号链接**：
-/// 实测 `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
+/// 实测 `/home/<user>/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
 /// 宿主沿 9P 跟不进那个挂载点，返回「既不是文件也不是目录」，解码于是报
 /// [`DecodedProject::Absent`]＝**「这个项目不存在」**。后果不是少一条路径，而是
 /// 调用方的别名分组（`len() >= 2`）让**整组消失** —— 同一个目录的项目记忆分裂成
@@ -370,9 +370,9 @@ mod tests {
     #[test]
     fn decode_resolves_an_in_root_path_under_the_fs_prefix() {
         let base = scratch("fsprefix");
-        let proj = base.join("home").join("simon").join("my-proj-with-dash");
+        let proj = base.join("home").join("dev").join("my-proj-with-dash");
         std::fs::create_dir_all(&proj).unwrap();
-        let enc = "-home-simon-my-proj-with-dash";
+        let enc = "-home-dev-my-proj-with-dash";
 
         assert_eq!(
             decode_project_dir(enc, &base.to_string_lossy()),
@@ -429,8 +429,8 @@ mod encode_tests {
     #[test]
     fn encoding_needs_no_probing() {
         assert_eq!(
-            encode_project_dir("/home/simon/workspace/QuotaBar"),
-            "-home-simon-workspace-QuotaBar"
+            encode_project_dir("/home/dev/workspace/QuotaBar"),
+            "-home-dev-workspace-QuotaBar"
         );
         // 盘符的 `:` 也换掉 —— 与 Claude 实际创建的目录名一致（`C--Users-…`）。
         assert_eq!(
@@ -447,11 +447,11 @@ mod encode_tests {
     #[test]
     fn a_canonical_wsl_root_encodes_its_in_distro_path() {
         let dirs = claude_project_dirs(
-            "wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar",
-            &[r"\wsl.localhost\Ubuntu-22.04\home\simon\workspace\QuotaBar".to_string()],
+            "wsl:Ubuntu-22.04:/home/dev/workspace/QuotaBar",
+            &[r"\wsl.localhost\Ubuntu-22.04\home\dev\workspace\QuotaBar".to_string()],
         );
         assert!(
-            dirs.contains(&"-home-simon-workspace-QuotaBar".to_string()),
+            dirs.contains(&"-home-dev-workspace-QuotaBar".to_string()),
             "会话真正用过的那个写法必须在候选里，实际：{dirs:?}"
         );
         assert!(

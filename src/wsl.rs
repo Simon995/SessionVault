@@ -223,10 +223,10 @@ pub fn list_jsonl_under_home(
     list_files_under_home(distro, rel_subpath, ".jsonl", deadline)
 }
 
-/// 发行版内的 `$HOME`（POSIX 形式，如 `/home/simon`）。
+/// 发行版内的 `$HOME`（POSIX 形式，如 `/home/<user>`）。
 ///
 /// 本模块其它函数都是「在 `$HOME` 下做点什么」，从不需要那个值本身。这一个需要：
-/// 调用方要用它拼出宿主可达的 UNC 路径 `\\wsl.localhost\<distro>\home\simon`，
+/// 调用方要用它拼出宿主可达的 UNC 路径 `\\wsl.localhost\<distro>\home\<user>`，
 /// 而那条路**不再起 `wsl.exe`**（走 9P 共享），是每次读都省一次进程的关键。
 ///
 /// 🔴 **`Err` 是「没问成」，不是「这个发行版没有 HOME」。** 两者的处置完全不同：

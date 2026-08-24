@@ -543,7 +543,7 @@ pub fn set_permissions(path: &Path, perm: std::fs::Permissions) -> std::io::Resu
 /// 🔴 **为什么要它，而不是让 `LocalBackend` 去问 `\\wsl.localhost\…`**：宿主侧
 /// 那条 UNC 路对**大多数**目录确实答得上来，于是这个后端看起来可有可无 ——
 /// 直到路上出现一个**符号链接**。实测
-/// `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`：
+/// `/home/<user>/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`：
 /// 链接的目标是 WSL 内部的挂载点，宿主沿 9P 跟不进去，`metadata` 返回「既不是
 /// 文件也不是目录」⇒ 调用方（`decode_project_dir`）读成**「这个项目不存在」**。
 /// 后果是同一个目录的项目记忆分裂成互不可见的两半，而界面上一切正常。
@@ -667,7 +667,7 @@ impl ProbeBackend for WslBackend {
 /// 不是全无用处：只要父目录可遍历，`Dir` / `File` / `Absent` 都是事实。唯一不可信的
 /// 是「有东西，但既不是文件也不是目录」—— 它几乎总是一个**宿主跟不进去的符号链接**，
 /// 而链接的另一头完全可能是目录。实测
-/// `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`：宿主沿
+/// `/home/<user>/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`：宿主沿
 /// 9P 跟不进那个挂载点，`metadata` 返回既非文件也非目录，`decode_project_dir` 于是
 /// 读成**「这个项目不存在」**，同一个目录的项目记忆分裂成互不可见的 37 + 24 两半。
 ///
@@ -936,9 +936,9 @@ mod tests {
         let b = WslBackend::under_host_prefix("Ubuntu-22.04", PREFIX);
         assert_eq!(
             b.to_linux(Path::new(&format!(
-                r"{PREFIX}\home\simon\workspace\QuotaBar"
+                r"{PREFIX}\home\dev\workspace\QuotaBar"
             ))),
-            Some("/home/simon/workspace/QuotaBar".to_string())
+            Some("/home/dev/workspace/QuotaBar".to_string())
         );
         // 前缀本身 ⇒ 发行版根。
         assert_eq!(b.to_linux(Path::new(PREFIX)), Some("/".to_string()));
@@ -1027,7 +1027,7 @@ mod tests {
 
     /// 🔴 **符号链接本身**：宿主说「有东西，但既不是文件也不是目录」。
     ///
-    /// 实测 `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
+    /// 实测 `/home/<user>/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
     /// 宿主沿 9P 跟不进那个挂载点。把这个答案当「不是目录」处理，`decode_project_dir`
     /// 就报「这个项目不存在」，同一个目录的记忆分裂成互不可见的两半。
     #[test]

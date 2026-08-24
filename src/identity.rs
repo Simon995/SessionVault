@@ -332,9 +332,9 @@ pub fn normalize_remote(url: &str) -> Option<String> {
 ///
 /// 🔴 **我最初把它解释成「进程之间行为不同」，那是错的**（2026-08-14 当天更正）。
 /// 真相是这个特定的根是一个**符号链接**：
-/// `/home/simon/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
+/// `/home/<user>/workspace/QuotaBar -> /mnt/c/Users/user/workspace/QuotaBar`，
 /// 链接指向 WSL 内部的挂载点，宿主沿 9P 跟不进去。**同一台机器上其它 WSL 项目
-/// （EyeVLM、corneal-staining-grading…）走 UNC 一直是好的** —— 所以「UNC 对 WSL
+/// （VisionApp、image-grading…）走 UNC 一直是好的** —— 所以「UNC 对 WSL
 /// 不可用」这个结论过宽，照它去设计会白白付掉每次探测一个 `wsl.exe` 的代价
 /// （实测一次往返 ≈1.5 秒）。真正成立的判据是**「这条路径归谁管」**：归发行版管的
 /// 内容，宿主答不上来时就该问它 —— 见 `probe::WslUncBackend` 的取舍。

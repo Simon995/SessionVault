@@ -212,7 +212,7 @@ pub fn probe_wsl(
             // WSL 里返回的永远是 Linux 路径（`/home/u/P`），而同一个项目在总库里
             // 有多种写法。第一版无条件转成规范形（`wsl:<distro>:/home/u/P`），于是
             // 注册表里**只有规范形的根**，而裸 Linux 形式的 `project_root`
-            // （实测 `/home/simon/workspace/EyeVLM` 一条就有 106,814 条事件）
+            // （实测 `/home/<user>/workspace/VisionApp` 一条就有 106,814 条事件）
             // 匹配不上任何根 —— 归属把它们全报成 `Unattributed`。
             //
             // 干跑当场抓到：同一个项目的两种形式，规范形归到了、裸形式没有。
@@ -276,7 +276,7 @@ where
 /// 🔴 **第三个参数 `canonical_form` 决定探测结果用哪种形式表达** —— 它跟随输入。
 /// 规范形 / UNC 的输入拿规范形的根，裸 Linux 输入拿裸 Linux 的根。
 /// 归属是纯字符串匹配，**登记什么形式就只认什么形式**；无条件转规范形会让裸形式
-/// 的路径全部归不到根（干跑实测：一条 `/home/simon/workspace/EyeVLM` 就是 106,814
+/// 的路径全部归不到根（干跑实测：一条 `/home/<user>/workspace/VisionApp` 就是 106,814
 /// 条事件）。
 pub fn probe_path(
     path: &str,
@@ -518,7 +518,7 @@ mod tests {
     fn the_probe_result_keeps_the_form_of_its_input() {
         // 🔴 这条是**干跑抓出来的真 bug**：第一版无条件把 WSL 探测结果转成规范形，
         // 于是注册表里只有规范形的根，而裸 Linux 形式的 project_root 匹配不上任何
-        // 根 —— 实测一条 `/home/simon/workspace/EyeVLM` 就是 106,814 条事件被报成
+        // 根 —— 实测一条 `/home/<user>/workspace/VisionApp` 就是 106,814 条事件被报成
         // Unattributed，而同一个项目的规范形 `wsl:Ubuntu-22.04:/home/…` 归到了。
         //
         // 归属是纯字符串匹配：**登记什么形式，就只认什么形式**。

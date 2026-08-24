@@ -11,8 +11,8 @@
 //!
 //! 压在一起时，前者的失败只能由后者去**编一个答案** —— 而它编的那个答案是 `cwd`。
 //! 实测后果：71.4% 的事件（`source = "wsl_cwd"`）从没做过项目根解析，因为 Windows
-//! 上 stat 不了 WSL 路径；同一个项目被记成 11 个 `project_root`（`EyeVLM/docs`、
-//! `EyeVLM/experimental_model/…`）。
+//! 上 stat 不了 WSL 路径；同一个项目被记成 11 个 `project_root`（`VisionApp/docs`、
+//! `VisionApp/experimental_model/…`）。
 //!
 //! 本模块只做**归属**：纯函数、零 I/O、必然给出结果（含「说不出来」那一种）。
 //! 发现在别处，产物是一份注册表喂给这里。
@@ -404,9 +404,9 @@ mod tests {
 
     #[test]
     fn attributes_a_subdirectory_to_its_root() {
-        let r = reg(&[("/home/u/EyeVLM", RootSource::Git)]);
-        let a = attribute(Some("/home/u/EyeVLM/docs/model_report"), &r);
-        assert_eq!(a.root(), Some("/home/u/EyeVLM"));
+        let r = reg(&[("/home/u/VisionApp", RootSource::Git)]);
+        let a = attribute(Some("/home/u/VisionApp/docs/model_report"), &r);
+        assert_eq!(a.root(), Some("/home/u/VisionApp"));
         assert!(a.is_attributed());
     }
 
@@ -432,16 +432,16 @@ mod tests {
         // 这是本 ADR 的要害：71.4% 的事件是这种形式，而它们在本机 stat 不了。
         // 归属是纯字符串的，所以它们照样归位。
         let r = reg(&[(
-            "wsl:Ubuntu-22.04:/home/simon/workspace/EyeVLM",
+            "wsl:Ubuntu-22.04:/home/dev/workspace/VisionApp",
             RootSource::Scan,
         )]);
         assert_eq!(
             attribute(
-                Some("wsl:Ubuntu-22.04:/home/simon/workspace/EyeVLM/experimental_model/seg"),
+                Some("wsl:Ubuntu-22.04:/home/dev/workspace/VisionApp/experimental_model/seg"),
                 &r,
             )
             .root(),
-            Some("wsl:Ubuntu-22.04:/home/simon/workspace/EyeVLM"),
+            Some("wsl:Ubuntu-22.04:/home/dev/workspace/VisionApp"),
         );
     }
 

@@ -36,7 +36,7 @@
   跨仓库                1 ← sid 是 "snapshot"，Class-B 快照的合成 id，不是真会话
 ```
 
-一个会话 11 个 `project_root`，而那 11 个全是 `EyeVLM/…` 的子目录
+一个会话 11 个 `project_root`，而那 11 个全是 `VisionApp/…` 的子目录
 （`docs/model_report`、`experimental_model/segmentation_oct/outputs/phase2`…）。
 **那不是「跨了 11 个项目」，是同一个项目被记成了 11 个。**
 
@@ -63,7 +63,7 @@ if is_unstattable_wsl {
 }
 ```
 
-⚠️ **那个守卫本身是对的**：在 Windows 上把 `/home/simon/…` 当本地路径去 walk，会去错盘、
+⚠️ **那个守卫本身是对的**：在 Windows 上把 `/home/<user>/…` 当本地路径去 walk，会去错盘、
 甚至命中无关仓库（`project_root.rs` 的测试注释里记着两次真踩过）。问题不在守卫，
 **在守卫之后做了什么**。
 
@@ -287,8 +287,8 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 > `.git`；一路没有才回退最近的构建 marker**」，**不是**原 P3 设想的「一路走到
 > 文件系统根找 `.git`」。
 >
-> 差别是承重的：前者路径上任何更近的 `.git` 都会先命中，所以 `EyeVLM/docs` 会停在
-> `EyeVLM`，永远轮不到 `~`；后者才有「命中 dotfiles 仓」的风险。
+> 差别是承重的：前者路径上任何更近的 `.git` 都会先命中，所以 `VisionApp/docs` 会停在
+> `VisionApp`，永远轮不到 `~`；后者才有「命中 dotfiles 仓」的风险。
 >
 > 唯一还能走到 home 的情况是「这条链上一个 `.git` 都没有」，所以再加一条：
 > **home 目录本身永远不算项目根**（但 home **之下**的真项目照常认 —— 排除的是
@@ -429,8 +429,8 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 匹配不上任何根：
 
 ```
-修复前   /home/simon/workspace/EyeVLM              106,814 条 → Unattributed
-         wsl:Ubuntu-22.04:/home/simon/…/EyeVLM     344,217 条 → 归到了
+修复前   /home/<user>/workspace/VisionApp              106,814 条 → Unattributed
+         wsl:Ubuntu-22.04:/home/<user>/…/VisionApp     344,217 条 → 归到了
 ```
 
 **同一个项目的两种形式，一种归到一种没有。** 修法：`probe_wsl` 的结果形式跟随
@@ -443,8 +443,8 @@ Claude Code / Codex 满足它（人在项目里敲命令）。**TumeChat 不满�
 #### 已知剩余：`/mnt/…` 那一族（43 条 Unattributed 的全部）
 
 ```
-26,572  /mnt/d/mwf/code/corneal-staining-grading
-22,256  /mnt/d/mwf/code/fbut-video-classifier
+26,572  /mnt/d/work/code/image-grading
+22,256  /mnt/d/work/code/video-classifier
  …
 ```
 

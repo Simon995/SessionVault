@@ -167,15 +167,15 @@ mod tests {
 
     #[test]
     fn a_wsl_root_is_reachable_over_unc_and_tagged_by_distro() {
-        let r = wsl_root("Ubuntu-22.04", "/home/simon");
+        let r = wsl_root("Ubuntu-22.04", "/home/dev");
         assert_eq!(r.fs_prefix, r"\\wsl.localhost\Ubuntu-22.04");
         assert_eq!(
             r.claude_home,
-            r"\\wsl.localhost\Ubuntu-22.04\home\simon\.claude"
+            r"\\wsl.localhost\Ubuntu-22.04\home\dev\.claude"
         );
         assert_eq!(
             r.codex_home,
-            r"\\wsl.localhost\Ubuntu-22.04\home\simon\.codex"
+            r"\\wsl.localhost\Ubuntu-22.04\home\dev\.codex"
         );
         assert_eq!(r.location, "wsl-Ubuntu-22.04");
     }

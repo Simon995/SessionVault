@@ -87,7 +87,7 @@ packfile，**代价远超本模块「只读 `.git/config`」的定位**。
 ## 🔴 P2 解决不了 `/mnt/…` 那一族，别把它算进收益
 
 实测另有 **114,746 条**事件的 `project_root` 是 `/mnt/…` 形式（WSL 里访问 Windows 盘
-的 checkout，如 `-mnt-d-mwf-code-EyeVLM`）。它们拿不到身份的原因**不是**「checkout 被
+的 checkout，如 `-mnt-d-work-code-VisionApp`）。它们拿不到身份的原因**不是**「checkout 被
 删了」，而是**从 Windows 侧经 UNC 回访 WSL 的 `/mnt/c` 是回环访问、被系统拒绝**。
 
 ⇒ 扫描时**同样**读不到 `.git/config` ⇒ P2 记不下任何东西。

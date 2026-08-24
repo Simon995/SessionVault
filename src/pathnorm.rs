@@ -258,7 +258,7 @@ pub fn mnt_to_windows(path: &str, mounts: &DriveMounts) -> Option<String> {
 ///   本机），**裸 Linux 与 `/mnt/…` 全落进本机分支**。
 ///
 /// 后果实测（2026-08-15）：20 个注册根里 3 个拿不到 `canonical_id`，而它们正是这两族
-/// —— 在 Windows 上 `/home/simon/…` 是当前盘的相对路径、`/mnt/c/…` 同理，
+/// —— 在 Windows 上 `/home/<user>/…` 是当前盘的相对路径、`/mnt/c/…` 同理，
 /// stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `record_identity_for_root` 丢弃。
 /// 而同一个目录的规范形那行**有**身份 ⇒ 同一份记忆按写法落进不同的桶。
 ///

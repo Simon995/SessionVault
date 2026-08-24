@@ -1131,7 +1131,7 @@ impl TotalStore {
         // 🔴 **更要紧的是它让一件事根本没法表达**：注册表只有根、没有观察者，所以
         // 「为注册表里每个根记一次身份」写不出来。身份记录因此只能挂在**事件投影**上，
         // 于是一个近期没有活动的项目 —— 哪怕注册表认得它、`.git` 就在那儿 ——
-        // 永远拿不到身份。实测：`wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar` 是
+        // 永远拿不到身份。实测：`wsl:Ubuntu-22.04:/home/<user>/workspace/QuotaBar` 是
         // `root_source=git` 的注册根，桥读得到它的 origin，而身份表里 **0 行**，
         // 因为那个项目最后一个会话文件停在一个月前。
         //
@@ -1663,7 +1663,7 @@ impl TotalStore {
     /// 从前这件事挂在 `apply_projection` 上：有事件落库才顺带记一次身份。那条路
     /// 有一个静默的盲区 —— **一个近期没有活动的项目永远拿不到身份**，哪怕注册表
     /// 认得它、`.git` 就在那儿、桥读得到它的 origin。实测：
-    /// `wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar` 是 `root_source=git` 的
+    /// `wsl:Ubuntu-22.04:/home/<user>/workspace/QuotaBar` 是 `root_source=git` 的
     /// 注册根，而身份表里 **0 行** —— 因为那个项目最后一个会话文件停在一个月前。
     ///
     /// 后果不是「少一行」：TumeFlow 的 merge key 是「有身份用身份，没有退回路径」，
@@ -6295,7 +6295,7 @@ mod project_identity_tests {
     ///
     /// 身份从前挂在 `apply_projection` 上：有事件落库才顺带记一次。于是注册表认得的
     /// 根、`.git` 就在那儿、origin 读得出来，而身份表里 **0 行**，只因为那个项目
-    /// 最近没人动过。实测形状：`wsl:Ubuntu-22.04:/home/simon/workspace/QuotaBar`
+    /// 最近没人动过。实测形状：`wsl:Ubuntu-22.04:/home/<user>/workspace/QuotaBar`
     /// 最后一个会话文件停在一个月前。
     ///
     /// 后果不是「少一行」：TumeFlow 的 merge key 是「有身份用身份、没有退回路径」，
