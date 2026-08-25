@@ -79,11 +79,15 @@ pub fn codex_config_dir() -> Option<PathBuf> {
 /// 通用 JSONL 根：**只认 `$SVAULT_JSONL_DIR`，没有默认值**。
 ///
 /// 🔴 **没有默认根是刻意的。** 这个 provider 的用途是「把外部投喂的对话变成一个
-/// **来源**」（评测适配层等把 messages 写成 append-log，再由常规扫描摄取）。
+/// **来源**」：调用方把 messages 写成 append-log，再由常规扫描摄取。
 /// 它不该在任何人的机器上默认扫任何东西 —— 环境变量没设 ⇒ `None` ⇒ 发现器跳过
-/// 并记一条 `no_config_dir`，两个消费者的行为**一个字节都不变**。
+/// 并记一条 `no_config_dir`，既有消费者的行为**一个字节都不变**。
 ///
-/// 判据：`descriptor_is_absent_without_the_env_var` 钉着这条。
+/// ⚠️ **别在这里举某个消费者当用途** —— 一个 provider 的正当性不该依赖谁在用它。
+/// 写进内核文档的消费者名字会让后来人以为它是为那件事存在的，而那个消费者消失
+/// 之后，这段注释仍然在这儿，声称一个不再成立的理由。
+///
+/// 判据：`the_generic_jsonl_provider_is_absent_without_its_env_var` 钉着这条。
 pub fn jsonl_config_dir() -> Option<PathBuf> {
     match std::env::var("SVAULT_JSONL_DIR") {
         Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
