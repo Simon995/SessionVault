@@ -112,7 +112,10 @@ fn attach_project_identities(sources: &mut [SourceRef], projects: &[SnapshotProj
 }
 
 /// 枚举本机能看到的全部 Class-B 快照来源（本机 + 每个 WSL 发行版）。
-pub fn enumerate() -> ClassBSources {
+/// `mounts` **显式传入**（不在函数里读）—— 与 `crate::project_root_registry` 同一条
+/// 理由：发现侧和归属侧必须用**同一份**运行期事实，各读一次可以拿到两份
+/// （中途 `wsl --shutdown` 就变）。它决定 `/mnt/<drive>/…` 的标识去不去 WSL 前缀。
+pub fn enumerate(mounts: &crate::pathnorm::DriveMounts) -> ClassBSources {
     // 根枚举与项目探测共用同一个上限：一个停掉的发行版会在两处都挂住，
     // 而两个独立的上限意味着最坏情况是它们之和。
     let found = crate::memory_roots::enumerate(None, probe_deadline());
@@ -149,7 +152,7 @@ pub fn enumerate() -> ClassBSources {
             let Some(encoded) = entry.file_name.to_str().map(str::to_string) else {
                 continue;
             };
-            let project_root = match decode_project_dir(&encoded, &root.fs_prefix) {
+            let project_root = match decode_project_dir(&encoded, &root.fs_prefix, mounts) {
                 DecodedProject::Found(p) => p,
                 DecodedProject::Absent => continue,
                 DecodedProject::Unresolvable(why) => {

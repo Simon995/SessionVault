@@ -700,7 +700,7 @@ fn run_sync_snapshots(store_arg: Option<PathBuf>) -> i32 {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
     };
-    let found = session_vault::class_b::enumerate();
+    let found = session_vault::class_b::enumerate(&session_vault::host_drive_mounts());
     for reason in &found.unreachable {
         emit(&Out::SyncUnreachable { reason });
     }

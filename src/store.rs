@@ -2443,11 +2443,26 @@ impl TotalStore {
             if r.root_source == "git" {
                 head.root_source = "git".to_string();
             }
-            if head.canonical_id.is_none() {
-                head.canonical_id = r.canonical_id;
-                // 判决跟着身份走 —— 分开取会得到「有身份但判决说没有」。
-                head.identity_verdict = r.identity_verdict;
-            }
+            // 🔴 **不把别人的身份嫁接给代表行**（2026-08-26 外部 review 逮到）。
+            //
+            // 上一版是「代表行没有身份就取组里任意一个非空的」。看似无害 ——
+            // 同一个目录的两种写法当然该有同一个身份。但 `NotProbed` 的含义是
+            // **「这个写法还没被扫过」**，不是「它没有身份」：
+            //
+            //   旧 `/mnt/c/w/p` 带着项目 A 的身份（扫过，但那是过去）
+            //   新 `C:\w\p` 是 NotProbed（刚出现，还没扫）
+            //   ⇒ 代表取新的（宿主可开）⇒ 继承了 A ⇒ 若那个目录如今是项目 B，
+            //      **B 的记忆全归到 A**
+            //
+            // ⚠️ 而**不合并时反倒没有这个问题**：消费方看到两行，B 的记忆归到
+            // 那个无身份的行，各自成行。所以合并**让情况变糟了** —— 这正是
+            // 「合错了没有任何东西会报错」那条判例的形状。
+            //
+            // ⇒ 代表行说不出身份就报说不出。下一轮 probe 会给它一个**当前**的
+            // 身份，那才是可信的。本仓的一贯立场：**宁可说不出来，不可给错的答案**。
+            //
+            // ⚠️ 身份行本身不受影响：`project_roots_report` 是按 `registry_key`
+            // 去 `project_identity` 表里查的，代表行**查得到它自己的**那条。
             head.first_seen_ms = head.first_seen_ms.min(r.first_seen_ms);
             head.last_seen_ms = head.last_seen_ms.max(r.last_seen_ms);
         }
@@ -3739,6 +3754,115 @@ fn event_type_key(t: EventType) -> &'static str {
 mod tests {
     use super::*;
     use crate::rawevent::{Actor, SourceLocation, TimeConfidence, TokenUsage, SCHEMA_VERSION};
+
+    // ── 根收敛（`converge_mnt_roots` / `merge_root_group`）─────────────────
+    //
+    // 🔴 **这一族此前零测试** —— 合并逻辑是 2026-08-25 加的，而「合错了没有任何
+    // 东西会报错」正是它最危险的地方：报告照常出，只是两个项目变成了一个。
+
+    fn root_row(path: &str, id: Option<&str>, verdict: IdentityVerdict) -> ProjectRootRow {
+        ProjectRootRow {
+            root_key: crate::attribution::registry_key(path, &Vec::new()),
+            root_path: path.to_string(),
+            root_source: "scan".to_string(),
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            aliases: Vec::new(),
+            canonical_id: id.map(str::to_string),
+            identity_verdict: verdict,
+        }
+    }
+
+    fn c_drive() -> crate::pathnorm::DriveMounts {
+        vec![("/mnt/c".to_string(), r"C:\".to_string())]
+    }
+
+    /// **前提**：两种写法确实收敛成一行。少了这条，下面两条断言可以在一个
+    /// 「根本没合并」的实现上照样绿 —— 本仓那条「护栏只挡它见过的形状」的反面。
+    #[test]
+    fn two_spellings_of_one_directory_converge_into_a_single_row() {
+        let rows = vec![
+            root_row("/mnt/c/w/p", None, IdentityVerdict::NotProbed),
+            root_row(r"C:\w\p", None, IdentityVerdict::NotProbed),
+        ];
+        let out = TotalStore::converge_mnt_roots(rows, &c_drive());
+        assert_eq!(
+            out.len(),
+            1,
+            "同一个目录的两种写法应收敛成一行，得到 {out:?}"
+        );
+        let head = &out[0];
+        for form in ["/mnt/c/w/p", r"C:\w\p"] {
+            assert!(
+                head.root_path == form || head.aliases.iter().any(|a| a == form),
+                "{form} 既不是代表也不在 aliases 里 ⇒ 消费方手上那种写法对不上号：{head:?}"
+            );
+        }
+    }
+
+    /// 🔴 **代表行说不出身份就报说不出，不继承组里别人的。**
+    ///
+    /// 上一版是「代表行没身份就取组里任意一个非空的」。`NotProbed` 的含义是
+    /// 「这个写法还没被扫过」，不是「它没有身份」 —— 于是一条**过去**扫到的
+    /// 身份会被嫁接到一条**当下**没扫过的行上。那个目录如今若是另一个项目，
+    /// 它的记忆全归到旧项目名下，而**没有任何东西会报错**。
+    ///
+    /// ⚠️ 断言写成「代表行的身份 == 它自己那条输入的身份」而不是写死 `None`：
+    /// 代表由 `host_openable_form` 选，跨平台会选中不同的行，而**要钉住的性质
+    /// 与选中谁无关** —— 身份归属于量到它的那一行。
+    #[test]
+    fn a_representative_reports_its_own_identity_never_a_groupmates() {
+        let inputs = vec![
+            root_row("/mnt/c/w/p", Some("gh:acme/old"), IdentityVerdict::Resolved),
+            root_row(r"C:\w\p", None, IdentityVerdict::NotProbed),
+        ];
+        let expected: Vec<(String, Option<String>)> = inputs
+            .iter()
+            .map(|r| (r.root_path.clone(), r.canonical_id.clone()))
+            .collect();
+
+        let out = TotalStore::converge_mnt_roots(inputs, &c_drive());
+        assert_eq!(out.len(), 1, "前提没成立：这两条没收敛，本条断言是空的");
+        let head = &out[0];
+        let own = expected
+            .iter()
+            .find(|(path, _)| *path == head.root_path)
+            .map(|(_, id)| id.clone())
+            .expect("代表行的路径必须来自输入之一");
+        assert_eq!(
+            head.canonical_id, own,
+            "代表行报了一个不属于它自己那条的身份 ⇒ 跨项目错误归属：{head:?}"
+        );
+        if own.is_none() {
+            assert_eq!(
+                head.identity_verdict,
+                IdentityVerdict::NotProbed,
+                "身份没继承但判决继承了 ⇒ 「没有身份」与「说它有」自相矛盾"
+            );
+        }
+    }
+
+    /// 身份**冲突**时整组不动 —— 合并要靠证据，猜一个等于替两个项目做决定。
+    #[test]
+    fn conflicting_identities_leave_the_group_unmerged() {
+        let rows = vec![
+            root_row("/mnt/c/w/p", Some("gh:acme/one"), IdentityVerdict::Resolved),
+            root_row(r"C:\w\p", Some("gh:acme/two"), IdentityVerdict::Resolved),
+        ];
+        let out = TotalStore::converge_mnt_roots(rows, &c_drive());
+        assert_eq!(out.len(), 2, "同键但身份互斥 ⇒ 不许合并，得到 {out:?}");
+    }
+
+    /// 挂载表说不出话（WSL 没跑）⇒ **照实分开**，不按路径形状猜。
+    #[test]
+    fn without_a_mount_table_nothing_converges() {
+        let rows = vec![
+            root_row("/mnt/c/w/p", None, IdentityVerdict::NotProbed),
+            root_row(r"C:\w\p", None, IdentityVerdict::NotProbed),
+        ];
+        let out = TotalStore::converge_mnt_roots(rows, &Vec::new());
+        assert_eq!(out.len(), 2, "没有挂载表就不该断定这两条是同一个目录");
+    }
 
     pub(super) fn mk_event(seq: u64, session: &str, content: Option<&str>) -> RawEvent {
         RawEvent {

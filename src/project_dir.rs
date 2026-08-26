@@ -53,8 +53,12 @@ pub enum DecodedProject {
 /// `base` 是宿主→根的文件系统前缀（ADR-033）：WSL 发行版经 UNC 到达时是
 /// `\\wsl.localhost\<distro>`（于是宿主探真实挂载点、返回宿主能打开的**物理
 /// 路径**），本机命名空间则为 `""`。
-pub fn decode_project_dir(enc: &str, base: &str) -> DecodedProject {
-    decode_project_dir_with(enc, base, probe_backend_for(base).as_ref())
+pub fn decode_project_dir(
+    enc: &str,
+    base: &str,
+    mounts: &crate::pathnorm::DriveMounts,
+) -> DecodedProject {
+    decode_project_dir_with(enc, base, probe_backend_for(base).as_ref(), mounts)
 }
 
 /// 按 root 的宿主前缀挑探测后端。
@@ -84,6 +88,7 @@ pub fn decode_project_dir_with(
     enc: &str,
     base: &str,
     backend: &dyn ProbeBackend,
+    mounts: &crate::pathnorm::DriveMounts,
 ) -> DecodedProject {
     let bytes = enc.as_bytes();
     let (root, encoded_path) = if !base.is_empty() {
@@ -152,7 +157,7 @@ pub fn decode_project_dir_with(
             None => DecodedProject::Absent,
         }
     } else {
-        DecodedProject::Found(drive_mount_identity(&path.to_string_lossy(), base))
+        DecodedProject::Found(drive_mount_identity(&path.to_string_lossy(), base, mounts))
     }
 }
 
@@ -175,11 +180,22 @@ pub fn decode_project_dir_with(
 /// 消费方拿事件里的写法去 `roots` 查身份 —— **查不到**，于是同一个仓在它的界面上
 /// 成了两个项目。两个出口对同一个问题给不同答案，正是本仓反复写规则去防的形状。
 ///
-/// ⚠️ **只对 `/mnt/<drive>/…` 生效**：`/home/<user>/…` 确实住在发行版里，它的标识
-/// 必须带前缀，否则在 Windows 上会被当成当前盘的相对路径 —— 那不是打不开，
-/// 是打开了错的东西。判据是 [`crate::pathnorm::is_windows_drive_mount`]，
-/// 与其它调用点同一个函数。
-fn drive_mount_identity(full: &str, base: &str) -> String {
+/// ⚠️ **只对确认指向 Windows 盘的那些生效**：`/home/<user>/…` 确实住在发行版里，
+/// 它的标识必须带前缀，否则在 Windows 上会被当成当前盘的相对路径 —— 那不是
+/// 打不开，是打开了错的东西。
+///
+/// 🔴 **判据是[挂载表](crate::pathnorm::mnt_to_windows)确认，不是路径长什么样**
+/// （2026-08-26 订正）。此前写的是 `is_windows_drive_mount`（纯字符串形状
+/// `/mnt/<单字母>/…`），而本仓别处早就规定这类判断要查实测挂载表 —— 理由逐字
+/// 写在 `pathnorm::RootReach` 那段：`automount.root` 可以改、配置改了可能没重启、
+/// `/mnt/data` 这类普通 Linux 挂载压根不是盘。
+///
+/// 这里判错的后果**不是**「换算成了错的盘」（本函数不换算），而是**丢掉发行版
+/// 区分**：两个 distro 各有一个 ext4 上的普通目录 `/mnt/c/proj`，两边都会被输出成
+/// 同一个 `/mnt/c/proj` ⇒ 消费方把**两个真实项目**的记忆合并。
+///
+/// 表说不出话（WSL 没跑）⇒ 保守：**保留前缀，不合并**。
+fn drive_mount_identity(full: &str, base: &str, mounts: &crate::pathnorm::DriveMounts) -> String {
     if base.is_empty() {
         return full.to_string();
     }
@@ -190,7 +206,19 @@ fn drive_mount_identity(full: &str, base: &str) -> String {
         "/{}",
         rest.trim_start_matches(['\\', '/']).replace('\\', "/")
     );
-    if crate::pathnorm::is_windows_drive_mount(&posix) {
+    // 🔴 **判据是挂载表确认，不是路径长什么样**（2026-08-26 外部 review 逮到）。
+    //
+    // 上一版用 `is_windows_drive_mount`（纯字符串：`/mnt/<单字母>/…`），而本仓
+    // 别处早就规定这类换算必须查实测挂载表（`pathnorm::RootReach` 那段逐字写着
+    // 理由：`automount.root` 改过、配置改了没重启、`/mnt/data` 这类普通挂载 ——
+    // 三种情况下形状判据都是错的）。
+    //
+    // 这里错的后果不是「换算成了错的盘」（本函数不做换算），而是**丢掉发行版
+    // 区分**：两个 distro 各有一个 ext4 上的普通目录 `/mnt/c/proj` 时，两边都会
+    // 被输出成同一个 `/mnt/c/proj` ⇒ 消费方把**两个真实项目**的记忆合并。
+    //
+    // 挂载表说不出话时（WSL 没跑）⇒ 保守：**保留前缀，不合并**。
+    if crate::pathnorm::mnt_to_windows(&posix, mounts).is_some() {
         posix
     } else {
         full.to_string()
@@ -309,13 +337,58 @@ mod tests {
     /// 而事件里的 `project_root` 是 UNC 前缀 + 同一段 —— **同一个 svault 两个出口
     /// 两种写法**，消费方按事件里的写法去 roots 查身份查不到，同一个仓于是在它的
     /// 界面上成了两个项目。
+    /// 没有挂载表 —— WSL 没跑起来时的真实形态。
+    fn no_mounts() -> crate::pathnorm::DriveMounts {
+        Vec::new()
+    }
+
+    /// 测试用的挂载表 —— `/mnt/c` 确认是 Windows 的 C 盘。
+    fn mounts_with_c() -> crate::pathnorm::DriveMounts {
+        vec![("/mnt/c".to_string(), r"C:\".to_string())]
+    }
+
     #[test]
     fn a_drive_mount_identity_drops_the_wsl_prefix() {
         let base = r"\\wsl.localhost\D";
         assert_eq!(
-            drive_mount_identity(&format!(r"{base}\mnt\c\Users\dev\proj"), base),
+            drive_mount_identity(
+                &format!(r"{base}\mnt\c\Users\dev\proj"),
+                base,
+                &mounts_with_c()
+            ),
             "/mnt/c/Users/dev/proj",
-            "指向 Windows 盘的路径，标识不该带发行版前缀"
+            "挂载表确认是 Windows 盘 ⇒ 标识不该带发行版前缀"
+        );
+    }
+
+    /// 🔴 **挂载表说不出话时保守：保留前缀，不合并。**
+    ///
+    /// 判据从「路径长什么样」换成「挂载表确认」（2026-08-26 外部 review 逮到）：
+    /// `automount.root` 改过、配置改了没重启、或 `/mnt/data` 这类普通 Linux 挂载
+    /// 时，形状判据都是错的。而这里错的后果是**丢掉发行版区分** —— 两个 distro
+    /// 各有一个 ext4 上的 `/mnt/c/proj` 会被输出成同一个标识，消费方于是把
+    /// **两个真实项目**的记忆合并。
+    #[test]
+    fn without_a_mount_table_the_prefix_stays() {
+        let base = r"\\wsl.localhost\D";
+        let full = format!(r"{base}\mnt\c\Users\dev\proj");
+        assert_eq!(
+            drive_mount_identity(&full, base, &Vec::new()),
+            full,
+            "挂载表为空时不许猜 /mnt/c 是哪个盘 —— 保留前缀，两个发行版才分得开"
+        );
+    }
+
+    /// **成对的另一半**：挂载表在、但这条路径**不在表里**（普通 Linux 挂载）
+    /// ⇒ 同样保留前缀。
+    #[test]
+    fn a_plain_linux_mount_keeps_the_prefix() {
+        let base = r"\\wsl.localhost\D";
+        let full = format!(r"{base}\mnt\data\proj");
+        assert_eq!(
+            drive_mount_identity(&full, base, &mounts_with_c()),
+            full,
+            "/mnt/data 不是 Windows 盘 —— 它住在发行版里，前缀必须留"
         );
     }
 
@@ -329,7 +402,7 @@ mod tests {
         let base = r"\\wsl.localhost\D";
         let full = format!(r"{base}\home\dev\proj");
         assert_eq!(
-            drive_mount_identity(&full, base),
+            drive_mount_identity(&full, base, &mounts_with_c()),
             full,
             "住在发行版里的路径，标识必须带前缀"
         );
@@ -339,7 +412,7 @@ mod tests {
     #[test]
     fn a_local_identity_is_untouched() {
         assert_eq!(
-            drive_mount_identity(r"C:\w\proj", ""),
+            drive_mount_identity(r"C:\w\proj", "", &mounts_with_c()),
             r"C:\w\proj",
             "本地路径不该被动"
         );
@@ -384,14 +457,14 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
 
         assert_eq!(
-            decode_project_dir(&enc_of(&project), ""),
+            decode_project_dir(&enc_of(&project), "", &no_mounts()),
             DecodedProject::Found(project.to_string_lossy().into_owned())
         );
 
         // 路径已不存在 → `Absent`（项目被删了）。**探明白了没有**，不是没问成。
         let gone = root.join("work").join("ghost");
         assert_eq!(
-            decode_project_dir(&enc_of(&gone), ""),
+            decode_project_dir(&enc_of(&gone), "", &no_mounts()),
             DecodedProject::Absent
         );
 
@@ -428,7 +501,7 @@ mod tests {
         }
 
         assert_eq!(
-            decode_project_dir_with(&enc, "", &probe::LocalBackend::unanchored()),
+            decode_project_dir_with(&enc, "", &probe::LocalBackend::unanchored(), &no_mounts()),
             DecodedProject::Found(decoy.to_string_lossy().into_owned()),
             "前提：探测全成功时这份布局解得出更短的那条 —— 否则下面那条断言是空的"
         );
@@ -440,7 +513,7 @@ mod tests {
                 probe::LocalBackend::unanchored().probe(p, Deadline::unbounded())
             }
         });
-        match decode_project_dir_with(&enc, "", &flaky) {
+        match decode_project_dir_with(&enc, "", &flaky, &no_mounts()) {
             DecodedProject::Unresolvable(_) => {}
             other => panic!("更长候选没问成却接受了更短的 ⇒ 跨项目错误归属，得到 {other:?}"),
         }
@@ -458,10 +531,13 @@ mod tests {
         let enc = "-home-dev-my-proj-with-dash";
 
         assert_eq!(
-            decode_project_dir(enc, &base.to_string_lossy()),
+            decode_project_dir(enc, &base.to_string_lossy(), &no_mounts()),
             DecodedProject::Found(proj.to_string_lossy().into_owned())
         );
-        assert_eq!(decode_project_dir(enc, ""), DecodedProject::Absent);
+        assert_eq!(
+            decode_project_dir(enc, "", &no_mounts()),
+            DecodedProject::Absent
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
