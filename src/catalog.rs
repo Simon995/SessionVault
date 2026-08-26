@@ -36,13 +36,52 @@ pub enum Status {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
     /// 相对 provider 配置根的子目录（如 `projects` / `sessions`）。
+    /// **空串 = 配置根自身**（`root.join("")` 等价于 `root`）。
     pub subdir: String,
-    /// 文件匹配 glob（如 `**/*.jsonl`）。
+    /// 文件匹配 glob。两种形态：
+    /// - 含通配符（`**/*.jsonl` / `*.md`）—— 按后缀收集，`recursive` 决定层数；
+    /// - **不含通配符**（`CLAUDE.md`）—— 那就是个**精确文件名**，按名字过滤。
     pub glob: String,
     pub source_mode: SourceMode,
     pub status: Status,
     /// 是否递归子目录发现。
     pub recursive: bool,
+    /// 这份制品**是什么类别** —— 消费方按它分派（TumeFlow 的 Class-B 就是
+    /// 按 `instruction` 走另一条解析）。
+    ///
+    /// 🔴 **声明，不是从 `glob` 猜**（2026-08-26 改）。此前是
+    /// `fn artifact_kind(mode, glob)`：`.rules` 结尾算 `rules`，**其余一律
+    /// `memory`**。于是往表里加一条 `CLAUDE.md` 会被判成 `memory`，而消费方
+    /// 按 `instruction` 分派 —— 加一行数据，行为在另一个文件里悄悄错掉，
+    /// 且没有任何东西会报。
+    ///
+    /// ⚠️ `AppendLog` 没有类别（它是会话流，不是状态快照）⇒ `None`。
+    #[serde(default)]
+    pub kind: Option<ArtifactKind>,
+}
+
+/// 状态快照的类别。**与 `RawEvent.artifact_kind` 的取值一一对应**，
+/// 序列化成同样的小写串，消费方（TumeFlow `snapshot.py`）据此分派。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    /// agent 自己写下的、已原子化的记忆文件。
+    Memory,
+    /// 授权规则一类的程序性记忆。
+    Rules,
+    /// **人手写的指令文件**（`CLAUDE.md` / `AGENTS.md`）——
+    /// 项目级的，以及**配置根下那份全局的**。
+    Instruction,
+}
+
+impl ArtifactKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Rules => "rules",
+            Self::Instruction => "instruction",
+        }
+    }
 }
 
 /// 一个 provider 的完整描述符（来源族 + 其下实现）。
@@ -109,6 +148,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::AppendLog,
                     status: Status::Stable,
                     recursive: true,
+                    kind: None,
                 },
                 Artifact {
                     subdir: "sessions".to_string(),
@@ -116,6 +156,23 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::AppendLog,
                     status: Status::Stable,
                     recursive: true,
+                    kind: None,
+                },
+                Artifact {
+                    // 🔴 **配置根下那份全局 `CLAUDE.md`**（2026-08-26 加）。
+                    //
+                    // 它此前不在表里，于是消费方两条路都拿不到它：主路径（快照）
+                    // 不扫，回落路径（TumeFlow 的直读 adapter）当时也跳过。实测那台
+                    // 机器上它有 33 KB、剥掉托管块后 3278 字**全是人手写的规则**。
+                    //
+                    // `subdir: ""` = 配置根自身；`glob` 不含通配符 ⇒ 按**精确文件名**
+                    // 匹配（见 `Artifact::glob` 的文档），所以不会顺带收走根下别的 `.md`。
+                    subdir: String::new(),
+                    glob: "CLAUDE.md".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: false,
+                    kind: Some(ArtifactKind::Instruction),
                 },
                 Artifact {
                     subdir: "projects".to_string(),
@@ -123,6 +180,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::SnapshotFile,
                     status: Status::Experimental,
                     recursive: true,
+                    kind: Some(ArtifactKind::Memory),
                 },
             ],
         },
@@ -137,6 +195,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::AppendLog,
                     status: Status::Stable,
                     recursive: true,
+                    kind: None,
                 },
                 Artifact {
                     subdir: "archived_sessions".to_string(),
@@ -144,6 +203,17 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::AppendLog,
                     status: Status::Experimental,
                     recursive: true,
+                    kind: None,
+                },
+                Artifact {
+                    // 🔴 **配置根下那份全局 `AGENTS.md`** —— 与 Claude 那条同理。
+                    // 实测 30 KB、剥掉托管块后 1491 字。
+                    subdir: String::new(),
+                    glob: "AGENTS.md".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: false,
+                    kind: Some(ArtifactKind::Instruction),
                 },
                 Artifact {
                     subdir: "memories".to_string(),
@@ -151,6 +221,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::SnapshotFile,
                     status: Status::Experimental,
                     recursive: false,
+                    kind: Some(ArtifactKind::Memory),
                 },
                 Artifact {
                     subdir: "memories/rollout_summaries".to_string(),
@@ -158,6 +229,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::SnapshotFile,
                     status: Status::Experimental,
                     recursive: false,
+                    kind: Some(ArtifactKind::Memory),
                 },
                 Artifact {
                     subdir: "memories/extensions/ad_hoc/notes".to_string(),
@@ -165,6 +237,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::SnapshotFile,
                     status: Status::Experimental,
                     recursive: false,
+                    kind: Some(ArtifactKind::Memory),
                 },
                 Artifact {
                     subdir: "rules".to_string(),
@@ -172,6 +245,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     source_mode: SourceMode::SnapshotFile,
                     status: Status::Experimental,
                     recursive: false,
+                    kind: Some(ArtifactKind::Rules),
                 },
             ],
         },
@@ -190,6 +264,8 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                 source_mode: SourceMode::AppendLog,
                 status: Status::Experimental,
                 recursive: true,
+                // AppendLog 是会话流，不是状态快照 ⇒ 没有类别。
+                kind: None,
             }],
         },
     ]
@@ -198,6 +274,69 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔴 **配置根下那份全局指令文件必须在表里** —— 两个 provider 各一条。
+    ///
+    /// 它此前不在，于是消费方两条路都拿不到它（主路径快照不扫、回落路径也跳过）。
+    /// 实测那台机器上四份加起来近 10 万字**全是人手写的规则**，而记忆层的核心
+    /// 价值正是把它们同步到各个 agent。
+    #[test]
+    fn the_global_instruction_file_is_declared_for_both_providers() {
+        let found: Vec<_> = builtin_descriptors()
+            .into_iter()
+            .flat_map(|d| {
+                d.artifacts
+                    .into_iter()
+                    .filter(|a| a.subdir.is_empty())
+                    .map(move |a| (d.source_type, a))
+            })
+            .collect();
+        assert_eq!(found.len(), 2, "配置根下的制品应当恰好两条：{found:?}");
+        for (_, art) in &found {
+            assert!(
+                art.glob == "CLAUDE.md" || art.glob == "AGENTS.md",
+                "配置根下只该声明指令文件，得到 {}",
+                art.glob
+            );
+            assert_eq!(
+                art.kind,
+                Some(ArtifactKind::Instruction),
+                "{} 的类别不是 instruction —— 消费方会走错分派",
+                art.glob
+            );
+            assert_eq!(art.source_mode, SourceMode::SnapshotFile);
+            assert!(!art.recursive, "配置根不该递归扫");
+        }
+    }
+
+    /// 🔴 **每条快照制品都得声明类别，一条都不许漏。**
+    ///
+    /// 上一版类别是从 `glob` 猜的（`.rules` → rules，**其余一律 memory**）。
+    /// 于是往表里加一行数据，行为会在另一个文件里悄悄错掉，且没有任何东西会报。
+    /// 现在它是声明 —— 而声明的价值取决于**没有人忘记写**。
+    #[test]
+    fn every_snapshot_artifact_declares_its_kind() {
+        for d in builtin_descriptors() {
+            for art in d.artifacts {
+                match art.source_mode {
+                    SourceMode::SnapshotFile => assert!(
+                        art.kind.is_some(),
+                        "{:?} 的 {}/{} 没声明类别",
+                        d.source_type,
+                        art.subdir,
+                        art.glob
+                    ),
+                    // 会话流不是状态快照 —— 它**必须**没有类别，而不是随便填一个。
+                    _ => assert!(
+                        art.kind.is_none(),
+                        "{:?} 的 {} 是 AppendLog 却带了类别",
+                        d.source_type,
+                        art.glob
+                    ),
+                }
+            }
+        }
+    }
 
     /// 🔴 **加一个内置 provider 会改变每个消费者的行为 —— 除非它默认不存在。**
     ///

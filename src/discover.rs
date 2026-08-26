@@ -384,7 +384,7 @@ fn discover_by_mode(
                     source_mode: art.source_mode,
                     path,
                     project_root: None,
-                    artifact_kind: artifact_kind(art.source_mode, &art.glob),
+                    artifact_kind: artifact_kind(art),
                 });
             }
         }
@@ -451,7 +451,16 @@ fn discover_wsl(
                 if art.source_mode != wanted {
                     continue;
                 }
-                let rel = format!("{base}/{}", art.subdir);
+                // 🔴 `subdir` 为空 = **配置根自身**，此时不许拼出尾部斜杠：
+                // 下面 `!recursive` 那道 retain 比的是 `parent.ends_with(&rel)`，
+                // 而 parent（`/home/<user>/.claude`）没有尾斜杠 ⇒ `.claude/` 恒不匹配
+                // ⇒ **WSL 侧那份全局指令文件被整个过滤掉**（实测：Windows 两份进来了、
+                // WSL 两份没有，而用户在两边各有一份）。
+                let rel = if art.subdir.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}/{}", art.subdir)
+                };
                 let Some(suffix) = artifact_suffix(&art.glob) else {
                     log::warn!(target: tag::DISCOVER, "unsupported artifact glob: {}", art.glob);
                     continue;
@@ -479,6 +488,17 @@ fn discover_wsl(
                             .is_some_and(|(parent, _)| parent.ends_with(&rel))
                     });
                 }
+                // 与本机侧同一条规则：不含通配符 ⇒ 精确文件名。
+                // ⚠️ 两侧各写一份是这段代码的既有形状（一个走 std 遍历、一个走
+                // `wsl find`），**改一处要记得改另一处** —— 全局指令文件正是
+                // 两侧都要扫的那类（用户在 Windows 与 WSL 各有一份）。
+                if !art.glob.contains('*') {
+                    files.retain(|p| {
+                        p.rsplit_once('/')
+                            .map(|(_, name)| name == art.glob)
+                            .unwrap_or(p == &art.glob)
+                    });
+                }
                 if art.glob == "**/memory/*.md" {
                     files.retain(|p| {
                         p.rsplit_once('/')
@@ -497,7 +517,7 @@ fn discover_wsl(
                         source_mode: art.source_mode,
                         path: PathBuf::from(p),
                         project_root: None,
-                        artifact_kind: artifact_kind(art.source_mode, &art.glob),
+                        artifact_kind: artifact_kind(art),
                     });
                 }
             }
@@ -514,18 +534,18 @@ fn discover_wsl(
 ) {
 }
 
-fn artifact_kind(mode: SourceMode, glob: &str) -> Option<String> {
-    if mode != SourceMode::SnapshotFile {
-        return None;
-    }
-    Some(
-        if glob.ends_with(".rules") {
-            "rules"
-        } else {
-            "memory"
-        }
-        .to_string(),
-    )
+/// 这份制品的类别 —— **读描述符里的声明，不再从 `glob` 猜**（2026-08-26）。
+///
+/// 🔴 上一版是 `if glob.ends_with(".rules") { "rules" } else { "memory" }`：
+/// 除了 `.rules` **一律 memory**。于是往 `catalog` 里加一条 `CLAUDE.md`
+/// 会被判成 `memory`，而消费方按 `instruction` 分派 —— **加一行数据，行为在
+/// 另一个文件里悄悄错掉，且没有任何东西会报**。
+///
+/// ⚠️ `AppendLog` 仍然没有类别（会话流不是状态快照）。这里**不再自己判**
+/// 那一条：`catalog` 里那些 `AppendLog` 条目的 `kind` 就是 `None`，
+/// 判据只有一处。
+fn artifact_kind(art: &crate::catalog::Artifact) -> Option<String> {
+    art.kind.map(|k| k.as_str().to_string())
 }
 
 fn artifact_suffix(glob: &str) -> Option<&str> {
@@ -564,6 +584,14 @@ pub fn collect_artifact_files_reported(
         return (out, false);
     };
     collect_files_into(dir, recursive, suffix, &mut out, &mut failed);
+    // 🔴 **不含通配符的 glob 就是个精确文件名。**
+    //
+    // 按后缀收集会把同目录下别的同后缀文件一起收走 —— 配置根下除了
+    // `CLAUDE.md` 还可能躺着别的 `.md`。这是条**通用规则**，不是为某一条
+    // 开的特例（下面那个 `**/memory/*.md` 才是特例，它得留着）。
+    if !glob.contains('*') {
+        out.retain(|p| p.file_name().and_then(|s| s.to_str()) == Some(glob));
+    }
     if glob == "**/memory/*.md" {
         out.retain(|p| {
             p.parent()
@@ -901,6 +929,34 @@ mod tests {
     /// ⚠️ 少了这一条，把整个 `probe_host_file` 写成恒 `Failed` 也能通过上面那条 ——
     /// 而那会让每个没写过 CLAUDE.md 的项目永久带着一个假故障，正是 AGENTS.md
     /// 里那句「目录不存在是事实」在防的。
+    /// 🔴 **不含通配符的 glob = 精确文件名**，不是「按后缀收整个目录」。
+    ///
+    /// 配置根下除了 `CLAUDE.md` 还躺着别的 `.md`；只按后缀收会把它们一起当成
+    /// 指令文件送进消费方。
+    #[test]
+    fn an_exact_filename_glob_matches_only_that_file() {
+        let dir = std::env::temp_dir().join(format!("sv-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["CLAUDE.md", "NOTES.md", "README.md"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+
+        let (got, failed) = super::collect_artifact_files_reported(&dir, "CLAUDE.md", false);
+        assert!(!failed);
+        let names: Vec<_> = got
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
+            .collect();
+        assert_eq!(names, vec!["CLAUDE.md"], "精确文件名收走了别的 .md");
+
+        // 成对的另一半：带通配符时仍然按后缀收全部 —— 否则这条改动会把
+        // `*.md` 那些既有条目一起改掉，而它们靠的正是「按后缀收」。
+        let (all, _) = super::collect_artifact_files_reported(&dir, "*.md", false);
+        assert_eq!(all.len(), 3, "带通配符的 glob 不该被精确匹配影响");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_root_without_instruction_files_is_absent_not_unreachable() {
         let dir = std::env::temp_dir().join(format!(
