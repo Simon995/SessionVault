@@ -2197,7 +2197,10 @@ impl TotalStore {
     ///
     /// 🔴 **不分页**：根是 O(100) 的有界集合。加 `--limit` 只会引入一条静默截断的
     /// 路径（`sessions-read` 为此不得不带 `truncated` 标志），收益为零。
-    pub fn project_roots_report(&self) -> Result<(Vec<ProjectRootRow>, i64), String> {
+    pub fn project_roots_report(
+        &self,
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> Result<(Vec<ProjectRootRow>, i64), String> {
         let conn = self
             .conn
             .lock()
@@ -2301,6 +2304,22 @@ impl TotalStore {
         for row in rows {
             out.push(row.map_err(|e| format!("decode project_root_registry row failed: {e}"))?);
         }
+        // 🔴 **收敛 `/mnt/<drive>/…` 与它的宿主形式 —— 这是本出口的责任。**
+        //
+        // `register_project_root` **故意**用空挂载表算存储键（那个键只用于本表去重），
+        // 并在注释里把收敛的责任交了出去：「归属结果照样与宿主形式那条收敛到一起」。
+        // 那句话对**归属**成立 —— 归属走 `project_root_registry()`，它重算键时带表。
+        // 但**本出口不走归属**，它直接吐存储行，于是收敛从未在这里发生。
+        //
+        // 实机后果（2026-08-26）：同一个仓的 `/mnt/c/users/<user>/workspace/<repo>`
+        // 与 `c:/users/<user>/workspace/<repo>` 作为两条根发出去，消费方看到两个项目。
+        // 而 `snapshots` 那个出口（走 class_b，握着 `fs_prefix`）给的是**能打开的**
+        // UNC 形 —— **同一个 svault 的两个出口对同一个项目给了不同答案**。
+        //
+        // ⚠️ 复用 `registry_key`，不在这里写第二套归一化：它是「同一个目录只能有
+        // 一个键」这条规则的唯一定义点，而本仓的头号复发缺陷正是同一条规则两份实现。
+        let out = Self::converge_mnt_roots(out, mounts);
+
         // 同一次持锁 —— 见上方「为什么清单与修订号是一次调用」。
         let revision: i64 = conn
             .query_row(
@@ -2317,6 +2336,123 @@ impl TotalStore {
                     .map_err(|e| format!("attribution_revision is not an integer ({v:?}): {e}"))
             })?;
         Ok((out, revision))
+    }
+
+    /// 把 `/mnt/<drive>/…` 与它的宿主形式合成一行 —— **`roots` 出口的收敛**。
+    ///
+    /// # 为什么在这里，而不是在存储层
+    ///
+    /// 存储键**故意**不收敛（[`TotalStore::register_project_root`] 传空挂载表：那个键
+    /// 只用于本表去重）。收敛需要挂载表，而挂载表是**运行期事实** —— WSL 没在跑时
+    /// 取不到。让它参与持久键，同一条路径就会因为「当时 WSL 在不在」算出两个键，
+    /// 而键写进去就不再变。**一个取决于瞬时状态的值没有资格当键。**
+    ///
+    /// 所以收敛属于**读出来的那一刻**：这一轮拿得到表就并，拿不到就照实分开，
+    /// 下一轮拿到了自动并上 —— 没有需要迁移的历史包袱。
+    ///
+    /// # 合并规则（每条都要能说出判据）
+    ///
+    /// | 字段 | 取谁 | 判据 |
+    /// | --- | --- | --- |
+    /// | `root_path` | **宿主打得开**的那个；都打不开取字典序最小 | 消费方拿它去 `open()`；字典序保证全序，否则同组每次换代表、界面看起来在跳 |
+    /// | `aliases` | 各成员写法的并集（不含 `root_path`） | 「同一个项目的其它写法」正是本字段的语义 |
+    /// | `root_source` | `git` 优先 | 它是更强的证据；`marker`（有 CLAUDE.md）是回退 |
+    /// | `canonical_id` | 非空的那个 | 🔴 **两个都非空且不同 ⇒ 不合并**，见下 |
+    /// | `identity_verdict` | 跟着 `canonical_id` 走 | 判决与身份必须同源，否则「有身份但判决说没有」 |
+    /// | `first_seen_ms` / `last_seen_ms` | min / max | 组的存活区间 |
+    ///
+    /// 🔴 **身份冲突时不合并。** 两条根算出同一个挂载键、却带着**不同**的
+    /// `canonical_id`，说明有个前提错了（挂载表过期？两个仓恰好挂在同一处？）。
+    /// 合并会把两个项目的记忆混在一起，而且**不报错** —— 那正是本仓
+    /// 「合错了没有任何东西会报错」那条判例的形状。宁可多一行，不可错并。
+    fn converge_mnt_roots(
+        rows: Vec<ProjectRootRow>,
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> Vec<ProjectRootRow> {
+        if mounts.is_empty() {
+            // 表为空 ⇒ `registry_key` 一律走 `None` 分支 ⇒ 分组等于按原键分，
+            // 白跑一趟。**照实分开**，并由调用方把「这一轮没能收敛」说出去。
+            return rows;
+        }
+        let mut order: Vec<String> = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<ProjectRootRow>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let key = crate::attribution::registry_key(&row.root_path, mounts);
+            if !groups.contains_key(&key) {
+                order.push(key.clone());
+            }
+            groups.entry(key).or_default().push(row);
+        }
+        let mut out = Vec::with_capacity(order.len());
+        for key in order {
+            let group = groups.remove(&key).unwrap_or_default();
+            match Self::merge_root_group(group) {
+                Ok(row) => out.push(row),
+                Err(unmerged) => out.extend(unmerged),
+            }
+        }
+        out
+    }
+
+    /// 一组同键的根 → 一行。身份冲突时原样返回整组（`Err`），**不猜**。
+    fn merge_root_group(
+        mut group: Vec<ProjectRootRow>,
+    ) -> Result<ProjectRootRow, Vec<ProjectRootRow>> {
+        if group.len() <= 1 {
+            return match group.pop() {
+                Some(row) => Ok(row),
+                // 空组进不来（分组时每个键至少一行），但**不用 `unwrap`**：
+                // 真进来了该是「这一组没有行」，不是 panic 掉整份报告。
+                None => Err(Vec::new()),
+            };
+        }
+        // 🔴 身份冲突 ⇒ 整组不动（见 `converge_mnt_roots` 的表）。
+        let mut ids = group.iter().filter_map(|r| r.canonical_id.as_deref());
+        if let Some(first) = ids.next() {
+            if ids.any(|other| other != first) {
+                log::warn!(
+                    target: crate::logging::tag::SQLITE,
+                    "root convergence skipped: same mount key, conflicting identities ({} rows)",
+                    group.len()
+                );
+                return Err(group);
+            }
+        }
+        // 代表：宿主打得开的优先；其次字典序最小（全序，不跳）。
+        group.sort_by(|a, b| {
+            let openable = |r: &ProjectRootRow| {
+                crate::project_dir::host_openable_form(
+                    &r.root_path,
+                    &r.aliases,
+                    crate::pathnorm::HostPlatform::current(),
+                )
+                .is_some()
+            };
+            openable(b)
+                .cmp(&openable(a))
+                .then_with(|| a.root_path.cmp(&b.root_path))
+        });
+        let mut head = group.remove(0);
+        for r in group {
+            for form in std::iter::once(r.root_path.clone()).chain(r.aliases) {
+                if form != head.root_path && !head.aliases.contains(&form) {
+                    head.aliases.push(form);
+                }
+            }
+            if r.root_source == "git" {
+                head.root_source = "git".to_string();
+            }
+            if head.canonical_id.is_none() {
+                head.canonical_id = r.canonical_id;
+                // 判决跟着身份走 —— 分开取会得到「有身份但判决说没有」。
+                head.identity_verdict = r.identity_verdict;
+            }
+            head.first_seen_ms = head.first_seen_ms.min(r.first_seen_ms);
+            head.last_seen_ms = head.last_seen_ms.max(r.last_seen_ms);
+        }
+        head.aliases.sort();
+        Ok(head)
     }
 
     /// 注册表里有多少个根。诊断用（验收第 3 条：`Unattributed` 的数量要报得出来）。
@@ -6519,6 +6655,100 @@ mod project_identity_tests {
     }
 
     #[test]
+    fn roots_report_converges_a_mnt_root_with_its_host_form() {
+        // 🔴 **`roots` 出口的收敛。** 存储层故意不收敛（键只用于本表去重，见
+        // `register_project_root`），并把责任交给读出的那一刻。而本出口从前直接吐
+        // 存储行 ⇒ 收敛从未发生 ⇒ 同一个仓以两条根发出去，消费方看到两个项目。
+        //
+        // 实机（2026-08-26）：TumeFlow 的作用域列表里同一个仓出现两行，
+        // 而 `snapshots` 出口给的却是能打开的 UNC 形 —— **同一个 svault 的两个出口
+        // 对同一个项目给了不同答案**。
+        let st = TotalStore::open_in_memory().unwrap();
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        st.register_project_root("/mnt/c/w/proj", RootSource::Git);
+        st.register_project_root(r"C:\w\proj", RootSource::Git);
+
+        // 存储层照旧是两行 —— 那是设计，别在这里改它。
+        let (raw, _) = st.project_roots_report(&Vec::new()).unwrap();
+        assert_eq!(raw.len(), 2, "空表下照实分开（成对断言的另一半在下一条）");
+
+        let (rows, _) = st.project_roots_report(&mounts).unwrap();
+        assert_eq!(rows.len(), 1, "有挂载表就该收敛成一行");
+        let row = &rows[0];
+        // 代表取**宿主打得开**的那个：消费方拿它去 open()。
+        assert_eq!(row.root_path, r"C:\w\proj");
+        // 另一种写法进 aliases —— 「同一个项目的其它写法」正是这个字段的语义，
+        // 而消费方手上的路径未必是代表那种形式。
+        assert!(
+            row.aliases.iter().any(|a| a == "/mnt/c/w/proj"),
+            "另一种写法要留在 aliases 里：{:?}",
+            row.aliases
+        );
+    }
+
+    #[test]
+    fn roots_report_refuses_to_merge_conflicting_identities() {
+        // 🔴 **合错了没有任何东西会报错** —— 所以宁可多一行，不可错并。
+        // 两条根算出同一个挂载键、却带着不同的 `canonical_id`，说明有个前提错了
+        // （挂载表过期？两个仓恰好挂在同一处？）。合并会把两个项目的记忆混在一起。
+        let st = TotalStore::open_in_memory().unwrap();
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        st.register_project_root("/mnt/c/w/proj", RootSource::Git);
+        st.register_project_root(r"C:\w\proj", RootSource::Git);
+        {
+            // 直接插身份行 —— 与 `a_differently_spelled_identity_row_still_matches`
+            // 同一种造法（生产路径要跑真扫描，这条测的不是那个）。
+            let conn = st.conn.lock().unwrap();
+            for (root, cid) in [
+                ("/mnt/c/w/proj", "git:example.com/a"),
+                ("c:/w/proj", "git:example.com/b"),
+            ] {
+                conn.execute(
+                    "INSERT INTO project_identity                        (project_root, canonical_id, first_seen_ms, last_seen_ms)                      VALUES (?1, ?2, 1, 2)",
+                    rusqlite::params![root, cid],
+                )
+                .unwrap();
+            }
+        }
+
+        let (rows, _) = st.project_roots_report(&mounts).unwrap();
+        assert_eq!(rows.len(), 2, "身份冲突时整组不动");
+    }
+
+    #[test]
+    fn identical_identities_do_merge() {
+        // 🔴 **上一条的对照，缺了它上一条几乎不设防。**
+        //
+        // 变异验证时发现的：把收敛整个去掉，`roots_report_refuses_to_merge_*`
+        // **照样绿** —— 它断言「两行」，而没有收敛时本来就是两行。
+        // 那条测试因此分不出「因为身份冲突所以没合并」与「根本没有合并这回事」。
+        //
+        // 这一条把原因钉死：**同样的两条根、身份相同 ⇒ 必须合并**。
+        // 两条一起才说明「不合并」是那个 `Err(group)` 分支干的。
+        let st = TotalStore::open_in_memory().unwrap();
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        st.register_project_root("/mnt/c/w/proj", RootSource::Git);
+        st.register_project_root(r"C:\w\proj", RootSource::Git);
+        {
+            let conn = st.conn.lock().unwrap();
+            for root in ["/mnt/c/w/proj", "c:/w/proj"] {
+                conn.execute(
+                    "INSERT INTO project_identity                        (project_root, canonical_id, first_seen_ms, last_seen_ms)                      VALUES (?1, 'git:example.com/same', 1, 2)",
+                    rusqlite::params![root],
+                )
+                .unwrap();
+            }
+        }
+
+        let (rows, _) = st.project_roots_report(&mounts).unwrap();
+        assert_eq!(rows.len(), 1, "身份相同就该合并 —— 否则上一条测的不是冲突");
+        assert_eq!(
+            rows[0].canonical_id.as_deref(),
+            Some("git:example.com/same")
+        );
+    }
+
+    #[test]
     fn without_a_mount_table_the_two_forms_stay_apart() {
         // 收敛不能凭空发生：没读到挂载表就不该猜 `/mnt/c` 是哪个盘。
         let st = TotalStore::open_in_memory().unwrap();
@@ -6617,7 +6847,9 @@ mod project_identity_tests {
         let st = TotalStore::open_in_memory().unwrap();
 
         // ① 读到了，确实没有根 ⇒ Ok(空)。
-        let (roots, rev) = st.project_roots_report().expect("空注册表要能读出来");
+        let (roots, rev) = st
+            .project_roots_report(&Vec::new())
+            .expect("空注册表要能读出来");
         assert!(roots.is_empty());
         assert_eq!(rev, 0, "还没注册过根，修订号是初始值 0");
 
@@ -6628,7 +6860,7 @@ mod project_identity_tests {
             .execute("DROP TABLE project_root_registry", [])
             .unwrap();
         let err = st
-            .project_roots_report()
+            .project_roots_report(&Vec::new())
             .expect_err("读不到注册表必须报错，不能返回空列表冒充「没有项目」");
         assert!(
             err.contains("project_root_registry"),
@@ -6644,7 +6876,7 @@ mod project_identity_tests {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root(r"C:\Users\u\Proj", RootSource::Git);
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots.len(), 1);
         let r = &roots[0];
         assert_eq!(r.root_path, r"C:\Users\u\Proj", "原始形式原样返回");
@@ -6666,12 +6898,12 @@ mod project_identity_tests {
     fn the_report_and_its_revision_come_from_one_read() {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("/w/A", RootSource::Git);
-        let (roots1, rev1) = st.project_roots_report().unwrap();
+        let (roots1, rev1) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots1.len(), 1);
         assert_eq!(rev1, 1, "一个新根 ⇒ 修订号 1");
 
         st.register_project_root("/w/B", RootSource::Git);
-        let (roots2, rev2) = st.project_roots_report().unwrap();
+        let (roots2, rev2) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots2.len(), 2, "清单跟上了");
         assert_eq!(rev2, 2, "修订号也跟上了 —— 两者必然同代");
     }
@@ -6686,7 +6918,7 @@ mod project_identity_tests {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("wsl:Ubuntu-22.04:/home/u/proj", RootSource::Git);
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(
             roots[0].aliases,
             vec![r"\\wsl.localhost\Ubuntu-22.04\home\u\proj"],
@@ -6696,7 +6928,7 @@ mod project_identity_tests {
         // 反过来也要成立 —— 归属发生在哪一侧决定了注册表存的是哪一种。
         let st2 = TotalStore::open_in_memory().unwrap();
         st2.register_project_root(r"\\wsl.localhost\Ubuntu-22.04\home\u\proj", RootSource::Git);
-        let (roots2, _) = st2.project_roots_report().unwrap();
+        let (roots2, _) = st2.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots2[0].aliases, vec!["wsl:Ubuntu-22.04:/home/u/proj"]);
     }
 
@@ -6709,7 +6941,7 @@ mod project_identity_tests {
     fn a_mnt_root_gets_no_guessed_alias() {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("/mnt/c/work/proj", RootSource::Git);
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert!(
             roots[0].aliases.is_empty(),
             "没有挂载表就不该猜出一个 Windows 形式：{:?}",
@@ -6722,7 +6954,7 @@ mod project_identity_tests {
     fn a_plain_path_has_no_aliases() {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root(r"D:\work\proj", RootSource::Git);
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert!(roots[0].aliases.is_empty());
         assert!(
             !roots[0].aliases.contains(&roots[0].root_path),
@@ -6752,7 +6984,7 @@ mod project_identity_tests {
             }
         }
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         let ids: Vec<_> = roots.iter().map(|r| r.canonical_id.as_deref()).collect();
         assert_eq!(
             ids,
@@ -6782,7 +7014,7 @@ mod project_identity_tests {
             .unwrap();
         }
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(
             roots[0].canonical_id.as_deref(),
             Some("git:example.com/o/r"),
@@ -6833,7 +7065,7 @@ mod project_identity_tests {
         // 第四种：登记在扫描**之后**，所以这一轮没问过它。
         st.register_project_root("/w/never-swept-56", RootSource::Git);
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         let verdict_of = |needle: &str| {
             roots
                 .iter()
@@ -6937,7 +7169,7 @@ mod project_identity_tests {
             .unwrap();
         }
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(
             roots[0].canonical_id.as_deref(),
             Some("git:example.com/o/r"),
@@ -6985,7 +7217,7 @@ mod project_identity_tests {
             (0, 1),
             "判决写不进去 ⇒ 这一轮不算数，要报成「没问成」"
         );
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(
             roots[0].identity_verdict,
             IdentityVerdict::NotProbed,
@@ -7004,7 +7236,7 @@ mod project_identity_tests {
             second.already_probed, 0,
             "缓存没撤回 —— 这个根在本进程内再也不会被问起"
         );
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots[0].identity_verdict, IdentityVerdict::Resolved);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -7017,7 +7249,7 @@ mod project_identity_tests {
     fn a_root_without_a_recorded_identity_says_so() {
         let st = TotalStore::open_in_memory().unwrap();
         st.register_project_root("/home/u/proj", RootSource::Git);
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots[0].canonical_id, None);
     }
 
@@ -7041,7 +7273,7 @@ mod project_identity_tests {
             )
             .unwrap();
 
-        let (roots, _) = st.project_roots_report().unwrap();
+        let (roots, _) = st.project_roots_report(&Vec::new()).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(
             roots[0].root_source, "from_the_future",

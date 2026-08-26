@@ -152,7 +152,48 @@ pub fn decode_project_dir_with(
             None => DecodedProject::Absent,
         }
     } else {
-        DecodedProject::Found(path.to_string_lossy().into_owned())
+        DecodedProject::Found(drive_mount_identity(&path.to_string_lossy(), base))
+    }
+}
+
+/// 解出来的路径若指向 **Windows 盘**（`/mnt/<drive>/…`），去掉 WSL 前缀。
+///
+/// # 为什么
+///
+/// 探测必须用拼了前缀的那个（UNC 形在宿主上打得开，裸 `/mnt/c/…` 打不开），
+/// 但**标识**不该带前缀：那条路径指的是 Windows 盘、**不住在发行版里** ——
+/// 与 `normalize_cwd` 规则 4「不给 `/mnt/…` 打 `wsl:<distro>:` 标」是同一条判断，
+/// 只是那一条从前没在这条路上做。
+///
+/// 🔴 **后果是同一个 svault 内部两种写法**（2026-08-26 实机）：
+///
+/// | 出口 | 同一个项目 |
+/// | --- | --- |
+/// | `roots`（登记的根走 [`crate::attribution::registry_key`]） | `/mnt/c/users/<user>/workspace/<repo>` |
+/// | `snapshots`（事件的 `project_root` 走这里） | UNC 前缀 + `/mnt/c/Users/<user>/workspace/<repo>` |
+///
+/// 消费方拿事件里的写法去 `roots` 查身份 —— **查不到**，于是同一个仓在它的界面上
+/// 成了两个项目。两个出口对同一个问题给不同答案，正是本仓反复写规则去防的形状。
+///
+/// ⚠️ **只对 `/mnt/<drive>/…` 生效**：`/home/<user>/…` 确实住在发行版里，它的标识
+/// 必须带前缀，否则在 Windows 上会被当成当前盘的相对路径 —— 那不是打不开，
+/// 是打开了错的东西。判据是 [`crate::pathnorm::is_windows_drive_mount`]，
+/// 与其它调用点同一个函数。
+fn drive_mount_identity(full: &str, base: &str) -> String {
+    if base.is_empty() {
+        return full.to_string();
+    }
+    let Some(rest) = full.strip_prefix(base) else {
+        return full.to_string();
+    };
+    let posix = format!(
+        "/{}",
+        rest.trim_start_matches(['\\', '/']).replace('\\', "/")
+    );
+    if crate::pathnorm::is_windows_drive_mount(&posix) {
+        posix
+    } else {
+        full.to_string()
     }
 }
 
@@ -261,6 +302,48 @@ pub fn host_openable_form(
 // 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
 #[allow(clippy::disallowed_methods)]
 mod tests {
+
+    /// 🔴 `/mnt/<drive>/…` 的**标识**不带 WSL 前缀 —— 它指的是 Windows 盘。
+    ///
+    /// 实机（2026-08-26）：不去前缀时，`roots` 登记的根是 `/mnt/c/users/…`，
+    /// 而事件里的 `project_root` 是 UNC 前缀 + 同一段 —— **同一个 svault 两个出口
+    /// 两种写法**，消费方按事件里的写法去 roots 查身份查不到，同一个仓于是在它的
+    /// 界面上成了两个项目。
+    #[test]
+    fn a_drive_mount_identity_drops_the_wsl_prefix() {
+        let base = r"\\wsl.localhost\D";
+        assert_eq!(
+            drive_mount_identity(&format!(r"{base}\mnt\c\Users\dev\proj"), base),
+            "/mnt/c/Users/dev/proj",
+            "指向 Windows 盘的路径，标识不该带发行版前缀"
+        );
+    }
+
+    /// **成对的另一半**：发行版内的路径**必须**保留前缀。
+    ///
+    /// 只写上一条的退化解是「一律去前缀」，而那会让 `/home/<user>/…` 在 Windows 上
+    /// 被当成当前盘的相对路径（`C:\home\…`）—— 不是打不开，是**打开了错的东西**，
+    /// 比报错更坏（`host_openable_form` 的文档逐字记着这条）。
+    #[test]
+    fn an_in_distro_identity_keeps_the_wsl_prefix() {
+        let base = r"\\wsl.localhost\D";
+        let full = format!(r"{base}\home\dev\proj");
+        assert_eq!(
+            drive_mount_identity(&full, base),
+            full,
+            "住在发行版里的路径，标识必须带前缀"
+        );
+    }
+
+    /// 本地 root（前缀为空）原样返回 —— 没有前缀可去。
+    #[test]
+    fn a_local_identity_is_untouched() {
+        assert_eq!(
+            drive_mount_identity(r"C:\w\proj", ""),
+            r"C:\w\proj",
+            "本地路径不该被动"
+        );
+    }
     use super::*;
     use crate::probe::ProbeError;
     use std::path::Path;

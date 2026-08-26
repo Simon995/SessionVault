@@ -86,7 +86,7 @@ fn probe_through_the_store(path: &str) {
     println!("sweep: {sweep:?}");
 
     // 🔴 报告失败**当场退出**，不渲染成一个说得出口的数字（诊断探针的纪律）。
-    let (roots, _) = match store.project_roots_report() {
+    let (roots, _) = match store.project_roots_report(&Vec::new()) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("project_roots_report failed: {e}");

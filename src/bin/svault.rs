@@ -563,6 +563,16 @@ enum Out<'a> {
     RootsSummary {
         roots: usize,
         attribution_revision: i64,
+        /// 这一轮**拿到挂载表了吗** —— 决定 `/mnt/<drive>/…` 的根能不能与它的
+        /// 宿主形式收敛成一行。
+        ///
+        /// 🔴 **必须说出口，不能只留一行 debug 日志。** 拿不到时同一个项目会以
+        /// 两条根发出去（`/mnt/c/users/…/<repo>` 与 `c:/users/…/<repo>`），而消费方
+        /// 看到的是「两个项目」—— 与「这台机器上真有两个项目」**长得一模一样**。
+        /// 本仓那条「『没问成』不能长得像『这里是空的』」在这里的形态。
+        ///
+        /// `false` ⇒ 消费方该把多出来的那些理解成「还没能收敛」，而不是新项目。
+        drive_mounts_available: bool,
     },
     /// 一条投影替换记录。消费者读到它就按 `source_*` **原子替换**自己那份物化。
     #[cfg(feature = "store")]
@@ -2796,7 +2806,16 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
             return 1;
         }
     };
-    let (roots, attribution_revision) = match store.project_roots_report() {
+    // 🔴 **表只读一次**，读两次会拿到两份运行期事实（中途 `wsl --shutdown` 就变），
+    // 于是「用来收敛的表」与「报告说拿到了的表」可以不是同一份。
+    let mounts = session_vault::host_drive_mounts();
+    if mounts.is_empty() {
+        log::warn!(
+            target: tag::CLI,
+            "drive mounts unavailable — /mnt roots will not converge with their host form;              consumers see them as separate projects (see RootsSummary.drive_mounts_available)"
+        );
+    }
+    let (roots, attribution_revision) = match store.project_roots_report(&mounts) {
         Ok(v) => v,
         Err(e) => {
             log::error!(target: tag::CLI, "project_roots_report failed: {e}");
@@ -2830,6 +2849,7 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
     emit(&Out::RootsSummary {
         roots: roots.len(),
         attribution_revision,
+        drive_mounts_available: !mounts.is_empty(),
     });
     0
 }
