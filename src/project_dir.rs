@@ -245,10 +245,20 @@ fn drive_mount_identity(full: &str, base: &str, mounts: &crate::pathnorm::DriveM
 /// Claude 编码的是**会话当时看到的 cwd**：WSL 会话是发行版内的
 /// `/home/u/proj`，本机会话是 `C:\Users\u\proj`（盘符的 `:` 也换成 `-`）。
 /// 所以调用方要拿**对应命名空间的那个写法**来编码，不能拿 UNC 或规范形。
+///
+/// 🔴 **下划线也换成 `-`**（2026-08-27 补）。此前只换了 `/ \ :`，于是路径里带 `_`
+/// 的项目算出来的目录名**根本不存在** ⇒ 它的 Claude 会话一条都归不到它头上，
+/// 而且不报错：消费方只看到「这个项目没有会话」，与「真的没跑过」长得一模一样。
+///
+/// 判据来自**实测的 `(目录名, cwd)` 对**，不是猜的：一个消费方机器上抓到 8 对，
+/// 其中 `<root>/third_party/<name>` 那条的目录名是 `…-third-party-…`（连字符），
+/// 而会话正文里的 `cwd` 逐字是 `…\third_party\…`（下划线）。补上这条映射后
+/// **8/8 全对**；`.` 等其它字符实测**原样保留**（`Ubuntu-22.04` 里的点还在），
+/// 所以这里逐字符列出要换的那几个，而不是「非字母数字一律换」。
 pub fn encode_project_dir(path: &str) -> String {
     path.chars()
         .map(|c| {
-            if matches!(c, '/' | '\\' | ':') {
+            if matches!(c, '/' | '\\' | ':' | '_') {
                 '-'
             } else {
                 c
@@ -452,18 +462,14 @@ mod tests {
         base
     }
 
-    /// 照 Claude 的编码规则把一条真实路径变回目录名（分隔符与盘符冒号都换成 `-`）。
+    /// 照 Claude 的编码规则把一条真实路径变回目录名。
+    ///
+    /// 🔴 **委托给生产实现，不再自己抄一遍**（2026-08-27）。原先这里是第二份
+    /// 逐字符 `matches!`，于是 2026-08-27 给生产那份补 `_` 时它**不会跟着变** ——
+    /// 「同一条规则两份实现」正是本仓反复付代价的形状，而这一次它就摆在测试里，
+    /// 专门用来生成断言的输入：漂开之后测试仍然全绿，只是考的不是生产行为了。
     fn enc_of(path: &Path) -> String {
-        path.to_string_lossy()
-            .chars()
-            .map(|c| {
-                if matches!(c, '/' | '\\' | ':') {
-                    '-'
-                } else {
-                    c
-                }
-            })
-            .collect()
+        encode_project_dir(&path.to_string_lossy())
     }
 
     #[test]
@@ -472,6 +478,12 @@ mod tests {
         let root = scratch("decode");
         let project = root.join("work").join("my-cool-repo");
         std::fs::create_dir_all(&project).unwrap();
+        // 临时目录里若带 `_`（用户名等），这条走的是**下面那条已知局限**而不是
+        // 本条要考的东西。跳过而不是让它按机器环境时红时绿。
+        if root.to_string_lossy().contains('_') {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
 
         assert_eq!(
             decode_project_dir(&enc_of(&project), "", &no_mounts()),
@@ -483,6 +495,41 @@ mod tests {
         assert_eq!(
             decode_project_dir(&enc_of(&gone), "", &no_mounts()),
             DecodedProject::Absent
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 🔴 **解码方向的 `_` 歧义：实测会答出「另一个真实存在的项目」。**
+    ///
+    /// 编码是多对一（`_` `/` `\` `:` 都变成 `-`），反过来必然有歧义；而重建是
+    /// 逐层探盘、每层只把成分用 `-` 拼回去 ⇒ 真实目录名里带 `_` 的那一层探不到，
+    /// 于是退到更短的切分，而更短的那个**恰好存在**时就返回了它。
+    ///
+    /// 这条**故意不修在这里**：拼字符串的修法（枚举 `-`/`_` 组合）是
+    /// 2^(成分数-1)，而 WSL 桥上每次探测是一次 `wsl.exe` —— 代价不可接受。
+    /// 正解是「列出子目录、逐个 [`encode_project_dir`] 去比」，那要给
+    /// `ProbeBackend` 加一个列目录方法（三个后端 + 桥）。
+    /// 缺陷与两条修法都记在 `docs/project-attribution.md`。
+    ///
+    /// 这里**只钉住已知的形状**，让它别悄悄变形：本测试断言的是
+    /// 「带 `_` 的路径当前重建不出来」。修好之后它会红 —— 那时把它改成
+    /// 正向断言（`Found(带下划线的那条)`），**别删**。
+    #[test]
+    fn decode_cannot_rebuild_an_underscore_yet() {
+        let root = scratch("underscore");
+        let project = root.join("work").join("my_project");
+        std::fs::create_dir_all(&project).unwrap();
+        if root.to_string_lossy().contains('_') {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        let got = decode_project_dir(&enc_of(&project), "", &no_mounts());
+        assert_ne!(
+            got,
+            DecodedProject::Found(project.to_string_lossy().into_owned()),
+            "解码能重建 `_` 了 —— 把这条改成正向断言，并更新 docs/project-attribution.md"
         );
 
         std::fs::remove_dir_all(&root).ok();
@@ -610,8 +657,41 @@ mod encode_tests {
         );
         // 盘符的 `:` 也换掉 —— 与 Claude 实际创建的目录名一致（`C--Users-…`）。
         assert_eq!(
-            encode_project_dir(r"C:\Users\user\workspace\QuotaBar"),
-            "C--Users-user-workspace-QuotaBar"
+            encode_project_dir(r"C:\Users\dev\workspace\QuotaBar"),
+            "C--Users-dev-workspace-QuotaBar"
+        );
+    }
+
+    /// 🔴 **下划线也是分隔符**（2026-08-27）。
+    ///
+    /// 只换 `/ \ :` 时，`<root>/third_party/<name>` 算出的目录名是
+    /// `…-third_party-…`，而 Claude 实际建的是 `…-third-party-…` ⇒ 那个目录
+    /// **永远不存在**，这个项目的会话一条也归不到它头上，**且不报错**：消费方
+    /// 看到的是「这个项目没有会话」，与「真的没跑过」长得一模一样。
+    ///
+    /// 判据来自实测的 `(目录名, cwd)` 对（8 对，补上这条后 8/8 全对），
+    /// 不是从字符类别推的。
+    #[test]
+    fn an_underscore_is_a_separator_too() {
+        assert_eq!(
+            encode_project_dir(r"C:\Users\dev\workspace\repo\third_party\sub"),
+            "C--Users-dev-workspace-repo-third-party-sub"
+        );
+        assert_eq!(
+            encode_project_dir("/home/dev/my_project"),
+            "-home-dev-my-project"
+        );
+    }
+
+    /// 🔴 **只换列出的那几个字符，别扩成「非字母数字一律换」。**
+    ///
+    /// 实测 `.` 原样保留（UNC 别名里的 `Ubuntu-22.04` 那个点还在）。扩大范围的
+    /// 后果与漏掉一样：算出一个不存在的目录名，而症状仍然是「这个项目没有会话」。
+    #[test]
+    fn a_dot_is_kept_verbatim() {
+        assert_eq!(
+            encode_project_dir(r"\\wsl.localhost\Ubuntu-22.04\home\dev\p"),
+            "--wsl.localhost-Ubuntu-22.04-home-dev-p"
         );
     }
 
