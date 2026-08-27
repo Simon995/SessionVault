@@ -27,37 +27,37 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 
 ## 现状（已实现）
 
-| 模块 | 职责 | 状态 |
-|---|---|---|
-| `catalog` | 声明式来源目录（provider × 子目录 × 形态） | ✅ Claude / Codex |
-| `discover` | 发现本地 + WSL 来源清单（不读内容） | ✅ 本地 + WSL |
-| `parser` | 行级 JSONL → `RawEvent`（Claude / Codex 字段映射、Codex 累计 token delta） | ✅ |
-| `pathnorm` | 宿主感知路径规范化（`HostPlatform`、UNC↔规范形、`workspace_location`） | ✅ |
-| `wsl` | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码） | ✅ 实机实测 |
-| `scan` | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹 | ✅ append_log + snapshot_file |
-| `cursor` | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`） | ✅ |
-| `svault` CLI | `discover` / `scan-all`（NDJSON 出 stdout），跨运行游标持久化 | ✅ |
-| `parity` 工具 | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0 |
-| 总库（持久化输出库） | append-only RawEvent 库 | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak） |
-| snapshot_file | Claude/Codex memory、rules、项目 instruction 状态快照 | ✅ experimental（Windows/WSL + 最新快照查询） |
-| sqlite_store / 其它 provider | 契约预留 | ⬜ `planned` |
+| 模块                         | 职责                                                                                         | 状态                                          |
+| ---------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `catalog`                    | 声明式来源目录（provider × 子目录 × 形态）                                                   | ✅ Claude / Codex                             |
+| `discover`                   | 发现本地 + WSL 来源清单（不读内容）                                                          | ✅ 本地 + WSL                                 |
+| `parser`                     | 行级 JSONL → `RawEvent`（Claude / Codex 字段映射、Codex 累计 token delta）                   | ✅                                            |
+| `pathnorm`                   | 宿主感知路径规范化（`HostPlatform`、UNC↔规范形、`workspace_location`）                       | ✅                                            |
+| `wsl`                        | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码）                             | ✅ 实机实测                                   |
+| `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
+| `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
+| `svault` CLI                 | `discover` / `scan-all`（NDJSON 出 stdout），跨运行游标持久化                                | ✅                                            |
+| `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
+| 总库（持久化输出库）         | append-only RawEvent 库                                                                      | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak）    |
+| snapshot_file                | Claude/Codex memory、rules、项目 instruction 状态快照                                        | ✅ experimental（Windows/WSL + 最新快照查询） |
+| sqlite_store / 其它 provider | 契约预留                                                                                     | ⬜ `planned`                                  |
 
 **实机实测（2026-06-14，真实本机数据）**：48 来源（19 local + 29 WSL）→ 23373 事件
 （8102 来自 WSL）；二次扫描借持久化游标 23476 → **0** 事件（全 cache-hit），增量端到端闭环。
 
 ## 核心设计
 
-| 维度 | 约定 |
-|---|---|
-| **来源目录** | 声明式单一事实源：要扫哪些 provider、每平台扫哪些路径，集中维护一份（现 Codex / Claude Code，后续 Cursor / Gemini）。 |
-| **provider 可扩展** | 加 provider = 加一个描述符 + 一个解析器，消费者代码与 `RawEvent` 契约不动。 |
-| **路径可配置** | 优先级：环境变量 > 用户配置 > 内置候选；前端填一个路径就能扫。 |
-| **宿主感知路径** | `pathnorm` 把「裸 Unix 绝对路径如何归属」按宿主平台分叉：Windows 宿主默认 WSL、Unix 原生判 local——修掉了 QuotaBar 内建的「裸 `/abs` 一律当 WSL」假设。Unix 路径语义在 Linux 原生与 WSL 内部共用同一套函数。 |
-| **无状态内核** | lib 是纯函数 `(目录 + 配置 + 游标) → (事件 + 新游标 + 报告)`：不写库、不落盘、不联网、不弹界面。游标**持久化由宿主负责**——`svault` CLI 提供一个默认实现（`--state` 状态文件）。 |
-| **RawEvent 契约** | 归一化事件 schema；去重唯一键 `(source_type, source_location, source_path, source_session_id, seq)`。 |
-| **时间语义** | 每条带 `occurred_at`（对话内时间，冲突裁决权威）+ `time_confidence`；latest-wins 只认 `occurred_at`，不认入库顺序 / offset。 |
-| **扫描报告** | 内核无头，但每轮产出结构化 `SourceReport`，由宿主（QuotaBar / TumeFlow）渲染 GUI。 |
-| **黄金 fixture** | tricky case 做成样例输入 + 期望输出，消费者升级内核前必须全绿——"坑只有一处"的物理保证。 |
+| 维度                | 约定                                                                                                                                                                                                        |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **来源目录**        | 声明式单一事实源：要扫哪些 provider、每平台扫哪些路径，集中维护一份（现 Codex / Claude Code，后续 Cursor / Gemini）。                                                                                       |
+| **provider 可扩展** | 加 provider = 加一个描述符 + 一个解析器，消费者代码与 `RawEvent` 契约不动。                                                                                                                                 |
+| **路径可配置**      | 优先级：环境变量 > 用户配置 > 内置候选；前端填一个路径就能扫。                                                                                                                                              |
+| **宿主感知路径**    | `pathnorm` 把「裸 Unix 绝对路径如何归属」按宿主平台分叉：Windows 宿主默认 WSL、Unix 原生判 local——修掉了 QuotaBar 内建的「裸 `/abs` 一律当 WSL」假设。Unix 路径语义在 Linux 原生与 WSL 内部共用同一套函数。 |
+| **无状态内核**      | lib 是纯函数 `(目录 + 配置 + 游标) → (事件 + 新游标 + 报告)`：不写库、不落盘、不联网、不弹界面。游标**持久化由宿主负责**——`svault` CLI 提供一个默认实现（`--state` 状态文件）。                             |
+| **RawEvent 契约**   | 归一化事件 schema；去重唯一键 `(source_type, source_location, source_path, source_session_id, seq)`。                                                                                                       |
+| **时间语义**        | 每条带 `occurred_at`（对话内时间，冲突裁决权威）+ `time_confidence`；latest-wins 只认 `occurred_at`，不认入库顺序 / offset。                                                                                |
+| **扫描报告**        | 内核无头，但每轮产出结构化 `SourceReport`，由宿主（QuotaBar / TumeFlow）渲染 GUI。                                                                                                                          |
+| **黄金 fixture**    | tricky case 做成样例输入 + 期望输出，消费者升级内核前必须全绿——"坑只有一处"的物理保证。                                                                                                                     |
 
 ## 总库 / 分库（P3 🟡）
 
@@ -76,15 +76,15 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 
 CLI（NDJSON）与 lib 等价（PyO3 wheel 后置）：
 
-| lib 接口 | 用途 |
-|---|---|
-| `catalog()` | 生效后的 provider 描述符列表（宿主据此渲染设置页） |
-| `discover()` | 发现来源清单（本地 + WSL），首次只发现不读内容 |
-| `discover_transcripts()` / `discover_snapshots()` | 分离会话与状态制品，防止 snapshot 污染会话投影 |
-| `discover_project_snapshots()` | 在宿主已确认的项目根内发现 CLAUDE.md / AGENTS.md；身份由宿主提供 |
-| `scan(source_ref, cursor_in, profile, roots)` | 单来源增量摄取主接口（无状态：游标进、游标出）。`roots` 是已知项目根注册表 —— 归属的唯一输入，**空表 = 一个根都不知道 ⇒ 每条路径 `Unattributed`**，不是退回 cwd 兜底 |
-| `TotalStore::sync_snapshots()` | 快照增量扫描并加密写入总库 |
-| `TotalStore::read_active_latest_snapshots()` | 每个来源的当前最新快照，删除文件不再返回 |
+| lib 接口                                          | 用途                                                                                                                                                                 |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `catalog()`                                       | 生效后的 provider 描述符列表（宿主据此渲染设置页）                                                                                                                   |
+| `discover()`                                      | 发现来源清单（本地 + WSL），首次只发现不读内容                                                                                                                       |
+| `discover_transcripts()` / `discover_snapshots()` | 分离会话与状态制品，防止 snapshot 污染会话投影                                                                                                                       |
+| `discover_project_snapshots()`                    | 在宿主已确认的项目根内发现 CLAUDE.md / AGENTS.md；身份由宿主提供                                                                                                     |
+| `scan(source_ref, cursor_in, profile, roots)`     | 单来源增量摄取主接口（无状态：游标进、游标出）。`roots` 是已知项目根注册表 —— 归属的唯一输入，**空表 = 一个根都不知道 ⇒ 每条路径 `Unattributed`**，不是退回 cwd 兜底 |
+| `TotalStore::sync_snapshots()`                    | 快照增量扫描并加密写入总库                                                                                                                                           |
+| `TotalStore::read_active_latest_snapshots()`      | 每个来源的当前最新快照，删除文件不再返回                                                                                                                             |
 
 CLI：
 
@@ -112,7 +112,7 @@ SessionVault **不从零写**，而是**抽取 QuotaBar 已实机验证的扫描
   diff `cache.db` 一致后切换（feature flag，留回退）。**待办**：soak 收尾删旧路径
 - **P3 ✅ ADR-027 C5 技术安全门已落地** 总库 `TotalStore`（QuotaBar 默认写者）使用
   AES-256-GCM `sv2` 信封；OS keychain 主密钥只包裹按 `(source_type, location, path,
-  project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并清理空闲页；事件身份与数据密钥
+project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并清理空闲页；事件身份与数据密钥
   分组均作为 AAD 防调换。`svault erase` 同事务写无正文墓碑、物理删除并回收孤立数据密钥，
   后续 `append_events` 按墓碑拒绝重扫复活。合成隔离跨进程 E2E 10/10 PASS；正式构建不包含
   fixture 密钥入口。TumeFlow 删除传播与 QuotaBar 双重确认已同步落地。
@@ -134,6 +134,9 @@ cargo test          # 单测（WSL 实机 IT 需 SVAULT_WSL_IT=1，默认跳过�
 - [docs/rawevent-reconciliation.md](docs/rawevent-reconciliation.md) —— `RawEvent` 契约 ⇄ QuotaBar 实际扫描器逐字段对账（P0）。
 - [docs/parity-contract.md](docs/parity-contract.md) —— 影子并跑对账契约（P2 step 1）：QuotaBar `usage_facts` ⇄ SessionVault RawEvent(usage) 的序数对齐、must-match/advisory 等价定义、字节边界、首测结果。`parity` 工具：`cargo run --features parity --bin parity -- …`。
 - [docs/LOGGING.md](docs/LOGGING.md) —— 日志规范（对齐 QuotaBar `docs/LOGGING.md`：`log` 复用宿主 sink、stdout=NDJSON/stderr=日志、正文不进日志；TumeFlow ADR-026）。
+- [docs/scan-state-model.md](docs/scan-state-model.md) —— 扫描与投影的状态模型：`AppendLogObservation` 四态、`ScanReasons` 组合原因 × `CommitPlan` 纯函数规划、`Deadline` 作为调用链参数、`Probed` 三态探测、幂等 `ProjectionToken`。
+- [docs/project-identity.md](docs/project-identity.md) —— 项目身份从「现算」到「记下来」（`project_identity` 表）。
+- [docs/project-attribution.md](docs/project-attribution.md) —— 会话归属到项目根的判据与解析链。
 - 跨仓库决策记录见 [TumeFlow `DECISIONS.md`](https://github.com/Simon995/TumeFlow/blob/main/docs/DECISIONS.md)（ADR-018～ADR-028）。其中与本仓直接相关：**ADR-024**（交付：CLI/lib/PyO3 与钉版）、**ADR-025**（四项架构保险：source_mode / 多形态游标 / 派生路径 / 两层目录）、**ADR-026**（日志）、**ADR-027**（隐私与删除：逻辑 append-only、物理可销毁、删除跨库传播）。
 
 ## 分发与版本
