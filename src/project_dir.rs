@@ -180,6 +180,11 @@ pub fn decode_project_dir_with(
 /// 消费方拿事件里的写法去 `roots` 查身份 —— **查不到**，于是同一个仓在它的界面上
 /// 成了两个项目。两个出口对同一个问题给不同答案，正是本仓反复写规则去防的形状。
 ///
+/// 🔴 **上面那张表描述的是「挂载表说不出话」那一档；2026-08-27 发现分歧在正常
+/// 工作时反而更大。** 两边都调 [`crate::pathnorm::mnt_to_windows`]，但 `roots`
+/// **用它的返回值**、这里只用它的**真假** ⇒ 表可用时 `roots` 给 `C:\…`、
+/// 这里给 `/mnt/c/…`。已订正为用返回值，两个出口这才真正对齐（见函数体内的表）。
+///
 /// ⚠️ **只对确认指向 Windows 盘的那些生效**：`/home/<user>/…` 确实住在发行版里，
 /// 它的标识必须带前缀，否则在 Windows 上会被当成当前盘的相对路径 —— 那不是
 /// 打不开，是打开了错的东西。
@@ -218,6 +223,12 @@ fn drive_mount_identity(full: &str, base: &str, mounts: &crate::pathnorm::DriveM
     // 被输出成同一个 `/mnt/c/proj` ⇒ 消费方把**两个真实项目**的记忆合并。
     //
     // 挂载表说不出话时（WSL 没跑）⇒ 保守：**保留前缀，不合并**。
+    //
+    // ⚠️ **这里产出的是「物理路径」，不是「身份」**（2026-08-27 说清）。
+    // 返回的 `/mnt/c/…` 是**发行版内**的写法 —— `read_path` 与 `HostProbe` 都靠它，
+    // 换成 `C:\…` 会让 WSL 侧的读取与探测同时废掉（`HostProbe::WslUnc` 拿着
+    // distro 与前缀去拼，而 `C:\…` 在那个命名空间里没有意义）。
+    // **身份**那一步在 [`crate::class_b`] 里另做（见那里的 `identity`）。
     if crate::pathnorm::mnt_to_windows(&posix, mounts).is_some() {
         posix
     } else {
@@ -347,6 +358,12 @@ mod tests {
         vec![("/mnt/c".to_string(), r"C:\".to_string())]
     }
 
+    /// 本函数产出的是**物理路径**（发行版内的写法）—— `read_path` 与 `HostProbe`
+    /// 都靠它。**身份**是另一件事，在 `class_b::snapshot_project_identity` 里做。
+    ///
+    /// ⚠️ 2026-08-27 我一度把换算加在这里，`cargo test` 当场没红（本函数的测试
+    /// 全绿），是**读下游**才发现 `HostProbe::WslUnc` 拿着 distro 与前缀去拼，
+    /// 而 `C:\…` 在那个命名空间里没有意义 —— 会同时废掉读取与探测。
     #[test]
     fn a_drive_mount_identity_drops_the_wsl_prefix() {
         let base = r"\\wsl.localhost\D";
@@ -357,7 +374,7 @@ mod tests {
                 &mounts_with_c()
             ),
             "/mnt/c/Users/dev/proj",
-            "挂载表确认是 Windows 盘 ⇒ 标识不该带发行版前缀"
+            "挂载表确认是 Windows 盘 ⇒ 物理路径不该带发行版前缀"
         );
     }
 

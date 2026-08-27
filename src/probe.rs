@@ -935,9 +935,7 @@ mod tests {
     fn a_host_unc_path_becomes_the_in_distro_absolute_path() {
         let b = WslBackend::under_host_prefix("Ubuntu-22.04", PREFIX);
         assert_eq!(
-            b.to_linux(Path::new(&format!(
-                r"{PREFIX}\home\dev\workspace\QuotaBar"
-            ))),
+            b.to_linux(Path::new(&format!(r"{PREFIX}\home\dev\workspace\QuotaBar"))),
             Some("/home/dev/workspace/QuotaBar".to_string())
         );
         // 前缀本身 ⇒ 发行版根。

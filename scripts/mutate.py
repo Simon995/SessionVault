@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -140,12 +141,82 @@ MUTATIONS: list[Mutation] = [
         must_fail=["a_streaming_only_round_claims_no_parser_revision"],
         why="只吐流的运行也记版本 ⇒ 日后第一次写库误判成「不欠重投影」",
     ),
+    # ── 快照身份 vs 物理路径（2026-08-27）────────────────────────────────
+    Mutation(
+        name="snapshot-identity-not-converted",
+        rel_path="src/class_b.rs",
+        old="    crate::pathnorm::mnt_to_windows(physical, mounts).unwrap_or_else(|| physical.to_string())",
+        new="    physical.to_string()",
+        must_fail=["the_identity_is_the_mount_tables_answer"],
+        why="退回订正前：事件携带物理路径 `/mnt/c/…`，而 roots 给 `C:\\…` ⇒ 两个出口对同一个项目给不同答案，消费方把它当成新项目单独蒸馏",
+    ),
+    Mutation(
+        name="snapshot-identity-guessed-by-shape",
+        rel_path="src/class_b.rs",
+        old="    crate::pathnorm::mnt_to_windows(physical, mounts).unwrap_or_else(|| physical.to_string())",
+        new='    crate::pathnorm::mnt_to_windows(physical, &vec![("/mnt/c".to_string(), "C:\\\\".to_string())]).unwrap_or_else(|| physical.to_string())',
+        must_fail=["without_the_mount_table_the_identity_is_unchanged"],
+        why="按形状猜而不查实测挂载表 ⇒ automount.root 改过 / `/mnt/data` 这类普通挂载时，事件被归到一个别的项目（甚至不存在的盘）名下",
+    ),
+    Mutation(
+        name="identity-leaks-into-the-physical-path",
+        rel_path="src/project_dir.rs",
+        old="    if crate::pathnorm::mnt_to_windows(&posix, mounts).is_some() {\n        posix",
+        new="    if let Some(host) = crate::pathnorm::mnt_to_windows(&posix, mounts) {\n        host",
+        must_fail=["a_drive_mount_identity_drops_the_wsl_prefix"],
+        why="把身份换算也做进物理路径 ⇒ read_path 与 HostProbe::WslUnc 拿到 `C:\\…`，而它在发行版命名空间里没有意义 ⇒ 读取与探测同时废掉（2026-08-27 我第一版就是这么写的，lib 测试当场全绿）",
+    ),
+    Mutation(
+        name="identity-not-stored-on-the-event",
+        rel_path="src/class_b.rs",
+        old="        project_root: snapshot_project_identity(physical, mounts),",
+        new="        project_root: physical.to_string(),",
+        must_fail=["the_project_carries_the_identity_but_reads_the_physical_path"],
+        why="算了身份却不存 ⇒ 事件照旧携带物理路径。⚠️ 这条**接线**错误此前没有任何测试挡得住（只测函数的那几条一条都不红），是把构造抽成 `snapshot_project` 之后才有地方钉它",
+    ),
 ]
+
+
+class DeadFilter(Exception):
+    """`must_fail` 里有一个匹配不到任何测试的名字 —— 脚本过期，不是护栏有效。"""
+
+
+#: `cargo test` 每个**测试目标**各打一行 `test result:` 摘要。
+_RESULT_LINE = re.compile(r"test result: \w+\. (\d+) passed; (\d+) failed;")
+
+
+def _matched_nothing(output: str) -> bool:
+    """这个过滤器**在所有目标里**都没匹配到测试吗？
+
+    🔴 **必须跨目标合计。** 第一版只查 `"0 passed; 0 failed" in output`，而
+    `--lib --bin svault` 是**两个**目标：过滤器命中 bin 里的测试时，lib 那个目标
+    照样打出 `0 passed; 0 failed` ⇒ 每一条变异都被误报成「死名字」（实测：
+    连对照组都被拦下了）。
+
+    ⚠️ 与本仓那条「`unreachable` 不等于『那里没有』」是同一条：
+    **「这个目标里没有」不等于「哪儿都没有」**。
+    """
+    totals = [(int(a), int(b)) for a, b in _RESULT_LINE.findall(output)]
+    if not totals:
+        return False  # 连摘要都没有 ⇒ 多半是编译失败，交给退出码去说
+    return all(p == 0 and f == 0 for p, f in totals)
 
 
 def run_tests(names: list[str]) -> tuple[bool, str]:
     """跑指定测试。返回 (是否全绿, 输出摘要)。"""
-    cmd = ["cargo", "test", *FEATURES, "--bin", "svault"]
+    # 🔴 **`--lib` 与 `--bin` 都要跑**（2026-08-27 补）。
+    #
+    # 此前只有 `--bin svault`，于是**住在 lib 模块里的护栏这个框架一条都验不了** ——
+    # 加了四条 `src/class_b.rs` / `src/project_dir.rs` 的变异，全部报「空转」，
+    # 而它们对应的测试其实好好地绿着，只是从没被跑到。
+    #
+    # ⚠️ 这个盲区的形状值得记：它不会漏报成「护栏有效」，而是**误报成「护栏空转」**
+    # —— 看起来更安全，实际同样坏：下一个人会去「修」一条本来就没问题的护栏，
+    # 或者干脆把那条变异删掉，于是真正的盲区被当成噪声抹平。
+    #
+    # ⚠️ 不写成裸 `cargo test`：那会连 `examples/` 一起编，而例子有自己的 feature
+    # 门控，编不过时整个框架停在基线那一步，与「护栏坏了」长得一模一样。
+    cmd = ["cargo", "test", *FEATURES, "--lib", "--bin", "svault"]
     if names:
         # 一次只跑一个过滤器；多个就逐个跑（cargo test 只收一个 filter）。
         ok = True
@@ -154,6 +225,22 @@ def run_tests(names: list[str]) -> tuple[bool, str]:
             p = subprocess.run(
                 [*cmd, n], cwd=ROOT, capture_output=True, text=True, encoding="utf-8"
             )
+            # 🔴 **过滤器一个都没匹配到 ⇒ 当场报错，不当「没红」**（2026-08-27 补）。
+            #
+            # `cargo test <不存在的名字>` **退出码是 0** —— 于是 `must_fail` 里一个
+            # 打错的、或随重构删掉的测试名，会静默地什么都不贡献。实测撞上过：
+            # 一条变异的清单里两个名字，其中一个已经不存在（`rc=0`），而整条变异
+            # 靠另一个名字判成「如期变红」—— 那个死名字看起来在守着什么，实际没有。
+            #
+            # 判据用输出而不是退出码：`0 passed; 0 failed` 才是「一个都没匹配到」。
+            if _matched_nothing(p.stdout + p.stderr):
+                # ⚠️ **不能只是把它算成「没红」** —— 那样一个死名字反而会让这条变异
+                # 判成「如期变红」（实测：塞一个不存在的名字进去，输出是 ✓）。
+                # 与「目标文本没出现」同一类：脚本过期，当场停，别继续给结论。
+                raise DeadFilter(
+                    f"`must_fail` 里的 `{n}` 一个测试都没匹配到 —— 打错了？被重构删了？"
+                    f" 这个名字在清单里什么都不守，而它看起来在守着什么"
+                )
             ok = ok and p.returncode == 0
             tails.append(f"{n}: rc={p.returncode}")
         return ok, "; ".join(tails)
@@ -202,6 +289,7 @@ def main() -> int:
             print(f"✗ [{m.name}] 替换后文本未变 —— 空转", file=sys.stderr)
             return 2
 
+        dead: str | None = None
         try:
             m.path.write_bytes(mutated.encode("utf-8"))
             ok, detail = run_tests(m.must_fail)
@@ -211,6 +299,8 @@ def main() -> int:
                 failures.append(m.name)
             else:
                 print(f"✓ [{m.name}] 如期变红（{detail}） — {m.why}")
+        except DeadFilter as e:
+            dead = str(e)
         finally:
             m.path.write_bytes(raw)
             # 🔴 **还原要断言，不能只是「我写回去了」。** 上面那个换行缺陷正是
@@ -219,6 +309,12 @@ def main() -> int:
             if m.path.read_bytes() != raw:
                 print(f"✗ [{m.name}] 还原后字节与读入时不同 —— 工作区已被污染", file=sys.stderr)
                 return 6
+
+        # `must_fail` 里有死名字 ⇒ 与「目标文本没出现」同一类：脚本过期，立刻停。
+        # （还原已在 `finally` 里做完，所以在这里返回是安全的。）
+        if dead:
+            print(f"✗ [{m.name}] {dead}", file=sys.stderr)
+            return 4
 
         # 对照组不红 ⇒ 后面的结论全部不作数，立刻停。
         if i == 0 and m.name in failures:
