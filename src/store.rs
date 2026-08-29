@@ -3890,6 +3890,7 @@ mod tests {
             content_hash: None,
             artifact_kind: None,
             observed_at: None,
+            modified_at: None,
             message_id: None,
             request_id: None,
         }
@@ -6466,6 +6467,7 @@ mod project_identity_tests {
             content_hash: None,
             artifact_kind: None,
             observed_at: None,
+            modified_at: None,
             message_id: None,
             request_id: None,
         }

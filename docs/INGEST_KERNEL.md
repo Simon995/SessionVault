@@ -55,6 +55,18 @@
 - **`source_mode`（形态）**：决定怎么读、用什么游标——
   - `append_log`：只增长的 JSONL（会话、history 的常态），按字节 `safe_offset` 增量读。
   - `snapshot_file`：会被整体重写/覆盖的文本（CLAUDE.md / AGENTS.md / rules / memory 等），按 SHA-256 内容指纹判变，变了产 `config_snapshot`。**已落地选择**：`full` 档把正文写入 `RawEvent.content`，随事件一起进入 AES-256-GCM 加密总库；`content_hash` 用于版本和增量，`observed_at` 只表示扫描观测时间，不伪造真实生效时间。后续体积证明需要时再评估按 hash 去重的 `snapshot_blob`，当前不提前增加第二存储契约。
+
+    🔴 **2026-08-29 新增 `modified_at`（源文件 mtime，Unix 秒串）。** 这**不是**推翻
+    「mtime 不冒充语义时间」那条 —— 它仍然**不**写进 `occurred_at`，而是自成一个字段，
+    由消费者显式选择怎么用。理由是消费者侧量出来的：`observed_at` 是**扫描时刻**，
+    206 个快照只有 110 个不同取值，**60% 与别人同秒**（首次上线时一次收进来的存量
+    文件全挤在一起，最大一堆 34 个）。⇒ 两个信号**互补**：`observed_at` 分得开
+    「扫描批次之间」，`modified_at` 分得开「批次之内的存量文件」。
+    ⚠️ 之所以不并进 `occurred_at`：`recent_sessions` 按 `occurred_at_unix_ms` 排序且
+    **不过滤 `config_snapshot`**，而下游正是靠那个判「用户最近有没有活动」——
+    快照文件本身就是下游写的，那会让它把自己的写入读成新活动。
+    ⚠️ 问不到（stat 失败 / WSL 桥不可用 / 非 Windows 构建）一律 `None`，
+    **不折进 0，也不折进 `observed_at`**。
   - `sqlite_store`：SQLite 状态库（Codex `CODEX_SQLITE_HOME`、Cursor `state.vscdb`），用表游标（`rowid` / `wal_lsn` / `content_hash`），**不可按字节读**。
   - `opaque_family`：官方未公开稳定结构的状态族（Claude background/supervisor state、Codex plugin bundle），只登记为"保留来源族"先不写死 glob。
 - **两层契约**：§3 区分**来源族**（稳定层：session log / snapshot 指令 / rules / hooks / skill root / plugin root / sqlite state root / derived 任务根）与**已验证实现**（易变层：具体子目录 glob，如 Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`）。子目录漂移只动易变层，**不拖公开契约升 major**。
@@ -662,7 +674,7 @@ SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器*
 
 **优先级与 P0 硬边界**（防止 P0 被总库/snapshot/sqlite/插件/隐私一起拖大）。**进度（截至 2026-06-14）**：
 
-- **P0（窄而硬）✅ 基本完成**：`RawEvent` v1 字段已定稿；`append_log` JSONL 与 Codex 累计 token 黄金语料已落地。`snapshot_file` 于 2026-07-13 从预留升级为 experimental：新增 `content_hash/artifact_kind/observed_at`，mtime 不冒充语义时间。`sqlite_store` / `opaque_family` / derived-path 仍按设计返回 `planned` / `skipped`。
+- **P0（窄而硬）✅ 基本完成**：`RawEvent` v1 字段已定稿；`append_log` JSONL 与 Codex 累计 token 黄金语料已落地。`snapshot_file` 于 2026-07-13 从预留升级为 experimental：新增 `content_hash/artifact_kind/observed_at`，mtime 不冒充语义时间（2026-08-29 补 `modified_at`：mtime **另立一个字段**，仍不进 `occurred_at` —— 见上文 `snapshot_file` 那条）。`sqlite_store` / `opaque_family` / derived-path 仍按设计返回 `planned` / `skipped`。
 - **P1 ✅ 基本完成**：Local Claude/Codex `append_log` 解析器已实装并过语料（`parser.rs` / `scan.rs` / `discover.rs` / `cursor.rs`，`svault scan-all` 已能吐 `RawEvent` NDJSON 流）。**游标已持久化**：`scan-all --state <file>`（默认 `<data_local_dir>/svault/cursors.json`，`--stateless` 关）跨运行续扫——实测二次扫描 23476→**0** 事件（全 cache-hit），Codex 累计 token 状态/`next_seq` 随游标存活。**路径规范化层已抽取并标准化**：`src/pathnorm.rs` 宿主感知（`HostPlatform`），UNC↔规范形互转、`workspace_location` 已接线产出（修掉了 QuotaBar「裸 `/abs` 一律当 WSL」的 Windows 宿主假设——Linux 原生跑时同路径正确判 `local`）。**WSL 访问桥已通（端到端实测）**：`src/wsl.rs`（移植 QuotaBar `wsl/mod.rs`）——纯逻辑（发行版名/UTF-16LE/`find -print0` 解析、`default_distro` 选择，跨平台单测）+ 实时层（`#[cfg(windows)]` spawn `wsl.exe`：`list_distros`/`list_jsonl_under_home`/`stat`/`read_range`/`read_file_at`，非 Windows 给桩）。`discover()` 枚举 `Wsl(distro)` 来源；扫描经 **`ByteSource` 抽象**（`scan.rs`）让本地（`File`/`Seek`）与 WSL（`wsl.exe stat` + `tail -c +K | head -c N`）**共用同一份**游标/回退/坏行冻结逻辑；`default_distro` 用来源自身发行版把裸 Linux cwd 打成精确 `wsl:<distro>`。**实测（2026-06-14，真实本机数据，metadata profile 无正文）**：48 来源（19 local + 29 WSL）→ 23373 事件，其中 **8102 来自 WSL**（Ubuntu-24.04 codex 7726 + Ubuntu-OpenClaw claude 376），**零 warning/error**。WSL 增量 tail（`read_range` start>0）由 env-gated 实机 IT（`SVAULT_WSL_IT=1`，`/tmp` 一次性文件）验证。**P1 剩余尾巴**：WSL 双位置真实**黄金语料** fixture（逻辑已全验，缺归档式回归 fixture）；snapshot/sqlite/其它 provider 属 P3 后续。
 - **P2 🟡 进行中**：
   - **step 1 ✅**：冻结 QuotaBar `cache.db` 黄金基线、写对账契约（[parity-contract.md](parity-contract.md)）、

@@ -142,6 +142,10 @@ impl ParseCtx {
             content_hash: None,
             artifact_kind: None,
             observed_at: None,
+            // append_log 的单条事件**没有**「文件写入时间」可言：整个 jsonl 一直在长，
+            // 它的 mtime 属于最后一行，不属于这一行。而这一路本来就有真时间
+            // （`occurred_at`，实测覆盖率 100%），不需要这个替代信号。
+            modified_at: None,
             message_id: None,
             request_id: None,
         }

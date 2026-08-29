@@ -326,6 +326,24 @@ pub struct RawEvent {
     /// 真实生效时间，因此 `time_confidence` 保持 low、`occurred_at` 不伪造。
     #[serde(default)]
     pub observed_at: Option<String>,
+    /// 快照源文件的 **mtime**（Unix 秒字符串）。`None` = 这一轮**没问出来**
+    /// （stat 失败 / WSL 桥不可用 / 平台不支持），**不是**「这个文件没有 mtime」。
+    ///
+    /// 🔴 **它与 [`Self::observed_at`] 不是二选一，是互补的**，因为它们分得开的
+    /// 东西不同（实测，消费者侧 206 个快照）：
+    ///
+    /// | | 它说什么 | 分得开什么 | 分不开什么 |
+    /// | --- | --- | --- | --- |
+    /// | `observed_at` | 我**什么时候看见**这个内容版本 | 扫描批次之间 | **批次之内** —— 首次上线时一次收进来的存量文件全挤在同一秒（实测 110 个取值 / 45.8 天，而 **60% 与别人同秒**，最大一堆 34 个） |
+    /// | `modified_at` | 这个文件**什么时候被写的** | 存量文件彼此 | 被 `git checkout` / 复制**清掉过**的那些 |
+    ///
+    /// ⚠️ **仍然不写进 `occurred_at`。** 一个文件没有「事件时间」，而
+    /// `recent_sessions` 按 `occurred_at_unix_ms` 排序且**不过滤 `config_snapshot`**
+    /// —— 把 mtime 塞进去，每个快照文件都会作为一行「最近会话」参与排序，
+    /// 而下游正是靠那个判「用户最近有没有活动」。**巩固写的就是这些文件**，
+    /// 于是它会把自己的写入读成新活动。⇒ 独立字段，由消费者显式选择怎么用。
+    #[serde(default)]
+    pub modified_at: Option<String>,
 
     // --- Claude-only ---
     pub message_id: Option<String>,

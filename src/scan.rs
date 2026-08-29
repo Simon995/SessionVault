@@ -108,6 +108,39 @@ fn scan_unimplemented(source: &SourceRef, _cursor_in: Option<Cursor>) -> ScanRes
     }
 }
 
+/// 快照源文件的 mtime（Unix 秒），**问不到返回 `None`**。
+///
+/// 🔴 三条路径各有各的失败方式，而它们**都不是**「这个文件没有 mtime」：
+///
+/// | 路径 | 问法 | 问不到时 |
+/// | --- | --- | --- |
+/// | 本机 | `probe::stat`（经边界闸，不直接 `std::fs::metadata`） | `Absent` / `Unknown` → `None` |
+/// | WSL（Windows 构建） | `wsl::stat` —— 它跑 `stat -c %Y` | 桥出错 / 文件不在 → `None` |
+/// | WSL（非 Windows 构建） | 那座桥编译进来的是桩 | 恒 `Err` → `None` |
+///
+/// ⚠️ 这里**刻意不 warn**：快照扫描每轮对每个文件都跑一次，而 WSL 侧一次
+/// `stat` 要拉一个 shell。把「拿不到」升成告警会在正常机器上刷屏
+/// （本仓那条「一个满屏误报的扫描器等于一个关掉的扫描器」）。
+/// 拿不到的后果是下游少一维排序信号，由 `modified_at: None` **如实表达**。
+fn snapshot_mtime(source: &SourceRef) -> Option<i64> {
+    match &source.source_location {
+        SourceLocation::Local => match crate::probe::LocalBackend::unanchored()
+            .stat(&source.path, crate::deadline::Deadline::unbounded())
+        {
+            crate::probe::Probed::Found(f) => f.modified_unix,
+            _ => None,
+        },
+        SourceLocation::Wsl(distro) => crate::wsl::stat(
+            distro,
+            &source.path.to_string_lossy(),
+            crate::deadline::Deadline::unbounded(),
+        )
+        .ok()
+        .flatten()
+        .map(|(_size, mtime)| mtime),
+    }
+}
+
 fn scan_snapshot_file(
     source: &SourceRef,
     cursor_in: Option<Cursor>,
@@ -180,6 +213,13 @@ fn scan_snapshot_file(
         .unwrap_or_default()
         .as_secs()
         .to_string();
+    // 源文件的 mtime —— 见 `RawEvent::modified_at`：它与 `observed_at` 互补，
+    // 一个分得开「扫描批次之间」，另一个分得开「批次之内的存量文件」。
+    //
+    // 🔴 **问不到就是 `None`，不折进任何一个值。** 三条路径各自可能失败
+    // （本机 stat 报 Unknown / WSL 桥不可用 / 非 Windows 构建没有那座桥），
+    // 而「没问出来」与「这个文件没有 mtime」在下游的处置不同。
+    let modified_at = snapshot_mtime(source).map(|s| s.to_string());
     let event = RawEvent {
         schema_version: SCHEMA_VERSION,
         source_type: source.source_type,
@@ -214,6 +254,7 @@ fn scan_snapshot_file(
         content_hash: Some(hash.clone()),
         artifact_kind: source.artifact_kind.clone(),
         observed_at: Some(observed_at),
+        modified_at,
         message_id: None,
         request_id: None,
     };
@@ -1210,5 +1251,98 @@ mod tests {
                 "跳过本文件，别把瞬时失败写成持久坏记录"
             );
         }
+    }
+    // ── 快照带上源文件的 mtime（2026-08-29）────────────────────────────
+
+    #[test]
+    fn a_snapshot_event_carries_the_source_file_mtime() {
+        // 🔴 判据是**它与 `observed_at` 分得开的东西不同**，不是「有个值」。
+        //
+        // 消费者侧实测：206 个快照的 `observed_at` 只有 110 个不同取值，
+        // **60% 与别人同秒**（首次上线时一次收进来的存量文件全挤在一起）。
+        // mtime 是那 60% 唯一能分开的信号。
+        let (path, src) = temp_snapshot("mtime", "# hello\n");
+        let res = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert_eq!(res.status, ScanStatus::Ok);
+        assert_eq!(res.events.len(), 1, "内容变了就该发一条快照事件");
+        let ev = &res.events[0];
+
+        let mtime = ev
+            .modified_at
+            .as_deref()
+            .expect("本机快照应当带上 mtime")
+            .parse::<i64>()
+            .expect("mtime 是 Unix 秒字符串");
+        let real = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(mtime, real, "报出来的 mtime 要等于文件真实的 mtime");
+
+        // **成对的另一半**：它没有顶掉别的时间字段。
+        assert!(
+            ev.occurred_at.is_none(),
+            "文件没有事件时间 —— mtime 不许被写进 occurred_at（§11），\
+             否则每个快照都会作为一行「最近会话」参与排序"
+        );
+        assert!(ev.observed_at.is_some(), "observed_at 仍然要有——两者互补");
+        assert_eq!(
+            ev.time_confidence,
+            crate::rawevent::TimeConfidence::Low,
+            "mtime 是弱信号（会被 checkout/复制清掉），置信度不许因此升到 high"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_append_log_event_has_no_modified_at() {
+        // 反向的一半：**追加日志的单条事件没有「文件写入时间」可言** ——
+        // 整个 jsonl 一直在长，它的 mtime 属于最后一行不属于这一行。
+        // 少了这条，「给所有事件都填上 mtime」也会全绿。
+        let (path, src) = temp_source("nomtime", &format!("{}\n", claude_line("s", "alpha")));
+        let res = scan_source(
+            &src,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert_eq!(res.status, ScanStatus::Ok);
+        assert!(!res.events.is_empty());
+        for ev in &res.events {
+            assert!(
+                ev.modified_at.is_none(),
+                "append_log 的事件不该带 modified_at"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_snapshot_whose_file_cannot_be_stat_says_none_not_zero() {
+        // 🔴 「没问出来」不是「时间是 0」。`snapshot_mtime` 走的是 `probe::stat`，
+        // 它对一个不存在的路径答 `Absent` ⇒ 必须落到 `None`。
+        //
+        // ⚠️ 这条用**直接调 `snapshot_mtime`** 而不是走 `scan_source`：文件不在时
+        // 扫描会先在读取那一步失败、根本不发事件，那样这条断言就**测不到它要测的
+        // 那一段**（本仓那条「变异要打断生产代码实际走的那条路径」的同族）。
+        let src = SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::SnapshotFile,
+            path: std::env::temp_dir().join("svault-definitely-not-here-9f3a1c.md"),
+            project_root: None,
+            artifact_kind: Some("memory".to_string()),
+        };
+        assert_eq!(super::snapshot_mtime(&src), None);
     }
 }
