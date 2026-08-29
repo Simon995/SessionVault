@@ -122,7 +122,7 @@ fn scan_unimplemented(source: &SourceRef, _cursor_in: Option<Cursor>) -> ScanRes
 /// `stat` 要拉一个 shell。把「拿不到」升成告警会在正常机器上刷屏
 /// （本仓那条「一个满屏误报的扫描器等于一个关掉的扫描器」）。
 /// 拿不到的后果是下游少一维排序信号，由 `modified_at: None` **如实表达**。
-fn snapshot_mtime(source: &SourceRef) -> Option<i64> {
+pub(crate) fn snapshot_mtime(source: &SourceRef) -> Option<i64> {
     match &source.source_location {
         SourceLocation::Local => match crate::probe::LocalBackend::unanchored()
             .stat(&source.path, crate::deadline::Deadline::unbounded())

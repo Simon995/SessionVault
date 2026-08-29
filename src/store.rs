@@ -3275,8 +3275,21 @@ impl TotalStore {
     /// ⇒ **16 分 06 秒**，其间 QuotaBar 的「蒸馏」满核空转、界面只显示「蒸馏中…」。
     /// 一次读之后是 176 条的线性匹配，量级从 O(source × 全表) 落到 O(全表 + source²)。
     ///
-    /// 纯函数（不借 `&self`），所以下面的单测能直接钉住三条分支。
-    fn snapshot_cursor(latest: &[(i64, RawEvent)], source: &SourceRef) -> Cursor {
+    /// 纯函数（不借 `&self`），所以下面的单测能直接钉住那几条分支。
+    ///
+    /// 🔴 **`mtime_probe` 是注入的，不是在这里直接 stat。** 加 `modified_at` 的
+    /// 补齐分支时我第一版就地调了 `crate::scan::snapshot_mtime` —— 那一下把上面
+    /// 那句「纯函数」变成了假话，而这个函数的可测性正建立在它上面。
+    /// 与 [`Self::read_active_latest_snapshots_with`] 注入 backend 同一个惯例：
+    /// **注入的是探测器而不是一个 `bool`**，否则测试钉住的是我自己造的映射。
+    ///
+    /// ⚠️ 它**只在缺 mtime 时被调用**（`is_none()` 短路在前）。稳态下一次都不调；
+    /// WSL 侧一次 stat 要拉一个 shell，无条件探会让整轮同步慢一个量级。
+    fn snapshot_cursor(
+        latest: &[(i64, RawEvent)],
+        source: &SourceRef,
+        mtime_probe: &dyn Fn(&SourceRef) -> Option<i64>,
+    ) -> Cursor {
         let found = latest.iter().map(|(_, event)| event).find(|event| {
             event.source_type == source.source_type
                 && event.source_location == source.source_location
@@ -3286,9 +3299,23 @@ impl TotalStore {
         if let Some(event) = found {
             // 内容未变但宿主补齐/修正了项目身份或 artifact kind 时也要发新版本；
             // 否则早期无身份快照会永久挡住后续规范化元数据。
-            if event.project_root == source.project_root
-                && event.artifact_kind == source.artifact_kind
-            {
+            //
+            // 🔴 **`modified_at` 归同一类**（2026-08-29）。存量快照是加这个字段
+            // 之前写的，而快照只在 `content_hash` 变了才重发 ⇒ 它们会**永久**停在
+            // `modified_at: None`，正是上面那句话说的「永久挡住后续规范化元数据」。
+            //
+            // ⚠️ **自限**：条件里带上「现在**取得到**」。只写 `is_none()` 的话，
+            // 一台 WSL 桥不通的机器会**每一轮都重发一版**（新版本同样没有 mtime
+            // ⇒ 下一轮再判一次「缺」）—— 快照版本没有上限，那是一个无声的
+            // 无限增长。取不到就不动它，等桥通了自然会补上。
+            //
+            // ⚠️ 这个探测**只在缺 mtime 时发生**：补齐之后 `is_some()` 短路，
+            // 稳态下一次 stat 都不多做。WSL 侧一次 stat 要拉一个 shell，
+            // 无条件探会让 `sync-snapshots` 慢一个量级。
+            let meta_stale = event.project_root != source.project_root
+                || event.artifact_kind != source.artifact_kind
+                || (event.modified_at.is_none() && mtime_probe(source).is_some());
+            if !meta_stale {
                 cursor.content_hash = event.content_hash.clone();
             }
             cursor.next_seq = event.seq.saturating_add(1);
@@ -3307,7 +3334,7 @@ impl TotalStore {
                 continue;
             }
             stats.sources += 1;
-            let cursor = Self::snapshot_cursor(&latest, source);
+            let cursor = Self::snapshot_cursor(&latest, source, &crate::scan::snapshot_mtime);
             // 空注册表在这条路上是**惰性**的，不是降级：快照（Class-B）的
             // `project_root` 由宿主直接填在 `SourceRef` 上，不从 cwd 归属而来 ——
             // `scan_snapshot_file` 压根不碰 `roots`。给非空的反而会让人以为它参与了判定。
@@ -3862,6 +3889,92 @@ mod tests {
         ];
         let out = TotalStore::converge_mnt_roots(rows, &Vec::new());
         assert_eq!(out.len(), 2, "没有挂载表就不该断定这两条是同一个目录");
+    }
+
+    // ── snapshot_cursor：元数据补齐要重发，但不许无限重发（2026-08-29）──────
+    //
+    // ⚠️ 这个函数的文档一直写着「纯函数……下面的单测能直接钉住三条分支」，
+    // 而在此之前**一条直接调它的测试都没有**。补上，那句话才成立。
+
+    fn snap_source(project_root: Option<&str>) -> crate::discover::SourceRef {
+        crate::discover::SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: crate::rawevent::SourceMode::SnapshotFile,
+            path: std::path::PathBuf::from("/p/CLAUDE.md"),
+            project_root: project_root.map(|s| s.to_string()),
+            artifact_kind: Some("memory".to_string()),
+        }
+    }
+
+    fn snap_event(project_root: Option<&str>, modified_at: Option<&str>) -> RawEvent {
+        let mut e = mk_event(7, "snapshot", Some("body"));
+        e.source_mode = crate::rawevent::SourceMode::SnapshotFile;
+        e.source_path = "/p/CLAUDE.md".to_string();
+        e.source_session_id = "snapshot".to_string();
+        e.event_type = EventType::ConfigSnapshot;
+        e.project_root = project_root.map(|s| s.to_string());
+        e.artifact_kind = Some("memory".to_string());
+        e.content_hash = Some("sha256:deadbeef".to_string());
+        e.occurred_at = None;
+        e.time_confidence = TimeConfidence::Low;
+        e.observed_at = Some("1787884118".to_string());
+        e.modified_at = modified_at.map(|s| s.to_string());
+        e
+    }
+
+    /// 元数据齐了 ⇒ 种上内容指纹 ⇒ 内容没变就不重发。**稳态不churn。**
+    #[test]
+    fn a_snapshot_with_complete_metadata_seeds_the_fingerprint_cursor() {
+        let latest = vec![(1, snap_event(Some("/p"), Some("1787000000")))];
+        // `Fn` 不能改捕获变量 —— 用 Cell 记次数（比换成 `FnMut` 轻）。
+        let probed = std::cell::Cell::new(0u32);
+        let cur = TotalStore::snapshot_cursor(&latest, &snap_source(Some("/p")), &|_| {
+            probed.set(probed.get() + 1);
+            Some(1)
+        });
+        assert_eq!(cur.content_hash.as_deref(), Some("sha256:deadbeef"));
+        // 🔴 **一次都不许探。** WSL 侧一次 stat 拉一个 shell，无条件探会让整轮
+        // 同步慢一个量级 —— 而那个代价不会有任何东西报出来。
+        assert_eq!(probed.get(), 0, "已经有 mtime 就不该再去 stat");
+    }
+
+    /// 存量快照缺 `modified_at`、而现在取得到 ⇒ **不种游标** ⇒ 重发一版补齐。
+    /// 与既有的「宿主补齐了 project_root」同一条路径。
+    #[test]
+    fn a_snapshot_missing_mtime_is_re_emitted_when_we_can_now_get_one() {
+        let latest = vec![(1, snap_event(Some("/p"), None))];
+        let cur = TotalStore::snapshot_cursor(&latest, &snap_source(Some("/p")), &|_| Some(1));
+        assert!(
+            cur.content_hash.is_none(),
+            "缺 mtime 且现在取得到 ⇒ 该重发一版，而不是永久停在没有 mtime"
+        );
+        // seq 仍要接着走 —— 重发的是**新版本**，不是从头开始。
+        assert_eq!(cur.next_seq, 8);
+    }
+
+    /// 🔴 **自限**：取不到就别动它。
+    ///
+    /// 只写 `is_none()` 的话，一台 WSL 桥不通的机器会**每一轮都重发一版**
+    /// （新版本同样没有 mtime ⇒ 下一轮再判一次「缺」）—— 而快照版本**没有上限**，
+    /// 那是一个无声的无限增长：`git status` 不会说，界面不会说，只有 `du` 看得见。
+    #[test]
+    fn a_snapshot_missing_mtime_is_left_alone_when_we_still_cannot_get_one() {
+        let latest = vec![(1, snap_event(Some("/p"), None))];
+        let cur = TotalStore::snapshot_cursor(&latest, &snap_source(Some("/p")), &|_| None);
+        assert_eq!(
+            cur.content_hash.as_deref(),
+            Some("sha256:deadbeef"),
+            "取不到 mtime 就不该重发 —— 否则每轮一版，无限增长"
+        );
+    }
+
+    /// 既有那条分支没被这次改动弄坏：身份变了照样重发。
+    #[test]
+    fn a_snapshot_whose_project_root_changed_is_still_re_emitted() {
+        let latest = vec![(1, snap_event(None, Some("1787000000")))];
+        let cur = TotalStore::snapshot_cursor(&latest, &snap_source(Some("/p")), &|_| Some(1));
+        assert!(cur.content_hash.is_none(), "宿主补齐了身份 ⇒ 该重发");
     }
 
     pub(super) fn mk_event(seq: u64, session: &str, content: Option<&str>) -> RawEvent {
