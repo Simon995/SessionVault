@@ -128,16 +128,28 @@ pub(crate) fn snapshot_mtime(source: &SourceRef) -> Option<i64> {
             .stat(&source.path, crate::deadline::Deadline::unbounded())
         {
             crate::probe::Probed::Found(f) => f.modified_unix,
-            _ => None,
+            // 🔴 两支都归 `None`，而它们**不是同一件事** —— 见上表。
+            // 合并在这里是安全的，理由只有一条：本函数的返回值只喂一维
+            // **排序信号**（`RawEvent.modified_at`），不驱动任何
+            // prune / 删除 / 归属判决。写成两支而不是 `_`，是为了让「我们
+            // 知道这个区别存在、并且是刻意压掉的」留在代码里：哪天这个值
+            // 被拿去做别的判断，改的人第一眼就看见这里压过一个三态。
+            crate::probe::Probed::Absent => None,
+            crate::probe::Probed::Unknown(_) => None,
         },
-        SourceLocation::Wsl(distro) => crate::wsl::stat(
+        // 同上：`Ok(None)`（文件不在）与 `Err`（桥没答上来 / 非 Windows 构建
+        // 的桩）分别写出来。原先这里是 `.ok().flatten()` —— 它把两者压成一个
+        // 表达式，于是「没问成」在代码上长得和「这里是空的」一模一样，正是
+        // 本仓反复立规矩要防的那个形状（`docs/scan-state-model.md` §5）。
+        SourceLocation::Wsl(distro) => match crate::wsl::stat(
             distro,
             &source.path.to_string_lossy(),
             crate::deadline::Deadline::unbounded(),
-        )
-        .ok()
-        .flatten()
-        .map(|(_size, mtime)| mtime),
+        ) {
+            Ok(Some((_size, mtime))) => Some(mtime),
+            Ok(None) => None,
+            Err(_) => None,
+        },
     }
 }
 
