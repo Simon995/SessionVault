@@ -172,6 +172,36 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 把路径反查成项目身份 —— **只读**，`roots` 的读侧配套。
+    ///
+    /// ## 为什么 `roots` 不够
+    ///
+    /// `roots` 给的是注册表里的**原始写法**，而消费方手上的路径来自别处：会话记的
+    /// `cwd`、用户点的目录。两者指同一个目录却对不上是常态 —— 注册表存
+    /// `wsl:<distro>:/home/…`（从 Windows 侧发现），而**在那个发行版里跑**的会话
+    /// 记的是裸 `/home/…`。直接比较不匹配，**而且不报错**，只表现成「这条会话没有项目」。
+    ///
+    /// 🔴 实测（2026-09-01，一台开发机）：281 条 codex 会话里 **31 条**栽在这一条，
+    /// 其中包括项目搬家**之后**新开的那几条 —— 不是历史债，是每个在发行版里跑的
+    /// 会话都会中招的活缺陷。
+    ///
+    /// 消费方自己补这条归一化是能补的，代价是同一条规则出现 N 份 —— 本仓为
+    /// 「同一条规则两处实现」付过多次代价。所以出口开在这里。
+    ///
+    /// ⚠️ **不做相似度猜测。** 叶子名相同不算证据（实测：`473` / `5670` 这类数字
+    /// 会撞进完全无关的仓库）。认不出来就报 `unknown`，那是正确答案。
+    #[cfg(feature = "store")]
+    Attribute {
+        /// 要反查的路径，可重复给。
+        #[arg(long = "path", required = true)]
+        paths: Vec<String>,
+        /// 展开裸 Linux 路径用的候选发行版，可重复给。
+        /// **不给则从注册表里已有的 `wsl:<distro>:` 根自动推**（那是本机实际见过的）。
+        #[arg(long = "distro")]
+        distros: Vec<String>,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 这台机器上有哪些**记忆根**（`~/.claude` + `~/.codex` 对），含每个 WSL 发行版。
     ///
     /// 与 `roots` 是两件事，别混：`roots` 回答「**事件被归因到**哪些项目根」（读总库）；
@@ -554,6 +584,55 @@ enum Out<'a> {
         /// 判决的理由；`resolved` / `not_probed` 没有。
         identity_detail: Option<String>,
     },
+    /// `attribute` 的一行 —— 一条路径的身份判决。
+    ///
+    /// 🔴 **五态各有自己的名字**，不压成「有身份 / 没身份」：
+    /// `resolved`（认出来了）／`no_identity`（**确认**那个仓没有 remote，**接受**）／
+    /// `identity_unavailable`（找到根了，身份这一轮**没问成**，**等或重试**）／
+    /// `ambiguous`（同样具体的两个根身份不同，**不猜**）／
+    /// `unknown`（没有任何已知根盖住它）。
+    /// 压成两态就又造一个「没问成长得像没有」，而这五种的下一步完全不同。
+    ///
+    /// ⚠️ `no_identity` 与 `identity_unavailable` 曾经是同一个判决 —— 那让消费方
+    /// 按「确认没有，接受」处理一个其实该重试的根，一次权限错误从此成为永久结论。
+    #[cfg(feature = "store")]
+    PathAttribution {
+        /// 问的那条路径，原样回显 —— 批量调用时消费方靠它对号。
+        path: String,
+        verdict: &'a str,
+        /// 命中的根（`resolved` / `no_identity` 有）。
+        root: Option<String>,
+        canonical_id: Option<String>,
+        /// **用哪种写法**撞上的。裸 Linux 路径要靠展开成 `wsl:<distro>:/…` 才撞得上，
+        /// 而排查「为什么这条认出来了那条没有」第一个要问的就是这个。
+        matched_form: Option<String>,
+        /// `ambiguous`：同样具体的候选 `(根, 身份)`。
+        candidates: Vec<(String, String)>,
+        /// `unknown`：试过哪些写法 —— 让「没试到」与「试了没有」分得开。
+        tried: Vec<String>,
+        /// `identity_unavailable` 时那个根的身份判决拼写（`not_probed` / `unresolved`）——
+        /// **等**还是**重试**由它决定。
+        identity_verdict: Option<String>,
+    },
+    /// `attribute` 的收尾摘要。
+    #[cfg(feature = "store")]
+    AttributeSummary {
+        paths: usize,
+        resolved: usize,
+        no_identity: usize,
+        identity_unavailable: usize,
+        ambiguous: usize,
+        unknown: usize,
+        /// 展开裸 Linux 路径用的候选发行版。**空 = 一条都没展开** ——
+        /// 那时 `unknown` 里很可能全是「本可以认出来」的，见该字段的用途。
+        distros: Vec<String>,
+        /// 这一轮**拿到挂载表了吗** —— 与 `RootsSummary` 同一个字段、同一个理由。
+        ///
+        /// 🔴 拿不到时 `/mnt/<drive>/…` 与它对应的 Windows 根**收敛不了**，
+        /// 那些查询会落进 `unknown`。没有这个标志，消费方分不出
+        /// 「库里没有这个根」与「本轮没拿到换算事实」—— 又一处「没问成长得像没有」。
+        drive_mounts_available: bool,
+    },
     /// `roots` 的收尾摘要。
     ///
     /// 🔴 `attribution_revision` 是消费方的**缓存失效锚**，与上面那些行来自同一次
@@ -662,6 +741,12 @@ fn main() {
         Command::SyncSnapshots { store } => run_sync_snapshots(store),
         #[cfg(feature = "store")]
         Command::Roots { store } => run_roots(store),
+        #[cfg(feature = "store")]
+        Command::Attribute {
+            paths,
+            distros,
+            store,
+        } => run_attribute(paths, distros, store),
         Command::StorePath => run_store_path(),
         Command::MemoryRoots {
             userprofile,
@@ -2850,6 +2935,181 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
     emit(&Out::RootsSummary {
         roots: roots.len(),
         attribution_revision,
+        drive_mounts_available: !mounts.is_empty(),
+    });
+    0
+}
+
+/// `attribute`：把路径反查成项目身份。**只读**。
+///
+/// 判定逻辑全在 [`session_vault::attribution::identify_path`]（纯函数、有单测）——
+/// 这里只做「开库、取根、拼输出」。本仓的规矩：**探测器注入了才测得到调用点**，
+/// 把判定写进 CLI 处理函数就等于它没有测试。
+#[cfg(feature = "store")]
+fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<PathBuf>) -> i32 {
+    use session_vault::attribution::{identify_path, PathIdentity, RootIdentity};
+
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
+    }
+    let store = match open_total_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    // 表只读一次 —— 与 `run_roots` 同一条理由（读两次会拿到两份运行期事实）。
+    let mounts = session_vault::host_drive_mounts();
+    // 🔴 拿不到挂载表时 `/mnt/<drive>/…` 与它的 Windows 根收敛不了，那些查询会落进
+    // `unknown` —— 而「库里没有」与「本轮没拿到换算事实」必须分得开。摘要里带标志，
+    // 这里再喊一声（与 `run_roots` 同一处置）。
+    if mounts.is_empty() {
+        log::warn!(
+            target: tag::CLI,
+            "drive mounts unavailable — /mnt paths cannot converge with their host roots;              such queries report unknown (see AttributeSummary.drive_mounts_available)"
+        );
+    }
+    let (rows, _revision) = match store.project_roots_report(&mounts) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!(target: tag::CLI, "project_roots_report failed: {e}");
+            return 1;
+        }
+    };
+    let roots: Vec<RootIdentity> = rows
+        .iter()
+        .map(|r| RootIdentity {
+            root: r.root_path.clone(),
+            // 🔴 别名必须带上：UNC 形式登记的根，它的规范形只在这里。
+            aliases: r.aliases.clone(),
+            canonical_id: r.canonical_id.clone(),
+            identity_verdict: r.identity_verdict.as_str().to_string(),
+        })
+        .collect();
+
+    // 🔴 不给 `--distro` 就**从注册表已有的规范形推**，而不是猜一个默认值：
+    // 推出来的是「本机实际见过的发行版」，而猜出来的（比如硬编码 `Ubuntu`）在别人
+    // 机器上会安静地一条都展不开 —— 那时 `unknown` 里全是本可以认出来的。
+    // ⚠️ **根与别名都要看**：UNC 形式登记的根，发行版名只出现在它的规范形别名里。
+    let distros: Vec<String> = if distros.is_empty() {
+        let mut d: Vec<String> = rows
+            .iter()
+            .flat_map(|r| std::iter::once(&r.root_path).chain(r.aliases.iter()))
+            .filter_map(|p| {
+                // UNC 先过规范形（拼串的唯一出口），再从 `wsl:<distro>:` 里取名字。
+                let canon = session_vault::pathnorm::canonical_wsl_unc(p);
+                let s = canon.as_deref().unwrap_or(p);
+                s.strip_prefix("wsl:")
+                    .and_then(|rest| rest.split_once(':'))
+                    .map(|(distro, _)| distro.to_string())
+            })
+            .collect();
+        d.sort();
+        d.dedup();
+        d
+    } else {
+        distros
+    };
+    if distros.is_empty() {
+        log::warn!(
+            target: tag::CLI,
+            "no WSL distros known — bare Linux paths cannot be expanded and will report unknown"
+        );
+    }
+
+    let (mut resolved, mut no_identity, mut ambiguous, mut unknown) = (0, 0, 0, 0);
+    let mut identity_unavailable = 0;
+    for path in &paths {
+        let out = match identify_path(path, &distros, &roots, &mounts) {
+            PathIdentity::Resolved {
+                root,
+                canonical_id,
+                matched_form,
+            } => {
+                resolved += 1;
+                Out::PathAttribution {
+                    path: path.clone(),
+                    verdict: "resolved",
+                    root: Some(root),
+                    canonical_id: Some(canonical_id),
+                    matched_form: Some(matched_form),
+                    candidates: Vec::new(),
+                    tried: Vec::new(),
+                    identity_verdict: None,
+                }
+            }
+            PathIdentity::NoIdentity { root, matched_form } => {
+                no_identity += 1;
+                Out::PathAttribution {
+                    path: path.clone(),
+                    verdict: "no_identity",
+                    root: Some(root),
+                    canonical_id: None,
+                    matched_form: Some(matched_form),
+                    candidates: Vec::new(),
+                    tried: Vec::new(),
+                    identity_verdict: None,
+                }
+            }
+            PathIdentity::IdentityUnavailable {
+                root,
+                matched_form,
+                verdict,
+            } => {
+                identity_unavailable += 1;
+                Out::PathAttribution {
+                    path: path.clone(),
+                    verdict: "identity_unavailable",
+                    root: Some(root),
+                    canonical_id: None,
+                    matched_form: Some(matched_form),
+                    candidates: Vec::new(),
+                    tried: Vec::new(),
+                    identity_verdict: Some(verdict),
+                }
+            }
+            PathIdentity::Ambiguous { candidates } => {
+                ambiguous += 1;
+                Out::PathAttribution {
+                    path: path.clone(),
+                    verdict: "ambiguous",
+                    root: None,
+                    canonical_id: None,
+                    matched_form: None,
+                    candidates,
+                    tried: Vec::new(),
+                    identity_verdict: None,
+                }
+            }
+            PathIdentity::Unknown { tried } => {
+                unknown += 1;
+                Out::PathAttribution {
+                    path: path.clone(),
+                    verdict: "unknown",
+                    root: None,
+                    canonical_id: None,
+                    matched_form: None,
+                    candidates: Vec::new(),
+                    tried,
+                    identity_verdict: None,
+                }
+            }
+        };
+        emit(&out);
+    }
+    emit(&Out::AttributeSummary {
+        paths: paths.len(),
+        resolved,
+        no_identity,
+        identity_unavailable,
+        ambiguous,
+        unknown,
+        distros,
         drive_mounts_available: !mounts.is_empty(),
     });
     0
