@@ -435,6 +435,233 @@ pub enum PathIdentity {
     },
 }
 
+// ── 同一个物理目录被登记了几次（ADR-050 决定 9 的度量）──────────────────────
+//
+// ## 🔴 为什么这条判据必须住在这里
+//
+// 决定 9 要消除的是「同一个**目录**在注册表里占多行」。而**同一个 `canonical_id`
+// 下的多条根有两种成因，处置相反**：
+//
+// | | 是什么 | 处置 |
+// | --- | --- | --- |
+// | (a) | 同一个**物理目录**被登记成多种写法 | 合并 |
+// | (b) | 同一个**项目**的多份 checkout（submodule / 独立克隆 / 另一侧系统） | 🔴 **绝不能合并** |
+//
+// 实测某台开发机：一个身份下 4 条根**全是 (b)** —— 四个真实存在、内容可以不同的
+// 目录。**按 `canonical_id` 分组去「合并重复」就是把它们抹成一个。**
+//
+// ⚠️ 而按 `registry_key` 分组是另一种错：它**不做发行版展开**，于是
+// `/home/<u>/p` 与 `wsl:<d>:/home/<u>/p` 算两个键，统计得 0 个重复，
+// 而肉眼可见有两对。
+//
+// ⇒ 判据与 [`identify_path`] 同源：把每条根的 `root + aliases` 都过 [`path_forms`]，
+// 再取比较键集合；**两条根有共同键 ⇒ 同一个目录**。
+//
+// 🔴 **本函数只报，不合并。** 合并要改数据、且会改变消费者今天看到的 `root` 值；
+// 在写入侧错误合并比查询侧的错更难回滚（查询错了下次查就纠正，合并错了要等到
+// 有人发现数据少了）。
+
+/// 一组根被判为「同一个目录」**凭的是什么**。
+///
+/// 🔴 **这个区分决定了写入侧能不能自动合并。** 注册表**故意不记「这条根是从哪
+/// 发现的」**（决定 3：不带 `source_location`），所以一条裸 Linux 路径**属于哪个
+/// 发行版是问不出来的** —— [`path_forms`] 把它展开成 `wsl:<distro>:/…` 是**猜**。
+///
+/// 反例（单发行版机器上构造不出来，逻辑上成立）：
+///
+/// ```text
+/// A = wsl:Ubuntu:/home/u/proj     ← 从 Windows 侧发现
+/// B = /home/u/proj                ← 裸形式，实际属于 Debian
+/// distros 从注册表推 ⇒ ["Ubuntu"]（Debian 没有任何根，推不出来）
+/// path_forms(B) ⇒ 含 wsl:Ubuntu:/home/u/proj ⇒ 与 A 相交 ⇒ 判为同一目录
+/// ```
+///
+/// **A 和 B 是两个系统里的两个目录，而判据说它们是同一个。**
+/// 漏检是安全的（少合一个），误判不安全（合错一个），而写入侧的错
+/// 「要等到有人发现数据少了」才暴露。
+///
+/// ⇒ **报告可以用 `DistroGuess`（宁可多报，人来看）；自动合并只接受 `Observed`。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBasis {
+    /// 只用**观测到的事实**就相交：注册表里登记的写法本身、它的 `aliases`、
+    /// 以及挂载表给出的 `/mnt/<drive>` ⇄ `<drive>:` 换算（挂载表是读来的，不是猜的）。
+    Observed,
+    /// **只有**在把裸路径展开成某个发行版的规范形（或反向）之后才相交 —— **推测**。
+    DistroGuess,
+}
+
+/// 一组指向**同一个物理目录**的根。`roots.len() > 1` 即决定 9 要消除的重复。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryGroup {
+    /// 注册表里的原始写法，按字典序。
+    pub roots: Vec<String>,
+    pub canonical_id: String,
+    /// 凭什么判为同一个目录 —— **写入侧据此决定敢不敢合**。
+    pub basis: GroupBasis,
+}
+
+/// 两条根的展开形式相交，**但它们身份不同** —— 多发行版机器上的歧义形状。
+///
+/// 🔴 **不许据此合并。** 裸 `/home/<u>/p` 在两个发行版下展开出两个候选，
+/// 可能与两条不同的根都相交；那时「它们是同一个目录」是**没有依据的猜测**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousOverlap {
+    pub left: String,
+    pub right: String,
+    pub left_id: String,
+    pub right_id: String,
+}
+
+/// [`same_directory_groups`] 的结果 —— **两个数分开报**。
+///
+/// 🔴 只报「重复目录数」的话，「合法 checkout 数」一旦被误读成「还没修干净」，
+/// 下一个人就会去合并它 —— 而那正是初稿那条度量会导致的事。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DirectoryGrouping {
+    /// 按物理目录分完组的结果（只含身份已解析的根）。
+    pub groups: Vec<DirectoryGroup>,
+    /// 身份不同却相交 —— 只报不合。
+    pub ambiguous: Vec<AmbiguousOverlap>,
+}
+
+impl DirectoryGrouping {
+    /// **同一个物理目录被登记成多行**的组数 —— 决定 9 落地后应为 0。
+    ///
+    /// ⚠️ 含 `DistroGuess` 那一类：**报告宁可多报**。要「敢不敢自动合并」用
+    /// [`Self::mergeable_duplicates`]。
+    pub fn duplicate_directories(&self) -> usize {
+        self.groups.iter().filter(|g| g.roots.len() > 1).count()
+    }
+
+    /// 其中**凭观测事实**就能确定是同一目录的 —— 写入侧只该合这些。
+    pub fn mergeable_duplicates(&self) -> usize {
+        self.groups
+            .iter()
+            .filter(|g| g.roots.len() > 1 && g.basis == GroupBasis::Observed)
+            .count()
+    }
+
+    /// **同一个项目下不同目录**的个数 —— 合法，**不该随决定 9 变化**。
+    ///
+    /// 口径：某个 `canonical_id` 下分出多于一组时，那些组**全部**计入。
+    /// ⚠️ 口径要写死并与消费侧对账 —— 「6」和「9」的差别只可能来自口径，
+    /// 而一个说不清分母的数与没有这个数差不多。
+    pub fn distinct_checkouts(&self) -> usize {
+        let mut by_id: std::collections::BTreeMap<&str, usize> = Default::default();
+        for g in &self.groups {
+            *by_id.entry(g.canonical_id.as_str()).or_default() += 1;
+        }
+        by_id.values().filter(|n| **n > 1).sum()
+    }
+}
+
+/// 把根按「同一个物理目录」分组。**纯函数、零 I/O**，与 [`attribute`] 同一条纪律。
+///
+/// ⚠️ **只看身份已解析的根**（`canonical_id` 为 `Some`）：身份没问成的根不该参与
+/// 「是不是同一个项目的两份 checkout」这个判断 —— 那会把「没问成」当成一个答案用。
+pub fn same_directory_groups(
+    roots: &[RootIdentity],
+    distros: &[String],
+    mounts: &DriveMounts,
+) -> DirectoryGrouping {
+    type Keys = std::collections::BTreeSet<String>;
+    // 每条根算**两套**键：
+    //   observed —— 只用登记的写法 + aliases（挂载表换算在 `registry_key` 里，
+    //               它是读来的事实）
+    //   expanded —— 再过一遍 `path_forms`（含裸 ⇄ 规范形的发行版展开，那是**猜**）
+    let keyed: Vec<(&RootIdentity, Keys, Keys)> = roots
+        .iter()
+        .filter(|r| r.canonical_id.is_some())
+        .map(|r| {
+            let spellings: Vec<&String> =
+                std::iter::once(&r.root).chain(r.aliases.iter()).collect();
+            let observed: Keys = spellings.iter().map(|s| registry_key(s, mounts)).collect();
+            let expanded: Keys = spellings
+                .iter()
+                .flat_map(|s| path_forms(s, distros))
+                .map(|f| registry_key(&f, mounts))
+                .collect();
+            (r, observed, expanded)
+        })
+        .collect();
+
+    let mut out = DirectoryGrouping::default();
+    struct Bucket {
+        members: Vec<usize>,
+        observed: std::collections::BTreeSet<String>,
+        expanded: std::collections::BTreeSet<String>,
+        basis: GroupBasis,
+    }
+    let mut buckets: Vec<Bucket> = Vec::new();
+    for (i, (r, observed, expanded)) in keyed.iter().enumerate() {
+        // 先找**凭事实**就相交的；找不到再退而求其次找靠展开相交的。
+        let same_id = |b: &Bucket| {
+            b.members
+                .iter()
+                .all(|m| keyed[*m].0.canonical_id == r.canonical_id)
+        };
+        let by_fact = buckets
+            .iter()
+            .position(|b| same_id(b) && !b.observed.is_disjoint(observed));
+        let by_guess = by_fact.or_else(|| {
+            buckets
+                .iter()
+                .position(|b| same_id(b) && !b.expanded.is_disjoint(expanded))
+        });
+        // 相交但**身份不同** ⇒ 歧义：只报，不合。
+        for b in buckets.iter() {
+            if !same_id(b) && !b.expanded.is_disjoint(expanded) {
+                let other = keyed[b.members[0]].0;
+                out.ambiguous.push(AmbiguousOverlap {
+                    left: other.root.clone(),
+                    right: r.root.clone(),
+                    left_id: other.canonical_id.clone().unwrap_or_default(),
+                    right_id: r.canonical_id.clone().unwrap_or_default(),
+                });
+            }
+        }
+        match by_guess {
+            Some(idx) => {
+                // 靠展开才并进来的 ⇒ 整组降级成 `DistroGuess`（一处推测，
+                // 整组就不再是纯事实 —— 写入侧要的是「这一组敢不敢合」）。
+                if by_fact.is_none() {
+                    buckets[idx].basis = GroupBasis::DistroGuess;
+                }
+                buckets[idx].members.push(i);
+                buckets[idx].observed.extend(observed.iter().cloned());
+                buckets[idx].expanded.extend(expanded.iter().cloned());
+            }
+            None => buckets.push(Bucket {
+                members: vec![i],
+                observed: observed.clone(),
+                expanded: expanded.clone(),
+                basis: GroupBasis::Observed,
+            }),
+        }
+    }
+    out.groups = buckets
+        .into_iter()
+        .map(|b| {
+            let mut roots: Vec<String> =
+                b.members.iter().map(|m| keyed[*m].0.root.clone()).collect();
+            roots.sort();
+            DirectoryGroup {
+                canonical_id: keyed[b.members[0]]
+                    .0
+                    .canonical_id
+                    .clone()
+                    .unwrap_or_default(),
+                roots,
+                basis: b.basis,
+            }
+        })
+        .collect();
+    out.groups.sort_by(|a, b| {
+        (a.canonical_id.as_str(), a.roots.first()).cmp(&(b.canonical_id.as_str(), b.roots.first()))
+    });
+    out
+}
+
 /// 一个比较键的**路径深度** —— 剥掉命名空间前缀之后的段数。
 ///
 /// 🔴 **不能用字符串长度当「具体性」。** `wsl:<distro>:/home/u/proj` 与
@@ -1101,6 +1328,132 @@ mod tests {
         let mounts: DriveMounts = vec![("/mnt/c".to_string(), "C:".to_string())];
         let got = identify_path("/mnt/c/ws/proj", &[], &roots, &mounts);
         assert!(matches!(got, PathIdentity::Resolved { .. }), "got {got:?}");
+    }
+
+    // ── same_directory_groups（决定 9 的度量）─────────────────────────────
+    //
+    // 🔴 这一组的第一条是**最重要的一条**：它钉住的是「初稿判据会做的那件事」——
+    // 把同一个项目的多份 checkout 抹成一个。那是不可逆的数据损坏。
+
+    /// 🔴 同一个仓的**多份 checkout 不得被合并** —— 它们是不同的真实目录。
+    /// 实测某机器上一个身份下有 4 条这样的根；按 `canonical_id` 分组会全并成 1。
+    #[test]
+    fn multiple_checkouts_of_one_repo_are_never_merged() {
+        let id = Some("git:example.com/o/repo");
+        let roots = [
+            root("C:/ws/host/third_party/repo", id),
+            root("C:/ws/repo", id),
+            root("C:/ws/other/third_party/repo", id),
+            root("wsl:Distro:/home/u/ws/host/third_party/repo", id),
+        ];
+        let g = same_directory_groups(&roots, &["Distro".to_string()], &DriveMounts::new());
+        assert_eq!(
+            g.groups.len(),
+            4,
+            "四个真实目录，一个都不该合：{:?}",
+            g.groups
+        );
+        assert_eq!(g.duplicate_directories(), 0);
+        assert_eq!(g.distinct_checkouts(), 4);
+    }
+
+    /// 裸形式与规范形是**同一个目录** —— 这是决定 9 真正要消除的那一类。
+    /// ⚠️ 按 `registry_key` 分组会漏掉它（不做发行版展开，算出两个键）。
+    #[test]
+    fn a_bare_and_a_canonical_spelling_of_one_directory_are_one_group() {
+        let id = Some("git:example.com/o/repo");
+        let roots = [
+            root("/home/u/ws/repo", id),
+            root("wsl:Distro:/home/u/ws/repo", id),
+        ];
+        let g = same_directory_groups(&roots, &["Distro".to_string()], &DriveMounts::new());
+        assert_eq!(g.groups.len(), 1, "{:?}", g.groups);
+        assert_eq!(g.duplicate_directories(), 1);
+        // 只有一组 ⇒ 不存在「同一项目的不同 checkout」。
+        assert_eq!(g.distinct_checkouts(), 0);
+        // 🔴 但它是**猜**出来的：注册表不记「这条裸路径从哪个发行版发现」，
+        // 所以写入侧不该据此自动合并。
+        assert_eq!(g.groups[0].basis, GroupBasis::DistroGuess);
+        assert_eq!(g.mergeable_duplicates(), 0);
+    }
+
+    /// 🔴 **保守取 distros 不会静默变成误判 —— 但挡住它的是 `basis`，不是「不分组」。**
+    ///
+    /// 消费侧提的反向测试是「`distros` 为空时两种写法不得被合并」。**那条期望太强**：
+    /// `wsl:<d>:/p → /p` 这个方向的展开**不依赖 `distros`**（剥前缀而已），所以空
+    /// `distros` 时它照样相交。
+    ///
+    /// 而「不分组」也**不是**我们想要的保护：那会让一台推不出发行版的机器报出
+    /// **0 个重复**，读起来像「干净」—— 又一个「没问成长得像没有」。
+    ///
+    /// ⇒ 正确的保护是：**照样报，但标成 `DistroGuess`，写入侧不合。**
+    /// 误判的风险由 [`GroupBasis`] 承担，不由「有没有分组」承担。
+    #[test]
+    fn without_any_distro_the_merge_is_still_only_a_guess() {
+        let id = Some("git:example.com/o/repo");
+        let roots = [
+            root("/home/u/ws/repo", id),
+            root("wsl:Distro:/home/u/ws/repo", id),
+        ];
+        let g = same_directory_groups(&roots, &[], &DriveMounts::new());
+        // 报得出来（否则「0 个重复」会被读成干净）
+        assert_eq!(g.duplicate_directories(), 1, "{:?}", g.groups);
+        // 但它是猜的 ⇒ 写入侧一个都不许合
+        assert_eq!(g.groups[0].basis, GroupBasis::DistroGuess);
+        assert_eq!(g.mergeable_duplicates(), 0);
+    }
+
+    /// `C:\…` ⇄ `/mnt/c/…` 由挂载表收敛 —— 缺表时它们会被判成两个目录。
+    #[test]
+    fn a_drive_and_its_mount_point_are_one_directory_when_the_table_is_there() {
+        let id = Some("git:example.com/o/repo");
+        let roots = [root("C:/ws/repo", id), root("/mnt/c/ws/repo", id)];
+        let mounts: DriveMounts = vec![("/mnt/c".to_string(), "C:".to_string())];
+        let g = same_directory_groups(&roots, &[], &mounts);
+        assert_eq!(g.duplicate_directories(), 1);
+        // 挂载表是**读来的事实**，不是猜 ⇒ 这一类写入侧可以合。
+        assert_eq!(g.groups[0].basis, GroupBasis::Observed);
+        assert_eq!(g.mergeable_duplicates(), 1);
+        // 反面：没有挂载表就换算不了，只能诚实地当两个目录。
+        assert_eq!(
+            same_directory_groups(&roots, &[], &DriveMounts::new()).duplicate_directories(),
+            0
+        );
+    }
+
+    /// 🔴 **多发行版歧义：相交但身份不同 ⇒ 只报，不合。**
+    ///
+    /// 这一支在单发行版机器上**永远不会被真实数据驱动**（消费侧点名要求补），
+    /// 所以只能靠构造：裸 `/home/u/ws/repo` 在两个发行版下各展开一个候选，
+    /// 分别与两条**身份不同**的根相交。合并它们就是在写入侧造一次错误合并。
+    #[test]
+    fn an_overlap_between_different_identities_is_reported_not_merged() {
+        let roots = [
+            root("wsl:A:/home/u/ws/repo", Some("git:example.com/o/one")),
+            root("/home/u/ws/repo", Some("git:example.com/o/two")),
+        ];
+        let g = same_directory_groups(
+            &roots,
+            &["A".to_string(), "B".to_string()],
+            &DriveMounts::new(),
+        );
+        assert_eq!(g.groups.len(), 2, "身份不同不许合：{:?}", g.groups);
+        assert_eq!(g.duplicate_directories(), 0);
+        assert_eq!(g.ambiguous.len(), 1, "必须报出来：{:?}", g.ambiguous);
+        let a = &g.ambiguous[0];
+        assert_ne!(a.left_id, a.right_id);
+    }
+
+    /// 身份没解析的根**不参与**分组 —— 那会把「没问成」当答案用。
+    #[test]
+    fn roots_without_a_resolved_identity_are_left_out() {
+        let roots = [
+            root_unprobed("wsl:Distro:/home/u/ws/a", "unresolved"),
+            root("/home/u/ws/b", Some("git:example.com/o/b")),
+        ];
+        let g = same_directory_groups(&roots, &["Distro".to_string()], &DriveMounts::new());
+        assert_eq!(g.groups.len(), 1);
+        assert_eq!(g.groups[0].canonical_id, "git:example.com/o/b");
     }
 
     /// 剥命名空间只剥前缀，不动路径本身。

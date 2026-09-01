@@ -171,6 +171,13 @@ enum Command {
     Roots {
         #[arg(long)]
         store: Option<PathBuf>,
+        /// 额外报出**同一个物理目录被登记了几次**（ADR-050 决定 9 的度量）。
+        ///
+        /// 🔴 报**两个**数，别只看第一个：`duplicate_directories`（应降到 0）与
+        /// `distinct_checkouts`（同一项目的不同 checkout，**合法，不该变**）。
+        /// 只看前者的话，后者一旦被误读成「还没修干净」，下一个人就会去合并它。
+        #[arg(long)]
+        duplicates: bool,
     },
     /// 把路径反查成项目身份 —— **只读**，`roots` 的读侧配套。
     ///
@@ -584,6 +591,26 @@ enum Out<'a> {
         /// 判决的理由；`resolved` / `not_probed` 没有。
         identity_detail: Option<String>,
     },
+    /// `roots --duplicates` 的一行 —— 一组指向同一个物理目录的根。
+    #[cfg(feature = "store")]
+    DirectoryGroupOut {
+        canonical_id: String,
+        /// 注册表里的原始写法。**长度 > 1 就是决定 9 要消除的重复。**
+        roots: Vec<String>,
+        /// 凭什么判为同一个目录：`observed`（登记的写法 / aliases / 挂载表换算 ——
+        /// 都是事实）或 `guess`（只有把裸路径展开成某个发行版的规范形才相交 ——
+        /// **推测**）。🔴 **写入侧只该合 `observed`**：注册表故意不记「这条根从哪
+        /// 发现」，所以裸路径属于哪个发行版是问不出来的。
+        basis: &'a str,
+    },
+    /// `roots --duplicates` 报出的一处**歧义**：相交但身份不同 —— 只报不合。
+    #[cfg(feature = "store")]
+    DirectoryAmbiguity {
+        left: String,
+        right: String,
+        left_id: String,
+        right_id: String,
+    },
     /// `attribute` 的一行 —— 一条路径的身份判决。
     ///
     /// 🔴 **五态各有自己的名字**，不压成「有身份 / 没身份」：
@@ -650,6 +677,15 @@ enum Out<'a> {
     RootsSummary {
         roots: usize,
         attribution_revision: i64,
+        /// 🔴 **同一个物理目录被登记成多行**的组数 —— 决定 9 落地后应为 0。
+        /// 只在 `--duplicates` 时计算；否则 `null`（**没算**与**算出来是 0** 是两件事）。
+        duplicate_directories: Option<usize>,
+        /// 其中**凭观测事实**就能确定的 —— 写入侧只该合这些。
+        mergeable_duplicates: Option<usize>,
+        /// 同一项目的**不同 checkout** 数 —— 合法，**不该随决定 9 变化**。
+        distinct_checkouts: Option<usize>,
+        /// 相交但身份不同的对数 —— 只报不合。
+        ambiguous_overlaps: Option<usize>,
         /// 这一轮**拿到挂载表了吗** —— 决定 `/mnt/<drive>/…` 的根能不能与它的
         /// 宿主形式收敛成一行。
         ///
@@ -748,7 +784,7 @@ fn main() {
         #[cfg(feature = "store")]
         Command::SyncSnapshots { store } => run_sync_snapshots(store),
         #[cfg(feature = "store")]
-        Command::Roots { store } => run_roots(store),
+        Command::Roots { store, duplicates } => run_roots(store, duplicates),
         #[cfg(feature = "store")]
         Command::Attribute {
             paths,
@@ -2885,7 +2921,7 @@ fn run_memory_roots(userprofile: Option<String>, timeout_secs: u64) -> i32 {
 }
 
 #[cfg(feature = "store")]
-fn run_roots(store_arg: Option<PathBuf>) -> i32 {
+fn run_roots(store_arg: Option<PathBuf>, duplicates: bool) -> i32 {
     let Some(store_path) = resolve_store_path(store_arg) else {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
@@ -2940,12 +2976,79 @@ fn run_roots(store_arg: Option<PathBuf>) -> i32 {
             identity_detail: r.identity_verdict.why().map(str::to_string),
         });
     }
+    // 决定 9 的度量 —— 只在被要求时算，且**不算就报 `null`**（「没算」与「算出来
+    // 是 0」是两件事；后者说「干净」，前者什么都没说）。
+    let (mut dup, mut mergeable, mut checkouts, mut ambiguous) = (None, None, None, None);
+    if duplicates {
+        use session_vault::attribution::{same_directory_groups, GroupBasis, RootIdentity};
+        let ids: Vec<RootIdentity> = roots
+            .iter()
+            .map(|r| RootIdentity {
+                root: r.root_path.clone(),
+                aliases: r.aliases.clone(),
+                canonical_id: r.canonical_id.clone(),
+                identity_verdict: r.identity_verdict.as_str().to_string(),
+            })
+            .collect();
+        let grouping = same_directory_groups(&ids, &infer_distros(&roots), &mounts);
+        for g in &grouping.groups {
+            if g.roots.len() > 1 {
+                emit(&Out::DirectoryGroupOut {
+                    canonical_id: g.canonical_id.clone(),
+                    roots: g.roots.clone(),
+                    basis: match g.basis {
+                        GroupBasis::Observed => "observed",
+                        GroupBasis::DistroGuess => "guess",
+                    },
+                });
+            }
+        }
+        for a in &grouping.ambiguous {
+            emit(&Out::DirectoryAmbiguity {
+                left: a.left.clone(),
+                right: a.right.clone(),
+                left_id: a.left_id.clone(),
+                right_id: a.right_id.clone(),
+            });
+        }
+        dup = Some(grouping.duplicate_directories());
+        mergeable = Some(grouping.mergeable_duplicates());
+        checkouts = Some(grouping.distinct_checkouts());
+        ambiguous = Some(grouping.ambiguous.len());
+    }
     emit(&Out::RootsSummary {
         roots: roots.len(),
         attribution_revision,
+        duplicate_directories: dup,
+        mergeable_duplicates: mergeable,
+        distinct_checkouts: checkouts,
+        ambiguous_overlaps: ambiguous,
         drive_mounts_available: !mounts.is_empty(),
     });
     0
+}
+
+/// 注册表里**实际见过**的 WSL 发行版 —— `attribute` 与 `roots --duplicates` 共用。
+///
+/// 🔴 不猜一个默认值（比如硬编码 `Ubuntu`）：那在别人机器上会安静地一条都展不开。
+/// ⚠️ 反过来它也漏掉「装了但还没有根」的发行版 —— 那**不安全**，所以靠它相交出来的
+/// 组一律标 `GroupBasis::DistroGuess`，写入侧不据此合并（见该枚举的文档）。
+#[cfg(feature = "store")]
+fn infer_distros(rows: &[session_vault::store::ProjectRootRow]) -> Vec<String> {
+    let mut d: Vec<String> = rows
+        .iter()
+        .flat_map(|r| std::iter::once(&r.root_path).chain(r.aliases.iter()))
+        .filter_map(|p| {
+            let canon = session_vault::pathnorm::canonical_wsl_unc(p);
+            let s = canon.as_deref().unwrap_or(p);
+            s.strip_prefix("wsl:")
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(distro, _)| distro.to_string())
+        })
+        .collect();
+    d.sort();
+    d.dedup();
+    d
 }
 
 /// `attribute`：把路径反查成项目身份。**只读**。
@@ -3005,21 +3108,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
     // 机器上会安静地一条都展不开 —— 那时 `unknown` 里全是本可以认出来的。
     // ⚠️ **根与别名都要看**：UNC 形式登记的根，发行版名只出现在它的规范形别名里。
     let distros: Vec<String> = if distros.is_empty() {
-        let mut d: Vec<String> = rows
-            .iter()
-            .flat_map(|r| std::iter::once(&r.root_path).chain(r.aliases.iter()))
-            .filter_map(|p| {
-                // UNC 先过规范形（拼串的唯一出口），再从 `wsl:<distro>:` 里取名字。
-                let canon = session_vault::pathnorm::canonical_wsl_unc(p);
-                let s = canon.as_deref().unwrap_or(p);
-                s.strip_prefix("wsl:")
-                    .and_then(|rest| rest.split_once(':'))
-                    .map(|(distro, _)| distro.to_string())
-            })
-            .collect();
-        d.sort();
-        d.dedup();
-        d
+        infer_distros(&rows)
     } else {
         distros
     };
