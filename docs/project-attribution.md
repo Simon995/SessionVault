@@ -495,7 +495,31 @@ wsl:<distro>:/home/<u>/ws/<repo>   aliases=[]
    ⚠️ 读 `roots` 输出的人要知道：**`no_identity` 的存量行里混着「其实是
    `checkout_missing`」的**，直到那些根被重新探测。
 
-   **可证伪的预言**（下次身份扫描之后核，一正一反）：
+   ##### ✅ 预言已验证（2026-09-02，两条全中）
+
+   宿主 v0.8.6 装机后**冷启动顺带触发**的扫描 —— 零额外动作，正是这条判据要的形状。
+
+   ```text
+   扫描前：两条都是 no_identity
+   扫描后：
+     [checkout_missing]  <本机路径>/<host-repo>/third_party/<repo>
+     [no_identity]       wsl:<distro>:/home/<u>/ws/<host-repo>/third_party/<repo>
+   ```
+
+   两个前提都先核过：**新进程** ✓（冷启动）；**那两条根真的被扫到** ✓ ——
+   `0 skipped (out of round budget)`。⇒ 走桥那条的「没变」是**真的没变**，
+   不是没轮到它。
+
+   🔴 **结论：上面那条「桥那侧分不出」的缺口注释是准确的，不该删。**
+   它从「写下来但没被真实数据驱动过」变成了**被驱动过的** —— 与决定 9 的
+   `Ambiguous` 分支不再是同一格（后者仍然只有构造测试）。
+
+   ⚠️ **顺带确认计数没被合并**：那一轮 `25 registered = 21 recorded + 0 already
+   + 3 no_remote + 1 checkout_missing + 0 unresolved + 0 skipped`（每个根恰好落
+   一格，`sweep.registered = roots.len()`）。⇒ `IdentitySweep::checkout_missing`
+   是独立的；宿主那行日志摘要没印它是**格式串**的事，不是计数合并。
+
+   **原预言**（下次身份扫描之后核，一正一反）：
 
    | 根 | 预期 | 依据 |
    | --- | --- | --- |
