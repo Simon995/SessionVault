@@ -51,8 +51,26 @@ use crate::probe::{FileKind, ProbeBackend, Probed};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitRoot {
     Found(PathBuf),
-    /// 探明白了：起点已不在磁盘上，或整条链上没有 `.git`。**这是事实。**
+    /// 探明白了：**起点在磁盘上，而整条链上没有 `.git`** —— 这个目录不是仓库。
+    /// **这是事实，接受它。**
     Absent,
+    /// 🔴 **起点本身已不在磁盘上** —— checkout 被删 / 搬走 / 换了盘。
+    ///
+    /// 从前它与 [`Self::Absent`] 是同一格，而两者对调用方意思完全不同：
+    ///
+    /// | | 说的是 | 下一步 |
+    /// | --- | --- | --- |
+    /// | `Absent` | 这个目录**不是仓库** | 接受 |
+    /// | `StartMissing` | 这个目录**已经不在了** | 🔴 那条路径上的证据没了；**已记下的身份仍然有效** |
+    ///
+    /// 实测（2026-09-01）：某个项目搬出宿主之后，它旧位置那两条根拿到
+    /// `no_identity` + `why = "no .git anywhere on this path"`，同时带着搬走**之前**
+    /// 记下的 `git:` 身份 —— 消费者看到的是一行自相矛盾的数据，而真相是
+    /// 「**目录没了**」被说成了「**确认这个仓没有 remote**」。
+    ///
+    /// ⚠️ 这是本仓「每种『没做』都有自己的名字」再往下一层：`Absent` 当初
+    /// 已经把「没问成」拆出去了（`Unknown`），但它自己里面还压着两件事。
+    StartMissing,
     /// **没问成** —— 本轮这个答案不作数，别据此写「这个项目没有身份」。
     Unknown(crate::probe::ProbeError),
 }
@@ -80,7 +98,8 @@ pub fn find_git_root(start: &Path) -> GitRoot {
 pub fn find_git_root_with(start: &Path, backend: &dyn ProbeBackend, d: Deadline) -> GitRoot {
     match backend.probe(start, d) {
         Probed::Found(_) => {}
-        Probed::Absent => return GitRoot::Absent,
+        // 🔴 起点不在盘上 ⇒ `StartMissing`，不是 `Absent`：见该变体的文档。
+        Probed::Absent => return GitRoot::StartMissing,
         Probed::Unknown(e) => return GitRoot::Unknown(e),
     }
     let mut cur = Some(start);
@@ -374,12 +393,17 @@ pub fn repo_id_for_root(
                 GitRoot::Found(p) => Ok(RepoIdentity {
                     id: canonical_repo_id(&p)?,
                     repo_root: Some(p.to_string_lossy().into_owned()),
+                    checkout_missing: false,
                 }),
-                GitRoot::Absent => Ok(RepoIdentity {
+                // ⚠️ 两个变体走同一个构造，但 `checkout_missing` 不同 ——
+                // **不重复探盘**：变体本身就是答案（同一条判据算两遍是本仓明令
+                // 要消除的形状）。
+                missing @ (GitRoot::Absent | GitRoot::StartMissing) => Ok(RepoIdentity {
                     // ⚠️ `path:` 用**原样的 root**，不是换算后的宿主形式 ——
                     // 它是给人看的标识，要能对回注册表里那一行。
                     id: format!("path:{root}"),
                     repo_root: None,
+                    checkout_missing: matches!(missing, GitRoot::StartMissing),
                 }),
                 GitRoot::Unknown(e) => Err(e),
             }
@@ -399,6 +423,15 @@ pub struct RepoIdentity {
     pub id: String,
     /// 身份所依据的仓库根。`None` = 这条链上没有可用的 `.git`。
     pub repo_root: Option<String>,
+    /// 🔴 **起点本身已不在磁盘上**（checkout 被删 / 搬走）—— 只在 `repo_root` 为
+    /// `None` 时有意义。
+    ///
+    /// 它与「这个目录不是仓库」是两件事，而 `path:` 前缀同时盖住两者：
+    /// 前者的正确处置是「**那条路径上的证据没了，已记下的身份仍然有效**」，
+    /// 后者是「接受，这里就不是仓库」。压成一个的后果实测过：一个项目搬出宿主之后，
+    /// 旧位置的根拿到 `no_identity` + `why = "no .git anywhere on this path"`，
+    /// 同时带着搬走之前记下的 `git:` 身份 —— 消费者看到一行自相矛盾的数据。
+    pub checkout_missing: bool,
 }
 
 /// 经访问桥在发行版内部解析身份 —— **与本机走同一套规则、同一份实现**。
@@ -455,7 +488,11 @@ fn wsl_repo_id_with(
             return Ok(RepoIdentity {
                 id: format!("path:{original_root}"),
                 repo_root: None,
-            })
+                // ⚠️ 走桥这一侧**分不出**「起点不在」与「链上没有 .git」——
+                // `git_config_path` 的 `Absent` 把两者压在一起。如实报 `false`
+                // （宁可少说，不可乱说）；要分得开得先给桥那一侧也做三态。
+                checkout_missing: false,
+            });
         }
         Probed::Unknown(e) => return Err(e),
     };
@@ -471,10 +508,12 @@ fn wsl_repo_id_with(
                 None => format!("path:{original_root}"),
             },
             repo_root: has_root,
+            checkout_missing: false,
         }),
         Probed::Absent => Ok(RepoIdentity {
             id: format!("path:{original_root}"),
             repo_root: has_root,
+            checkout_missing: false,
         }),
         Probed::Unknown(e) => Err(e),
     }
@@ -614,9 +653,12 @@ mod tests {
         let root = scratch("deleted-child");
         seed_repo(&root, Some("git@github.com:o/outer.git"));
         let gone = root.join("was-a-checkout");
+        // 🔴 2026-09-01 起判 `StartMissing` 而不是 `Absent`：**「目录没了」与
+        // 「这个目录不是仓库」是两件事**，而它们从前是同一格。原断言留在这条
+        // 注释里是为了说明改的是什么 —— 不上溯这一条**没有变**，变的是名字。
         assert_eq!(
             find_git_root(&gone),
-            GitRoot::Absent,
+            GitRoot::StartMissing,
             "路径不存在时必须拒绝，不能上溯到 {root:?}"
         );
     }
