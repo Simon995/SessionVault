@@ -613,6 +613,10 @@ enum Out<'a> {
         /// `identity_unavailable` 时那个根的身份判决拼写（`not_probed` / `unresolved`）——
         /// **等**还是**重试**由它决定。
         identity_verdict: Option<String>,
+        /// 这条 `unknown` **可能**是挂载表缺席造成的（试过的写法里真含
+        /// `/mnt/<drive>/…` 而本轮没拿到挂载表）。⚠️ 不是无条件标志 ——
+        /// 恒常出现的告警会被划过去，那时它与没有这个字段是同一个东西。
+        mounts_needed: bool,
     },
     /// `attribute` 的收尾摘要。
     #[cfg(feature = "store")]
@@ -626,6 +630,10 @@ enum Out<'a> {
         /// 展开裸 Linux 路径用的候选发行版。**空 = 一条都没展开** ——
         /// 那时 `unknown` 里很可能全是「本可以认出来」的，见该字段的用途。
         distros: Vec<String>,
+        /// 其中**可能由挂载表缺席造成**的有几条 —— `drive_mounts_available` 说的是
+        /// 「有没有拿到」，这个说的是「它这一轮**咬到了**几条」。两者都要：
+        /// 拿不到但一条 `/mnt/…` 查询都没有时，前者为 false 而后者为 0，那不是问题。
+        mounts_blocked: usize,
         /// 这一轮**拿到挂载表了吗** —— 与 `RootsSummary` 同一个字段、同一个理由。
         ///
         /// 🔴 拿不到时 `/mnt/<drive>/…` 与它对应的 Windows 根**收敛不了**，
@@ -3024,6 +3032,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
 
     let (mut resolved, mut no_identity, mut ambiguous, mut unknown) = (0, 0, 0, 0);
     let mut identity_unavailable = 0;
+    let mut mounts_blocked = 0;
     for path in &paths {
         let out = match identify_path(path, &distros, &roots, &mounts) {
             PathIdentity::Resolved {
@@ -3041,6 +3050,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
                     candidates: Vec::new(),
                     tried: Vec::new(),
                     identity_verdict: None,
+                    mounts_needed: false,
                 }
             }
             PathIdentity::NoIdentity { root, matched_form } => {
@@ -3054,6 +3064,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
                     candidates: Vec::new(),
                     tried: Vec::new(),
                     identity_verdict: None,
+                    mounts_needed: false,
                 }
             }
             PathIdentity::IdentityUnavailable {
@@ -3071,6 +3082,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
                     candidates: Vec::new(),
                     tried: Vec::new(),
                     identity_verdict: Some(verdict),
+                    mounts_needed: false,
                 }
             }
             PathIdentity::Ambiguous { candidates } => {
@@ -3084,10 +3096,17 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
                     candidates,
                     tried: Vec::new(),
                     identity_verdict: None,
+                    mounts_needed: false,
                 }
             }
-            PathIdentity::Unknown { tried } => {
+            PathIdentity::Unknown {
+                tried,
+                mounts_needed,
+            } => {
                 unknown += 1;
+                if mounts_needed {
+                    mounts_blocked += 1;
+                }
                 Out::PathAttribution {
                     path: path.clone(),
                     verdict: "unknown",
@@ -3097,6 +3116,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
                     candidates: Vec::new(),
                     tried,
                     identity_verdict: None,
+                    mounts_needed,
                 }
             }
         };
@@ -3109,6 +3129,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
         identity_unavailable,
         ambiguous,
         unknown,
+        mounts_blocked,
         distros,
         drive_mounts_available: !mounts.is_empty(),
     });

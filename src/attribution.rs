@@ -378,8 +378,27 @@ pub const VERDICT_NO_IDENTITY: &str = "no_identity";
 /// 「两个根都盖得住它」这四件事，而它们的下一步完全不同（找 / 接受 / 重试 / 别猜）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathIdentity {
-    /// 认出来了。`matched_form` = **查询**的哪种写法撞上的（原样 / 展开出的规范形 /
-    /// 裸路径），不是根那一侧的别名 —— 排查「为什么这条认出来了那条没有」第一个要问它。
+    /// 认出来了。
+    ///
+    /// 🔴 **`root` 是注册表里的原始写法，不是这个项目的规范名 —— 别拿它当对齐依据。**
+    /// 同一个目录在注册表里可以有多行，实测（2026-09-01，一台开发机）某个项目有
+    /// **三条根、同一个 `canonical_id`**：
+    ///
+    /// ```text
+    /// /home/<u>/ws/<repo>                aliases=[]
+    /// C:\Users\<u>\ws\<repo>             aliases=["/mnt/c/Users/<u>/ws/<repo>"]
+    /// wsl:<distro>:/home/<u>/ws/<repo>   aliases=[]
+    /// ```
+    ///
+    /// 于是本函数与 [`attribute`] 对**同一条 cwd** 会返回**不同写法**的根 —— 各自
+    /// 匹配到其中不同的一条。单独看都对（比较键收敛了），但拿返回的 `root` 去写库，
+    /// 就在同一张表里造出第四种写法。消费侧为这一族付过多次代价：同一个物理目录
+    /// 占两行、数字劈成两半，而界面上看不出来。
+    ///
+    /// ⇒ **要判「是不是同一个项目」一律用 `canonical_id`**；`root` 只用于展示与排查。
+    ///
+    /// `matched_form` = **查询**的哪种写法撞上的（原样 / 展开出的规范形 / 裸路径），
+    /// 不是根那一侧的别名 —— 排查「为什么这条认出来了那条没有」第一个要问它。
     Resolved {
         root: String,
         canonical_id: String,
@@ -402,7 +421,18 @@ pub enum PathIdentity {
     /// 同样具体的两个根盖住它，而它们身份不同 —— **不猜**。
     Ambiguous { candidates: Vec<(String, String)> },
     /// 没有任何已知根盖住它。`tried` 是试过的写法，让「没试到」与「试了没有」分得开。
-    Unknown { tried: Vec<String> },
+    ///
+    /// `mounts_needed` = **这条 `unknown` 可能是挂载表缺席造成的**：试过的写法里
+    /// 真的含 `/mnt/<drive>/…`，而传进来的挂载表是空的 ⇒ 它与对应的 Windows 根
+    /// 收敛不了，于是「库里真没有」与「本轮没拿到换算事实」压成了同一个答案。
+    ///
+    /// 🔴 **故意不做成无条件的「挂载表可用吗」标志。** 空表只影响 `/mnt/<drive>/…`，
+    /// 对其余查询是噪声 —— 而一个恒常出现的告警会被划过去，那时它与没有这个字段
+    /// 是同一个东西。只在**它真的可能造成这条判决**时才为 `true`。
+    Unknown {
+        tried: Vec<String>,
+        mounts_needed: bool,
+    },
 }
 
 /// 一个比较键的**路径深度** —— 剥掉命名空间前缀之后的段数。
@@ -501,7 +531,16 @@ pub fn identify_path(
         }
     }
     if hits.is_empty() {
-        return PathIdentity::Unknown { tried: forms };
+        // 挂载表缺席**可能**是这条 unknown 的成因 —— 仅当试过的写法里真有
+        // `/mnt/<drive>/…` 时才这么说，否则它是噪声（见该字段的文档）。
+        let mounts_needed = mounts.is_empty()
+            && forms
+                .iter()
+                .any(|f| crate::pathnorm::is_windows_drive_mount(f));
+        return PathIdentity::Unknown {
+            tried: forms,
+            mounts_needed,
+        };
     }
     hits.sort_by_key(|(_, _, depth)| std::cmp::Reverse(*depth));
     let (top, form, top_depth) = hits[0];
@@ -819,7 +858,14 @@ mod tests {
         )];
         let got = identify_path("/home/u/ws/proj", &[], &roots, &DriveMounts::new());
         match got {
-            PathIdentity::Unknown { tried } => assert_eq!(tried, vec!["/home/u/ws/proj"]),
+            PathIdentity::Unknown {
+                tried,
+                mounts_needed,
+            } => {
+                assert_eq!(tried, vec!["/home/u/ws/proj"]);
+                // 裸 Linux 路径与挂载表无关 —— 别在这里喊狼。
+                assert!(!mounts_needed);
+            }
             other => panic!("expected Unknown, got {other:?}"),
         }
     }
@@ -1031,6 +1077,30 @@ mod tests {
             }
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    /// [P2] 挂载表缺席**且**查询真的是 `/mnt/<drive>/…` ⇒ 说出来。
+    /// 🔴 只断言 `false` 那一格等于没断言 —— 一个恒不为真的字段与没有这个字段一样。
+    #[test]
+    fn an_unknown_that_a_missing_mount_table_could_explain_says_so() {
+        let roots = [root("C:/ws/proj", Some("git:example.com/o/proj"))];
+        let got = identify_path("/mnt/c/ws/proj", &[], &roots, &DriveMounts::new());
+        match got {
+            PathIdentity::Unknown { mounts_needed, .. } => assert!(mounts_needed),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// 反面：有挂载表时同一条查询该**认出来**，而不是报「可能是挂载表的锅」。
+    /// 没有这一条，上面那条可能只是因为 `/mnt/c/ws/proj` 永远匹配不上。
+    #[test]
+    fn with_a_mount_table_the_same_mnt_path_resolves() {
+        let roots = [root("C:/ws/proj", Some("git:example.com/o/proj"))];
+        // ⚠️ 键是**完整挂载点**（`/mnt/c`），不是盘符字母 —— 第一版写成 `"c"`，
+        // 这条测试当场红了。反面测试的价值正在这里：它逼出了错的 fixture。
+        let mounts: DriveMounts = vec![("/mnt/c".to_string(), "C:".to_string())];
+        let got = identify_path("/mnt/c/ws/proj", &[], &roots, &mounts);
+        assert!(matches!(got, PathIdentity::Resolved { .. }), "got {got:?}");
     }
 
     /// 剥命名空间只剥前缀，不动路径本身。
