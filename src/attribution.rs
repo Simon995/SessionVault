@@ -351,30 +351,50 @@ fn folds_case(p: &str) -> bool {
 /// 少一个依赖就少一处「`store` feature 关掉时编不过」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootIdentity {
-    /// 注册表里的原始写法（`C:\…` / `wsl:<distro>:/…` / 裸 Linux）。
+    /// 注册表里的原始写法（`C:\…` / `wsl:<distro>:/…` / UNC / 裸 Linux）。
     pub root: String,
+    /// 同一个根的其它**等价写法**（`ProjectRootRow::aliases`）。
+    ///
+    /// 🔴 **必须参与匹配。** 注册表按发现时看到的那种形式存根：UNC 形式登记的根，
+    /// 它的规范形只在 `aliases` 里。只拿 `root` 去比，一条发行版内的裸路径查询
+    /// 就永远撞不上那个 UNC 根 —— 而结果是 `unknown`，**看起来像「库里没有」**。
+    pub aliases: Vec<String>,
     /// 规范身份（`git:…`）。`None` = 这个根问不出身份，**为什么**看 `identity_verdict`。
     pub canonical_id: Option<String>,
-    /// 身份探测结论的线上拼写（`resolved` / `no_identity` / `unresolved`）。
+    /// 身份探测结论的线上拼写（`not_probed` / `resolved` / `no_identity` / `unresolved`）。
     pub identity_verdict: String,
 }
 
-/// 一条路径的身份判决 —— **四态，每种「说不出来」有自己的名字**。
+/// [`RootIdentity::identity_verdict`] 里**「确认没有 remote」**那一个取值。
+///
+/// 🔴 提成常量是为了让「只有它才配叫 `NoIdentity`」这件事有一处可查的依据 ——
+/// 其余取值（`not_probed` / `unresolved`）是「**没问成**」，处置是等或重试。
+pub const VERDICT_NO_IDENTITY: &str = "no_identity";
+
+/// 一条路径的身份判决 —— **五态，每种「说不出来」有自己的名字**。
 ///
 /// 🔴 压成 `Option<String>` 就又造一个「没问成长得像没有」：调用方分不出
-/// 「这个目录不属于任何已知项目」「属于一个没有 remote 的仓库」「两个根都盖得住它」
-/// 这三件事，而它们的下一步完全不同。
+/// 「这个目录不属于任何已知项目」「属于一个没有 remote 的仓库」「身份这一轮没问成」
+/// 「两个根都盖得住它」这四件事，而它们的下一步完全不同（找 / 接受 / 重试 / 别猜）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathIdentity {
-    /// 认出来了。`matched_form` 说的是**用哪种写法**撞上的 —— 排查时第一个要问的。
+    /// 认出来了。`matched_form` = **查询**的哪种写法撞上的（原样 / 展开出的规范形 /
+    /// 裸路径），不是根那一侧的别名 —— 排查「为什么这条认出来了那条没有」第一个要问它。
     Resolved {
         root: String,
         canonical_id: String,
         matched_form: String,
     },
-    /// 找到根了，但那个仓库**没有可跨 checkout 的身份**（没有 origin remote）。
-    /// 这是事实，不是失败 —— 本地仓库就是这样。
-    NoIdentity {
+    /// 找到根了，且**确认**那个仓库没有可跨 checkout 的身份（没有 origin remote）。
+    /// 这是事实，不是失败 —— 本地仓库就是这样，**接受**。
+    NoIdentity { root: String, matched_form: String },
+    /// 找到根了，但它的身份**这一轮没问成**（`not_probed` 还没扫到 / `unresolved`
+    /// 探测失败：访问桥不通、权限拒绝）。
+    ///
+    /// 🔴 **它与 `NoIdentity` 不是同一件事**，而它们此前被压成同一个判决 ——
+    /// 消费方会按「确认没有，接受」处理一个其实该**重试**的根，
+    /// 于是一次权限错误变成一条永久的错误结论。`verdict` 带上是哪一种。
+    IdentityUnavailable {
         root: String,
         matched_form: String,
         verdict: String,
@@ -383,6 +403,33 @@ pub enum PathIdentity {
     Ambiguous { candidates: Vec<(String, String)> },
     /// 没有任何已知根盖住它。`tried` 是试过的写法，让「没试到」与「试了没有」分得开。
     Unknown { tried: Vec<String> },
+}
+
+/// 一个比较键的**路径深度** —— 剥掉命名空间前缀之后的段数。
+///
+/// 🔴 **不能用字符串长度当「具体性」。** `wsl:<distro>:/home/u/proj` 与
+/// `/home/u/proj` 指向同一深度的路径，但前者多了 `wsl:<distro>:` 那一截；
+/// 按长度排序会让它**无条件胜出**，于是两个身份不同的同深度根不会进歧义分支，
+/// 而是被静默解析成其中一个 —— 跨项目错误归属，且不报错。
+fn namespace_free_depth(key: &str) -> usize {
+    let bare = strip_namespace(key);
+    bare.split('/').filter(|s| !s.is_empty()).count()
+}
+
+/// 剥掉 `wsl:<distro>:` / `//wsl.localhost/<distro>` / `//wsl$/<distro>` 前缀。
+/// 剥不掉就原样返回（Windows 盘符路径、裸 Linux 路径本来就没有命名空间前缀）。
+fn strip_namespace(key: &str) -> &str {
+    if let Some(rest) = key.strip_prefix("wsl:") {
+        if let Some((_, tail)) = rest.split_once(':') {
+            return tail;
+        }
+    }
+    for prefix in ["//wsl.localhost/", "//wsl$/"] {
+        if let Some(rest) = key.strip_prefix(prefix) {
+            return rest.split_once('/').map_or("", |(_, tail)| tail);
+        }
+    }
+    key
 }
 
 /// 一条路径的等价写法 —— 裸 Linux ⇄ `wsl:<distro>:/…`。
@@ -434,31 +481,38 @@ pub fn identify_path(
     mounts: &DriveMounts,
 ) -> PathIdentity {
     let forms = path_forms(path, distros);
-    // (根, 撞上它的那种写法, 归一化根键长度)
+    // (根, 撞上它的那种写法, **剥掉命名空间之后**的路径深度)
     let mut hits: Vec<(&RootIdentity, &str, usize)> = Vec::new();
     for form in &forms {
         let key = registry_key(form, mounts);
         for r in roots {
-            let rk = registry_key(&r.root, mounts);
-            if covers(&rk, &key) && !hits.iter().any(|(h, _, _)| h.root == r.root) {
-                hits.push((r, form.as_str(), rk.len()));
+            if hits.iter().any(|(h, _, _)| h.root == r.root) {
+                continue;
+            }
+            // 🔴 `root` 与它的**所有别名**都参与匹配：UNC 形式登记的根，
+            // 它的规范形只在 `aliases` 里。只比 `root` 就永远撞不上。
+            let matched = std::iter::once(&r.root)
+                .chain(r.aliases.iter())
+                .map(|form| registry_key(form, mounts))
+                .find(|rk| covers(rk, &key));
+            if let Some(rk) = matched {
+                hits.push((r, form.as_str(), namespace_free_depth(&rk)));
             }
         }
     }
     if hits.is_empty() {
         return PathIdentity::Unknown { tried: forms };
     }
-    hits.sort_by(|a, b| b.2.cmp(&a.2));
-    let (top, form, top_len) = hits[0];
+    hits.sort_by_key(|(_, _, depth)| std::cmp::Reverse(*depth));
+    let (top, form, top_depth) = hits[0];
     // 同样具体、身份不同 ⇒ 歧义。身份相同的多条写法不是歧义（同一个仓库）。
-    let tied: Vec<&(&RootIdentity, &str, usize)> = hits
+    let tied = hits
         .iter()
-        .filter(|(r, _, len)| *len == top_len && r.canonical_id != top.canonical_id)
-        .collect();
-    if !tied.is_empty() {
+        .any(|(r, _, depth)| *depth == top_depth && r.canonical_id != top.canonical_id);
+    if tied {
         let mut candidates: Vec<(String, String)> = hits
             .iter()
-            .filter(|(_, _, len)| *len == top_len)
+            .filter(|(_, _, depth)| *depth == top_depth)
             .map(|(r, _, _)| {
                 (
                     r.root.clone(),
@@ -467,6 +521,7 @@ pub fn identify_path(
             })
             .collect();
         candidates.sort();
+        candidates.dedup();
         return PathIdentity::Ambiguous { candidates };
     }
     match &top.canonical_id {
@@ -475,7 +530,14 @@ pub fn identify_path(
             canonical_id: id.clone(),
             matched_form: form.to_string(),
         },
-        None => PathIdentity::NoIdentity {
+        // 🔴 **只有确认没有 remote 才叫 `NoIdentity`。** `not_probed` / `unresolved`
+        // 是「没问成」，处置是等或重试 —— 把它们说成「确认没有」，等于让一次
+        // 权限错误变成一条永久的错误结论。
+        None if top.identity_verdict == VERDICT_NO_IDENTITY => PathIdentity::NoIdentity {
+            root: top.root.clone(),
+            matched_form: form.to_string(),
+        },
+        None => PathIdentity::IdentityUnavailable {
             root: top.root.clone(),
             matched_form: form.to_string(),
             verdict: top.identity_verdict.clone(),
@@ -691,13 +753,31 @@ mod tests {
     fn root(path: &str, id: Option<&str>) -> RootIdentity {
         RootIdentity {
             root: path.to_string(),
+            aliases: Vec::new(),
             canonical_id: id.map(str::to_string),
             identity_verdict: if id.is_some() {
                 "resolved"
             } else {
-                "no_identity"
+                VERDICT_NO_IDENTITY
             }
             .to_string(),
+        }
+    }
+
+    /// 身份**没问成**的根（`not_probed` / `unresolved`）—— 与「确认没有」是两回事。
+    fn root_unprobed(path: &str, verdict: &str) -> RootIdentity {
+        RootIdentity {
+            root: path.to_string(),
+            aliases: Vec::new(),
+            canonical_id: None,
+            identity_verdict: verdict.to_string(),
+        }
+    }
+
+    fn root_with_aliases(path: &str, aliases: &[&str], id: Option<&str>) -> RootIdentity {
+        RootIdentity {
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            ..root(path, id)
         }
     }
 
@@ -817,7 +897,9 @@ mod tests {
             &DriveMounts::new(),
         );
         match got {
-            PathIdentity::NoIdentity { verdict, .. } => assert_eq!(verdict, "no_identity"),
+            PathIdentity::NoIdentity { root, .. } => {
+                assert_eq!(root, "wsl:Distro:/home/u/ws/local-only")
+            }
             other => panic!("expected NoIdentity, got {other:?}"),
         }
     }
@@ -834,5 +916,129 @@ mod tests {
     fn a_canonical_form_expands_back_to_the_bare_path() {
         let forms = path_forms("wsl:Distro:/home/u/ws/proj", &[]);
         assert!(forms.contains(&"/home/u/ws/proj".to_string()), "{forms:?}");
+    }
+
+    // ── 评审 [P1]×3 + [P2] 逼出来的四条 ───────────────────────────────────
+    //
+    // 🔴 三条都是同一族：**把「没问成」说成了别的东西**。它们能同时存在，是因为
+    // 我原来的测试只覆盖「问到了」和「确认没有」两格 —— 而出事的永远是第三格。
+
+    /// [P1] `unresolved`（探测失败）**不是**「确认没有 remote」。
+    /// 说成后者，消费方会「接受」一个其实该**重试**的根 ——
+    /// 一次权限错误从此变成永久的错误结论。
+    #[test]
+    fn a_root_whose_identity_probe_failed_is_not_reported_as_confirmed_absent() {
+        let roots = [root_unprobed("wsl:Distro:/home/u/ws/proj", "unresolved")];
+        let got = identify_path(
+            "/home/u/ws/proj",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::IdentityUnavailable { verdict, .. } => assert_eq!(verdict, "unresolved"),
+            other => panic!("expected IdentityUnavailable, got {other:?}"),
+        }
+    }
+
+    /// [P1] `not_probed`（还没扫到）同理 —— 处置是**等**，不是接受。
+    #[test]
+    fn a_root_not_probed_yet_is_not_reported_as_confirmed_absent() {
+        let roots = [root_unprobed("wsl:Distro:/home/u/ws/proj", "not_probed")];
+        let got = identify_path(
+            "/home/u/ws/proj",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        assert!(
+            matches!(got, PathIdentity::IdentityUnavailable { .. }),
+            "got {got:?}"
+        );
+    }
+
+    /// [P1] 具体性按**剥掉命名空间后的路径深度**，不按字符串长度。
+    ///
+    /// `wsl:Distro:/home/u/ws/proj` 比 `/home/u/ws/proj` 长 12 个字符，但它们**同深度**。
+    /// 按长度排会让前者无条件胜出 ⇒ 两个身份不同的同深度根被静默解析成其中一个。
+    #[test]
+    fn same_depth_roots_in_different_namespaces_are_ambiguous_not_longest_string() {
+        let roots = [
+            root("wsl:Distro:/home/u/ws/proj", Some("git:example.com/o/one")),
+            root("/home/u/ws/proj", Some("git:example.com/o/two")),
+        ];
+        let got = identify_path(
+            "/home/u/ws/proj",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::Ambiguous { candidates } => {
+                assert_eq!(candidates.len(), 2, "{candidates:?}")
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// 深度真的不同时仍取更深的那个 —— 修 [P1] 不能把「嵌套根」那条弄反。
+    #[test]
+    fn a_deeper_root_still_wins_across_namespaces() {
+        let roots = [
+            root("/home/u/ws/outer", Some("git:example.com/o/outer")),
+            root(
+                "wsl:Distro:/home/u/ws/outer/inner",
+                Some("git:example.com/o/inner"),
+            ),
+        ];
+        let got = identify_path(
+            "/home/u/ws/outer/inner/src",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::Resolved { canonical_id, .. } => {
+                assert_eq!(canonical_id, "git:example.com/o/inner")
+            }
+            other => panic!("expected Resolved(inner), got {other:?}"),
+        }
+    }
+
+    /// [P1] UNC 形式登记的根：它的规范形只在 `aliases` 里，别名必须参与匹配。
+    /// 不参与就恒 `unknown` —— 而 `unknown` 看起来像「库里没有这个根」。
+    #[test]
+    fn a_unc_root_is_matched_through_its_canonical_alias() {
+        let roots = [root_with_aliases(
+            "//wsl.localhost/Distro/home/u/ws/proj",
+            &["wsl:Distro:/home/u/ws/proj"],
+            Some("git:example.com/o/proj"),
+        )];
+        let got = identify_path(
+            "/home/u/ws/proj/src",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::Resolved {
+                root, matched_form, ..
+            } => {
+                assert_eq!(root, "//wsl.localhost/Distro/home/u/ws/proj");
+                // `matched_form` 是**查询**的哪种写法撞上的（这里是展开出来的规范形），
+                // 不是根那一侧的别名 —— 两者都有用，但这个字段只答前者。
+                assert_eq!(matched_form, "wsl:Distro:/home/u/ws/proj/src");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// 剥命名空间只剥前缀，不动路径本身。
+    #[test]
+    fn namespace_stripping_keeps_the_path_intact() {
+        assert_eq!(namespace_free_depth("wsl:Distro:/home/u/ws/proj"), 4);
+        assert_eq!(namespace_free_depth("/home/u/ws/proj"), 4);
+        assert_eq!(namespace_free_depth("//wsl.localhost/Distro/home/u/ws"), 3);
+        assert_eq!(namespace_free_depth("c:/ws/proj"), 3);
     }
 }

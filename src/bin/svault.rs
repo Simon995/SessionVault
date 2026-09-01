@@ -586,11 +586,15 @@ enum Out<'a> {
     },
     /// `attribute` 的一行 —— 一条路径的身份判决。
     ///
-    /// 🔴 **四态各有自己的名字**，不压成「有身份 / 没身份」：
-    /// `resolved`（认出来了）／`no_identity`（找到根了，那个仓没有 remote，**接受**）／
+    /// 🔴 **五态各有自己的名字**，不压成「有身份 / 没身份」：
+    /// `resolved`（认出来了）／`no_identity`（**确认**那个仓没有 remote，**接受**）／
+    /// `identity_unavailable`（找到根了，身份这一轮**没问成**，**等或重试**）／
     /// `ambiguous`（同样具体的两个根身份不同，**不猜**）／
-    /// `unknown`（没有任何已知根盖住它 —— 可能是从没扫到过的路径）。
-    /// 压成两态就又造一个「没问成长得像没有」，而这四种的下一步完全不同。
+    /// `unknown`（没有任何已知根盖住它）。
+    /// 压成两态就又造一个「没问成长得像没有」，而这五种的下一步完全不同。
+    ///
+    /// ⚠️ `no_identity` 与 `identity_unavailable` 曾经是同一个判决 —— 那让消费方
+    /// 按「确认没有，接受」处理一个其实该重试的根，一次权限错误从此成为永久结论。
     #[cfg(feature = "store")]
     PathAttribution {
         /// 问的那条路径，原样回显 —— 批量调用时消费方靠它对号。
@@ -606,7 +610,8 @@ enum Out<'a> {
         candidates: Vec<(String, String)>,
         /// `unknown`：试过哪些写法 —— 让「没试到」与「试了没有」分得开。
         tried: Vec<String>,
-        /// `no_identity` 时那个根的身份判决拼写（`no_identity` / `unresolved`）。
+        /// `identity_unavailable` 时那个根的身份判决拼写（`not_probed` / `unresolved`）——
+        /// **等**还是**重试**由它决定。
         identity_verdict: Option<String>,
     },
     /// `attribute` 的收尾摘要。
@@ -615,11 +620,18 @@ enum Out<'a> {
         paths: usize,
         resolved: usize,
         no_identity: usize,
+        identity_unavailable: usize,
         ambiguous: usize,
         unknown: usize,
         /// 展开裸 Linux 路径用的候选发行版。**空 = 一条都没展开** ——
         /// 那时 `unknown` 里很可能全是「本可以认出来」的，见该字段的用途。
         distros: Vec<String>,
+        /// 这一轮**拿到挂载表了吗** —— 与 `RootsSummary` 同一个字段、同一个理由。
+        ///
+        /// 🔴 拿不到时 `/mnt/<drive>/…` 与它对应的 Windows 根**收敛不了**，
+        /// 那些查询会落进 `unknown`。没有这个标志，消费方分不出
+        /// 「库里没有这个根」与「本轮没拿到换算事实」—— 又一处「没问成长得像没有」。
+        drive_mounts_available: bool,
     },
     /// `roots` 的收尾摘要。
     ///
@@ -2953,6 +2965,15 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
     };
     // 表只读一次 —— 与 `run_roots` 同一条理由（读两次会拿到两份运行期事实）。
     let mounts = session_vault::host_drive_mounts();
+    // 🔴 拿不到挂载表时 `/mnt/<drive>/…` 与它的 Windows 根收敛不了，那些查询会落进
+    // `unknown` —— 而「库里没有」与「本轮没拿到换算事实」必须分得开。摘要里带标志，
+    // 这里再喊一声（与 `run_roots` 同一处置）。
+    if mounts.is_empty() {
+        log::warn!(
+            target: tag::CLI,
+            "drive mounts unavailable — /mnt paths cannot converge with their host roots;              such queries report unknown (see AttributeSummary.drive_mounts_available)"
+        );
+    }
     let (rows, _revision) = match store.project_roots_report(&mounts) {
         Ok(v) => v,
         Err(e) => {
@@ -2964,6 +2985,8 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
         .iter()
         .map(|r| RootIdentity {
             root: r.root_path.clone(),
+            // 🔴 别名必须带上：UNC 形式登记的根，它的规范形只在这里。
+            aliases: r.aliases.clone(),
             canonical_id: r.canonical_id.clone(),
             identity_verdict: r.identity_verdict.as_str().to_string(),
         })
@@ -2972,12 +2995,16 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
     // 🔴 不给 `--distro` 就**从注册表已有的规范形推**，而不是猜一个默认值：
     // 推出来的是「本机实际见过的发行版」，而猜出来的（比如硬编码 `Ubuntu`）在别人
     // 机器上会安静地一条都展不开 —— 那时 `unknown` 里全是本可以认出来的。
+    // ⚠️ **根与别名都要看**：UNC 形式登记的根，发行版名只出现在它的规范形别名里。
     let distros: Vec<String> = if distros.is_empty() {
         let mut d: Vec<String> = rows
             .iter()
-            .filter_map(|r| {
-                r.root_path
-                    .strip_prefix("wsl:")
+            .flat_map(|r| std::iter::once(&r.root_path).chain(r.aliases.iter()))
+            .filter_map(|p| {
+                // UNC 先过规范形（拼串的唯一出口），再从 `wsl:<distro>:` 里取名字。
+                let canon = session_vault::pathnorm::canonical_wsl_unc(p);
+                let s = canon.as_deref().unwrap_or(p);
+                s.strip_prefix("wsl:")
                     .and_then(|rest| rest.split_once(':'))
                     .map(|(distro, _)| distro.to_string())
             })
@@ -2996,6 +3023,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
     }
 
     let (mut resolved, mut no_identity, mut ambiguous, mut unknown) = (0, 0, 0, 0);
+    let mut identity_unavailable = 0;
     for path in &paths {
         let out = match identify_path(path, &distros, &roots, &mounts) {
             PathIdentity::Resolved {
@@ -3015,15 +3043,28 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
                     identity_verdict: None,
                 }
             }
-            PathIdentity::NoIdentity {
-                root,
-                matched_form,
-                verdict,
-            } => {
+            PathIdentity::NoIdentity { root, matched_form } => {
                 no_identity += 1;
                 Out::PathAttribution {
                     path: path.clone(),
                     verdict: "no_identity",
+                    root: Some(root),
+                    canonical_id: None,
+                    matched_form: Some(matched_form),
+                    candidates: Vec::new(),
+                    tried: Vec::new(),
+                    identity_verdict: None,
+                }
+            }
+            PathIdentity::IdentityUnavailable {
+                root,
+                matched_form,
+                verdict,
+            } => {
+                identity_unavailable += 1;
+                Out::PathAttribution {
+                    path: path.clone(),
+                    verdict: "identity_unavailable",
                     root: Some(root),
                     canonical_id: None,
                     matched_form: Some(matched_form),
@@ -3065,9 +3106,11 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
         paths: paths.len(),
         resolved,
         no_identity,
+        identity_unavailable,
         ambiguous,
         unknown,
         distros,
+        drive_mounts_available: !mounts.is_empty(),
     });
     0
 }
