@@ -145,21 +145,59 @@ pub fn discover_project_snapshots(
 ///
 /// best-effort：没 WSL / `wsl.exe` 卡住 ⇒ 空表 ⇒ `/mnt/…` 那族不与宿主形式收敛，
 /// **不是**退回按盘符猜（那会把事件归到别的项目名下）。
+/// 🔴 **四种结果从前压成同一个空 vec，而只有其中一种会 log（还是 `debug` 级）。**
+///
+/// | 实际发生的 | 从前的返回 | 从前说了吗 |
+/// | --- | --- | --- |
+/// | 列不出发行版（没装 WSL / `wsl.exe` 卡住） | 空表 | ❌ |
+/// | 列得出但没有默认发行版 | 空表 | ❌ |
+/// | 取挂载表失败 | 空表 | 只有 `debug` |
+/// | **取到了，而它本来就是空的** | 空表 | ❌ |
+///
+/// 后果实测过（2026-09-02 跨会话排查）：一轮重投影里 `/mnt/…` 与它的宿主形式**没有
+/// 收敛**，而那一轮的日志里**关于挂载表一个字都没有** —— 于是「机制成立」查得出来，
+/// 「那一轮到底是不是空表」**永远证不了**。⇒ 每一种都说出来，并且**报条数**：
+/// 「0 条」与「没问成」在布尔上一样，在计数上不一样。
+///
+/// ⚠️ **返回类型仍然把四种压成一个空 vec** —— 消费方分不出。改类型会动两个消费者的
+/// 签名，属于另一个决定；这里先让**日志**分得出（见下方 `next`）。
 pub fn host_drive_mounts() -> pathnorm::DriveMounts {
-    wsl::list_distros(crate::deadline::Deadline::unbounded())
-        .ok()
-        .and_then(|d| wsl::default_distro(&d))
-        .and_then(|d| match wsl::drive_mounts(&d, crate::deadline::Deadline::unbounded()) {
-            Ok(m) => Some(m),
-            Err(e) => {
-                log::debug!(
-                    target: logging::tag::SCAN,
-                    "drive mounts unavailable: {e} — /mnt paths will not converge with their host form"
-                );
-                None
-            }
-        })
-        .unwrap_or_default()
+    let distros = match wsl::list_distros(crate::deadline::Deadline::unbounded()) {
+        Ok(d) => d,
+        Err(e) => {
+            log::info!(
+                target: logging::tag::SCAN,
+                "drive mounts: none — cannot list distros ({e}); /mnt paths will not converge with their host form"
+            );
+            return Vec::new();
+        }
+    };
+    let Some(distro) = wsl::default_distro(&distros) else {
+        log::info!(
+            target: logging::tag::SCAN,
+            "drive mounts: none — no default distro among {} listed; /mnt paths will not converge",
+            distros.len()
+        );
+        return Vec::new();
+    };
+    match wsl::drive_mounts(&distro, crate::deadline::Deadline::unbounded()) {
+        Ok(m) => {
+            // 🔴 **报条数，不报「有没有」**：`0 条`（问到了，机器上就没有映射）与
+            // 「没问成」是两件事，而布尔把它们说成同一件。
+            log::info!(
+                target: logging::tag::SCAN,
+                "drive mounts: {} entries from distro <default>", m.len()
+            );
+            m
+        }
+        Err(e) => {
+            log::info!(
+                target: logging::tag::SCAN,
+                "drive mounts: none — probe failed ({e}); /mnt paths will not converge with their host form"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// 读出项目根注册表 —— **归属的唯一输入**（ADR-050）。
