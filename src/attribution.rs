@@ -328,6 +328,161 @@ fn folds_case(p: &str) -> bool {
     crate::pathnorm::is_windows_drive_mount(p)
 }
 
+// ── 按路径反查项目身份（ADR-050 的读侧出口）──────────────────────────────────
+//
+// ## 为什么它必须在这一层，而不是每个消费者各写一份
+//
+// 注册表按**发现时看到的那种写法**存根：从 Windows 侧发现的 WSL 项目存成
+// `wsl:<distro>:/home/…`，而**在那个发行版里跑**的会话记下的 `cwd` 是裸 Linux 路径
+// `/home/…`。两者指同一个目录，直接比较却对不上 —— 而且**不报错**，只表现成
+// 「这条会话没有项目」。
+//
+// 🔴 实测（2026-09-01，某台开发机）：281 条 codex 会话里 **31 条**因为这一条认不出
+// 归属，其中包括项目搬家**之后**新开的那几条 —— 所以它不是历史债，是**每个在发行版
+// 里跑的会话都会中招**的活缺陷。
+//
+// 消费者自己补这条归一化是能补的，代价是同一条规则出现 N 份：本仓已经为
+// 「同一条规则两处实现」付过多次代价（`decode_project_dir` 被删就是其中一次）。
+// 所以出口开在这里，与 `roots` 是「项目身份的唯一对外出口」同一个模式。
+
+/// 注册表里一个根的**身份视图** —— [`identify_path`] 的输入。
+///
+/// 刻意只带三个字段：这一层不需要知道存储层 `ProjectRootRow` 的其余部分，
+/// 少一个依赖就少一处「`store` feature 关掉时编不过」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootIdentity {
+    /// 注册表里的原始写法（`C:\…` / `wsl:<distro>:/…` / 裸 Linux）。
+    pub root: String,
+    /// 规范身份（`git:…`）。`None` = 这个根问不出身份，**为什么**看 `identity_verdict`。
+    pub canonical_id: Option<String>,
+    /// 身份探测结论的线上拼写（`resolved` / `no_identity` / `unresolved`）。
+    pub identity_verdict: String,
+}
+
+/// 一条路径的身份判决 —— **四态，每种「说不出来」有自己的名字**。
+///
+/// 🔴 压成 `Option<String>` 就又造一个「没问成长得像没有」：调用方分不出
+/// 「这个目录不属于任何已知项目」「属于一个没有 remote 的仓库」「两个根都盖得住它」
+/// 这三件事，而它们的下一步完全不同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathIdentity {
+    /// 认出来了。`matched_form` 说的是**用哪种写法**撞上的 —— 排查时第一个要问的。
+    Resolved {
+        root: String,
+        canonical_id: String,
+        matched_form: String,
+    },
+    /// 找到根了，但那个仓库**没有可跨 checkout 的身份**（没有 origin remote）。
+    /// 这是事实，不是失败 —— 本地仓库就是这样。
+    NoIdentity {
+        root: String,
+        matched_form: String,
+        verdict: String,
+    },
+    /// 同样具体的两个根盖住它，而它们身份不同 —— **不猜**。
+    Ambiguous { candidates: Vec<(String, String)> },
+    /// 没有任何已知根盖住它。`tried` 是试过的写法，让「没试到」与「试了没有」分得开。
+    Unknown { tried: Vec<String> },
+}
+
+/// 一条路径的等价写法 —— 裸 Linux ⇄ `wsl:<distro>:/…`。
+///
+/// 🔴 **裸 Linux 路径本身不含发行版**，所以展开需要调用方给出候选发行版；
+/// 给不出就只有原样一种写法，而那正是今天对不上的原因。展开出多个候选时，
+/// 判决可能是 [`PathIdentity::Ambiguous`] —— 那是**正确**的答案，不是缺陷。
+pub fn path_forms(path: &str, distros: &[String]) -> Vec<String> {
+    let p = path.trim();
+    let mut out = vec![p.to_string()];
+    let push = |out: &mut Vec<String>, s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    // `wsl:<distro>:/p` → 裸 `/p`（在那个发行版里跑的会话会这么记）。
+    if let Some(rest) = p.strip_prefix("wsl:").or_else(|| p.strip_prefix("WSL:")) {
+        if let Some((_, tail)) = rest.split_once(':') {
+            push(&mut out, tail.to_string());
+        }
+    }
+    // UNC → 规范形 → 裸；`canonical_wsl_unc` 是规范形拼串的唯一出口。
+    if let Some(canon) = crate::pathnorm::canonical_wsl_unc(p) {
+        push(&mut out, canon.clone());
+        if let Some((_, tail)) = canon.trim_start_matches("wsl:").split_once(':') {
+            push(&mut out, tail.to_string());
+        }
+    }
+    // 裸 Linux 绝对路径 → 每个候选发行版的规范形。
+    // ⚠️ `/mnt/<drive>/…` 不在此列：那是挂进来的 Windows 盘，由 `registry_key`
+    //    的挂载表换算，再套发行版前缀会把同一个目录变成两个键。
+    if p.starts_with('/') && !crate::pathnorm::is_windows_drive_mount(p) {
+        for d in distros {
+            push(&mut out, format!("wsl:{d}:{p}"));
+        }
+    }
+    out
+}
+
+/// 这条路径属于哪个项目 —— **纯函数、零 I/O**，与 [`attribute`] 同一条纪律。
+///
+/// 嵌套的根按**最具体**的那个算（`…/QuotaBar` 与 `…/QuotaBar/third_party/X` 同时
+/// 盖住时取后者）—— 否则每个子模块都会被判成歧义。只有**同样具体**的两个根身份不同
+/// 才是真歧义。
+pub fn identify_path(
+    path: &str,
+    distros: &[String],
+    roots: &[RootIdentity],
+    mounts: &DriveMounts,
+) -> PathIdentity {
+    let forms = path_forms(path, distros);
+    // (根, 撞上它的那种写法, 归一化根键长度)
+    let mut hits: Vec<(&RootIdentity, &str, usize)> = Vec::new();
+    for form in &forms {
+        let key = registry_key(form, mounts);
+        for r in roots {
+            let rk = registry_key(&r.root, mounts);
+            if covers(&rk, &key) && !hits.iter().any(|(h, _, _)| h.root == r.root) {
+                hits.push((r, form.as_str(), rk.len()));
+            }
+        }
+    }
+    if hits.is_empty() {
+        return PathIdentity::Unknown { tried: forms };
+    }
+    hits.sort_by(|a, b| b.2.cmp(&a.2));
+    let (top, form, top_len) = hits[0];
+    // 同样具体、身份不同 ⇒ 歧义。身份相同的多条写法不是歧义（同一个仓库）。
+    let tied: Vec<&(&RootIdentity, &str, usize)> = hits
+        .iter()
+        .filter(|(r, _, len)| *len == top_len && r.canonical_id != top.canonical_id)
+        .collect();
+    if !tied.is_empty() {
+        let mut candidates: Vec<(String, String)> = hits
+            .iter()
+            .filter(|(_, _, len)| *len == top_len)
+            .map(|(r, _, _)| {
+                (
+                    r.root.clone(),
+                    r.canonical_id.clone().unwrap_or_else(|| "-".to_string()),
+                )
+            })
+            .collect();
+        candidates.sort();
+        return PathIdentity::Ambiguous { candidates };
+    }
+    match &top.canonical_id {
+        Some(id) => PathIdentity::Resolved {
+            root: top.root.clone(),
+            canonical_id: id.clone(),
+            matched_form: form.to_string(),
+        },
+        None => PathIdentity::NoIdentity {
+            root: top.root.clone(),
+            matched_form: form.to_string(),
+            verdict: top.identity_verdict.clone(),
+        },
+    }
+}
+
 #[cfg(test)]
 // 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
 // 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
@@ -526,5 +681,158 @@ mod tests {
             assert_eq!(RootSource::parse(s.as_str()), Some(s));
         }
         assert_eq!(RootSource::parse("nonsense"), None);
+    }
+
+    // ── identify_path ─────────────────────────────────────────────────────
+    //
+    // 🔴 路径一律用**脱敏**的假名（`/home/u/ws/…`、`Distro`、`example.com`）——
+    // 本仓是公开仓，真实用户名 / 内网主机名 / 项目名不进代码。
+
+    fn root(path: &str, id: Option<&str>) -> RootIdentity {
+        RootIdentity {
+            root: path.to_string(),
+            canonical_id: id.map(str::to_string),
+            identity_verdict: if id.is_some() {
+                "resolved"
+            } else {
+                "no_identity"
+            }
+            .to_string(),
+        }
+    }
+
+    /// 本模块存在的**全部理由**：注册表存带发行版限定的规范形，而在那个发行版里跑的
+    /// 会话记的是裸 Linux 路径。这一条红了，出口就没意义了。
+    #[test]
+    fn a_bare_linux_cwd_resolves_to_the_distro_qualified_root() {
+        let roots = [root(
+            "wsl:Distro:/home/u/ws/proj",
+            Some("git:example.com/o/proj"),
+        )];
+        let got = identify_path(
+            "/home/u/ws/proj",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::Resolved {
+                root,
+                canonical_id,
+                matched_form,
+            } => {
+                assert_eq!(root, "wsl:Distro:/home/u/ws/proj");
+                assert_eq!(canonical_id, "git:example.com/o/proj");
+                // 撞上它的是**展开出来的**那种写法 —— 排查时要看得见。
+                assert_eq!(matched_form, "wsl:Distro:/home/u/ws/proj");
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+    }
+
+    /// 不给发行版就展不开 —— 这正是修复前的行为，留一条测试钉住「为什么需要它」。
+    #[test]
+    fn without_a_distro_the_same_path_is_honestly_unknown() {
+        let roots = [root(
+            "wsl:Distro:/home/u/ws/proj",
+            Some("git:example.com/o/proj"),
+        )];
+        let got = identify_path("/home/u/ws/proj", &[], &roots, &DriveMounts::new());
+        match got {
+            PathIdentity::Unknown { tried } => assert_eq!(tried, vec!["/home/u/ws/proj"]),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    /// 嵌套的根取**最具体**的那个 —— 否则每个子模块都会被判成歧义。
+    #[test]
+    fn a_nested_root_wins_over_its_parent() {
+        let roots = [
+            root(
+                "wsl:Distro:/home/u/ws/outer",
+                Some("git:example.com/o/outer"),
+            ),
+            root(
+                "wsl:Distro:/home/u/ws/outer/third_party/inner",
+                Some("git:example.com/o/inner"),
+            ),
+        ];
+        let got = identify_path(
+            "/home/u/ws/outer/third_party/inner/src",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::Resolved { canonical_id, .. } => {
+                assert_eq!(canonical_id, "git:example.com/o/inner");
+            }
+            other => panic!("expected Resolved(inner), got {other:?}"),
+        }
+    }
+
+    /// 同一个仓库以多种写法登记**不是**歧义 —— 身份相同就是同一个项目。
+    #[test]
+    fn two_spellings_of_the_same_repo_are_not_ambiguous() {
+        let roots = [
+            root("wsl:Distro:/home/u/ws/proj", Some("git:example.com/o/proj")),
+            root("/home/u/ws/proj", Some("git:example.com/o/proj")),
+        ];
+        let got = identify_path(
+            "/home/u/ws/proj/src",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        assert!(matches!(got, PathIdentity::Resolved { .. }), "got {got:?}");
+    }
+
+    /// 同样具体、身份不同 ⇒ **不猜**。两个发行版里各有一份同名项目就是这一格。
+    #[test]
+    fn equally_specific_roots_with_different_identities_are_ambiguous() {
+        let roots = [
+            root("wsl:A:/home/u/ws/proj", Some("git:example.com/o/one")),
+            root("wsl:B:/home/u/ws/proj", Some("git:example.com/o/two")),
+        ];
+        let got = identify_path(
+            "/home/u/ws/proj",
+            &["A".to_string(), "B".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::Ambiguous { candidates } => assert_eq!(candidates.len(), 2),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// 「找到根了但那个仓库没有 remote」是**事实**，不是失败 —— 它有自己的名字。
+    #[test]
+    fn a_root_without_a_remote_reports_no_identity_not_unknown() {
+        let roots = [root("wsl:Distro:/home/u/ws/local-only", None)];
+        let got = identify_path(
+            "/home/u/ws/local-only/src",
+            &["Distro".to_string()],
+            &roots,
+            &DriveMounts::new(),
+        );
+        match got {
+            PathIdentity::NoIdentity { verdict, .. } => assert_eq!(verdict, "no_identity"),
+            other => panic!("expected NoIdentity, got {other:?}"),
+        }
+    }
+
+    /// `/mnt/<drive>/…` **不**套发行版前缀 —— 它是挂进来的 Windows 盘，由挂载表换算。
+    #[test]
+    fn a_windows_drive_mount_is_not_expanded_with_a_distro_prefix() {
+        let forms = path_forms("/mnt/c/ws/proj", &["Distro".to_string()]);
+        assert_eq!(forms, vec!["/mnt/c/ws/proj"]);
+    }
+
+    /// 规范形能展回裸路径 —— 反方向也要成立，否则注册表存裸形时又对不上。
+    #[test]
+    fn a_canonical_form_expands_back_to_the_bare_path() {
+        let forms = path_forms("wsl:Distro:/home/u/ws/proj", &[]);
+        assert!(forms.contains(&"/home/u/ws/proj".to_string()), "{forms:?}");
     }
 }
