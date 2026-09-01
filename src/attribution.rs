@@ -736,7 +736,7 @@ pub fn path_forms(path: &str, distros: &[String]) -> Vec<String> {
 
 /// 这条路径属于哪个项目 —— **纯函数、零 I/O**，与 [`attribute`] 同一条纪律。
 ///
-/// 嵌套的根按**最具体**的那个算（`…/QuotaBar` 与 `…/QuotaBar/third_party/X` 同时
+/// 嵌套的根按**最具体**的那个算（`…/<repo>` 与 `…/<repo>/third_party/<sub>` 同时
 /// 盖住时取后者）—— 否则每个子模块都会被判成歧义。只有**同样具体**的两个根身份不同
 /// 才是真歧义。
 pub fn identify_path(
