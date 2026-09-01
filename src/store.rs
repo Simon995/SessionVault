@@ -596,6 +596,10 @@ enum IdentityOutcome {
     /// **确认**这个根没有可用的 remote —— 事实，不写 `path:` 兜底行（约束 1）。
     /// 带上是哪一种：没有 `.git`，还是有 `.git` 但里面没 origin。
     NoRemote(&'static str),
+    /// 🔴 **那个目录本身不在磁盘上了** —— 与 `NoRemote` 分开，见
+    /// [`IdentityVerdict::CheckoutMissing`]。同样是终态（重试不会变），
+    /// 但**已记下的 `canonical_id` 仍然有效**。
+    CheckoutMissing,
     /// **没问成**：探测失败 / 拿不到锁 / 写失败。缓存已撤回，下一轮重试。
     Unresolved(String),
 }
@@ -640,10 +644,40 @@ pub enum IdentityVerdict {
     /// 「有身份 + 本轮没问成」是一个真实且有用的状态。
     Resolved,
     /// **确认**这个根说不出跨系统身份。**接受**，别再算。
+    ///
+    /// 🔴 **它在两侧的含义不同，读 `roots` 输出的人必须知道**（2026-09-01）：
+    ///
+    /// | 探测路径 | `no_identity` 说的是 |
+    /// | --- | --- |
+    /// | 本机（Windows / Linux 本地 stat） | **确认**没有可用 remote —— 目录不在会走 [`Self::CheckoutMissing`] |
+    /// | 走访问桥（WSL） | 「确认没有 remote」**或**「目录不在」，**分不出** |
+    ///
+    /// 原因：桥那一侧的 `git_config_path` 只有二态，把「起点不在」和「链上没有
+    /// `.git`」压在同一个 `Absent` 里（本机那一侧 2026-09-01 已拆开）。
+    ///
+    /// ⚠️ **后果是不能把两侧的计数直接相加** —— 那等于把一个含义窄的数和一个
+    /// 含义宽的数当成同一种。要么分侧报，要么等桥那一侧也做三态。
     NoIdentity {
         /// 哪一种：没有 `.git`，还是有 `.git` 但里面没 origin。
         why: String,
     },
+    /// 🔴 **这个根的目录本身已不在磁盘上** —— checkout 被删 / 搬走 / 换了盘。
+    ///
+    /// 与 [`Self::NoIdentity`] 是两件事，而它们从前是同一格：
+    ///
+    /// | | 说的是 | 处置 |
+    /// | --- | --- | --- |
+    /// | `NoIdentity` | **确认**这个仓没有可用 remote | 接受，别再算 |
+    /// | `CheckoutMissing` | 那个**目录没了** | 🔴 **已记下的 `canonical_id` 仍然有效**；别据此说这个项目没有身份 |
+    ///
+    /// 实测（2026-09-01）：某项目搬出宿主之后，它旧位置的两条根拿到
+    /// `no_identity` + `why = "no .git anywhere on this path"`，**同时**带着搬走
+    /// 之前记下的 `git:` 身份 —— 消费者看到一行自相矛盾的数据，而真相是
+    /// 「目录没了」被说成了「确认这个仓没有 remote」。
+    ///
+    /// ⚠️ 也**不是** [`Self::Unresolved`]：那条说「没问成，重试」，而这里问成了 ——
+    /// 答案就是「不在了」，重试不会变。
+    CheckoutMissing,
     /// **没问成**（命名空间够不着 / 桥不通 / 权限 / 写库失败）。
     /// **重试**，且**绝不据此做删除类决定**。
     Unresolved {
@@ -660,6 +694,7 @@ impl IdentityVerdict {
             Self::NotProbed => "not_probed",
             Self::Resolved => "resolved",
             Self::NoIdentity { .. } => "no_identity",
+            Self::CheckoutMissing => "checkout_missing",
             Self::Unresolved { .. } => "unresolved",
         }
     }
@@ -670,7 +705,10 @@ impl IdentityVerdict {
             Self::NoIdentity { why } | Self::Unresolved { why } => Some(why.as_str()),
             // 🔴 **不用 `_` 兜底**：将来加一个「问到一半」之类的变体时，
             // 这里要**编译不过**，而不是静默给出 `None`。
-            Self::NotProbed | Self::Resolved => None,
+            // ⚠️ `CheckoutMissing` 归这一档：**理由就是判决本身**（那个目录不在了），
+            // 再编一句 why 只会多一处要维护的措辞。这条闸 2026-09-01 加该变体时
+            // 真的挡住了一次「顺手写个 `_ => None`」。
+            Self::NotProbed | Self::Resolved | Self::CheckoutMissing => None,
         }
     }
 
@@ -690,6 +728,7 @@ impl IdentityVerdict {
         match outcome {
             "resolved" => Self::Resolved,
             "no_identity" => Self::NoIdentity { why: why() },
+            "checkout_missing" => Self::CheckoutMissing,
             "unresolved" => Self::Unresolved { why: why() },
             other => Self::Unresolved {
                 why: format!("unrecognized verdict from a newer writer: {other}"),
@@ -708,6 +747,10 @@ pub struct IdentitySweep {
     pub recorded: usize,
     pub already_probed: usize,
     pub no_remote: usize,
+    /// 🔴 那个目录**不在磁盘上了** —— 与 `no_remote` 分开计数：一个说「这个仓
+    /// 确认没有 remote」，一个说「那条路径上的东西没了」，而后者往往意味着
+    /// **项目搬走了**，是个该被看见的信号。
+    pub checkout_missing: usize,
     pub unresolved: usize,
     pub skipped_out_of_budget: usize,
     /// 连注册表都没读成 —— 这一轮**什么都没扫**，与「扫了但零结果」不同。
@@ -1726,6 +1769,7 @@ impl TotalStore {
                 IdentityOutcome::AlreadyProbed => sweep.already_probed += 1,
                 IdentityOutcome::Recorded => sweep.recorded += 1,
                 IdentityOutcome::NoRemote(_) => sweep.no_remote += 1,
+                IdentityOutcome::CheckoutMissing => sweep.checkout_missing += 1,
                 IdentityOutcome::Unresolved(_) => sweep.unresolved += 1,
             }
         }
@@ -1762,6 +1806,7 @@ impl TotalStore {
             IdentityOutcome::NoRemote(why) => IdentityVerdict::NoIdentity {
                 why: (*why).to_string(),
             },
+            IdentityOutcome::CheckoutMissing => IdentityVerdict::CheckoutMissing,
             IdentityOutcome::Unresolved(why) => IdentityVerdict::Unresolved { why: why.clone() },
         };
         if !self.note_identity_verdict(root, &verdict) {
@@ -1849,6 +1894,11 @@ impl TotalStore {
                     return IdentityOutcome::Unresolved(e.to_string());
                 }
             };
+        // 🔴 「目录没了」先于「没有 remote」判 —— 后者说的是「这个仓确认没有
+        // remote」，而目录都不在了，那句话没有依据。
+        if identity.checkout_missing {
+            return IdentityOutcome::CheckoutMissing;
+        }
         if !identity.id.starts_with("git:") {
             // 约束 1：不写 `path:` 兜底行（这是**确认**没有 remote 的情形）。
             // 「问过了」保留 —— 它是终态，下一轮不必再问。
@@ -6733,6 +6783,49 @@ mod project_identity_tests {
         assert_eq!((sweep.recorded, sweep.unresolved), (0, 0));
     }
 
+    /// 🔴 **checkout 没了 ≠ 确认这个仓没有 remote。**
+    ///
+    /// 这是 2026-09-01 修的那个 bug 的护栏：从前两者都落 `no_identity`
+    /// （`why = "no .git anywhere on this path"`），于是消费者看到
+    /// **`no_identity` + 一个 `git:` 身份**并存 —— 一行自相矛盾的数据，
+    /// 而正确读法是「那个目录不在了，已记下的身份仍然有效」。
+    #[test]
+    fn a_deleted_checkout_reports_checkout_missing_not_no_identity() {
+        let root = scratch("gone-vs-not-a-repo");
+        let proj = root.join("Proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        seed_repo(&proj, Some("git@github.com:o/Proj.git"));
+        let store = TotalStore::open_in_memory().unwrap();
+        ingest(&store, &proj, 0);
+        let root_str = proj.to_string_lossy().into_owned();
+
+        std::fs::remove_dir_all(&proj).unwrap();
+        store.forget_identity_probe(&root_str); // 逼它重新判一次
+        let outcome = store.record_identity_for_root(
+            &root_str,
+            None,
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert_eq!(outcome, IdentityOutcome::CheckoutMissing, "{outcome:?}");
+
+        // ⚠️ 反面同样要钉：一个**存在但不是仓库**的目录仍然是 `NoRemote` ——
+        // 只写正面的话，「一律报 CheckoutMissing」也能让上面那条绿。
+        let plain = root.join("just-a-folder");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain_str = plain.to_string_lossy().into_owned();
+        let outcome = store.record_identity_for_root(
+            &plain_str,
+            None,
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert!(
+            matches!(outcome, IdentityOutcome::NoRemote(_)),
+            "存在但不是仓库 ⇒ 仍是 NoRemote，got {outcome:?}"
+        );
+    }
+
     #[test]
     fn identity_survives_the_checkout_being_deleted() {
         // 🔴 **这条就是 project_identity 表存在的全部理由。** 实测有个项目留着 16 万条
@@ -6754,8 +6847,8 @@ mod project_identity_tests {
         std::fs::remove_dir_all(&proj).unwrap();
         assert_eq!(
             crate::identity::find_git_root(&proj),
-            crate::identity::GitRoot::Absent,
-            "前提：磁盘上真的没了"
+            crate::identity::GitRoot::StartMissing,
+            "前提：磁盘上真的没了 —— 而这一格现在有自己的名字（不再与「不是仓库」同格）"
         );
         assert_eq!(
             store.project_identity(&root_str),

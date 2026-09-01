@@ -544,8 +544,16 @@ impl DirectoryGrouping {
     /// **同一个项目下不同目录**的个数 —— 合法，**不该随决定 9 变化**。
     ///
     /// 口径：某个 `canonical_id` 下分出多于一组时，那些组**全部**计入。
-    /// ⚠️ 口径要写死并与消费侧对账 —— 「6」和「9」的差别只可能来自口径，
-    /// 而一个说不清分母的数与没有这个数差不多。
+    ///
+    /// 🔴 **「已解析身份」指的是 `canonical_id.is_some()`，不是
+    /// `identity_verdict == "resolved"`。** 两者会分叉：一个 checkout 搬走之后，
+    /// 它旧位置那条根的 verdict 是 `checkout_missing`（最后一次探测的结果），
+    /// 而 `canonical_id` 是搬走**之前**记下的、**仍然有效**的身份。
+    /// 按 verdict 过滤会把这类根整个丢掉 —— 而它们确实指向真实存在过的目录，
+    /// 也确实可能与别的写法重复。
+    ///
+    /// ⚠️ 口径要写死并与消费侧对账 —— 两边曾经一个报 6 一个报 9，
+    /// 差的正是这条过滤规则；而一个说不清分母的数与没有这个数差不多。
     pub fn distinct_checkouts(&self) -> usize {
         let mut by_id: std::collections::BTreeMap<&str, usize> = Default::default();
         for g in &self.groups {
