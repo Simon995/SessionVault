@@ -5,3 +5,7 @@
 *.toml text eol=lf
 *.md text eol=lf
 *.py text eol=lf
+
+# hook 必须是 LF 行尾：CRLF 会在 shebang 行尾多一个 CR 字符，
+# 于是 Linux/WSL 上报「找不到解释器」—— 而 hook 不运行是**静默**的。
+.githooks/* text eol=lf

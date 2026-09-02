@@ -1,0 +1,42 @@
+#!/bin/sh
+# 公开仓脱敏闸 —— 在**推送这一刻**拦住，而不是事后发现。
+#
+# 🔴 为什么是 pre-push 而不是 pre-commit：本仓的判据是「上传的东西里有没有泄露」，
+# 而上传发生在 push。commit 可以随便改，push 出去的是公开历史。
+#
+# ⚠️ 它保护的是**这一份工作副本**：`.git/hooks/` 不在版本控制里，所以本文件靠
+# `git config core.hooksPath .githooks` 生效（见 AGENTS.md）。从别处克隆而没配
+# 那一行的副本**不受保护** —— 这个缺口写在明处，好让下一个人能推翻它。
+
+set -eu
+
+ROOT=$(git rev-parse --show-toplevel)
+cd "$ROOT"
+
+# 🔴 **正向断言地找解释器**，不是「没报错就当它在」：这台机器上 `python` 是
+# Microsoft Store 的应用执行别名占位符 —— 它**静默不执行**、不报错、返回 0。
+# 判据只能是「它有没有吐出我要的那个串」。
+PROBE='print("svault-probe-ok")'
+PY=""
+if [ "$(uv run python -c "$PROBE" 2>/dev/null || true)" = "svault-probe-ok" ]; then
+    PY="uv run python"
+elif [ "$(python3 -c "$PROBE" 2>/dev/null || true)" = "svault-probe-ok" ]; then
+    PY="python3"
+elif [ "$(python -c "$PROBE" 2>/dev/null || true)" = "svault-probe-ok" ]; then
+    PY="python"
+fi
+
+if [ -z "$PY" ]; then
+    echo "pre-push: 找不到能真正执行的 Python —— **拒绝推送**。" >&2
+    echo "  🔴 这里 fail closed：「没检查」与「检查通过」不是一回事，" >&2
+    echo "     而放行会让后者的话被前者说出来（见 AGENTS.md 第二条地基）。" >&2
+    echo "  装 uv 或让 python3 可用后重试；确认要跳过用 git push --no-verify。" >&2
+    exit 1
+fi
+
+if ! $PY scripts/check-public-safe.py; then
+    echo "" >&2
+    echo "pre-push: 脱敏闸未过 —— **拒绝推送**。" >&2
+    echo "  ⚠️ 工作区改得掉；commit message 推上去就是公开历史，要 rebase 重写。" >&2
+    exit 1
+fi
