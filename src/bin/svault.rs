@@ -378,6 +378,18 @@ enum Out<'a> {
         source_location: SourceLocation,
         source_mode: SourceMode,
         path: String,
+        /// 🔴 **这份来源是什么类别** —— 让消费方在**发现阶段**就能决定
+        /// 「要不要同步它」，而不必先把内容拉进来才知道类别。
+        ///
+        /// 判例（2026-09-02）：一个消费方需要排除 `tasks`（386 条待办清单，
+        /// 人刚判过「状态清单不该进长期记忆」），但保留同一次 `discover` 里的
+        /// `skills` / `plans` / `history`。**过去它做不到** —— 类别只出现在
+        /// `snapshots` 的 `RawEvent.artifact_kind` 里，那已经是内容阶段了。
+        ///
+        /// ⚠️ 值一直存在于 `DiscoveredSource`，只是**没往外发**。
+        /// `AppendLog` 没有类别（它是会话流，不是状态快照）⇒ `null`。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact_kind: Option<String>,
     },
     /// scan 产出的一条归一化事件（TumeFlow 依赖的事件流契约）。
     Event { event: &'a RawEvent },
@@ -923,6 +935,7 @@ fn run_discover() -> i32 {
                     source_location: s.source_location.clone(),
                     source_mode: s.source_mode,
                     path: s.path.display().to_string(),
+                    artifact_kind: s.artifact_kind.clone(),
                 });
             }
             emit(&Out::Summary {
@@ -2239,6 +2252,48 @@ mod tests {
 
     /// 锁定 NDJSON 线契约：TumeFlow（P3-③ 消费侧）按 `kind` 分流并读这些字段名，
     /// 改名 = 破坏跨语言契约，故用断言钉死 `pulled` / `pull_summary` 的外形。
+    /// 🔴 **`discover` 的每一行必须带上类别** —— 消费方靠它在**发现阶段**
+    /// 决定「要不要同步这个来源」。
+    ///
+    /// ⚠️ 实测栽过（2026-09-02）：`DiscoveredSource.artifact_kind` 一直有值，
+    /// 但 `Out::Source` **没把它发出去**。于是消费方只能在拿到内容之后
+    /// （`snapshots` 的 `RawEvent.artifact_kind`）才知道类别 —— 而它要的正是
+    /// 「**别同步这一类**」，那时已经晚了。
+    ///
+    /// 🔴 这一族叫「值存在、没发出去」：库内是对的，线上少一格，而两者
+    /// 在消费方眼里长得像「本仓不区分这个」。
+    #[test]
+    fn discover_rows_carry_the_artifact_kind() {
+        let row = serde_json::to_value(Out::Source {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::SnapshotFile,
+            path: "C:/u/.claude/tasks/a/1.json".to_string(),
+            artifact_kind: Some("task".to_string()),
+        })
+        .unwrap();
+        assert_eq!(row["kind"], "source");
+        assert_eq!(
+            row["artifact_kind"], "task",
+            "类别没发出去 —— 消费方无法在同步前按类别排除"
+        );
+
+        // ⚠️ 反面同样要钉：`AppendLog` 没有类别（会话流不是状态快照），
+        // 那一行**不该**出现这个键 —— 只写正面的话，「一律发 null」也能让上面那条绿。
+        let stream = serde_json::to_value(Out::Source {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_mode: SourceMode::AppendLog,
+            path: "C:/u/.claude/projects/p/s.jsonl".to_string(),
+            artifact_kind: None,
+        })
+        .unwrap();
+        assert!(
+            stream.get("artifact_kind").is_none(),
+            "AppendLog 不该带类别键，得到 {stream:?}"
+        );
+    }
+
     #[test]
     fn pull_ndjson_wire_shape_is_stable() {
         let ev = mk_event(0, "s");
