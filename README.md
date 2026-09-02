@@ -11,7 +11,10 @@ svault 构建 diff `cache.db` 一致后删旧路径；首测 9134 条 usage must
 TumeFlow `svault pull --since` 消费拉取环已通。待办 = P2 soak 删旧路径 + at-rest 加密 / erase
 （P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，非 SessionVault 待办）。
 Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/指纹/入库，TumeFlow 只做语义解析。
-最后更新：2026-07-13
+最后更新：**上面这段跨仓状态停在 2026-07-13，可能已过期**；CLI 能力表已于 2026-09-02 核过。
+
+> ⚠️ 跨仓进度（P2 soak 有没有删旧路径、消费方发布到哪一版）**要问那两个仓，不在本仓能确证的范围内** ——
+> 与其猜一个新日期，不如说清这段的时效边界。
 
 ---
 
@@ -36,7 +39,7 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | `wsl`                        | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码）                             | ✅ 实机实测                                   |
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
-| `svault` CLI                 | `discover` / `scan-all`（NDJSON 出 stdout），跨运行游标持久化                                | ✅                                            |
+| `svault` CLI                 | **14 个子命令**（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `changes` / `gc` / `erase`；跨运行游标持久化 | ✅ 2026-09-02 核 |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
 | 总库（持久化输出库）         | append-only RawEvent 库                                                                      | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak）    |
 | snapshot_file                | Claude/Codex memory、rules、项目 instruction 状态快照                                        | ✅ experimental（Windows/WSL + 最新快照查询） |
