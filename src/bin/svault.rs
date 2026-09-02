@@ -133,6 +133,15 @@ enum Command {
         /// 事件总数上界（防一个超大会话吃光内存 / LLM 上下文）。
         #[arg(long, default_value_t = 50000)]
         max_events: usize,
+        /// **接着上次读**：只取 `seq` 严格大于此值的事件。
+        ///
+        /// 值来自上一轮该会话那条 `session_cursor` 的 `last_seq`，原样传回来即可。
+        ///
+        /// 🔴 **只在恰好一个 `--session` 时接受** —— `seq` 是**每个会话各自的**，
+        /// 拿一个 seq 去过滤多个会话几乎总是调用方搞错了。与其在文档里叮嘱，
+        /// 不如让那个组合**根本执行不了**（本仓judged：判据能进校验，就别留在注释里）。
+        #[arg(long)]
+        after_seq: Option<u64>,
         #[arg(long)]
         store: Option<PathBuf>,
     },
@@ -557,7 +566,32 @@ enum Out<'a> {
     SessionsReadSummary {
         sessions: usize,
         events: u64,
+        /// ⚠️ **全局的**「有没有任何会话被截断」，保留原语义不动（既有消费方在读它）。
+        /// 要知道**哪个**会话没读完、以及从哪接着读，看 `session_cursor` 行。
         truncated: bool,
+    },
+    /// `sessions-read` 里**每个会话各一行**：它这一轮读到哪、还有没有、怎么接着读。
+    ///
+    /// 🔴 它存在的理由是 `SessionsReadSummary.truncated` answers 不了的那个问题：
+    /// **哪一个**会话没读完。N 个会话压成一个布尔，消费方只能重读全部。
+    #[cfg(feature = "store")]
+    SessionCursor {
+        /// 原样回显入参 `--session` 的那一条 —— 批量调用时消费方靠它对号。
+        session: String,
+        /// 这一轮交付了几条事件。
+        events: u64,
+        /// 🔴 **三态**：`true` 还有、`false` 查过了没有、**`null` 没查**
+        /// （预算在轮到它之前就用尽了）。`null` 与 `false` 混为一谈就会让消费方
+        /// 把「没查」当成「读完了」，从此再不来取。
+        has_more: Option<bool>,
+        /// 续读游标：下一轮 `--after-seq` 原样传它。`null` = 这一轮一条都没取到。
+        last_seq: Option<u64>,
+        /// 本轮最后一个**成功解码**事件的 `occurred_at` —— 按时刻记进度的消费方
+        /// 用它零翻译，不必把 offset 反查成时间。
+        last_occurred_at: Option<String>,
+        /// 🔴 取到了但**解不开**的行数。与「没有这些行」是两件事 ——
+        /// 不报的话，一段密钥异常会被读成一段空历史。
+        decode_failed: usize,
     },
     #[cfg(feature = "store")]
     Snapshot { offset: i64, event: &'a RawEvent },
@@ -789,8 +823,9 @@ fn main() {
         Command::SessionsRead {
             sessions,
             max_events,
+            after_seq,
             store,
-        } => run_sessions_read(sessions, max_events, store),
+        } => run_sessions_read(sessions, max_events, after_seq, store),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
@@ -2262,6 +2297,33 @@ mod tests {
     ///
     /// 🔴 这一族叫「值存在、没发出去」：库内是对的，线上少一格，而两者
     /// 在消费方眼里长得像「本仓不区分这个」。
+    /// 🔴 **`--after-seq` 配多个 `--session` 必须被拒**，而不是「照做但结果没人看得懂」。
+    ///
+    /// `seq` 是**每个会话各自的**：拿一个 seq 去过滤 N 个会话，每个都被按别人的
+    /// 进度裁一刀，结果看起来只是「少了些事件」—— **没有任何东西会报错**。
+    /// ⇒ 让这个组合执行不了，比在文档里叮嘱可靠（判据能进校验，就别留在注释里）。
+    #[cfg(feature = "store")]
+    #[test]
+    fn after_seq_with_many_sessions_is_refused_not_silently_applied() {
+        let two = vec![
+            "claude_code/local/p/a".to_string(),
+            "claude_code/local/p/b".to_string(),
+        ];
+        assert_eq!(
+            run_sessions_read(two.clone(), 100, Some(5), None),
+            2,
+            "多会话 + --after-seq 必须退 2"
+        );
+        // ⚠️ 反面：不给 --after-seq 时多会话是合法的，这道闸不该顺手把它也拦掉。
+        // 只写正面的话，「一律退 2」也能让上面那条绿。
+        // （这里只验它**没在校验这一步**退 2；后续因缺 store 退 1 是另一回事。）
+        assert_ne!(
+            run_sessions_read(two, 100, None, Some(PathBuf::from("/nonexistent/x.db"))),
+            2,
+            "没给 --after-seq 的多会话不该被这道闸拦"
+        );
+    }
+
     #[test]
     fn discover_rows_carry_the_artifact_kind() {
         let row = serde_json::to_value(Out::Source {
@@ -3315,7 +3377,23 @@ fn run_gc(dry_run: bool, store_arg: Option<PathBuf>) -> i32 {
 
 /// `sessions-read`：按会话身份读当前投影的全部事件。
 #[cfg(feature = "store")]
-fn run_sessions_read(specs: Vec<String>, max_events: usize, store_arg: Option<PathBuf>) -> i32 {
+fn run_sessions_read(
+    specs: Vec<String>,
+    max_events: usize,
+    after_seq: Option<u64>,
+    store_arg: Option<PathBuf>,
+) -> i32 {
+    // 🔴 **让错的组合执行不了，而不是在文档里叮嘱。** `seq` 是每个会话各自的，
+    // 拿一个 seq 去过滤多个会话几乎总是调用方搞错了 —— 而它错得很安静：
+    // 每个会话都按别人的进度被裁一刀，结果看起来只是「少了些事件」。
+    if after_seq.is_some() && specs.len() != 1 {
+        log::error!(
+            target: tag::CLI,
+            "--after-seq 只能与恰好一个 --session 同用（本次 {} 个）—— seq 是每个会话各自的",
+            specs.len()
+        );
+        return 2;
+    }
     let Some(store_path) = resolve_store_path(store_arg) else {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
@@ -3346,18 +3424,37 @@ fn run_sessions_read(specs: Vec<String>, max_events: usize, store_arg: Option<Pa
             return 1;
         }
     };
-    match store.read_sessions(&sessions, max_events) {
-        Ok(events) => {
-            for (offset, ev) in &events {
-                emit(&Out::Pulled {
-                    offset: *offset,
-                    event: ev,
+    match store.read_sessions_resumable(&sessions, max_events, after_seq) {
+        Ok(pages) => {
+            let mut total = 0u64;
+            for page in &pages {
+                for (offset, ev) in &page.events {
+                    emit(&Out::Pulled {
+                        offset: *offset,
+                        event: ev,
+                    });
+                }
+                total += page.events.len() as u64;
+            }
+            // 🔴 游标行在事件之后、摘要之前 —— 消费方读完一个会话的事件，
+            // 紧接着就拿到「它读到哪」，不必把整个输出缓存起来再回头找。
+            for page in &pages {
+                emit(&Out::SessionCursor {
+                    // `index` 对回入参那一条 —— 不靠顺序猜。
+                    session: specs[page.index].clone(),
+                    events: page.events.len() as u64,
+                    has_more: page.has_more,
+                    last_seq: page.last_seq,
+                    last_occurred_at: page.last_occurred_at.clone(),
+                    decode_failed: page.decode_failed,
                 });
             }
             emit(&Out::SessionsReadSummary {
                 sessions: sessions.len(),
-                events: events.len() as u64,
-                truncated: events.len() >= max_events,
+                events: total,
+                // ⚠️ 旧字段**语义不动**（既有消费方在读它）：只说「有没有任何会话
+                // 还有剩」。`None`（没查过）不算 —— 它没资格说「还有」。
+                truncated: pages.iter().any(|p| p.has_more == Some(true)),
             });
             0
         }

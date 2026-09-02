@@ -30,6 +30,7 @@ AGENTS.md 开头就写着「不得出现真实用户名、个人路径、邮箱�
 from __future__ import annotations
 
 import os
+import subprocess
 import re
 import sys
 
@@ -128,6 +129,42 @@ def self_test() -> None:
         sys.exit("SELF-TEST 失败：漏掉了编码形态 -home-carol- —— 扫描器坏了")
 
 
+def scan_commit_messages(rev_range: str) -> tuple[list[str], int]:
+    """扫一个 revision range 的 **commit message**。
+
+    🔴 为什么需要它：`git push` 上传的不只是工作区文件，**commit message 同样进
+    公开历史**，而本脚本此前只 `os.walk` 文件树 —— 那一半从来没被检查过。
+    2026-09-02 核出这个缺口时历史恰好是干净的；**「这次没事」不是「以后没事」**。
+
+    ⚠️ 返回 `(问题, 实际检查的提交数)` —— **必须把条数报出去**：取不到提交时
+    `git log` 返回空，而「零个提交、没有问题」与「一个都没检查」在布尔上一模一样，
+    正是 AGENTS.md「第二条地基」那个形状。调用方据条数判断这句「干净」覆盖了什么。
+    """
+    fmt = "%H" + chr(31) + "%B" + chr(30)
+    try:
+        out = subprocess.run(
+            ["git", "log", "--format=" + fmt, rev_range],
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+    except OSError as e:
+        return ([("  <git 不可用：%s>" % e)], 0)
+    if out.returncode != 0:
+        # 🔴 「范围解析失败」不是「没有问题」—— 说出来，别静默当成干净。
+        return ([("  <git log %s 失败：%s>" % (rev_range, out.stderr.strip()[:200]))], 0)
+    problems: list[str] = []
+    checked = 0
+    for record in out.stdout.split(chr(30)):
+        record = record.strip()
+        if not record:
+            continue
+        sha, _, body = record.partition(chr(31))
+        checked += 1
+        for hit in findings_in(body):
+            problems.append("  commit %s: %s" % (sha[:8], hit))
+    return (problems, checked)
+
+
 def main() -> int:
     self_test()
 
@@ -159,7 +196,20 @@ def main() -> int:
         )
         return 1
 
+    # 🔴 **推送前还要扫 commit message** —— 它和文件一样进公开历史。
+    # 默认范围「本地领先 origin/main 的那些」= 这次 push 会上传的正是它们。
+    rev_range = sys.argv[1] if len(sys.argv) > 1 else "origin/main..HEAD"
+    msg_problems, checked = scan_commit_messages(rev_range)
+    if msg_problems:
+        print("commit message 里发现可能的真实身份（%d 处）：" % len(msg_problems))
+        print(*msg_problems, sep=chr(10))
+        print("⚠️ message 推上去就是公开历史的一部分，改它要 rebase 重写。")
+        return 1
+
     print("public-safe: 扫了 %d 个文件，未发现真实用户名 / 个人路径 / 邮箱。" % scanned)
+    # ⚠️ **报条数，不报「有没有」**：0 条待推提交与「一条都没检查」在布尔上一样，
+    # 在计数上不一样。
+    print("public-safe: 另扫了 %d 条 commit message（范围 %s）。" % (checked, rev_range))
     print("（自检先通过，所以这句『干净』是有依据的。）")
     return 0
 
