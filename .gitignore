@@ -17,3 +17,7 @@ Thumbs.db
 *.snapshot.db
 *.snapshot.db-wal
 *.snapshot.db-shm
+
+# Python（scripts/ 下的闸与工具；importlib 加载时会生成）
+__pycache__/
+*.py[cod]
