@@ -72,6 +72,25 @@ pub enum ArtifactKind {
     /// **人手写的指令文件**（`CLAUDE.md` / `AGENTS.md`）——
     /// 项目级的，以及**配置根下那份全局的**。
     Instruction,
+    /// 🔴 **技能 = 「怎么做」，与 [`Self::Memory`]（「知道什么」）分开。**
+    ///
+    /// 消费方 2026-09-02 明确要求过**不要与 `Memory` 合并**：混一类之后它那侧
+    /// 分不开程序性与陈述性记忆。
+    ///
+    /// ⚠️ **只收 `.md` 正文**。同目录下还有脚本（`.py` / `.mjs`）、图片（`.png` /
+    /// `.svg`）、`__pycache__` 的 `.pyc`、`.marker` —— 实测 `~/.codex/skills` 60 个
+    /// 文件里 md 只有 23 个。**那些是代码与资产，不是这个用户的经验**（与消费方
+    /// 自己排除 `plugins` 同一条理由）。
+    Skill,
+    /// 任务与其**决策演化**。实测键恒为
+    /// `{id, subject, description, activeForm, status, blocks, blockedBy}`（82/82），
+    /// 正文里是带日期的复核记录 —— 「以前为什么用 A、何时改成 B」的载体。
+    ///
+    /// ⚠️ **只收 `.json`**：同目录下的 `.lock`（运行时锁，可能正被占用）与
+    /// `.highwatermark`（游标）不是内容。实测 93 个文件里 json 只有 82 个。
+    Task,
+    /// 计划正文（含 Context 与取舍）。量小质高。
+    Plan,
 }
 
 impl ArtifactKind {
@@ -80,6 +99,9 @@ impl ArtifactKind {
             Self::Memory => "memory",
             Self::Rules => "rules",
             Self::Instruction => "instruction",
+            Self::Skill => "skill",
+            Self::Task => "task",
+            Self::Plan => "plan",
         }
     }
 }
@@ -182,6 +204,35 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     recursive: true,
                     kind: Some(ArtifactKind::Memory),
                 },
+                Artifact {
+                    // 🔴 **只取 `.md`**：同树下还有 `.py` / `.pyc`（`__pycache__`）。
+                    // 实测本机 8 个文件里 md 只有 5 个 —— 用 `**/*` 会把编译缓存收进总库。
+                    subdir: "skills".to_string(),
+                    glob: "**/*.md".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: true,
+                    kind: Some(ArtifactKind::Skill),
+                },
+                Artifact {
+                    // ⚠️ **只取 `.json`**：同目录下的 `.lock` 是运行时锁（可能正被
+                    // 另一个进程持有）、`.highwatermark` 是游标。实测 93 个文件里
+                    // json 只有 82 个，而那 82 个键完全一致。
+                    subdir: "tasks".to_string(),
+                    glob: "**/*.json".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: true,
+                    kind: Some(ArtifactKind::Task),
+                },
+                Artifact {
+                    subdir: "plans".to_string(),
+                    glob: "*.md".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: false,
+                    kind: Some(ArtifactKind::Plan),
+                },
             ],
         },
         ProviderDescriptor {
@@ -246,6 +297,17 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Rules),
+                },
+                Artifact {
+                    // 🔴 **只取 `.md`**：实测本机 60 个文件里 md 只有 23 个，其余是
+                    // `.py` / `.mjs` / `.cjs`（脚本）、`.png` / `.svg`（资产）、
+                    // `.yaml` / `.txt` / `.marker`。用 `**/*` 会把图片收进记忆总库。
+                    subdir: "skills".to_string(),
+                    glob: "**/*.md".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: true,
+                    kind: Some(ArtifactKind::Skill),
                 },
             ],
         },

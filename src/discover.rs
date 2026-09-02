@@ -555,6 +555,11 @@ fn artifact_suffix(glob: &str) -> Option<&str> {
         Some(".md")
     } else if glob.ends_with(".jsonl") {
         Some(".jsonl")
+    } else if glob.ends_with(".json") {
+        // 🔴 **必须排在 `.jsonl` 之后**：两者只差一个字母，顺序反了会让
+        // `**/*.jsonl` 先撞上这一支。（`".jsonl".ends_with(".json")` 其实是
+        // `false`，所以今天反了也不会错 —— 但那是巧合，不是保证。）
+        Some(".json")
     } else {
         None
     }
@@ -661,6 +666,31 @@ fn collect_files_into(
 // 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
 #[allow(clippy::disallowed_methods)]
 mod tests {
+
+    /// 🔴 **每一条内置描述符的 `glob`，`artifact_suffix` 都必须认得。**
+    ///
+    /// 认不得的后果是**一条 `warn` 加一个空结果** —— 而「不支持这个后缀」与
+    /// 「这个目录本来就没文件」在 stdout 上**一模一样**（本仓第二条地基）。
+    ///
+    /// ⚠️ 实测栽过（2026-09-02）：给 `tasks` 加 `**/*.json` 时 `artifact_suffix`
+    /// 只认 `.rules` / `.md` / `.jsonl`，于是那 386 个文件**一个都没被发现**，
+    /// 而唯一的信号是一行被 `2>/dev/null` 丢掉的 warn。
+    ///
+    /// ⇒ 这道闸把「加描述符时用了不支持的后缀」从**运行时的一行日志**变成
+    /// **测试期的红**：新加一条 `glob` 而忘了教 `artifact_suffix`，这条当场失败。
+    #[test]
+    fn every_builtin_glob_is_one_artifact_suffix_understands() {
+        for d in crate::catalog::builtin_descriptors() {
+            for art in &d.artifacts {
+                assert!(
+                    super::artifact_suffix(&art.glob).is_some(),
+                    "{} 的 glob `{}` 不被 artifact_suffix 支持 ——                      它会在运行时只报一条 warn 然后静默返回空",
+                    d.name,
+                    art.glob,
+                );
+            }
+        }
+    }
 
     /// 🔴 本地遍历失败也必须报出来（评审 [P2]）—— `read_dir` / 目录项 / `file_type`
     /// 的错误从前一律被当成「这里没有文件」，而 `local` 位置的 prune 据此删存量：
