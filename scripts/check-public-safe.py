@@ -82,8 +82,17 @@ EMAIL_OK = re.compile(
 
 
 def is_placeholder(name: str) -> bool:
-    """由构造就是占位符的两类，不必逐个登记进白名单。"""
-    return (name.startswith("<") and name.endswith(">")) or set(name) <= {".", "…"}
+    """由构造就是占位符的几类，不必逐个登记进白名单。
+
+    🔴 **按开头判，不按整体形状判**（2026-09-02 改）。原版要求 `<...>` 成对、
+    或整个名字只由点和省略号构成 —— 而 `HOME_PAT` 的捕获组会一直吃到下一个
+    ASCII 标点，于是散文里的 `/home/<真名>` 捕到 `<真名>` 尚可，
+    `/home/…），而后面整段中文` 却捕成一长串，两条规则都对不上 ⇒ **假阳**。
+
+    ⚠️ 试过在正则里排除 CJK，那会把 `<真名>` 截断成 `<` —— **换了个假阳而已**。
+    按开头判则两者都对：真实路径不会以 `<` 或 `…` 起头，所以不漏。
+    """
+    return name.startswith(("<", "…", ".")) or set(name) <= {".", "…"}
 
 
 def findings_in(text: str) -> list[str]:
