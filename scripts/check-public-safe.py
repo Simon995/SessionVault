@@ -65,7 +65,20 @@ ALLOWED_LITERALS = ("Simon Ma", "Simon995")
 HOME_PAT = re.compile(r"(?:/home/|[/\\]Users[/\\])([^/\\\s\"\'`,;:)\]}]+)")
 ENCODED_PAT = re.compile(r"-home-([A-Za-z0-9_<>]+)")
 EMAIL_PAT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-EMAIL_OK = re.compile(r"(example.(com|net|org)|noreply|@github\.com|@ts-|localhost)")
+# 🔴 **每一条都要锚定。** 裸子串 `noreply` 会放过任何含它的**真实**地址
+# （`noreply@某公司.com` 是常见的真实发件地址）—— 那是**假阴**，比假阳更坏：
+# 假阳会被看见并烦人，假阴什么都不说。2026-09-02 实测确认过这一格。
+#
+# ⚠️ 白名单里每一条都必须是「**必然假阳**」——每次提交必然出现、且不可能是
+# 真实身份的那些。挡不住这个判据的，就该收窄而不是留着。
+EMAIL_OK = re.compile(
+    r"(@users\.noreply\.github\.com$"          # GitHub 署名（本仓提交者）
+    r"|^noreply@anthropic\.com$"                # Co-Authored-By 署名
+    r"|^noreply@github\.com$"                   # GitHub 系统提交
+    r"|^git@github\.com$"                       # SSH remote URL，不是邮箱
+    r"|[@.]example\.(com|net|org)$"             # RFC 2606 保留域（含 corp.example.net 这类子域）
+    r"|@ts-|localhost)"
+)
 
 
 def is_placeholder(name: str) -> bool:
@@ -140,7 +153,10 @@ def scan_commit_messages(rev_range: str) -> tuple[list[str], int]:
     `git log` 返回空，而「零个提交、没有问题」与「一个都没检查」在布尔上一模一样，
     正是 AGENTS.md「第二条地基」那个形状。调用方据条数判断这句「干净」覆盖了什么。
     """
-    fmt = "%H" + chr(31) + "%B" + chr(30)
+    # 🔴 **不只 `%B`**：author / committer 邮箱同样进公开历史，而它们
+    # **不在 message 正文里** —— 2026-09-02 实测本仓早期有 34 个提交的署名是
+    # 真实私人 / 工作邮箱，而当时只扫 `%B` 的闸对它们完全沉默。
+    fmt = "%H" + chr(31) + "%an <%ae>%n%cn <%ce>%n%B" + chr(30)
     try:
         out = subprocess.run(
             ["git", "log", "--format=" + fmt, rev_range],
