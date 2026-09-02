@@ -91,6 +91,12 @@ pub enum ArtifactKind {
     Task,
     /// 计划正文（含 Context 与取舍）。量小质高。
     Plan,
+    /// 用户输入历史（`history.jsonl`）。实测每行恒带
+    /// `{display, pastedContents, timestamp, project, sessionId}`（1968/1968，解析零失败）。
+    ///
+    /// 🔴 它同时补两个别处最缺的格：**100% 带 unix 时间戳**、**100% 带 project**，
+    /// 而且**100% 带 `sessionId`** —— 最后这个让它能挂回具体会话。
+    History,
 }
 
 impl ArtifactKind {
@@ -102,6 +108,7 @@ impl ArtifactKind {
             Self::Skill => "skill",
             Self::Task => "task",
             Self::Plan => "plan",
+            Self::History => "history",
         }
     }
 }
@@ -233,6 +240,32 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     recursive: false,
                     kind: Some(ArtifactKind::Plan),
                 },
+                Artifact {
+                    // 🔴 **形态是有意降级的，这里留痕**（2026-09-02）。
+                    //
+                    // 这个文件是 **append-only**（实测 1951 → 1968 行，纯追加），
+                    // 它的**正确**形态是 [`SourceMode::AppendLog`]（字节偏移游标，
+                    // 只读新增那一段）。这里用 `SnapshotFile` 是**权宜**：
+                    // `parse_lines` 按 `source_type` 分派，`ClaudeCode` 会走
+                    // `parse_claude` —— 那个 parser 是为**会话** JSONL 写的，
+                    // 而本文件的键完全不同（无 `message` / `role`）。走 AppendLog
+                    // 得先让 parser 认这第二种形状，那是另一个决定。
+                    //
+                    // ⚠️ **代价说清楚**：`SnapshotFile` 按指纹存整份，而这个文件
+                    // 几乎天天在长 ⇒ 每次内容变化存一份约 533 KB 的新快照。
+                    // 消费方若只要增量，今天要自己按 `timestamp` 去重。
+                    //
+                    // ⇒ **转 AppendLog 的那天，游标语义会从「指纹」变成「字节偏移」**，
+                    // 那是对消费方的一次真实变更，按跨会话规则 5 单独报。
+                    //
+                    // `subdir: ""` = 配置根自身；`glob` 不含通配符 ⇒ 精确文件名。
+                    subdir: String::new(),
+                    glob: "history.jsonl".to_string(),
+                    source_mode: SourceMode::SnapshotFile,
+                    status: Status::Experimental,
+                    recursive: false,
+                    kind: Some(ArtifactKind::History),
+                },
             ],
         },
         ProviderDescriptor {
@@ -353,21 +386,39 @@ mod tests {
                     .map(move |a| (d.source_type, a))
             })
             .collect();
-        assert_eq!(found.len(), 2, "配置根下的制品应当恰好两条：{found:?}");
-        for (_, art) in &found {
+        // 🔴 **按类别筛，不按「根下总条数」**（2026-09-02 改）。
+        //
+        // 原版断言「根下恰好两条」，那把两件事压在一起：真正的意图（**每个
+        // provider 各有一条全局指令文件**）和一个副作用（配置根下不许有别的
+        // 东西）。后者不是意图 —— 加一条根下的 `history.jsonl` 就会让它红，
+        // 而那条制品本身完全合法。
+        //
+        // ⚠️ 而且原版**更弱**：`len() == 2` 允许「一个 provider 两条、另一个
+        // 一条都没有」。现在显式钉「各一条」。
+        let instructions: Vec<_> = found
+            .iter()
+            .filter(|(_, a)| a.kind == Some(ArtifactKind::Instruction))
+            .collect();
+        assert_eq!(
+            instructions.len(),
+            2,
+            "配置根下的全局指令文件应当恰好两条：{instructions:?}"
+        );
+        assert_ne!(
+            instructions[0].0, instructions[1].0,
+            "两条指令文件必须分属两个 provider，不能同一个 provider 占两条：{instructions:?}"
+        );
+        for (_, art) in &instructions {
             assert!(
                 art.glob == "CLAUDE.md" || art.glob == "AGENTS.md",
-                "配置根下只该声明指令文件，得到 {}",
-                art.glob
-            );
-            assert_eq!(
-                art.kind,
-                Some(ArtifactKind::Instruction),
-                "{} 的类别不是 instruction —— 消费方会走错分派",
+                "声明成 instruction 的根下制品只该是那两个文件名，得到 {}",
                 art.glob
             );
             assert_eq!(art.source_mode, SourceMode::SnapshotFile);
-            assert!(!art.recursive, "配置根不该递归扫");
+        }
+        // 「配置根不该递归」对根下**所有**制品成立，与类别无关。
+        for (_, art) in &found {
+            assert!(!art.recursive, "配置根不该递归扫：{}", art.glob);
         }
     }
 
