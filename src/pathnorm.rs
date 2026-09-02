@@ -202,9 +202,13 @@ pub fn is_windows_drive_mount(path: &str) -> bool {
         return false;
     };
     let bytes = rest.as_bytes();
-    // 用 `map_or(true, ..)`（1.0 起）而非 `is_none_or`（1.82 才稳定）：等价且更保守，
-    // 不给 MSRV 添约束。
-    bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1).map_or(true, |b| *b == b'/')
+    // `is_none_or`（1.82 稳定）在本仓 MSRV 1.85 之内。
+    //
+    // 📌 这里原先用 `map_or(true, ..)`，注释写着「不给 MSRV 添约束」——**而那条理由
+    // 与 MSRV 1.85 是同一个提交写下的**（2e62132「honest MSRV」），也就是说它
+    // **落笔时就不成立**，不是后来过期。⇒ 「为什么这样做」的注释同样要有判据：
+    // 这一条本可以在写下的那一刻被 `rust-version` 那一行否掉。
+    bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1).is_none_or(|b| *b == b'/')
 }
 
 /// WSL 里 Windows 盘的挂载表 —— **发现的一项运行期事实**（`(挂载点, Windows 路径)`）。
