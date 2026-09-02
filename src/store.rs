@@ -757,6 +757,42 @@ pub struct IdentitySweep {
     pub unreadable: Option<String>,
 }
 
+/// 一个会话这一轮读到的一**页** + 它自己的续读游标。
+///
+/// 🔴 **per-session，不是把 N 个会话压成一个 `truncated` 布尔** —— 那样
+/// 「**哪个**会话没读完」就说不出来，而消费方要的正是这个：它按会话记进度。
+///
+/// ⚠️ 与 [`SessionRead`]（[`TotalStore::read_session`] 单数版的结果）**不是一回事**：
+/// 那个服务 transcript，把「不完整」显式抛给调用方决策；这个服务增量拉取，
+/// 单坏行 skip 并靠 `decode_failed` 报数。两个读 API 的韧性策略按消费者需求分流。
+#[derive(Debug, Clone)]
+pub struct SessionPage {
+    /// 对应入参 `sessions` 的下标 —— 让调用方**对号**，不必按返回顺序猜。
+    pub index: usize,
+    pub events: Vec<(i64, RawEvent)>,
+    /// 这个会话还有没有没读的。
+    ///
+    /// 🔴 **三态，`None` 是「没查」**：预算在轮到它之前就用尽了。
+    /// `Some(false)` 说的是「**查过了**，没有更多」——那是一句只有查过才有资格说的话。
+    /// 压成 `bool` 就又造一个「没问成长得像没有」（见 AGENTS.md 第二条地基）。
+    pub has_more: Option<bool>,
+    /// 续读游标：下一轮把它原样传回 `after_seq`。`None` = 这一轮一条都没取到。
+    ///
+    /// ⚠️ 它记的是「**读到哪儿**」，不是「成功解了什么」——取到但解不开的行也推进它
+    /// （见 `decode_failed`）。否则下一轮从同一个坏行重来，**永远卡在那里**。
+    pub last_seq: Option<u64>,
+    /// 本次最后一个**成功解码**事件的 `occurred_at`。
+    ///
+    /// 🔴 给按**时刻**记进度的消费方零翻译用。⚠️ 可能为 `None`：这一轮没解开任何行，
+    /// 或那条事件本身没有时间（`occurred_at` 本就是 `Option`）。
+    pub last_occurred_at: Option<String>,
+    /// 取到了但**解不开**的行数。
+    ///
+    /// 🔴 与「没有这些行」是两件事：前者说「有内容，这一轮读不出来」，
+    /// 后者说「这里就是空的」。不报出来的话，消费方会把一段密钥异常读成一段空历史。
+    pub decode_failed: usize,
+}
+
 const RAW_EVENTS_INDEX_DDL: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_raw_events_session ON raw_events(source_session_id);
 CREATE INDEX IF NOT EXISTS idx_raw_events_project ON raw_events(project_root);
@@ -2879,12 +2915,56 @@ impl TotalStore {
         sessions: &[(String, String, String, String)],
         max_events: usize,
     ) -> StoreResult<Vec<(i64, RawEvent)>> {
+        // 🔴 **委托，不复制** —— 同一条查询只有一处实现。两份相似 SQL 必然漂，
+        // 而漂的方向（一份加了过滤、另一份没加）不会让任何东西变红。
+        Ok(self
+            .read_sessions_resumable(sessions, max_events, None)?
+            .into_iter()
+            .flat_map(|r| r.events)
+            .collect())
+    }
+
+    /// 同 [`Self::read_sessions`]，但**能接着上次读**，且**逐会话**报游标。
+    ///
+    /// ## 为什么要有它
+    ///
+    /// 事件数超过 `max_events` 的会话，用 [`Self::read_sessions`] **永远读不完**：
+    /// 每次都从头取同样的前 N 条，没有任何办法跳过已处理的部分。实测一台机器上
+    /// 60 个最近会话里有 1 个 58,514 事件的会话恒被截断 —— 而**会话是长大的**，
+    /// 今天不超的明天会超，且最长的往往最值钱。
+    ///
+    /// ## 游标语义
+    ///
+    /// 顺序由 `ORDER BY r.seq ASC, r.offset ASC` 确定，**会话内 `seq` 单调**，
+    /// 所以 `after_seq` 就是「这个会话已经处理到哪儿」。下一轮把
+    /// [`SessionPage::last_seq`] 原样传回来即可。
+    ///
+    /// ⚠️ `after_seq` 是**每个会话各自的** seq。传多个会话时它对所有会话生效 ——
+    /// 那几乎总是调用方搞错了，所以 CLI 那一层**只在恰好一个 `--session` 时**
+    /// 接受它（让错误的组合根本表达不出来，而不是写在注释里）。
+    pub fn read_sessions_resumable(
+        &self,
+        sessions: &[(String, String, String, String)],
+        max_events: usize,
+        after_seq: Option<u64>,
+    ) -> StoreResult<Vec<SessionPage>> {
         let conn = self.conn.lock().unwrap();
-        let mut out = Vec::new();
+        let mut out: Vec<SessionPage> = Vec::new();
+        let mut spent = 0usize;
         let mut key_cache = HashMap::new();
-        for (st, loc, path, sid) in sessions {
-            if out.len() >= max_events {
-                break;
+        for (index, (st, loc, path, sid)) in sessions.iter().enumerate() {
+            if spent >= max_events {
+                // 🔴 预算用尽 ⇒ 这个会话**根本没查**。`has_more: None` 说的正是
+                // 「不知道」，而不是「没有更多」—— 后者是一句它没资格说的话。
+                out.push(SessionPage {
+                    index,
+                    events: Vec::new(),
+                    has_more: None,
+                    last_seq: None,
+                    last_occurred_at: None,
+                    decode_failed: 0,
+                });
+                continue;
             }
             let mut stmt = conn.prepare(&format!(
                 r#"SELECT {ENCRYPTED_ROW_COLUMNS}
@@ -2903,26 +2983,64 @@ impl TotalStore {
                               OR (t.scope = 'source_path'  AND t.key = r.source_path)
                               OR (t.scope = 'project_root' AND t.key = r.project_root)
                       )
+                      AND (?6 IS NULL OR r.seq > ?6)
                     ORDER BY r.seq ASC, r.offset ASC
                     LIMIT ?5"#
             ))?;
-            let remaining = (max_events - out.len()) as i64;
+            let budget = max_events - spent;
+            // 🔴 **多取一行**用来分辨「恰好取满」与「真的还有更多」。
+            // 只按 `len() == budget` 判会把前者说成后者 —— 那是一句猜测，
+            // 而消费方会据它再发一轮永远读不到东西的请求。
+            let probe_limit = (budget + 1) as i64;
+            let after = after_seq.map(|v| i64::try_from(v).unwrap_or(i64::MAX));
             let rows = stmt.query_map(
-                params![st, loc, path, sid, remaining],
+                params![st, loc, path, sid, probe_limit, after],
                 EncryptedRow::from_sql,
             )?;
+            let mut events = Vec::new();
+            let mut has_more = false;
+            let mut last_seq = None;
+            let mut last_occurred_at = None;
+            let mut decode_failed = 0usize;
+            let mut seen = 0usize;
             for row in rows {
                 let row = row?;
+                seen += 1;
+                if seen > budget {
+                    // 探测行：只证明「还有更多」，**不消费、不推进游标** ——
+                    // 推进了就等于把一条没交付的事件说成已处理。
+                    has_more = true;
+                    break;
+                }
+                // 🔴 游标记「**读到哪儿**」，不是「解开了什么」：`seq` 是明文列，
+                // 解不开的行也推进它。否则下一轮从同一个坏行重来，**永远卡住**。
+                // 那些行计进 `decode_failed`，不会被说成「不存在」。
+                last_seq = Some(row.seq as u64);
                 match self.decode_event_on(&conn, &mut key_cache, &row) {
-                    Ok(ev) => out.push((row.offset, ev)),
+                    Ok(ev) => {
+                        last_occurred_at = ev.occurred_at.clone();
+                        events.push((row.offset, ev));
+                    }
                     // 单行解不开只 skip+warn，不让整个会话失败 —— 与 `read_since_page`
                     // 同一套韧性策略。
-                    Err(e) => log::warn!(
-                        target: crate::logging::tag::SQLITE,
-                        "raw_events offset={} skipped in read_sessions: {e}", row.offset
-                    ),
+                    Err(e) => {
+                        decode_failed += 1;
+                        log::warn!(
+                            target: crate::logging::tag::SQLITE,
+                            "raw_events offset={} skipped in read_sessions: {e}", row.offset
+                        );
+                    }
                 }
             }
+            spent += events.len();
+            out.push(SessionPage {
+                index,
+                events,
+                has_more: Some(has_more),
+                last_seq,
+                last_occurred_at,
+                decode_failed,
+            });
         }
         Ok(out)
     }
@@ -4025,6 +4143,102 @@ mod tests {
         let latest = vec![(1, snap_event(None, Some("1787000000")))];
         let cur = TotalStore::snapshot_cursor(&latest, &snap_source(Some("/p")), &|_| Some(1));
         assert!(cur.content_hash.is_none(), "宿主补齐了身份 ⇒ 该重发");
+    }
+
+    /// 🔴 **超过预算的会话必须能接着读完** —— 这是 `read_sessions_resumable` 存在的
+    /// 全部理由。
+    ///
+    /// 判例（2026-09-02，真库）：一个 58,786 事件的会话在 `read_sessions` 下**永远
+    /// 读不完** —— 每轮都从头取同样的前 N 条，没有任何办法跳过已处理的部分。
+    /// 而**会话是长大的**：消费方报这个数时它还是 58,514。
+    #[test]
+    fn an_oversized_session_can_be_read_to_the_end_in_pages() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let evs: Vec<RawEvent> = (0..25).map(|i| mk_event(i, "big", Some("x"))).collect();
+        store.append_events(&evs, Projection::Append).unwrap();
+        let spec = vec![(
+            "claude_code".to_string(),
+            "local".to_string(),
+            "/p/file.jsonl".to_string(),
+            "big".to_string(),
+        )];
+
+        // 分页读到底，累计必须**恰好**等于总数：少了是漏读，多了是重读。
+        let mut after = None;
+        let mut total = 0usize;
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 20, "没有收敛 —— 游标没在前进");
+            let pages = store.read_sessions_resumable(&spec, 10, after).unwrap();
+            let page = &pages[0];
+            total += page.events.len();
+            // 🔴 每一条都必须严格大于上一轮的游标，否则就是重读。
+            if let Some(a) = after {
+                assert!(
+                    page.events.iter().all(|(_, e)| e.seq > a),
+                    "取到了 seq <= after_seq 的事件 —— 过滤没生效"
+                );
+            }
+            if page.has_more != Some(true) {
+                assert_eq!(
+                    page.has_more,
+                    Some(false),
+                    "查过了就该说 false，不该是 None"
+                );
+                break;
+            }
+            after = page.last_seq;
+        }
+        assert_eq!(total, 25, "分页读完的总数必须与写入数相等");
+        assert_eq!(
+            rounds, 3,
+            "25 条 / 每页 10 ⇒ 3 轮（第 3 轮 5 条且 has_more=false）"
+        );
+    }
+
+    /// 🔴 **`has_more` 是三态，`None` 说的是「没查」。**
+    ///
+    /// 预算在轮到某个会话之前就用尽时，它**根本没被查询**。报 `Some(false)`
+    /// 等于替它说「没有更多」—— 那是一句只有查过才有资格说的话，而消费方会
+    /// 据此再也不来取它。压成 `bool` 就又造一个「没问成长得像没有」。
+    #[test]
+    fn a_session_never_reached_says_unknown_not_no_more() {
+        let store = TotalStore::open_in_memory().unwrap();
+        for sid in ["a", "b"] {
+            let evs: Vec<RawEvent> = (0..5).map(|i| mk_event(i, sid, Some("x"))).collect();
+            store.append_events(&evs, Projection::Append).unwrap();
+        }
+        let specs: Vec<_> = ["a", "b"]
+            .iter()
+            .map(|sid| {
+                (
+                    "claude_code".to_string(),
+                    "local".to_string(),
+                    "/p/file.jsonl".to_string(),
+                    sid.to_string(),
+                )
+            })
+            .collect();
+        // 预算 5 ⇒ 第一个会话吃满，第二个一条都没查。
+        let pages = store.read_sessions_resumable(&specs, 5, None).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].events.len(), 5);
+        assert_eq!(
+            pages[1].has_more, None,
+            "没查过的会话必须报 None（不知道），不能报 Some(false)（没有更多）"
+        );
+        assert_eq!(pages[1].last_seq, None, "没查过就没有游标可给");
+        // ⚠️ 反面同样要钉：查过且真的没有更多，才是 Some(false)。
+        // 只写正面的话，「一律报 None」也能让上面那条绿。
+        let one = store
+            .read_sessions_resumable(&specs[1..], 100, None)
+            .unwrap();
+        assert_eq!(
+            one[0].has_more,
+            Some(false),
+            "查过了、确实没有更多 ⇒ Some(false)"
+        );
     }
 
     pub(super) fn mk_event(seq: u64, session: &str, content: Option<&str>) -> RawEvent {
