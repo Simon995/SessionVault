@@ -174,7 +174,10 @@ fn attach_project_identities(sources: &mut [SourceRef], projects: &[SnapshotProj
 pub fn enumerate(mounts: &crate::pathnorm::DriveMounts) -> ClassBSources {
     // 根枚举与项目探测共用同一个上限：一个停掉的发行版会在两处都挂住，
     // 而两个独立的上限意味着最坏情况是它们之和。
-    let found = crate::memory_roots::enumerate(None, probe_deadline());
+    // `local_root` 要求显式给 userprofile（`None` 就没有本机根）——这里必须传，
+    // 否则本机 `projects/` 从不被枚举，本地快照的 `project_root` 恒为 None。
+    let userprofile = std::env::var("USERPROFILE").ok();
+    let found = crate::memory_roots::enumerate(userprofile.as_deref(), probe_deadline());
     // 🔴 根本身就没数全时，**先把这件事带上**。此前这条路径拿到的是一个更短的
     // 根列表，而下游只会看到「这个位置没有快照」—— 与「那里确实没有」无从分辨。
     let mut unreachable: Vec<String> = found
@@ -273,6 +276,21 @@ pub fn enumerate(mounts: &crate::pathnorm::DriveMounts) -> ClassBSources {
 
 #[cfg(test)]
 mod tests {
+
+    /// 本机快照必须带得上 `project_root`。
+    ///
+    /// 漏掉本机根时它们全是 `None`，而输出看起来只是「这些来源没有项目」。
+    #[cfg(windows)]
+    #[test]
+    fn local_snapshots_carry_a_project_root() {
+        let found = super::enumerate(&crate::host_drive_mounts());
+        assert!(
+            found.sources.iter().any(|s| {
+                s.source_location == SourceLocation::Local && s.project_root.is_some()
+            }),
+            "本机来源一条都没带上 project_root —— 本机根没被枚举"
+        );
+    }
     use super::*;
 
     #[test]
