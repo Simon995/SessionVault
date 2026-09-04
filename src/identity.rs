@@ -485,13 +485,17 @@ fn wsl_repo_id_with(
         Probed::Found(p) => p,
         // 探明白了：这个根下没有可用的 `.git` —— 事实，不是没问成。
         Probed::Absent => {
+            // 桥的 `Absent` 把「起点不在」与「链上没有 .git」压在一起，
+            // 补一次起点探测分开它们 —— 只在否定结论上付这次往返。
+            let checkout_missing = match backend.probe(root, deadline) {
+                Probed::Absent => true,
+                Probed::Found(_) => false,
+                Probed::Unknown(e) => return Err(e),
+            };
             return Ok(RepoIdentity {
                 id: format!("path:{original_root}"),
                 repo_root: None,
-                // ⚠️ 走桥这一侧**分不出**「起点不在」与「链上没有 .git」——
-                // `git_config_path` 的 `Absent` 把两者压在一起。如实报 `false`
-                // （宁可少说，不可乱说）；要分得开得先给桥那一侧也做三态。
-                checkout_missing: false,
+                checkout_missing,
             });
         }
         Probed::Unknown(e) => return Err(e),
@@ -556,6 +560,51 @@ pub fn canonical_repo_id_with(
 // 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
 #[allow(clippy::disallowed_methods)]
 mod tests {
+
+    /// 桥那侧要分得开「起点不在」与「链上没有 .git」。
+    ///
+    /// 压成一格时，一个已搬走的 WSL checkout 报 `no_identity` 却带着有效身份 ——
+    /// 消费方据此挑代表会选中一个磁盘上不存在的路径。
+    #[test]
+    fn the_bridge_tells_a_missing_checkout_from_a_non_repo() {
+        struct NoGit {
+            root_exists: bool,
+        }
+        impl ProbeBackend for NoGit {
+            fn probe(&self, p: &Path, _d: Deadline) -> Probed<FileKind> {
+                if p.to_string_lossy().contains(".git") || !self.root_exists {
+                    Probed::Absent
+                } else {
+                    Probed::Found(FileKind::Dir)
+                }
+            }
+            fn read_text(&self, _p: &Path, _d: Deadline) -> Probed<String> {
+                Probed::Absent
+            }
+        }
+
+        let gone = super::wsl_repo_id_with(
+            "/home/u/moved-away",
+            "wsl:D:/home/u/moved-away",
+            &NoGit { root_exists: false },
+            Deadline::unbounded(),
+        )
+        .expect("probe answered");
+        assert!(gone.checkout_missing, "起点不在应报 checkout_missing");
+
+        // 反面：起点在、只是不是仓库 —— 只写正面的话「一律 true」也能绿。
+        let plain = super::wsl_repo_id_with(
+            "/home/u/not-a-repo",
+            "wsl:D:/home/u/not-a-repo",
+            &NoGit { root_exists: true },
+            Deadline::unbounded(),
+        )
+        .expect("probe answered");
+        assert!(
+            !plain.checkout_missing,
+            "起点在、不是仓库 ⇒ 不该报 checkout_missing"
+        );
+    }
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
