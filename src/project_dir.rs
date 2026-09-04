@@ -13,9 +13,12 @@
 //! Rust 那份修好了 WSL 符号链接，Python 那份没有，实测同一个编码名给出
 //! `\\wsl.localhost\…\QuotaBar` 与 `None` 两个答案。
 //!
-//! 所以规则收口到这里写**一次**：Rust 侧直接调；Python 侧经 `svault
-//! decode-project-dir` 子命令（TumeFlow 与 SessionVault 之间本来就只有二进制
-//! 接口，没有源码依赖）。
+//! 所以规则收口到这里写**一次**：Rust 侧直接调。
+//!
+//! ⚠️ 原文写着「Python 侧经 `svault decode-project-dir` 子命令」——
+//! **那个子命令从未存在**（2026-09-04 跑 `--help` 核实，报 unrecognized）。
+//! 对外的出口是 `roots` 每行的 `claude_project_dirs`：**正向编码**（路径 → 目录名），
+//! 无歧义，不必反解。反向解码只在库内用。
 //!
 //! # 为什么必须探文件系统
 //!
