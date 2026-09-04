@@ -64,6 +64,10 @@ ALLOWED_LITERALS = ("Simon Ma", "Simon995")
 #   `-home-X-…`（Claude 的目录编码）X 到下一个 `-` 为止
 HOME_PAT = re.compile(r"(?:/home/|[/\\]Users[/\\])([^/\\\s\"\'`,;:)\]}]+)")
 ENCODED_PAT = re.compile(r"-home-([A-Za-z0-9_<>]+)")
+# 🔴 自动生成的托管块：内容来自私有记忆蒸馏，本仓**不保证它适合公开**。
+# 2026-09-04 实测一次：一条「本仓某处有敏感历史」的记忆被蒸馏进了 CLAUDE.md。
+# ⇒ 一律拦下，由人决定删或留。字面量只写在本文件（扫描器跳过自己）。
+MANAGED_BLOCK_PAT = re.compile("<!--[ ]*[A-Za-z0-9_]+:MEMORY")
 EMAIL_PAT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # 🔴 **每一条都要锚定。** 裸子串 `noreply` 会放过任何含它的**真实**地址
 # （`noreply@某公司.com` 是常见的真实发件地址）—— 那是**假阴**，比假阳更坏：
@@ -105,6 +109,8 @@ def findings_in(text: str) -> list[str]:
                 if is_placeholder(name) or name in ALLOWED_HOME_NAMES:
                     continue
                 out.append(f"line {i}: 家目录里出现 {name!r} —— {m.group(0)!r}")
+        if MANAGED_BLOCK_PAT.search(line):
+            out.append(f"line {i}: 自动生成的托管块 —— 蒸馏内容未经公开性审查")
         for m in EMAIL_PAT.finditer(line):
             if not EMAIL_OK.search(m.group(0)):
                 out.append(f"line {i}: 邮箱 {m.group(0)!r}")
@@ -129,6 +135,12 @@ def self_test() -> None:
         sys.exit("SELF-TEST 失败：漏掉了 Users\\bob —— 扫描器坏了，本次结果不作数")
     if not any("realcompany.io" in h for h in hits):
         sys.exit("SELF-TEST 失败：漏掉了真实邮箱 —— 扫描器坏了，本次结果不作数")
+    block = findings_in("<!-- SOMETOOL:MEMORY v0 BEGIN -->")
+    if not block:
+        sys.exit("SELF-TEST 失败：漏掉了托管块 —— 扫描器坏了，本次结果不作数")
+    if findings_in("讨论 memory 块的普通一行，不该报"):
+        sys.exit("SELF-TEST 失败：把普通文本当成托管块 —— 会淹掉真信号")
+
     if any("example.net" in h for h in hits):
         sys.exit("SELF-TEST 失败：把 example.* 当成了真实邮箱 —— 会淹掉真信号")
 
