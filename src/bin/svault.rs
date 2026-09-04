@@ -723,6 +723,8 @@ enum Out<'a> {
     RootsSummary {
         roots: usize,
         attribution_revision: i64,
+        /// 目录已不在磁盘上的根数 —— 摘要此前只报「重复」不报「消失」。
+        checkout_missing: usize,
         /// 🔴 **同一个物理目录被登记成多行**的组数 —— 决定 9 落地后应为 0。
         /// 只在 `--duplicates` 时计算；否则 `null`（**没算**与**算出来是 0** 是两件事）。
         duplicate_directories: Option<usize>,
@@ -3136,6 +3138,10 @@ fn run_roots(store_arg: Option<PathBuf>, duplicates: bool) -> i32 {
     emit(&Out::RootsSummary {
         roots: roots.len(),
         attribution_revision,
+        checkout_missing: roots
+            .iter()
+            .filter(|r| r.identity_verdict.as_str() == "checkout_missing")
+            .count(),
         duplicate_directories: dup,
         mergeable_duplicates: mergeable,
         distinct_checkouts: checkouts,
