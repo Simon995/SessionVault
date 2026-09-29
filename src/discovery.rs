@@ -319,8 +319,8 @@ pub fn probe_path(
     //
     // 原先落到 `probe_local`：`Path::new("/mnt/d/…")` 在 Windows 上是**当前盘根的
     // 相对路径**，于是要么探不到（报 `None`）、要么更糟 —— 误中当前盘上真实存在的
-    // `\mnt\…`。而 `None` 会被调用方按「确认无根」缓存 24 小时，
-    // 一次 WSL 超时就让这一族路径整天归不到根。
+    // `\mnt\…`。而 `None` 会被调用方按「确认无根」走长退避，
+    // 一次 WSL 超时就让这一族路径长时间归不到根。
     //
     // 与本 ADR 的主线同一条：`Probe::None`（问了、没有）与 `Probe::Failed`（没问成）
     // 必须分开 —— 这里属于后者，退避该按「暂时故障」的那档走。
@@ -329,8 +329,8 @@ pub fn probe_path(
         // 🔴 **探到的根按宿主形式返回，不转回 `/mnt/…`** —— 见 `probe_mnt_with` 的说明。
         pathnorm::RootReach::Local(host_path) => probe_local(&host_path),
         // 🔴 **换算不出来是「没问成」，不是「没有根」**（评审 [P2]）。
-        // `None` 会被调用方按「确认无根」缓存 24 小时，一次 WSL 超时就让这一族
-        // 路径整天归不到根；而落回 `probe_local` 更糟 —— `/mnt/d/…` 在 Windows 上是
+        // `None` 会被调用方按「确认无根」走长退避，一次 WSL 超时就让这一族
+        // 路径长时间归不到根；而落回 `probe_local` 更糟 —— `/mnt/d/…` 在 Windows 上是
         // 当前盘根的相对路径，可能**误中**真实存在的 `\mnt\…`。
         pathnorm::RootReach::Unknown(reason) => Probe::Failed { reason },
         // 上面已 `return`。
@@ -724,8 +724,8 @@ mod tests {
         //
         // 原先落到 `probe_local`：`/mnt/d/…` 在 Windows 上是**当前盘根的相对路径**，
         // 于是要么探不到（报 `None`）、要么更糟 —— 误中当前盘上真实存在的 `\mnt\…`。
-        // 而 `None` 会被调用方按「确认无根」缓存 24 小时，一次 WSL 超时就让这一族路径
-        // 整天归不到根。
+        // 而 `None` 会被调用方按「确认无根」走长退避，一次 WSL 超时就让这一族路径
+        // 长时间归不到根。
         //
         // ⚠️ 只在 Windows 上成立：非 Windows 宿主上 `/mnt/d/…` 是真实本机路径，
         // 该走 `probe_local`。
