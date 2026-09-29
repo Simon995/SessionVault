@@ -665,7 +665,8 @@ enum Out<'a> {
     },
     /// `roots --duplicates` 的一行 —— 一组指向同一个物理目录的根。
     #[cfg(feature = "store")]
-    DirectoryGroupOut {
+    #[serde(rename = "directory_group_out")] // 线上 kind 已发布，不随变体名改
+    DirectoryGroup {
         canonical_id: String,
         /// 注册表里的原始写法。**长度 > 1 就是决定 9 要消除的重复。**
         roots: Vec<String>,
@@ -2156,6 +2157,18 @@ mod tests {
     use session_vault::rawevent::{Actor, EventType, TimeConfidence, TokenUsage, SCHEMA_VERSION};
     use session_vault::TotalStore;
 
+    /// 线上 `kind` 是契约：变体名可以改，输出的串不行。
+    #[test]
+    fn directory_group_keeps_its_published_kind() {
+        let out = Out::DirectoryGroup {
+            canonical_id: "git:example.com/o/r".into(),
+            roots: Vec::new(),
+            basis: "observed",
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["kind"], "directory_group_out");
+    }
+
     fn mk_event(seq: u64, session: &str) -> RawEvent {
         RawEvent {
             schema_version: SCHEMA_VERSION,
@@ -3139,7 +3152,7 @@ fn run_roots(store_arg: Option<PathBuf>, duplicates: bool) -> i32 {
         let grouping = same_directory_groups(&ids, &infer_distros(&roots), &mounts);
         for g in &grouping.groups {
             if g.roots.len() > 1 {
-                emit(&Out::DirectoryGroupOut {
+                emit(&Out::DirectoryGroup {
                     canonical_id: g.canonical_id.clone(),
                     roots: g.roots.clone(),
                     basis: match g.basis {

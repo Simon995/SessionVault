@@ -768,7 +768,7 @@ mod encode_tests {
         assert_eq!(
             host_openable_form(
                 "wsl:Ubuntu-22.04:/home/u/p",
-                &[unc.clone()],
+                std::slice::from_ref(&unc),
                 HostPlatform::Windows
             ),
             Some(unc)

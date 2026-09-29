@@ -1701,27 +1701,6 @@ impl TotalStore {
         })
     }
 
-    /// 把一份投影应用到一个源文件上 —— 一个显式的文件级事务。
-    ///
-    /// 与 [`TotalStore::append_events`] 的三处差别，每一处都对应一个曾经出过事的形状：
-    ///
-    /// 1. **作用域显式**（`batch.source`），不从第一条事件反推。于是**空批有意义**：
-    ///    `Rollback` / `Reparse` 带空批 = 「这个文件的当前投影就是空的」。区分「替换为空」
-    ///    与「无事可做」的是 `mode`，不是批的长度。
-    /// 2. **校验每条事件都属于 `batch.source`**。此前作用域是猜的，猜错不会报错，只会把
-    ///    事件写进别的文件的投影里。
-    /// 3. **切头与写事件同一事务**。失败则头与旧投影原样保留 —— 与 QuotaBar 那条
-    ///    「`parser_revision` 只在投影真的落库后才推进」的不变式配套：重投影没落库时下一轮
-    ///    仍须是 `Reparse`，否则退化成 `Append`，同 seq 被 dedup 丢弃，新解析永久丢失。
-    ///
-    /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
-    ///
-    /// 🔴 **本函数不再记项目身份**（2026-08-14）。那件事现在由
-    /// [`sweep_registered_root_identities`] 按注册表驱动 —— 挂在这里的盲区是
-    /// 「近期没有活动的项目永远拿不到身份」，理由写在那个函数上。
-    ///
-    /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
-
     /// 把一条「问过了」从 `identity_seen` 里撤回。
     ///
     /// 🔴 **「问过了」这个缓存只该记住终态。** `identity_seen` 是**先记后算**的
@@ -2589,6 +2568,26 @@ impl TotalStore {
         }
     }
 
+    /// 把一份投影应用到一个源文件上 —— 一个显式的文件级事务。
+    ///
+    /// 与 [`TotalStore::append_events`] 的三处差别，每一处都对应一个曾经出过事的形状：
+    ///
+    /// 1. **作用域显式**（`batch.source`），不从第一条事件反推。于是**空批有意义**：
+    ///    `Rollback` / `Reparse` 带空批 = 「这个文件的当前投影就是空的」。区分「替换为空」
+    ///    与「无事可做」的是 `mode`，不是批的长度。
+    /// 2. **校验每条事件都属于 `batch.source`**。此前作用域是猜的，猜错不会报错，只会把
+    ///    事件写进别的文件的投影里。
+    /// 3. **切头与写事件同一事务**。失败则头与旧投影原样保留 —— 与 QuotaBar 那条
+    ///    「`parser_revision` 只在投影真的落库后才推进」的不变式配套：重投影没落库时下一轮
+    ///    仍须是 `Reparse`，否则退化成 `Append`，同 seq 被 dedup 丢弃，新解析永久丢失。
+    ///
+    /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
+    ///
+    /// 🔴 **本函数不再记项目身份**（2026-08-14）。那件事现在由
+    /// [`sweep_registered_root_identities`] 按注册表驱动 —— 挂在这里的盲区是
+    /// 「近期没有活动的项目永远拿不到身份」，理由写在那个函数上。
+    ///
+    /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
     pub fn apply_projection(&self, batch: FileProjectionBatch) -> StoreResult<ProjectionStats> {
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();

@@ -1029,14 +1029,6 @@ mod tests {
         }
     }
 
-    /// 🔴 Claude 的 `effort` 曾被整条链路丢弃。
-    ///
-    /// 它在 assistant 行的**顶层**（与 `requestId` 同层），不在 `message` 里；
-    /// 本函数此前根本不读它，而 QuotaBar 的回退解析器硬编码 `effort: None`，
-    /// 注释还写着 Anthropic 不记录它 —— 那句话曾经是真的。
-    ///
-    /// 断言用 `max`：实测样本里最常见的取值，且是 **Claude 独有**（Codex 只有
-    /// low/medium/high/xhigh），所以任何「照抄 Codex 枚举」的实现都会在这里红。
     // -----------------------------------------------------------------------
     // 通用 JSONL（黄金 fixture，§11）
     // -----------------------------------------------------------------------
@@ -1162,6 +1154,14 @@ mod tests {
         assert_ne!(keys[0], keys[1], "两条不同记录的 key 不许相同");
     }
 
+    /// 🔴 Claude 的 `effort` 曾被整条链路丢弃。
+    ///
+    /// 它在 assistant 行的**顶层**（与 `requestId` 同层），不在 `message` 里；
+    /// 解析器此前根本不读它，而 QuotaBar 的回退解析器硬编码 `effort: None`，
+    /// 注释还写着 Anthropic 不记录它 —— 那句话曾经是真的。
+    ///
+    /// 断言用 `max`：实测样本里最常见的取值，且是 **Claude 独有**（Codex 只有
+    /// low/medium/high/xhigh），所以任何「照抄 Codex 枚举」的实现都会在这里红。
     #[test]
     fn claude_usage_carries_top_level_effort() {
         let line = serde_json::json!({

@@ -488,6 +488,7 @@ fn main() {
 ///   - `total_qb_extra` > 0：SV 漏发了 QB 有的 usage（整文件 / 桶缺失也落这里）。
 ///     空的 SV 输出会让每个 combo 全进 qb_extra → 判败，避免被自动化误当绿灯。
 ///   - `total_sv_extra_unknown` > 0：SV 多发且非增长尾、未归类的 usage（疑似重复 / 过度提取）。
+///
 /// 非判败：`sv_growth_tail`（SV 扫到冻结基线之后的新增数据，合法）/ advisory（ts/cwd/root）。
 ///
 /// `report_io_failed`：传了 `--report` 但序列化 / 写入失败 → 2，避免调用方误以为报告已生成。

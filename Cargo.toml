@@ -26,6 +26,11 @@ name = "parity"
 path = "src/bin/parity.rs"
 required-features = ["parity"]
 
+# 用到 `session_vault::store`；不声明的话默认 feature 下 `--all-targets` 编不过。
+[[example]]
+name = "identity_probe"
+required-features = ["store"]
+
 [features]
 # 仅启用 parity diff 工具（纯逻辑，复用既有 serde_json/clap，无新依赖）。
 parity = []
