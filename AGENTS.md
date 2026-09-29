@@ -649,6 +649,9 @@ SourceType 变体
 4. **路径来自别人的数据时，不许「不在就建」**（`mkdir -p` / `exist_ok=True`）——
    它把一次响亮的失败换成一次静默的写入。
 
+目录已经搬走或删掉的会话，身份用 `svault session-origin`：回源读会话自己记下的远端，
+与 `roots` 的 `canonical_id` 同一个出口（`identity::git_id_of_remote`）。只有 codex 会话记远端。
+
 ⚠️ CLI **没有**「任意路径 → 宿主写法」的出口，`roots` 的 `host_path` 也**故意**不做
 挂载表换算（有了出口就改这一行）。缺什么按规则 2 提，别在消费方补。
 
