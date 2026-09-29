@@ -50,7 +50,9 @@ pub enum RootSource {
     Git,
     /// 目录下有构建 marker（`Cargo.toml` / `package.json` / …）且**没有** `.git`。
     Marker,
-    /// 由宿主的目录扫描给出（QuotaBar 的 `enumerate_source_roots` 等）。
+    /// 宿主自己扫目录、经 `register_project_root` 登记的根。
+    /// ⚠️ 注册表读到认不出的来源标签时也回落到它（见 `project_root_registry`），
+    /// 所以数据里的 `scan` 也可能是「标签认不出」。
     Scan,
     /// 用户显式配置。
     Configured,
