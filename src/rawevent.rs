@@ -92,6 +92,17 @@ impl SourceLocation {
             SourceLocation::Wsl(distro) => format!("wsl:{distro}"),
         }
     }
+
+    /// [`Self::as_key`] 的反向。认不出返回 `None`，不猜成 `Local`。
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "local" => Some(SourceLocation::Local),
+            _ => key
+                .strip_prefix("wsl:")
+                .filter(|d| !d.is_empty())
+                .map(|d| SourceLocation::Wsl(d.to_string())),
+        }
+    }
 }
 
 /// 来源物理形态（ADR-025 保险①）。决定游标形态与增量读取策略。

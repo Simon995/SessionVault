@@ -145,6 +145,15 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 会话自己记下的仓库远端及其 `git:` 身份 —— 目录搬走之后仍拿得到。
+    ///
+    /// 回源读会话文件，不碰总库。id 与 `roots` 的 `canonical_id` 同一套规则，
+    /// 但出处是会话记录、不是对 checkout 的探测。只有 codex 会话记远端。
+    SessionOrigin {
+        /// 与 `sessions-read` 同形：`<type>/<location>/<path>/<session_id>`，可重复。
+        #[arg(long = "session", value_name = "SPEC", required = true)]
+        sessions: Vec<String>,
+    },
     /// 返回总库中每个 snapshot source 的最新版本，供 TumeFlow Class-B 主路径消费。
     #[cfg(feature = "store")]
     Snapshots {
@@ -593,6 +602,23 @@ enum Out<'a> {
         /// 不报的话，一段密钥异常会被读成一段空历史。
         decode_failed: usize,
     },
+    /// `session-origin` 每个会话一行。
+    SessionOrigin {
+        /// 原样回显入参 `--session`。
+        session: &'a str,
+        /// `recorded` / `not_recorded` / `source_missing` / `unreadable`。
+        verdict: &'static str,
+        repository_url: Option<String>,
+        canonical_id: Option<String>,
+        error: Option<String>,
+    },
+    SessionOriginSummary {
+        sessions: usize,
+        recorded: usize,
+        not_recorded: usize,
+        source_missing: usize,
+        unreadable: usize,
+    },
     #[cfg(feature = "store")]
     Snapshot { offset: i64, event: &'a RawEvent },
     #[cfg(feature = "store")]
@@ -828,6 +854,7 @@ fn main() {
             after_seq,
             store,
         } => run_sessions_read(sessions, max_events, after_seq, store),
+        Command::SessionOrigin { sessions } => run_session_origin(sessions),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
@@ -3407,21 +3434,13 @@ fn run_sessions_read(
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    // `<type>/<location>/<path>/<session>`：path 可能含 `/`，所以从两端切 —— 前两段
-    // 与最后一段取值受限且不含分隔符，中间全归 path。与 EvidenceRef v1 同一个道理。
     let mut sessions = Vec::new();
     for spec in &specs {
-        let parts: Vec<&str> = spec.split('/').collect();
-        if parts.len() < 4 {
+        let Some(s) = parse_session_spec(spec) else {
             log::error!(target: tag::CLI, "bad --session spec (need type/loc/path/session): {spec}");
             return 2;
-        }
-        sessions.push((
-            parts[0].to_string(),
-            parts[1].to_string(),
-            parts[2..parts.len() - 1].join("/"),
-            parts[parts.len() - 1].to_string(),
-        ));
+        };
+        sessions.push(s);
     }
     let store = match open_total_store(&store_path) {
         Ok(s) => s,
@@ -3469,6 +3488,82 @@ fn run_sessions_read(
             1
         }
     }
+}
+
+/// `<type>/<location>/<path>/<session>`：path 可能含 `/`，所以从两端切 —— 前两段
+/// 与最后一段取值受限且不含分隔符，中间全归 path。与 EvidenceRef v1 同一个道理。
+fn parse_session_spec(spec: &str) -> Option<(String, String, String, String)> {
+    let parts: Vec<&str> = spec.split('/').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    Some((
+        parts[0].to_string(),
+        parts[1].to_string(),
+        parts[2..parts.len() - 1].join("/"),
+        parts[parts.len() - 1].to_string(),
+    ))
+}
+
+fn run_session_origin(specs: Vec<String>) -> i32 {
+    use session_vault::rawevent::SourceLocation;
+    use session_vault::session_origin::{read_codex_origin, SessionOrigin};
+
+    let mut parsed = Vec::new();
+    for spec in &specs {
+        let loc = parse_session_spec(spec)
+            .and_then(|(t, l, p, s)| Some((t, SourceLocation::from_key(&l)?, p, s)));
+        let Some(s) = loc else {
+            log::error!(target: tag::CLI, "bad --session spec (need type/loc/path/session): {spec}");
+            return 2;
+        };
+        parsed.push((spec, s));
+    }
+    let mut counts = [0usize; 4];
+    for (spec, (source_type, location, path, session_id)) in parsed {
+        let origin = if source_type == "codex" {
+            read_codex_origin(
+                &location,
+                &path,
+                &session_id,
+                session_vault::deadline::Deadline::unbounded(),
+            )
+        } else {
+            SessionOrigin::NotRecorded
+        };
+        let (slot, verdict, url, id, error) = match origin {
+            SessionOrigin::Recorded {
+                repository_url,
+                canonical_id,
+            } => (
+                0,
+                "recorded",
+                Some(repository_url),
+                Some(canonical_id),
+                None,
+            ),
+            SessionOrigin::NotRecorded => (1, "not_recorded", None, None, None),
+            SessionOrigin::SourceMissing => (2, "source_missing", None, None, None),
+            SessionOrigin::Unreadable(e) => (3, "unreadable", None, None, Some(e)),
+        };
+        counts[slot] += 1;
+        emit(&Out::SessionOrigin {
+            session: spec,
+            verdict,
+            repository_url: url,
+            canonical_id: id,
+            error,
+        });
+    }
+    let [recorded, not_recorded, source_missing, unreadable] = counts;
+    emit(&Out::SessionOriginSummary {
+        sessions: specs.len(),
+        recorded,
+        not_recorded,
+        source_missing,
+        unreadable,
+    });
+    0
 }
 
 /// `changes`：投影替换的变更流。

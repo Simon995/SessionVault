@@ -338,6 +338,12 @@ pub fn normalize_remote(url: &str) -> Option<String> {
     }
 }
 
+/// 远端 URL → `git:` 身份。**唯一出口**：注册根与会话记录都经它，
+/// 同一个远端才保证得到同一个 id。
+pub fn git_id_of_remote(url: &str) -> Option<String> {
+    normalize_remote(url).map(|norm| format!("git:{norm}"))
+}
+
 /// 一个**根**（可能是本机路径，也可能是 `wsl:<distro>:/abs` 规范形）的身份。
 ///
 /// 🔴 **规范形 WSL 根本机 stat 不了，必须经访问桥**（2026-08-14 实测）。
@@ -507,10 +513,7 @@ fn wsl_repo_id_with(
     match read_origin_from_config(&config, backend, deadline) {
         Probed::Found(url) => Ok(RepoIdentity {
             // 规范化不出来（空串 / 畸形）也是**读到了** —— 与本机那条对齐。
-            id: match normalize_remote(&url) {
-                Some(norm) => format!("git:{norm}"),
-                None => format!("path:{original_root}"),
-            },
+            id: git_id_of_remote(&url).unwrap_or_else(|| format!("path:{original_root}")),
             repo_root: has_root,
             checkout_missing: false,
         }),
@@ -545,11 +548,9 @@ pub fn canonical_repo_id_with(
     d: Deadline,
 ) -> Result<String, crate::probe::ProbeError> {
     match read_origin_url_with(git_root, backend, d) {
-        Probed::Found(url) => match normalize_remote(&url) {
-            Some(norm) => Ok(format!("git:{norm}")),
-            // url 在那儿但规范化不出来（空串 / 畸形）—— 读到了，是事实。
-            None => Ok(format!("path:{}", git_root.to_string_lossy())),
-        },
+        // url 在那儿但规范化不出来（空串 / 畸形）—— 读到了，是事实。
+        Probed::Found(url) => Ok(git_id_of_remote(&url)
+            .unwrap_or_else(|| format!("path:{}", git_root.to_string_lossy()))),
         Probed::Absent => Ok(format!("path:{}", git_root.to_string_lossy())),
         Probed::Unknown(e) => Err(e),
     }

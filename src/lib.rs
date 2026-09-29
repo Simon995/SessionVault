@@ -35,6 +35,7 @@ pub mod scan;
 /// 同一组问题。理由写在模块头。
 #[cfg(feature = "store")]
 pub mod scan_plan;
+pub mod session_origin;
 /// 不可变 RawEvent 总库（§13 / ADR-020）——`store` feature 门控（持久化组件，内核仍无状态）。
 #[cfg(feature = "store")]
 pub mod store;
