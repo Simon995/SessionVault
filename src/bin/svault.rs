@@ -25,8 +25,16 @@ use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
 use session_vault::store::{ExclusionReason, Projection};
 use session_vault::SourceRef;
 
+/// `0.0.0 (<提交>)` —— 版本号本身不携带信息，提交才分得出是哪个构建。
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SVAULT_BUILD_COMMIT"),
+    ")"
+);
+
 #[derive(Parser)]
-#[command(name = "svault", version, about = "SessionVault ingestion CLI")]
+#[command(name = "svault", version = VERSION, about = "SessionVault ingestion CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
