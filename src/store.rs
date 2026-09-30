@@ -503,6 +503,36 @@ pub struct ReadPage {
     pub max_scanned_offset: Option<i64>,
 }
 
+/// 每来源最新快照的判定结果 —— 不在 `active` 里的**每一条都有去处**。
+///
+/// `active.len() + excluded.len()` = 参与判定的最新快照行数（墓碑命中的行已被
+/// erase 物理删除，不在其中）。
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotView {
+    pub active: Vec<(i64, RawEvent)>,
+    pub excluded: Vec<ExcludedSnapshot>,
+    /// `active` 里有几条是存在性**没问成**、保守留下的 —— 不是确认还在。
+    pub kept_unverified: usize,
+}
+
+/// 被排除的一条最新快照。来源身份取自明文列，所以解不开的行也报得出是谁。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedSnapshot {
+    pub offset: i64,
+    pub source_type: String,
+    pub source_location: String,
+    pub source_path: String,
+    pub reason: ExclusionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExclusionReason {
+    /// 源文件确认不在，或已不是普通文件。
+    SourceGone,
+    /// 行在、解不开 —— **不是**「删了」。
+    DecodeFailed(String),
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SnapshotSyncStats {
     pub sources: u64,
@@ -3312,6 +3342,21 @@ impl TotalStore {
     /// 每个 snapshot source 的最新版本。按 `(type, location, path)` 分组取最大
     /// offset，并遵守 erase 墓碑。TumeFlow 用它读取当前 Class-B 状态，不必从总库头扫。
     pub fn read_latest_snapshots(&self) -> StoreResult<Vec<(i64, RawEvent)>> {
+        let view = self.latest_snapshot_rows()?;
+        for f in &view.excluded {
+            if let ExclusionReason::DecodeFailed(e) = &f.reason {
+                log::warn!(
+                    target: crate::logging::tag::SQLITE,
+                    "latest snapshot offset={} skipped (decode failed): {e}", f.offset
+                );
+            }
+        }
+        Ok(view.active)
+    }
+
+    /// 最新快照行：解得开的进 `active`，解不开的（带明文身份）进 `excluded`。
+    /// 存在性还没判 —— 那是 [`Self::snapshot_view_with`] 的事。
+    fn latest_snapshot_rows(&self) -> StoreResult<SnapshotView> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             r#"SELECT r.offset, r.source_type, r.source_location, r.source_path,
@@ -3334,19 +3379,22 @@ impl TotalStore {
                 ORDER BY r.source_type, r.source_location, r.source_path"#,
         )?;
         let rows = stmt.query_map([], EncryptedRow::from_sql)?;
-        let mut out = Vec::new();
+        let mut view = SnapshotView::default();
         let mut cache = HashMap::new();
         for row in rows {
             let row = row?;
             match self.decode_event_on(&conn, &mut cache, &row) {
-                Ok(event) => out.push((row.offset, event)),
-                Err(e) => log::warn!(
-                    target: crate::logging::tag::SQLITE,
-                    "latest snapshot offset={} skipped (decode failed): {e}", row.offset
-                ),
+                Ok(event) => view.active.push((row.offset, event)),
+                Err(e) => view.excluded.push(ExcludedSnapshot {
+                    offset: row.offset,
+                    source_type: row.source_type,
+                    source_location: row.source_location,
+                    source_path: row.source_path,
+                    reason: ExclusionReason::DecodeFailed(e.to_string()),
+                }),
             }
         }
-        Ok(out)
+        Ok(view)
     }
 
     /// `read_latest_snapshots` 的当前可见视图：已明确删除的源文件不返回；探测**失败**
@@ -3362,10 +3410,16 @@ impl TotalStore {
     /// 两支的差别不是谁更细心，是本机那支的判定**内联在调用点**、没有类型逼它表态。
     /// 现在两支都经 [`crate::probe`]：三态里只有 `Absent` 才是删除。
     pub fn read_active_latest_snapshots(&self) -> StoreResult<Vec<(i64, RawEvent)>> {
-        self.read_active_latest_snapshots_with(&crate::probe::LocalBackend::unanchored())
+        Ok(self.snapshot_view()?.active)
     }
 
-    /// [`Self::read_active_latest_snapshots`] 的可测形态 —— **本机 backend 注入**。
+    /// [`Self::read_active_latest_snapshots`]，外加被排除的每一条及其原因 ——
+    /// 「不在列表里」有「确认删了」和「没读成」两种来由，消费方要分得开。
+    pub fn snapshot_view(&self) -> StoreResult<SnapshotView> {
+        self.snapshot_view_with(&crate::probe::LocalBackend::unanchored())
+    }
+
+    /// [`Self::snapshot_view`] 的可测形态 —— **本机 backend 注入**。
     ///
     /// 🔴 拆出来是因为「探测失败 ⇒ 保留」这条**在本机造不出来**：要让一次
     /// `std::fs::metadata` 返回 `NotFound` 以外的错误，得靠权限、句柄耗尽或
@@ -3375,11 +3429,12 @@ impl TotalStore {
     /// ⚠️ 注入的是 backend **而不是** `bool`：测试驱动的必须是生产那段 `match`
     /// 本身，否则钉住的只是我自己造的映射（AGENTS.md：「纯函数的测试钉的是映射，
     /// 永远说不了输入的来路」）。
-    pub(crate) fn read_active_latest_snapshots_with(
-        &self,
-        local: &dyn ProbeBackend,
-    ) -> StoreResult<Vec<(i64, RawEvent)>> {
-        let rows = self.read_latest_snapshots()?;
+    pub(crate) fn snapshot_view_with(&self, local: &dyn ProbeBackend) -> StoreResult<SnapshotView> {
+        let SnapshotView {
+            active: rows,
+            excluded,
+            ..
+        } = self.latest_snapshot_rows()?;
         let mut by_distro: HashMap<String, Vec<String>> = HashMap::new();
         for (_, event) in &rows {
             if let SourceLocation::Wsl(distro) = &event.source_location {
@@ -3406,31 +3461,50 @@ impl TotalStore {
                 }
             }
         }
-        Ok(rows
-            .into_iter()
-            .filter(|(_, event)| match &event.source_location {
+        let mut view = SnapshotView {
+            excluded,
+            ..Default::default()
+        };
+        for (offset, event) in rows {
+            // `Some(false)` 确认不在；`None` 没问成。
+            let present = match &event.source_location {
                 SourceLocation::Local => {
                     match local.probe(Path::new(&event.source_path), Deadline::unbounded()) {
+                        crate::probe::Probed::Found(crate::probe::FileKind::File) => Some(true),
                         // 存在但不是普通文件（被换成目录/符号链）—— 也是**事实**，
                         // 那个快照的源确实不在了。
-                        crate::probe::Probed::Found(crate::probe::FileKind::File) => true,
-                        crate::probe::Probed::Found(_) | crate::probe::Probed::Absent => false,
-                        // 🔴 没问成 ⇒ **保留**，与 WSL 支同一判据。
+                        crate::probe::Probed::Found(_) | crate::probe::Probed::Absent => {
+                            Some(false)
+                        }
                         crate::probe::Probed::Unknown(e) => {
                             log::warn!(
                                 target: crate::logging::tag::SNAPSHOT,
                                 "local snapshot existence probe failed; keeping last version: {e}"
                             );
-                            true
+                            None
                         }
                     }
                 }
                 SourceLocation::Wsl(distro) => existing
                     .get(distro)
                     .and_then(Option::as_ref)
-                    .is_none_or(|paths| paths.contains(&event.source_path)),
-            })
-            .collect())
+                    .map(|paths| paths.contains(&event.source_path)),
+            };
+            if present == Some(false) {
+                view.excluded.push(ExcludedSnapshot {
+                    offset,
+                    source_type: source_type_key(event.source_type).to_string(),
+                    source_location: event.source_location.as_key(),
+                    source_path: event.source_path,
+                    reason: ExclusionReason::SourceGone,
+                });
+            } else {
+                // 🔴 没问成 ⇒ **保留**，与 WSL 支同一判据；但记下它没被确认。
+                view.kept_unverified += usize::from(present.is_none());
+                view.active.push((offset, event));
+            }
+        }
+        Ok(view)
     }
 
     /// 在**已读好的**「每来源最新快照」集合里定位 `source`，据此算增量游标。
@@ -4325,6 +4399,76 @@ mod tests {
         assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
     }
 
+    /// 「不在活跃集里」的每一条都要有去处和原因 —— 解不开的行从前只打一行 warn
+    /// 就消失，CLI 消费方会把它读成「删了」。
+    #[test]
+    fn every_latest_snapshot_is_either_active_or_excluded_with_a_reason() {
+        let dir = std::env::temp_dir().join(format!(
+            "svault-view-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = |name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("# {name}\n")).unwrap();
+            SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Local,
+                source_mode: SourceMode::SnapshotFile,
+                path,
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            }
+        };
+        let (kept, gone, broken) = (source("kept.md"), source("gone.md"), source("broken.md"));
+        let replaced = source("replaced.md");
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .sync_snapshots(&[kept, gone.clone(), broken.clone(), replaced.clone()])
+            .unwrap();
+
+        std::fs::remove_file(&gone.path).unwrap();
+        // 被换成目录：路径还在，但源文件不在了。
+        std::fs::remove_file(&replaced.path).unwrap();
+        std::fs::create_dir(&replaced.path).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE raw_events SET event_json = 'not-an-envelope' WHERE source_path = ?1",
+                params![broken.path.to_string_lossy()],
+            )
+            .unwrap();
+
+        let view = store.snapshot_view().unwrap();
+        let reasons: HashMap<String, &ExclusionReason> = view
+            .excluded
+            .iter()
+            .map(|e| (e.source_path.clone(), &e.reason))
+            .collect();
+        assert_eq!(
+            view.active.len() + view.excluded.len(),
+            4,
+            "有一条无痕消失了"
+        );
+        assert_eq!(view.active.len(), 1);
+        for gone in [&gone, &replaced] {
+            assert_eq!(
+                reasons[&*gone.path.to_string_lossy()],
+                &ExclusionReason::SourceGone
+            );
+        }
+        assert!(matches!(
+            reasons[&*broken.path.to_string_lossy()],
+            ExclusionReason::DecodeFailed(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// 🔴 **本机快照的「没问成」必须保留，与 WSL 支同一判据。**
     ///
     /// 从前本机支是 `Path::new(&event.source_path).is_file()` —— 权限拒绝、句柄耗尽、
@@ -4370,28 +4514,27 @@ mod tests {
         store.sync_snapshots(std::slice::from_ref(&source)).unwrap();
         assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
 
-        // 文件真的还在，但探测「没问成」⇒ 必须保留。
+        // 文件真的还在，但探测「没问成」⇒ 必须保留，并记为未确认。
         let unknown = Fixed(|p| {
             crate::probe::Probed::Unknown(crate::probe::ProbeError::new(p, "permission denied"))
         });
+        let view = store.snapshot_view_with(&unknown).unwrap();
         assert_eq!(
-            store
-                .read_active_latest_snapshots_with(&unknown)
-                .unwrap()
-                .len(),
-            1,
+            (view.active.len(), view.kept_unverified, view.excluded.len()),
+            (1, 1, 0),
             "探测失败被当成删除 —— 这个项目的指令文件会静默退出视图"
         );
 
         // 反向：探明白了没有 ⇒ 才是删除。少了这条，恒 `true` 的实现也能绿。
         let absent = Fixed(|_| crate::probe::Probed::Absent);
+        let view = store.snapshot_view_with(&absent).unwrap();
         assert!(
-            store
-                .read_active_latest_snapshots_with(&absent)
-                .unwrap()
-                .is_empty(),
+            view.active.is_empty(),
             "确认不存在的源文件仍被返回 —— 已删除的项目规则会一直挂在视图里"
         );
+        assert_eq!(view.kept_unverified, 0);
+        assert_eq!(view.excluded[0].reason, ExclusionReason::SourceGone);
+        assert_eq!(view.excluded[0].source_path, path.to_string_lossy());
 
         std::fs::remove_file(path).unwrap();
     }

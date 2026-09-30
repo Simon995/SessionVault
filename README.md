@@ -98,7 +98,10 @@ CLI：
   退出码：`0` 成功 / `1` 发现失败 / `2` **游标保存失败**（`summary.state_saved=false`，
   本轮增量游标未推进，下游应重试或预期重复）。
 - `svault snapshots [--store <path>]` —— 输出每个 snapshot source 的当前最新版本；
-  供 TumeFlow Class-B 主路径消费，不要求从总库头扫描历史。
+  供 TumeFlow Class-B 主路径消费，不要求从总库头扫描历史。不在列表里的最新快照
+  各出一行 `snapshot_excluded`，带原因：`source_gone`（确认不在）/ `decode_failed`
+  （没读成，**不是**删了）。**判「已删」要凭 `source_gone`，不能凭「不在列表里」** ——
+  本仓从没采到的来源也不在列表里。
 
 ## 落地路线（绞杀者迁移）
 
