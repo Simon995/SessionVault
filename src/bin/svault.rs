@@ -22,7 +22,7 @@ use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
 // 而算错只在**特定 feature 组合**下现形（少了 ⇒ 某个组合编译失败；多了 ⇒ 另一个组合
 // unused import 告警）。使用点覆盖到整个 store feature 之后，那个精算就该退场。
 #[cfg(feature = "store")]
-use session_vault::store::Projection;
+use session_vault::store::{ExclusionReason, Projection};
 use session_vault::SourceRef;
 
 #[derive(Parser)]
@@ -621,8 +621,26 @@ enum Out<'a> {
     },
     #[cfg(feature = "store")]
     Snapshot { offset: i64, event: &'a RawEvent },
+    /// 最新快照里被排除的一条。`reason`：`source_gone`（源文件确认不在或已不是
+    /// 普通文件）/ `decode_failed`（行在、解不开 —— **不是**删了）。
     #[cfg(feature = "store")]
-    SnapshotSummary { snapshots: u64 },
+    SnapshotExcluded {
+        offset: i64,
+        source_type: &'a str,
+        source_location: &'a str,
+        source_path: &'a str,
+        reason: &'static str,
+        error: Option<&'a str>,
+    },
+    /// `snapshots + source_gone + decode_failed` = 参与判定的最新快照行数。
+    #[cfg(feature = "store")]
+    SnapshotSummary {
+        snapshots: u64,
+        source_gone: usize,
+        decode_failed: usize,
+        /// `snapshots` 里存在性**没问成**、保守留下的条数。
+        kept_unverified: usize,
+    },
     /// `roots` 的一行。
     #[cfg(feature = "store")]
     ProjectRoot {
@@ -953,21 +971,45 @@ fn run_snapshots(store_arg: Option<PathBuf>) -> i32 {
             return 2;
         }
     };
-    let rows = match store.read_active_latest_snapshots() {
-        Ok(rows) => rows,
+    let view = match store.snapshot_view() {
+        Ok(view) => view,
         Err(e) => {
             log::error!(target: tag::CLI, "snapshot read failed: {e}");
             return 2;
         }
     };
-    for (offset, event) in &rows {
+    for (offset, event) in &view.active {
         emit(&Out::Snapshot {
             offset: *offset,
             event,
         });
     }
+    let (mut source_gone, mut decode_failed) = (0, 0);
+    for x in &view.excluded {
+        let (reason, error) = match &x.reason {
+            ExclusionReason::SourceGone => {
+                source_gone += 1;
+                ("source_gone", None)
+            }
+            ExclusionReason::DecodeFailed(e) => {
+                decode_failed += 1;
+                ("decode_failed", Some(e.as_str()))
+            }
+        };
+        emit(&Out::SnapshotExcluded {
+            offset: x.offset,
+            source_type: &x.source_type,
+            source_location: &x.source_location,
+            source_path: &x.source_path,
+            reason,
+            error,
+        });
+    }
     emit(&Out::SnapshotSummary {
-        snapshots: rows.len() as u64,
+        snapshots: view.active.len() as u64,
+        source_gone,
+        decode_failed,
+        kept_unverified: view.kept_unverified,
     });
     0
 }
@@ -2432,9 +2474,18 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot["kind"], "snapshot");
         assert_eq!(snapshot["offset"], 43);
-        let snapshot_summary = serde_json::to_value(Out::SnapshotSummary { snapshots: 1 }).unwrap();
+        let snapshot_summary = serde_json::to_value(Out::SnapshotSummary {
+            snapshots: 1,
+            source_gone: 2,
+            decode_failed: 3,
+            kept_unverified: 4,
+        })
+        .unwrap();
         assert_eq!(snapshot_summary["kind"], "snapshot_summary");
         assert_eq!(snapshot_summary["snapshots"], 1);
+        assert_eq!(snapshot_summary["source_gone"], 2);
+        assert_eq!(snapshot_summary["decode_failed"], 3);
+        assert_eq!(snapshot_summary["kept_unverified"], 4);
 
         let erased = serde_json::to_value(Out::EraseSummary {
             deleted_events: 3,
