@@ -7,7 +7,9 @@
 > [`docs/rawevent-reconciliation.md`](docs/rawevent-reconciliation.md)；
 > **扫描/投影的状态模型**（`AppendLogObservation` · `ScanReasons` × `CommitPlan` ·
 > `Deadline` · `Probed` · 幂等 token）见
-> [`docs/scan-state-model.md`](docs/scan-state-model.md)。
+> [`docs/scan-state-model.md`](docs/scan-state-model.md)；**总库体积与待优化项**
+> （存了什么、哪些可回收，2026-10-08 只记录未动手）见
+> [`docs/storage-growth.md`](docs/storage-growth.md)。
 > 本文只写「动手前必须知道、否则会出事」的那些 —— 而本仓那些事**几乎全都来自
 > 一个事实：它有多个互不知情的消费者**。
 
