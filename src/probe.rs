@@ -520,6 +520,33 @@ pub fn create_dir_all(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// 新建一个只有属主可读写的文件（Unix 上建出来就是 `0600`，不经过「先默认权限、后收紧」
+/// 的窗口）；文件已存在就失败，不覆盖。**变更操作，透传 `Result`**。
+#[allow(clippy::disallowed_methods)]
+pub fn create_private_file(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(contents.as_ref())
+}
+
+/// 文件对组或其他用户开放了任何权限吗。只在 Unix 上有意义；别处答 `Found(false)`。
+#[allow(clippy::disallowed_methods)]
+pub fn open_to_others(path: &Path) -> Probed<bool> {
+    match std::fs::metadata(path) {
+        #[cfg(unix)]
+        Ok(meta) => {
+            Probed::Found(std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o077 != 0)
+        }
+        #[cfg(not(unix))]
+        Ok(_) => Probed::Found(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probed::Absent,
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
 /// 写文件。**变更操作，透传 `Result`**。
 #[allow(clippy::disallowed_methods)]
 pub fn write_bytes(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {

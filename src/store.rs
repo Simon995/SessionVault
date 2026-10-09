@@ -27,8 +27,7 @@ use crate::discover::SourceRef;
 use crate::probe::{ProbeBackend, Probed};
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
 use crate::store_crypto::{
-    create_os_key, data_key_id, is_envelope, load_os_key, new_data_key_id, CryptoError,
-    StoreCipher, StoreKey,
+    data_key_id, is_envelope, new_data_key_id, CryptoError, KeySource, StoreCipher, StoreKey,
 };
 use crate::Profile;
 
@@ -1049,15 +1048,20 @@ impl TotalStore {
     /// 密钥只从 OS keychain 读取。全新库或既有明文库可创建首把密钥；若检测到已有密文但
     /// keychain 中没有对应密钥则硬失败，绝不生成新钥匙覆盖并造成静默数据丢失。
     pub fn open(path: &Path) -> StoreResult<Self> {
+        Self::open_with_source(path, &KeySource::from_env())
+    }
+
+    /// [`Self::open`] 的可测形态 —— 主密钥来源由调用方给。
+    pub(crate) fn open_with_source(path: &Path, source: &KeySource) -> StoreResult<Self> {
         if let Some(parent) = path.parent() {
             crate::probe::create_dir_all(parent)?;
             restrict_permissions(parent, 0o700);
         }
         let encrypted_store = store_has_encrypted_rows(path)?;
-        let key = match load_os_key()? {
+        let key = match source.load()? {
             Some(key) => key,
             None if encrypted_store => return Err(CryptoError::MissingKey.into()),
-            None => create_os_key()?,
+            None => source.create()?,
         };
         let conn = Connection::open(path)?;
         restrict_permissions(path, 0o600);
@@ -1067,7 +1071,7 @@ impl TotalStore {
     /// **只读地**打开一个已存在的总库 —— 不存在就说不存在，**绝不建**。
     ///
     /// 🔴 [`Self::open`] 的签名**说不出「不存在」**：它 `create_dir_all` + 让 SQLite
-    /// 建文件 + 必要时 `create_os_key()`。也就是说「我只想读一下」的调用方一旦直接
+    /// 建文件 + 必要时新建主密钥。也就是说「我只想读一下」的调用方一旦直接
     /// 用它，就会**凭空给用户造一个空库和一把 OS 密钥，而且不报错**。
     ///
     /// 后果不是理论上的：QuotaBar 的 `known_project_identities` 为此在调用点自己
@@ -1104,7 +1108,9 @@ impl TotalStore {
     /// 会在打开那一刻改掉别人正在写的库。库缺本程序要读的表或列时报
     /// [`StoreError::SchemaBehind`]；多出来的（库比本程序新）不影响读，放行。
     pub fn open_read_only(path: &Path) -> StoreResult<Self> {
-        let key = load_os_key()?.ok_or(CryptoError::MissingKey)?;
+        let key = KeySource::from_env()
+            .load()?
+            .ok_or(CryptoError::MissingKey)?;
         Self::open_read_only_with_key(path, key)
     }
 
@@ -4561,6 +4567,89 @@ mod tests {
             TotalStore::open_read_only_with_key(&absent, StoreKey::from_bytes([7; 32])).is_err()
         );
         assert!(!absent.exists(), "只读打开建出了一个库");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 用密钥文件建一个带快照的库，返回（目录, 库, 密钥文件）。
+    fn key_file_store(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "svault-kf-{tag}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("memory.md");
+        std::fs::write(&src, "# m\n").unwrap();
+        let (db, key) = (dir.join("total_store.db"), dir.join("store.key"));
+        let store = TotalStore::open_with_source(&db, &KeySource::File(key.clone())).unwrap();
+        store
+            .sync_snapshots(&[SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Local,
+                source_mode: SourceMode::SnapshotFile,
+                path: src,
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            }])
+            .unwrap();
+        drop(store);
+        (dir, db, key)
+    }
+
+    /// 首次建库生成密钥文件；之后读写打开、只读打开都靠它，读得出建库时写的数据。
+    #[test]
+    fn a_key_file_is_created_once_and_opens_the_store_again() {
+        let (dir, db, key) = key_file_store("roundtrip");
+        assert!(key.exists(), "建库没有生成密钥文件");
+        let source = KeySource::File(key.clone());
+        let again = TotalStore::open_with_source(&db, &source).unwrap();
+        assert_eq!(again.read_latest_snapshots().unwrap().len(), 1);
+        drop(again);
+        let ro = TotalStore::open_read_only_with_key(&db, source.load().unwrap().unwrap()).unwrap();
+        assert_eq!(ro.read_latest_snapshots().unwrap().len(), 1);
+        drop(ro);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 库里已有加密数据而密钥文件丢了：拒绝打开，且不悄悄生成一把新的 ——
+    /// 新钥匙解不开旧数据，还会和旧数据混在同一个库里。
+    #[test]
+    fn a_lost_key_file_is_refused_not_regenerated() {
+        let (dir, db, key) = key_file_store("lost");
+        std::fs::remove_file(&key).unwrap();
+        match TotalStore::open_with_source(&db, &KeySource::File(key.clone())) {
+            Err(StoreError::Crypto(CryptoError::MissingKey)) => {}
+            Err(e) => panic!("应报 MissingKey，实际 {e}"),
+            Ok(_) => panic!("丢了密钥照样打开了"),
+        }
+        assert!(!key.exists(), "丢了密钥后悄悄生成了一把新的");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_key_file_is_an_error() {
+        let (dir, db, key) = key_file_store("corrupt");
+        std::fs::write(&key, "not-a-key").unwrap();
+        assert!(TotalStore::open_with_source(&db, &KeySource::File(key)).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 密钥文件对组或其他用户开放了权限就拒绝；建出来的文件本身必须是 0600。
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_open_to_others_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, db, key) = key_file_store("perm");
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "生成的密钥文件权限是 {mode:o}");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        match TotalStore::open_with_source(&db, &KeySource::File(key)) {
+            Err(StoreError::Crypto(CryptoError::KeyFile(_))) => {}
+            Err(e) => panic!("应报 KeyFile，实际 {e}"),
+            Ok(_) => panic!("组和其他用户可读的密钥文件照样用了"),
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8203,7 +8292,7 @@ mod project_identity_tests {
 
     /// 🔴 **只读打开不许留下任何痕迹。**
     ///
-    /// `open` 会 `create_dir_all` + 让 SQLite 建文件 + 必要时 `create_os_key()`，
+    /// `open` 会 `create_dir_all` + 让 SQLite 建文件 + 必要时新建主密钥，
     /// 所以一个「我只想读一下」的调用方用错入口，就会**凭空给用户造一个空库和
     /// 一把 OS 密钥，而且不报错**。QuotaBar 为此在调用点自己先探一次 ——
     /// 一条本该由 API 消化掉的知识外泄到了消费者身上。
