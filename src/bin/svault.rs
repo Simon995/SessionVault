@@ -972,7 +972,7 @@ fn run_snapshots(store_arg: Option<PathBuf>) -> i32 {
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(store) => store,
         Err(e) => {
             log::error!(target: tag::CLI, "snapshot store open failed: {e}");
@@ -1791,7 +1791,7 @@ fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option
             return 1;
         }
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: path={} err={e}", store_path.display());
@@ -1908,6 +1908,20 @@ fn open_total_store(
         return session_vault::TotalStore::open_with_key(path, key);
     }
     session_vault::TotalStore::open(path)
+}
+
+/// 只读子命令用它：不建库、不建密钥、不迁移（见 `TotalStore::open_read_only`）。
+/// 本程序可能比写入方新，打开那一刻跑 `migrate()` 会改掉别人正在写的库。
+#[cfg(feature = "store")]
+fn open_total_store_read_only(
+    path: &std::path::Path,
+) -> session_vault::store::StoreResult<session_vault::TotalStore> {
+    #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
+    if let Ok(encoded) = std::env::var("SVAULT_ACCEPTANCE_KEY") {
+        let key = session_vault::StoreKey::from_encoded(&encoded)?;
+        return session_vault::TotalStore::open_read_only_with_key(path, key);
+    }
+    session_vault::TotalStore::open_read_only(path)
 }
 
 #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
@@ -3055,7 +3069,7 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: {e}");
@@ -3147,7 +3161,7 @@ fn run_roots(store_arg: Option<PathBuf>, duplicates: bool) -> i32 {
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: {e}");
@@ -3289,7 +3303,7 @@ fn run_attribute(paths: Vec<String>, distros: Vec<String>, store_arg: Option<Pat
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: {e}");
@@ -3514,7 +3528,7 @@ fn run_sessions_read(
         };
         sessions.push(s);
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: {e}");
@@ -3648,7 +3662,7 @@ fn run_changes(since_seq: i64, limit: usize, store_arg: Option<PathBuf>) -> i32 
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    let store = match open_total_store(&store_path) {
+    let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
         Err(e) => {
             log::error!(target: tag::CLI, "open total store failed: {e}");
