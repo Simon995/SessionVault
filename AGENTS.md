@@ -15,6 +15,12 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 - 变异验证用 `scripts/mutate.py`：变异要打在生产实际走的路径上，脚本自己备份、自己还原并核字节一致。
 - 「没问成」在 `src/` 里的规模现查，不写进文档：`grep -rc 没问成 src/ --include=*.rs | awk -F: '{s+=$2} END {print s}'`。
 
+### 提交与分支（不依赖全局指令：只读本文件的环境也要照做）
+
+- 代码、脚本、hook 改动走独立分支，做完请人 review，人同意后才合并推送；纯文档改动可直接提交 main。
+- 提交消息用 Conventional Commits：`<type>(<scope>): <subject>`，主题中文、不超过 50 字；正文分 What / Why / Impact / Validation。
+- 作者用 GitHub noreply 邮箱，不用工作邮箱；按文件名逐个暂存，不用 `git add -A` / `git add .`；不用 `--no-verify` 跳 hook。
+
 ## 2. 公开仓
 
 - 本仓公开。不得出现真实用户名、内部主机名、个人路径、真实项目名、邮箱：散文与注释写 `<user>` / `<distro>` / `<repo>`，测试 fixture 用中性字面量（`dev` / `me` / `u`）。数字保留：脱的是身份，不是证据。

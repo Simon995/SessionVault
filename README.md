@@ -134,6 +134,13 @@ cargo build         # lib + svault
 cargo test          # 单测（WSL 实机 IT 需 SVAULT_WSL_IT=1，默认跳过）
 ```
 
+## 主密钥从哪来
+
+默认在 OS 密钥链（Windows 凭据管理器 / macOS 钥匙串 / Linux Secret Service）。无桌面的 Linux
+没有 Secret Service，这时设 `SVAULT_KEY_FILE=<路径>`：首次建库在该路径生成密钥文件（权限 `0600`），
+之后从它读；对组或其他用户开放了权限的文件会被拒绝，文件丢了不会重新生成（报 `MissingKey`）。
+同步到 Linux 主机的方案见 [docs/linux-replica.md](docs/linux-replica.md)。
+
 ## 文档
 
 - [docs/INGEST_KERNEL.md](docs/INGEST_KERNEL.md) —— 完整设计契约（来源目录、provider 扩展、`RawEvent`、游标、扫描报告、总库/分库、黄金语料、落地计划与进度）。

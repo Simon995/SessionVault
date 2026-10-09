@@ -11,11 +11,15 @@ const DATA_ENVELOPE_PREFIX: &str = "sv2";
 const WRAPPED_KEY_PREFIX: &str = "svk1";
 const KEYCHAIN_SERVICE: &str = "session-vault";
 const KEYCHAIN_ACCOUNT: &str = "total-store-master-v1";
+/// 设了就从这个文件取主密钥，不碰 OS 密钥链 —— 无桌面的 Linux 没有 Secret Service。
+pub const KEY_FILE_ENV: &str = "SVAULT_KEY_FILE";
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
-    #[error("total-store key is missing from the OS keychain")]
+    #[error("total-store key is missing (OS keychain, or the file named by SVAULT_KEY_FILE)")]
     MissingKey,
+    #[error("key file {0}")]
+    KeyFile(String),
     #[error("invalid total-store key")]
     InvalidKey,
     #[error("OS keychain: {0}")]
@@ -204,6 +208,57 @@ pub(crate) fn new_data_key_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     STANDARD_NO_PAD.encode(bytes)
+}
+
+/// 主密钥从哪来：OS 密钥链，或 [`KEY_FILE_ENV`] 指定的文件。
+pub(crate) enum KeySource {
+    OsKeychain,
+    File(std::path::PathBuf),
+}
+
+impl KeySource {
+    pub(crate) fn from_env() -> Self {
+        match std::env::var_os(KEY_FILE_ENV) {
+            Some(path) if !path.is_empty() => Self::File(path.into()),
+            _ => Self::OsKeychain,
+        }
+    }
+
+    pub(crate) fn load(&self) -> Result<Option<StoreKey>, CryptoError> {
+        match self {
+            Self::OsKeychain => load_os_key(),
+            Self::File(path) => load_key_file(path),
+        }
+    }
+
+    pub(crate) fn create(&self) -> Result<StoreKey, CryptoError> {
+        match self {
+            Self::OsKeychain => create_os_key(),
+            Self::File(path) => {
+                let key = StoreKey::generate();
+                crate::probe::create_private_file(path, key.encode())
+                    .map_err(|e| CryptoError::KeyFile(format!("{}: {e}", path.display())))?;
+                Ok(key)
+            }
+        }
+    }
+}
+
+/// 文件不在是 `Ok(None)`；对组或其他用户开放了权限就拒绝，不读。
+fn load_key_file(path: &std::path::Path) -> Result<Option<StoreKey>, CryptoError> {
+    use crate::probe::Probed;
+    let refuse = |why: String| CryptoError::KeyFile(format!("{}: {why}", path.display()));
+    match crate::probe::open_to_others(path) {
+        Probed::Absent => return Ok(None),
+        Probed::Found(true) => return Err(refuse("readable by group or others; chmod 600".into())),
+        Probed::Found(false) => {}
+        Probed::Unknown(e) => return Err(refuse(e.to_string())),
+    }
+    match crate::probe::read_text(path, None) {
+        Probed::Found(text) => StoreKey::decode(text.trim()).map(Some),
+        Probed::Absent => Ok(None),
+        Probed::Unknown(e) => Err(refuse(e.to_string())),
+    }
 }
 
 pub(crate) fn load_os_key() -> Result<Option<StoreKey>, CryptoError> {
