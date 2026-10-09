@@ -59,11 +59,14 @@
   不设该变量时仍是 Secret Service 那条报错（对照）。
 - 部署建议（主机定了再落）：用 systemd 的加密凭据把密钥文件交给服务，不明文落盘。
 
-### 三、本仓发布 svault
+### 三、本仓发布 svault（脚本已做，2026-10-09；渠道人定为本机脚本 + GitHub Release）
 
-- 从打了标签的提交构建 Windows / Linux 两个二进制，附 sha256；`--version` 带提交号（已有）。
+- `scripts/release.py <tag>`：本机编 Windows 版、WSL 里编 Linux 版；`--version` 必须正好是当前提交、
+  不带 `-dirty`；编译时把家目录映射成 `~`，编完逐字节扫描，二进制里嵌着本机家目录就拒绝发布
+  （反向对照：未映射的构建里有上千处，会被拦下）。默认试运行；`--publish` 只认 origin/main 上干净的提交，
+  打标签、发 GitHub Release（附 `SHA256SUMS` 与 `Cargo.lock`）、把 Windows 版装到 `%LOCALAPPDATA%\svault\bin`。
 - 消费方用配置的显式路径，启动时正向断言版本与所需子命令；本仓合并影响 CLI 形状的改动后按规则 4 通知。
-- 待定：发布渠道（GitHub Release / 本机固定安装目录）与更新方式。
+- Linux 主机上的安装位置等主机定了再定。
 
 ### 四、增量复制（主机定了再做）
 

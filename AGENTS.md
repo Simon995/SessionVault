@@ -12,6 +12,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 - clippy：`cargo clippy --all-targets --all-features -- -D warnings` 保持 0 条。
 - 公开仓闸：`uv run python scripts/check-public-safe.py`（扫整个工作区和 `origin/main..HEAD` 的 commit message，先自检再扫）。
 - 体量闸：`uv run python scripts/check-agents-budget.py`（本文件 ≤200 行、≤24 KB、单行 ≤320 字符；`CLAUDE.md` 只能是 `@AGENTS.md` 导入壳）。
+- 发布 svault：`uv run python scripts/release.py <tag>` 试运行，加 `--publish` 才打标签、发 GitHub Release、装到 `%LOCALAPPDATA%\svault\bin`；二进制里嵌着本机家目录就拒绝发布。
 - 变异验证用 `scripts/mutate.py`：变异要打在生产实际走的路径上，脚本自己备份、自己还原并核字节一致。
 - 「没问成」在 `src/` 里的规模现查，不写进文档：`grep -rc 没问成 src/ --include=*.rs | awk -F: '{s+=$2} END {print s}'`。
 

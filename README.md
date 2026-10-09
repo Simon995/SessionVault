@@ -155,4 +155,9 @@ cargo test          # 单测（WSL 实机 IT 需 SVAULT_WSL_IT=1，默认跳过�
 ## 分发与版本
 
 Rust **lib**（QuotaBar 原生 cargo 依赖）+ **CLI**（NDJSON 出 stdout，TumeFlow 子进程消费）+ 可选 **PyO3** wheel。
+
+**CLI 二进制由本仓发布**（2026-10-09 起）：`uv run python scripts/release.py <tag>` 在本机编
+Windows 版、在 WSL 里编 Linux 版，逐项验证后试运行结束；加 `--publish` 才打标签、发 GitHub
+Release（附 `SHA256SUMS` 与构建用的 `Cargo.lock`），并把 Windows 版装到 `%LOCALAPPDATA%\svault\bin\svault.exe`。
+消费方读发布物的显式路径，并正向断言 `svault --version` 括号里的提交与所需子命令。
 来源目录、`RawEvent`、`SourceReport`、游标均为公开 API，破坏即 major 版本；早期两消费者用 git submodule pin 到某 commit，契约稳定后再走 registry 正式发版。
