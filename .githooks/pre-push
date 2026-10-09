@@ -40,3 +40,9 @@ if ! $PY scripts/check-public-safe.py; then
     echo "  ⚠️ 工作区改得掉；commit message 推上去就是公开历史，要 rebase 重写。" >&2
     exit 1
 fi
+
+# 指令文件会自己长胖：体量超了也拒绝推送（判例、历史搬进 docs/，留一行指针）。
+if ! $PY scripts/check-agents-budget.py; then
+    echo "pre-push: AGENTS.md 体量闸未过 —— **拒绝推送**。" >&2
+    exit 1
+fi
