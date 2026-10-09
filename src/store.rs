@@ -13,7 +13,7 @@
 //! - `event_json` 只以版本化 AES-256-GCM 信封落盘；密钥由 OS keychain 持久化，SQLite 内不留
 //!   密钥或明文。旧明文库首次打开时原地迁移并清理空闲页（ADR-027）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -63,6 +63,10 @@ pub enum StoreError {
         before: u64,
         after: u64,
     },
+    /// 只读打开时，库缺本程序要读的表或列：库比本程序旧，或被不兼容地改过。
+    /// 只读打开不迁移，只能报出来，由写入方先升级。
+    #[error("store schema lacks {missing:?} that this svault reads; upgrade the writer first")]
+    SchemaBehind { missing: Vec<String> },
 }
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
@@ -840,6 +844,40 @@ CREATE INDEX IF NOT EXISTS idx_raw_events_occurred ON raw_events(occurred_at_uni
 /// 🔴 **解析仍然只有 Rust 那一处实现**。这里注册的是同一个函数的 SQL 门面，不是第二份
 /// 规则 —— 用 SQL 表达式去切时间串必然与 Rust 分叉，而分叉的表现是**排序悄悄不对**，
 /// 不报错。归一化规则（时区偏移、小数秒位数、闰年）见 [`crate::rawevent::occurred_at_unix_ms`]。
+/// 每张表（不含 SQLite 内部表）的列名。
+fn table_columns(conn: &Connection) -> StoreResult<BTreeMap<String, BTreeSet<String>>> {
+    let tables: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut out = BTreeMap::new();
+    for table in tables {
+        let cols = conn
+            .prepare("SELECT name FROM pragma_table_info(?1)")?
+            .query_map([&table], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        out.insert(table, cols);
+    }
+    Ok(out)
+}
+
+/// `expected` 里有、`actual` 里没有的表（`表名`）与列（`表名.列名`）。
+fn missing_columns(
+    actual: &BTreeMap<String, BTreeSet<String>>,
+    expected: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (table, cols) in expected {
+        match actual.get(table) {
+            None => out.push(table.clone()),
+            Some(have) => out.extend(cols.difference(have).map(|c| format!("{table}.{c}"))),
+        }
+    }
+    out
+}
+
 fn register_sql_functions(conn: &Connection) -> StoreResult<()> {
     use rusqlite::functions::FunctionFlags;
     conn.create_scalar_function(
@@ -1059,6 +1097,40 @@ impl TotalStore {
     }
 
     /// 使用宿主提供的密钥打开数据库。适用于测试和不由默认 OS keychain 管理密钥的嵌入方。
+    /// 只读打开已存在的总库：不建库、不建密钥、不跑 `migrate()`，连接以
+    /// `SQLITE_OPEN_READ_ONLY` 打开 —— 写不进去由 SQLite 保证，不靠调用方自律。
+    ///
+    /// 给只读消费方用：它的 svault 可能比写入方新，而 [`Self::open`] 的 `migrate()`
+    /// 会在打开那一刻改掉别人正在写的库。库缺本程序要读的表或列时报
+    /// [`StoreError::SchemaBehind`]；多出来的（库比本程序新）不影响读，放行。
+    pub fn open_read_only(path: &Path) -> StoreResult<Self> {
+        let key = load_os_key()?.ok_or(CryptoError::MissingKey)?;
+        Self::open_read_only_with_key(path, key)
+    }
+
+    /// [`Self::open_read_only`] 的可测形态 —— 密钥由调用方给。
+    pub fn open_read_only_with_key(path: &Path, key: StoreKey) -> StoreResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        register_sql_functions(&conn)?;
+        // 「应有的表结构」取自本程序自己的 `migrate()`，不在这里另抄一份。
+        let expected = table_columns(&Self::open_in_memory()?.conn.lock().unwrap())?;
+        let missing = missing_columns(&table_columns(&conn)?, &expected);
+        if !missing.is_empty() {
+            return Err(StoreError::SchemaBehind { missing });
+        }
+        let store = Self {
+            conn: Mutex::new(conn),
+            cipher: StoreCipher::new(key),
+            identity_seen: Mutex::new(HashSet::new()),
+        };
+        store.validate_cipher()?;
+        Ok(store)
+    }
+
     pub fn open_with_key(path: &Path, key: StoreKey) -> StoreResult<Self> {
         if let Some(parent) = path.parent() {
             crate::probe::create_dir_all(parent)?;
@@ -4397,6 +4469,99 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(store.read_active_latest_snapshots().unwrap().is_empty());
         assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
+    }
+
+    /// 写入方建好的文件库，带一条快照；密钥固定，只读侧才能用同一把打开。
+    fn file_store_with_snapshot(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "svault-ro-{tag}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("memory.md");
+        std::fs::write(&src, "# m\n").unwrap();
+        let db = dir.join("total_store.db");
+        let store = TotalStore::open_with_key(&db, StoreKey::from_bytes([7; 32])).unwrap();
+        store
+            .sync_snapshots(&[SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Local,
+                source_mode: SourceMode::SnapshotFile,
+                path: src,
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            }])
+            .unwrap();
+        drop(store);
+        (dir, db)
+    }
+
+    #[test]
+    fn read_only_open_reads_what_the_writer_wrote_and_refuses_to_write() {
+        let (dir, db) = file_store_with_snapshot("rw");
+        let ro = TotalStore::open_read_only_with_key(&db, StoreKey::from_bytes([7; 32])).unwrap();
+        assert_eq!(ro.read_latest_snapshots().unwrap().len(), 1);
+        assert!(
+            ro.tombstone(TombstoneScope::SourcePath, "x").is_err(),
+            "只读连接写进去了"
+        );
+        drop(ro);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 库比本程序旧（少一张本程序要读的表）：只读打开要报出来，而且不能顺手补上 ——
+    /// 补上就是替写入方迁移了共享库。对照：正常打开会把它建回来。
+    #[test]
+    fn read_only_open_reports_an_older_schema_and_never_migrates_it() {
+        let (dir, db) = file_store_with_snapshot("old");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP TABLE projection_log;")
+            .unwrap();
+        let has_table = || -> i64 {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'projection_log'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        match TotalStore::open_read_only_with_key(&db, StoreKey::from_bytes([7; 32])) {
+            Err(StoreError::SchemaBehind { missing }) => assert_eq!(missing, ["projection_log"]),
+            Err(e) => panic!("应报 SchemaBehind，实际 {e}"),
+            Ok(_) => panic!("库缺表却照常打开了"),
+        }
+        assert_eq!(has_table(), 0, "只读打开替写入方迁移了库");
+
+        drop(TotalStore::open_with_key(&db, StoreKey::from_bytes([7; 32])).unwrap());
+        assert_eq!(has_table(), 1, "对照失效：正常打开应当把这张表建回来");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_open_tolerates_a_newer_schema_and_never_creates_a_store() {
+        let (dir, db) = file_store_with_snapshot("new");
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("ALTER TABLE raw_events ADD COLUMN from_a_newer_svault TEXT;")
+            .unwrap();
+        assert!(
+            TotalStore::open_read_only_with_key(&db, StoreKey::from_bytes([7; 32])).is_ok(),
+            "库比本程序新、多一列不影响读"
+        );
+
+        let absent = dir.join("absent.db");
+        assert!(
+            TotalStore::open_read_only_with_key(&absent, StoreKey::from_bytes([7; 32])).is_err()
+        );
+        assert!(!absent.exists(), "只读打开建出了一个库");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 「不在活跃集里」的每一条都要有去处和原因 —— 解不开的行从前只打一行 warn
