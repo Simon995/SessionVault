@@ -66,7 +66,7 @@ pub use report::ScanReport;
 #[cfg(feature = "store")]
 pub use store::{
     AppendStats, EraseStats, FileProjectionBatch, GcStats, KeyImport, Projection, ProjectionChange,
-    ProjectionStats, ReadPage, RecentSession, SessionRead, SnapshotSyncStats, SourceKey,
+    ProjectionStats, ReadPage, RecentSession, Rekeyed, SessionRead, SnapshotSyncStats, SourceKey,
     StoreStatus, TombstoneScope, TotalStore,
 };
 #[cfg(feature = "store")]

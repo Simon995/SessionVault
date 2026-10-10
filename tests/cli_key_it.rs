@@ -40,6 +40,13 @@ fn line(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+/// 钥匙文件夹具：Unix 上 svault 拒绝对组或其他用户可读的钥匙文件，夹具得和真的一样是 0600。
+fn write_key(path: &Path, key: &str) {
+    std::fs::write(path, key).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+}
+
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap().trim().to_string()
 }
@@ -64,8 +71,8 @@ fn a_key_travels_by_file_and_only_where_it_belongs() {
         }])
         .unwrap();
     let (key_a, key_b) = (dir.join("a.key"), dir.join("b.key"));
-    std::fs::write(&key_a, KEY_A).unwrap();
-    std::fs::write(&key_b, KEY_B).unwrap();
+    write_key(&key_a, KEY_A);
+    write_key(&key_b, KEY_B);
     let db_arg = db.to_str().unwrap();
 
     // 导出：写进新文件、内容就是本机那把；同一路径再导出被拒、不覆盖。
@@ -116,6 +123,31 @@ fn a_key_travels_by_file_and_only_where_it_belongs() {
     ];
     assert!(!svault(&empty, &args).status.success());
     assert!(!empty.exists());
+
+    // 换钥：本机（fresh，钥匙 A）把库换到 B 下；旧钥匙备份在旁边；再跑一次什么都不改。
+    let out = svault(
+        &fresh,
+        &["key-import", "--from", b, "--store", db_arg, "--rekey"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rekeyed = line(&out);
+    assert_eq!(rekeyed["kind"], "key_rekeyed");
+    assert_eq!(rekeyed["outcome"], "rekeyed");
+    assert!(rekeyed["rewrapped"].as_u64().unwrap() >= 1);
+    let backup = rekeyed["previous_key_backup"].as_str().unwrap();
+    let backup = Path::new(backup.strip_prefix("file:").unwrap());
+    assert_eq!(read(backup), KEY_A, "旧钥匙没备份对");
+    assert_eq!(read(&fresh), KEY_B, "本机钥匙没换");
+    let out = svault(
+        &fresh,
+        &["key-import", "--from", b, "--store", db_arg, "--rekey"],
+    );
+    assert_eq!(line(&out)["outcome"], "already_present");
+    assert_eq!(line(&out)["rewrapped"], 0);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }

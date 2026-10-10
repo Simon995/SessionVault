@@ -203,7 +203,7 @@ enum Command {
     },
     /// 把 `key-export` 导出的主密钥装进本机：OS 密钥链；设了 `SVAULT_KEY_FILE` 则新建那个文件。
     ///
-    /// 本机已有**另一把**钥匙时拒绝：装上新的，旧钥匙加密的数据就再也打不开（换钥还没做）。
+    /// 本机已有**另一把**钥匙时拒绝：装上新的，旧钥匙加密的数据就再也打不开 —— 要换，加 `--rekey`。
     /// 本机总库（或 `--store` 指的库）存在时，先确认这把钥匙打得开它；输出里
     /// `verified_against_store` 说明这一步做没做。
     #[cfg(feature = "store")]
@@ -212,6 +212,11 @@ enum Command {
         from: PathBuf,
         #[arg(long)]
         store: Option<PathBuf>,
+        /// 本机已有另一把钥匙时，把本机总库换到这把钥匙下（`TotalStore::rekey`）：旧钥匙先备份，
+        /// 数据密钥在一个事务里改包，最后才换本机的钥匙。**先退出 QuotaBar / TumeFlow**；
+        /// Windows 上库被别的进程开着会拒绝。断了重跑即可。
+        #[arg(long)]
+        rekey: bool,
     },
     /// 本库的标识（多机同步用，见 `docs/linux-replica.md` 第四部分）：
     /// `{"kind":"store_info","store_id":"<32 位十六进制>"}`。
@@ -458,6 +463,15 @@ enum Out<'a> {
     KeyImported {
         outcome: &'static str,
         verified_against_store: bool,
+    },
+    /// `key-import --rekey` 的唯一一行。`previous_key_backup` 是旧钥匙备份的位置（不含钥匙），
+    /// 本机原本就是这把钥匙时为 `null`；`rewrapped > 0` 而 `outcome = "healed"` 表示补改了遗留。
+    #[cfg(feature = "store")]
+    KeyRekeyed {
+        outcome: &'static str,
+        rewrapped: usize,
+        already: usize,
+        previous_key_backup: Option<String>,
     },
     /// `store-info` 的唯一一行。`store_id` 缺失时输出 `null`，不省略这个键。
     #[cfg(feature = "store")]
@@ -932,7 +946,7 @@ fn main() {
         #[cfg(feature = "store")]
         Command::KeyExport { to } => run_key_export(to),
         #[cfg(feature = "store")]
-        Command::KeyImport { from, store } => run_key_import(from, store),
+        Command::KeyImport { from, store, rekey } => run_key_import(from, store, rekey),
         #[cfg(feature = "store")]
         Command::Roots { store, duplicates } => run_roots(store, duplicates),
         #[cfg(feature = "store")]
@@ -3281,7 +3295,7 @@ fn run_key_export(to: PathBuf) -> i32 {
 }
 
 #[cfg(feature = "store")]
-fn run_key_import(from: PathBuf, store_arg: Option<PathBuf>) -> i32 {
+fn run_key_import(from: PathBuf, store_arg: Option<PathBuf>, rekey: bool) -> i32 {
     // 显式给的库必须在；没给就验本机默认的库 —— 在才验。探不动不是「没有库」：那样会跳过
     // 验证、把一把打不开本机数据的钥匙装进去。
     let explicit = store_arg.is_some();
@@ -3300,6 +3314,31 @@ fn run_key_import(from: PathBuf, store_arg: Option<PathBuf>) -> i32 {
         },
         None => None,
     };
+    if rekey {
+        let Some(store) = store else {
+            log::error!(target: tag::CLI, "--rekey needs the total store (default path or --store)");
+            return 1;
+        };
+        return match session_vault::TotalStore::rekey(&from, &store) {
+            Ok(done) => {
+                emit(&Out::KeyRekeyed {
+                    outcome: match (&done.previous_key_backup, done.rewrapped) {
+                        (Some(_), _) => "rekeyed",
+                        (None, 0) => "already_present",
+                        (None, _) => "healed",
+                    },
+                    rewrapped: done.rewrapped,
+                    already: done.already,
+                    previous_key_backup: done.previous_key_backup,
+                });
+                0
+            }
+            Err(e) => {
+                log::error!(target: tag::CLI, "rekey failed: {e}");
+                1
+            }
+        };
+    }
     match session_vault::TotalStore::import_master_key(&from, store.as_deref()) {
         Ok(outcome) => {
             emit(&Out::KeyImported {

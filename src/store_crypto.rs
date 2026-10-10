@@ -229,9 +229,10 @@ pub(crate) fn new_store_id() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 主密钥从哪来：OS 密钥链，或 [`KEY_FILE_ENV`] 指定的文件。
+/// 主密钥从哪来：OS 密钥链里的一个条目，或 [`KEY_FILE_ENV`] 指定的文件。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeySource {
-    OsKeychain,
+    Keychain { service: String, account: String },
     File(std::path::PathBuf),
 }
 
@@ -239,13 +240,24 @@ impl KeySource {
     pub(crate) fn from_env() -> Self {
         match std::env::var_os(KEY_FILE_ENV) {
             Some(path) if !path.is_empty() => Self::File(path.into()),
-            _ => Self::OsKeychain,
+            _ => Self::Keychain {
+                service: KEYCHAIN_SERVICE.into(),
+                account: KEYCHAIN_ACCOUNT.into(),
+            },
         }
     }
 
     pub(crate) fn load(&self) -> Result<Option<StoreKey>, CryptoError> {
         match self {
-            Self::OsKeychain => load_os_key(),
+            Self::Keychain { service, account } => {
+                let entry = keyring::Entry::new(service, account)
+                    .map_err(|e| CryptoError::Keychain(e.to_string()))?;
+                match entry.get_password() {
+                    Ok(value) => StoreKey::decode(&value).map(Some),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(e) => Err(CryptoError::Keychain(e.to_string())),
+                }
+            }
             Self::File(path) => load_key_file(path),
         }
     }
@@ -259,11 +271,62 @@ impl KeySource {
     /// 把给定的钥匙放进这个来源。文件来源只新建、不覆盖；密钥链来源由调用方先确认里面没有别的钥匙。
     pub(crate) fn install(&self, key: &StoreKey) -> Result<(), CryptoError> {
         match self {
-            Self::OsKeychain => keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .and_then(|entry| entry.set_password(&key.encode()))
-                .map_err(|e| CryptoError::Keychain(e.to_string())),
+            Self::Keychain { .. } => self.replace(key),
             Self::File(path) => crate::probe::create_private_file(path, key.encode())
                 .map_err(|e| CryptoError::KeyFile(format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// 换掉这个来源里的钥匙（换钥最后一步）。文件来源先写到旁边的新文件再改名，不留半截。
+    pub(crate) fn replace(&self, key: &StoreKey) -> Result<(), CryptoError> {
+        match self {
+            Self::Keychain { service, account } => keyring::Entry::new(service, account)
+                .and_then(|entry| entry.set_password(&key.encode()))
+                .map_err(|e| CryptoError::Keychain(e.to_string())),
+            Self::File(path) => {
+                let fail =
+                    |e: std::io::Error| CryptoError::KeyFile(format!("{}: {e}", path.display()));
+                let mut tmp = path.clone().into_os_string();
+                tmp.push(".new");
+                let tmp = std::path::PathBuf::from(tmp);
+                crate::probe::create_private_file(&tmp, key.encode()).map_err(fail)?;
+                crate::probe::rename(&tmp, path).map_err(fail)
+            }
+        }
+    }
+
+    /// 换钥前放旧钥匙的地方：同一个密钥链服务下另一个条目，或密钥文件旁边另一个文件。
+    pub(crate) fn backup_slot(&self, stamp: &str) -> Self {
+        match self {
+            Self::Keychain { service, account } => Self::Keychain {
+                service: service.clone(),
+                account: format!("{account}.previous-{stamp}"),
+            },
+            Self::File(path) => {
+                let mut backup = path.clone().into_os_string();
+                backup.push(format!(".previous-{stamp}"));
+                Self::File(backup.into())
+            }
+        }
+    }
+
+    /// 记进库里的位置描述（不含钥匙本身）；[`KeySource::from_locator`] 读回。
+    pub(crate) fn locator(&self) -> String {
+        match self {
+            Self::Keychain { service, account } => format!("keychain:{service}/{account}"),
+            Self::File(path) => format!("file:{}", path.display()),
+        }
+    }
+
+    pub(crate) fn from_locator(locator: &str) -> Option<Self> {
+        if let Some(rest) = locator.strip_prefix("keychain:") {
+            let (service, account) = rest.split_once('/')?;
+            Some(Self::Keychain {
+                service: service.into(),
+                account: account.into(),
+            })
+        } else {
+            locator.strip_prefix("file:").map(|p| Self::File(p.into()))
         }
     }
 }
@@ -282,15 +345,5 @@ pub(crate) fn load_key_file(path: &std::path::Path) -> Result<Option<StoreKey>, 
         Probed::Found(text) => StoreKey::decode(text.trim()).map(Some),
         Probed::Absent => Ok(None),
         Probed::Unknown(e) => Err(refuse(e.to_string())),
-    }
-}
-
-pub(crate) fn load_os_key() -> Result<Option<StoreKey>, CryptoError> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| CryptoError::Keychain(e.to_string()))?;
-    match entry.get_password() {
-        Ok(value) => StoreKey::decode(&value).map(Some),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(CryptoError::Keychain(e.to_string())),
     }
 }
