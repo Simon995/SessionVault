@@ -45,8 +45,10 @@ fn every_read_subcommand_leaves_an_older_store_unmigrated() {
         .unwrap();
 
     let store = db.to_str().unwrap();
-    let reads: [&[&str]; 9] = [
+    let reads: [&[&str]; 10] = [
         &["erasures"],
+        // 不加 `--apply` 只预览：只读打开，同样不许迁移。
+        &["reattribute"],
         &["store-info"],
         &["pull", "--since", "0"],
         &["changes", "--since-seq", "0"],
