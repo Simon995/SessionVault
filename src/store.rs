@@ -4112,7 +4112,25 @@ impl TotalStore {
     }
 
     /// 在同一事务写墓碑并物理删除命中正文。墓碑不含正文，确保后续增量和全量重建都不会复活。
+    ///
+    /// 不带挂载表：按项目根删时收得到 UNC 写法、规范形、发行版里的 `/mnt`，收不到
+    /// `<盘>:\…` 与 `/mnt/<盘>/…` 互认 —— 那要 [`Self::tombstone_covering`] 带上挂载表。
     pub fn tombstone(&self, scope: TombstoneScope, key: &str) -> StoreResult<EraseStats> {
+        self.tombstone_covering(scope, key, &Vec::new())
+    }
+
+    /// 同 [`Self::tombstone`]，按项目根删时把库里**同一目录的每种写法**（按
+    /// [`crate::attribution::registry_key`] 与 `mounts` 判同一）各记一条墓碑、一起删掉。
+    ///
+    /// 只按字符串删，同一项目的 UNC 写法事件会留下原文（TumeChat 2026-10-10 按规则 2 提：
+    /// 真库有 855 条事件的项目根还是 UNC 写法）；每种写法各记一条，读路径与消费方按字符串
+    /// 对墓碑就都对得上，不必各自再学一遍路径换算。
+    pub fn tombstone_covering(
+        &self,
+        scope: TombstoneScope,
+        key: &str,
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> StoreResult<EraseStats> {
         if key.trim().is_empty() {
             return Err(StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -4121,14 +4139,31 @@ impl TotalStore {
         }
         let mut conn = self.conn.lock().unwrap();
         let tx = Self::write_tx(&mut conn)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO tombstones (scope, key, tombstoned_at) VALUES (?1, ?2, ?3)",
-            params![scope.as_str(), key, now_unix_secs()],
-        )?;
-        let deleted = tx.execute(
-            &format!("DELETE FROM raw_events WHERE {} = ?1", scope.column()),
-            params![key],
-        )?;
+        let mut keys = vec![key.to_string()];
+        if scope == TombstoneScope::ProjectRoot {
+            // `data_keys` 按（来源, 项目根）分组，库里出现过的项目根它都有，且比事件表小几个数量级。
+            let target = crate::attribution::registry_key(key, mounts);
+            let spellings: Vec<String> = tx
+                .prepare("SELECT DISTINCT project_root FROM data_keys WHERE project_root <> ''")?
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            keys.extend(
+                spellings
+                    .into_iter()
+                    .filter(|s| s != key && crate::attribution::registry_key(s, mounts) == target),
+            );
+        }
+        let mut deleted = 0;
+        for k in &keys {
+            tx.execute(
+                "INSERT OR REPLACE INTO tombstones (scope, key, tombstoned_at) VALUES (?1, ?2, ?3)",
+                params![scope.as_str(), k, now_unix_secs()],
+            )?;
+            deleted += tx.execute(
+                &format!("DELETE FROM raw_events WHERE {} = ?1", scope.column()),
+                params![k],
+            )?;
+        }
         let keys_destroyed = tx.execute(
             r#"DELETE FROM data_keys
                 WHERE NOT EXISTS (
@@ -4181,6 +4216,16 @@ impl TotalStore {
     /// 把别的库（别的机器）的删除记录接收进本库：本库没有的，照 [`Self::tombstone`] 记下并删掉
     /// 本库里命中的正文；已有的不动。删除跨库传播（ADR-027）：会话所属的机器经此删掉原文。
     pub fn adopt_tombstones(&self, foreign: &[Tombstone]) -> StoreResult<AdoptStats> {
+        self.adopt_tombstones_covering(foreign, &Vec::new())
+    }
+
+    /// 同 [`Self::adopt_tombstones`]，按项目根的那些照 [`Self::tombstone_covering`] 带挂载表删：
+    /// 本机库里同一目录的别的写法一起删掉。
+    pub fn adopt_tombstones_covering(
+        &self,
+        foreign: &[Tombstone],
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> StoreResult<AdoptStats> {
         let local: HashSet<(TombstoneScope, String)> = self
             .tombstones()?
             .into_iter()
@@ -4192,7 +4237,9 @@ impl TotalStore {
                 stats.already += 1;
                 continue;
             }
-            stats.deleted_events += self.tombstone(t.scope, &t.key)?.deleted_events;
+            stats.deleted_events += self
+                .tombstone_covering(t.scope, &t.key, mounts)?
+                .deleted_events;
             stats.adopted += 1;
         }
         Ok(stats)
@@ -4657,6 +4704,108 @@ mod tests {
     ///
     /// 判例（2026-09-02，真库）：一个 58,786 事件的会话在 `read_sessions` 下**永远
     /// 读不完** —— 每轮都从头取同样的前 N 条，没有任何办法跳过已处理的部分。
+    /// 按项目根删：同一目录的各种写法（规范形与 UNC 写法）一起删、各记一条墓碑，读路径两种都取不到；
+    /// 别的发行版的同名路径不动（TumeChat 2026-10-10 的三条判据）。
+    #[test]
+    fn erasing_a_project_root_covers_every_spelling_of_that_directory() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let put = |session: &str, root: &str| {
+            let evs: Vec<RawEvent> = (0..2)
+                .map(|i| {
+                    let mut e = mk_event(i, session, Some("x"));
+                    e.project_root = Some(root.to_string());
+                    e
+                })
+                .collect();
+            store.append_events(&evs, Projection::Append).unwrap();
+        };
+        put("canon", "wsl:Ubuntu:/home/u/ws/p");
+        put("unc", r"\\wsl.localhost\Ubuntu\home\u\ws\p");
+        put("other", "wsl:Debian:/home/u/ws/p");
+        put("other_unc", r"\\wsl.localhost\Debian\home\u\ws\p");
+
+        let stats = store
+            .tombstone(TombstoneScope::ProjectRoot, "wsl:Ubuntu:/home/u/ws/p")
+            .unwrap();
+        assert_eq!(stats.deleted_events, 4);
+        let mut keys: Vec<String> = store
+            .tombstones()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.key)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                r"\\wsl.localhost\Ubuntu\home\u\ws\p".to_string(),
+                "wsl:Ubuntu:/home/u/ws/p".to_string()
+            ]
+        );
+        let read = |session: &str| {
+            let spec = (
+                "claude_code".to_string(),
+                "local".to_string(),
+                "/p/file.jsonl".to_string(),
+                session.to_string(),
+            );
+            store.read_sessions_resumable(&[spec], 100, None).unwrap()[0]
+                .events
+                .len()
+        };
+        assert_eq!(
+            (read("canon"), read("unc")),
+            (0, 0),
+            "同一目录的写法没删干净"
+        );
+        assert_eq!(
+            (read("other"), read("other_unc")),
+            (2, 2),
+            "别的发行版被误删"
+        );
+        let pulled = store.read_since_page(0, 100).unwrap().events;
+        assert!(pulled
+            .iter()
+            .all(|(_, e)| e.source_session_id.starts_with("other")));
+        assert_eq!(pulled.len(), 4);
+    }
+
+    /// 带上挂载表时，`<盘>:\…` 与 `/mnt/<盘>/…`（含经发行版看的）也是同一目录；不带时不互认。
+    #[test]
+    fn erasing_with_a_mount_table_also_covers_the_drive_spelling() {
+        let mounts: crate::pathnorm::DriveMounts = vec![("/mnt/c".to_string(), "C:".to_string())];
+        for (with_mounts, want_left) in [(true, 0), (false, 2)] {
+            let store = TotalStore::open_in_memory().unwrap();
+            for (session, root) in [
+                ("host", r"C:\Users\u\ws\q"),
+                ("mnt", "/mnt/c/Users/u/ws/q"),
+                ("distro", "wsl:Ubuntu:/mnt/c/Users/u/ws/q"),
+            ] {
+                let evs: Vec<RawEvent> = (0..1)
+                    .map(|i| {
+                        let mut e = mk_event(i, session, Some("x"));
+                        e.project_root = Some(root.to_string());
+                        e
+                    })
+                    .collect();
+                store.append_events(&evs, Projection::Append).unwrap();
+            }
+            let table = if with_mounts {
+                mounts.clone()
+            } else {
+                Vec::new()
+            };
+            store
+                .tombstone_covering(TombstoneScope::ProjectRoot, r"C:\Users\u\ws\q", &table)
+                .unwrap();
+            assert_eq!(
+                store.status().unwrap().count,
+                want_left,
+                "挂载表 = {with_mounts}"
+            );
+        }
+    }
+
     /// 别的库的删除记录：本库没有的记下并删掉命中的正文，已有的不动；重跑什么都不做。
     #[test]
     fn foreign_tombstones_are_adopted_once_and_erase_local_copies() {

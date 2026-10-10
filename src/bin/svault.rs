@@ -2136,7 +2136,14 @@ fn run_erase(
             return 1;
         }
     };
-    match store.tombstone(scope.into(), &key) {
+    // 按项目根删时带上本机挂载表：`<盘>:\…` 与 `/mnt/<盘>/…` 也认成同一目录、一起删。
+    let scope: session_vault::TombstoneScope = scope.into();
+    let mounts = if scope == session_vault::TombstoneScope::ProjectRoot {
+        session_vault::host_drive_mounts()
+    } else {
+        Vec::new()
+    };
+    match store.tombstone_covering(scope, &key, &mounts) {
         Ok(stats) => {
             emit(&Out::EraseSummary {
                 deleted_events: stats.deleted_events,
@@ -2321,6 +2328,9 @@ fn run_stores(store_arg: Option<PathBuf>, replicas_arg: Option<PathBuf>) -> i32 
 struct Erased {
     /// `(scope, key)` → 最早删的那条与它所在的库。
     all: std::collections::BTreeMap<(session_vault::TombstoneScope, String), (i64, Option<String>)>,
+    /// 按项目根删的那些，换成注册表比较键：副本里同一目录的别的写法（UNC / 规范形）也认得出，
+    /// 不必等它所属的机器收下删除记录。不带挂载表 —— 合读不为此起 wsl.exe。
+    root_keys: std::collections::HashSet<String>,
 }
 
 #[cfg(feature = "store")]
@@ -2331,6 +2341,14 @@ impl Erased {
         let mut erased = Self::default();
         for (store_id, store) in stores {
             for t in store.tombstones()? {
+                if t.scope == session_vault::TombstoneScope::ProjectRoot {
+                    erased
+                        .root_keys
+                        .insert(session_vault::attribution::registry_key(
+                            &t.key,
+                            &Vec::new(),
+                        ));
+                }
                 let seen = erased
                     .all
                     .entry((t.scope, t.key))
@@ -2355,7 +2373,10 @@ impl Erased {
 
     /// 一条事件被盖住（它所在的项目根被删了）。
     fn covers_root(&self, project_root: Option<&str>) -> bool {
-        project_root.is_some_and(|root| self.has(session_vault::TombstoneScope::ProjectRoot, root))
+        project_root.is_some_and(|root| {
+            self.root_keys
+                .contains(&session_vault::attribution::registry_key(root, &Vec::new()))
+        })
     }
 
     fn tombstones(&self) -> Vec<session_vault::Tombstone> {
@@ -2452,7 +2473,25 @@ fn run_adopt_erasures(store_arg: Option<PathBuf>, replicas: Option<PathBuf>) -> 
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    let stats = match open_total_store(&store_path).and_then(|s| s.adopt_tombstones(&foreign)) {
+    // 有本机还没有的按项目根删除记录时才取挂载表 —— 取一次要起 wsl.exe，而这条命令每轮同步都跑。
+    let adopted = open_total_store(&store_path).and_then(|store| {
+        let local: std::collections::HashSet<_> = store
+            .tombstones()?
+            .into_iter()
+            .map(|t| (t.scope, t.key))
+            .collect();
+        let new_root = foreign.iter().any(|t| {
+            t.scope == session_vault::TombstoneScope::ProjectRoot
+                && !local.contains(&(t.scope, t.key.clone()))
+        });
+        let mounts = if new_root {
+            session_vault::host_drive_mounts()
+        } else {
+            Vec::new()
+        };
+        store.adopt_tombstones_covering(&foreign, &mounts)
+    });
+    let stats = match adopted {
         Ok(stats) => stats,
         Err(e) => {
             log::error!(target: tag::CLI, "adopt tombstones failed: {e}");
