@@ -1182,11 +1182,19 @@ impl TotalStore {
     /// 消费者身上**，而忘了探不会编译失败，只会安静地建库。
     ///
     /// 三态照 [`Probed`] 的既有语义：`Absent` 是事实（这台机器还没建过总库，常态）；
-    /// `Unknown` 是**没问成**（权限/句柄/UNC/密钥），调用方不得把它当成「没有」。
+    /// `Unknown` 是**没问成**（权限/句柄/UNC/密钥缺失/库比本程序旧/库坏），调用方不得把它当成「没有」。
+    ///
+    /// 走 [`Self::open_read_only`]：只读连接、不跑 `migrate()`。2026-10-10 之前它走的是
+    /// [`Self::open`] —— 文档说「只读」，实际每次都迁移一遍别人正在写的库（QuotaBar 实测一次
+    /// 25–33 ms，只读打开 3–5 ms）。
     ///
     /// ⚠️ 想要「不在就建」的仍然用 [`Self::open`] —— 写入方（扫描器、同步器）本来
     /// 就该建。这里加的是**读**的那一半，不是替换。
     pub fn open_existing(path: &Path) -> Probed<Self> {
+        Self::open_existing_from(path, &KeySource::from_env())
+    }
+
+    pub(crate) fn open_existing_from(path: &Path, source: &KeySource) -> Probed<Self> {
         // 存在性探测走 `probe.rs`，不裸调 `std::fs::metadata` —— 那条边界由
         // `clippy::disallowed_methods` + `verify-agents-md.mjs` 守着，而它在这次
         // 改动里**当场抓到了我**：第一版就是裸调 metadata。
@@ -1195,9 +1203,14 @@ impl TotalStore {
             Probed::Absent => return Probed::Absent,
             Probed::Unknown(e) => return Probed::Unknown(e),
         }
-        match Self::open(path) {
+        let opened = source
+            .load()
+            .map_err(StoreError::from)
+            .and_then(|key| key.ok_or_else(|| CryptoError::MissingKey.into()))
+            .and_then(|key| Self::open_read_only_with_key(path, key));
+        match opened {
             Ok(store) => Probed::Found(store),
-            // 文件在、却打不开 —— 密钥缺失 / 库损坏 / 权限。这**不是**「没有总库」。
+            // 文件在、却打不开 —— 密钥缺失 / 库比本程序旧 / 库损坏 / 权限。这**不是**「没有总库」。
             Err(e) => Probed::Unknown(crate::probe::ProbeError::new(path, e)),
         }
     }
@@ -5242,6 +5255,48 @@ mod tests {
         assert!(fresh.load().unwrap().is_none(), "打不开库的钥匙被装上了");
         std::fs::remove_dir_all(dir_a).unwrap();
         std::fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    /// 打开的是只读的：读得出，写不进；库比本程序旧时不替写入方迁移，而是报 `Unknown`；
+    /// 钥匙不在也是 `Unknown`（不是「没有总库」，也不新建钥匙）。
+    #[test]
+    fn open_existing_is_read_only_and_never_migrates() {
+        let (dir, db, key) = key_file_store("existing-ro");
+        let source = KeySource::File(key);
+        let Probed::Found(store) = TotalStore::open_existing_from(&db, &source) else {
+            panic!("库在、钥匙在，却没打开");
+        };
+        assert_eq!(store.read_latest_snapshots().unwrap().len(), 1);
+        assert!(store.set_backfilled(true).is_err(), "只读打开却写进去了");
+        drop(store);
+
+        let has_log = || {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'projection_log'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch("DROP TABLE projection_log;")
+            .unwrap();
+        assert!(matches!(
+            TotalStore::open_existing_from(&db, &source),
+            Probed::Unknown(_)
+        ));
+        assert_eq!(has_log(), 0, "打开时替写入方迁移了库");
+
+        let no_key = KeySource::File(dir.join("absent.key"));
+        assert!(matches!(
+            TotalStore::open_existing_from(&db, &no_key),
+            Probed::Unknown(_)
+        ));
+        assert!(!dir.join("absent.key").exists(), "打开时新建了钥匙");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // ── 换钥 ─────────────────────────────────────────────────────────────────────
