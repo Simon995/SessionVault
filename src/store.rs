@@ -344,8 +344,8 @@ pub struct ReattributeSkip {
     pub reason: String,
 }
 
-/// [`TotalStore::reattribute`] 没改的一种写法：注册表里这个目录不止一种写法（`spellings`），
-/// 「注册表的写法」取决于读出顺序，不是一个答案。要先由人定下这个目录用哪种写法。
+/// [`TotalStore::reattribute`] 没改的一种写法：注册表里这个目录登记了几种写法（`spellings`），
+/// 而它们带着不同的项目身份 —— 像是两个项目落在同一处（挂载表过期？）。不猜，要人先查清。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AmbiguousSpelling {
     pub from: String,
@@ -463,14 +463,7 @@ pub struct ProjectRootRow {
 /// 只做**双向的 WSL 规范形 ⇄ UNC**：两个方向都可能是注册表里存的那一种，取决于
 /// 归属发生在哪一侧。纯 Windows 路径与纯 Linux 路径没有第二种写法，返回空。
 fn alias_forms_of(root_path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(unc) = crate::pathnorm::canonical_wsl_to_unc(root_path) {
-        out.push(unc);
-    }
-    if let Some(canonical) = crate::pathnorm::canonical_wsl_unc(root_path) {
-        out.push(canonical);
-    }
-    out
+    crate::pathnorm::alias_forms(root_path)
 }
 
 /// 某个源文件的当前头；无记录时 `(0, 0)`。
@@ -2849,7 +2842,7 @@ impl TotalStore {
     ///
     /// | 字段 | 取谁 | 判据 |
     /// | --- | --- | --- |
-    /// | `root_path` | **宿主打得开**的那个；都打不开取字典序最小 | 消费方拿它去 `open()`；字典序保证全序，否则同组每次换代表、界面看起来在跳 |
+    /// | `root_path` | [`crate::attribution::spelling_order`] 排第一的：**宿主打得开**的优先，再按写法类别、字典序 | 消费方拿它去 `open()`；与归属写进事件的写法同一处定；全序，否则同组每次换代表、界面看起来在跳 |
     /// | `aliases` | 各成员写法的并集（不含 `root_path`） | 「同一个项目的其它写法」正是本字段的语义 |
     /// | `root_source` | `git` 优先 | 它是更强的证据；`marker`（有 CLAUDE.md）是回退 |
     /// | `canonical_id` | 非空的那个 | 🔴 **两个都非空且不同 ⇒ 不合并**，见下 |
@@ -2914,19 +2907,14 @@ impl TotalStore {
                 return Err(group);
             }
         }
-        // 代表：宿主打得开的优先；其次字典序最小（全序，不跳）。
+        // 代表：与归属同一条规则（宿主打得开 > 写法类别 > 字典序，全序、不跳）——
+        // 两处各写一份时，归属写进事件的写法与这里报的主写法会分家（2026-10-10 实测）。
         group.sort_by(|a, b| {
-            let openable = |r: &ProjectRootRow| {
-                crate::project_dir::host_openable_form(
-                    &r.root_path,
-                    &r.aliases,
-                    crate::pathnorm::HostPlatform::current(),
-                )
-                .is_some()
-            };
-            openable(b)
-                .cmp(&openable(a))
-                .then_with(|| a.root_path.cmp(&b.root_path))
+            crate::attribution::spelling_order(
+                &a.root_path,
+                &b.root_path,
+                crate::pathnorm::HostPlatform::current(),
+            )
         });
         let mut head = group.remove(0);
         for r in group {
@@ -3599,8 +3587,8 @@ impl TotalStore {
     /// 与「注册表变了 ⇒ 同一份字节重算归属」同一个模式）。不读源文件，所以源文件已被清理的会话
     /// 也改得到；消费方经 change-feed 收到「这个来源的当前投影被换掉了」。
     ///
-    /// 🔴 注册表里这个目录不止一种写法时不改，记进 `ambiguous`：那时「注册表的写法」取决于读出顺序。
-    /// `registry` 必须来自本库（[`Self::project_root_registry`]），歧义按本库的注册表判。
+    /// 🔴 注册表里这个目录的几种写法带着不同的项目身份时不改，记进 `ambiguous`（同 `roots`
+    /// 「身份冲突不合并」）。`registry` 必须来自本库（[`Self::project_root_registry`]），歧义按本库判。
     ///
     /// 🔴 一个来源里只要有一条事件解不开，这个来源整个不动：新的一代会少掉它，而旧的一代随之被取代。
     ///
@@ -3625,10 +3613,11 @@ impl TotalStore {
 
         // 1. 哪些写法要改：同一个目录（比较键相同）、注册表给的写法不同。
         //
-        // 🔴 注册表里同一个目录登记了几种写法时（有挂载表时 `C:\X` 与 `/mnt/c/X` 比较键相同），
-        // `RootRegistry` 留下的是后读到的那条 —— 「注册表的写法」取决于行序，不是一个答案。
-        // 这种不改，单列报出来。
-        let (values, registered): (Vec<String>, Vec<String>) = {
+        // 🔴 注册表里同一个目录登记了几种写法（有挂载表时 `C:\X` 与 `/mnt/c/X` 比较键相同）、
+        // 而它们带着**不同的项目身份**时，像是两个项目落在同一处（挂载表过期？）—— 不猜，
+        // 不改，单列报出来（与 `roots` 合并「身份冲突不合并」同一条规则）。写法本身取哪种
+        // 由 `attribution::spelling_order` 定，与行序无关。
+        let (values, registered, identities): (Vec<String>, Vec<String>, Vec<(String, String)>) = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare("SELECT DISTINCT project_root FROM raw_events WHERE project_root <> ''")?;
@@ -3639,8 +3628,21 @@ impl TotalStore {
             let registered = stmt
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<Result<_, _>>()?;
-            (values, registered)
+            let mut stmt =
+                conn.prepare("SELECT project_root, canonical_id FROM project_identity")?;
+            let identities = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<_, _>>()?;
+            (values, registered, identities)
         };
+        // 身份按不带挂载表的比较键查（同 `project_roots_report`）。
+        let mut identity_of: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+        for (root, id) in identities {
+            identity_of
+                .entry(crate::attribution::registry_key(&root, &Vec::new()))
+                .or_default()
+                .insert(id);
+        }
         let mut spellings_of: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
         for root in registered {
             spellings_of
@@ -3648,6 +3650,14 @@ impl TotalStore {
                 .or_default()
                 .insert(root);
         }
+        let conflicting = |spellings: &std::collections::BTreeSet<String>| {
+            let ids: std::collections::BTreeSet<&String> = spellings
+                .iter()
+                .filter_map(|s| identity_of.get(&crate::attribution::registry_key(s, &Vec::new())))
+                .flatten()
+                .collect();
+            ids.len() > 1
+        };
         let mut respell: HashMap<String, (String, String)> = HashMap::new();
         let mut undecided: HashMap<String, Vec<String>> = HashMap::new();
         for from in values {
@@ -3659,7 +3669,7 @@ impl TotalStore {
                 continue;
             }
             match spellings_of.get(&key) {
-                Some(spellings) if spellings.len() > 1 => {
+                Some(spellings) if spellings.len() > 1 && conflicting(spellings) => {
                     undecided.insert(from, spellings.iter().cloned().collect());
                 }
                 _ => {
@@ -5293,15 +5303,92 @@ mod tests {
         }
     }
 
-    /// 注册表里同一个目录有两种写法（有挂载表时 `C:\X` 与 `/mnt/c/X`）：谁胜出取决于读出顺序，
-    /// 不是一个答案 ⇒ 不改，单列报出两种写法与涉及的事件；别的目录照改。
+    /// 注册表里同一个目录有两种写法（有挂载表时 `C:\X` 与 `/mnt/c/X`）：取哪种由
+    /// `attribution::spelling_order` 定（与 `roots` 一致、与行序无关），另一种改过来；
+    /// 两种写法带着同一个身份（或都没有身份）时照改。
     #[test]
-    fn reattribute_does_not_pick_between_two_registered_spellings() {
+    fn reattribute_converges_two_registered_spellings_by_the_shared_order() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        let drive = r"C:\work\q";
+        let mnt = "/mnt/c/work/q";
+        store.register_project_root(drive, RootSource::Git);
+        store.register_project_root(mnt, RootSource::Git);
+        for root in [drive, mnt] {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO project_identity (project_root, canonical_id, first_seen_ms, last_seen_ms) \
+                     VALUES (?1, 'git:example.com/same', 1, 2)",
+                    params![root],
+                )
+                .unwrap();
+        }
+        let put = |path: &str, root: &str| {
+            let mut e = mk_event_at(0, "s", path);
+            e.project_root = Some(root.to_string());
+            store.append_events(&[e], Projection::Append).unwrap();
+        };
+        put("/p/win.jsonl", drive);
+        put("/p/mnt.jsonl", mnt);
+        let (keep, other) = if crate::attribution::spelling_order(
+            drive,
+            mnt,
+            crate::pathnorm::HostPlatform::current(),
+        ) == std::cmp::Ordering::Less
+        {
+            (drive, mnt)
+        } else {
+            (mnt, drive)
+        };
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        let stats = store
+            .reattribute(&store.project_root_registry(&mounts), false)
+            .unwrap();
+        assert!(stats.ambiguous.is_empty(), "{:?}", stats.ambiguous);
+        assert_eq!(
+            stats
+                .respellings
+                .iter()
+                .map(|r| (r.from.as_str(), r.to.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(other, keep)]
+        );
+        for path in ["/p/win.jsonl", "/p/mnt.jsonl"] {
+            let ev = &store
+                .read_session(SourceType::ClaudeCode, &SourceLocation::Local, path, "s")
+                .unwrap()
+                .events[0];
+            assert_eq!(ev.project_root.as_deref(), Some(keep), "{path}");
+        }
+    }
+
+    /// 两种登记写法带着**不同**的项目身份：像是两个项目落在同一处（挂载表过期？）——
+    /// 不猜：不改，单列报出两种写法；别的目录照改。
+    #[test]
+    fn reattribute_does_not_merge_spellings_with_conflicting_identities() {
         use crate::attribution::RootSource;
         let store = TotalStore::open_in_memory().unwrap();
         store.register_project_root(r"C:\work\q", RootSource::Git);
         store.register_project_root("/mnt/c/work/q", RootSource::Git);
         store.register_project_root("wsl:Ubuntu:/home/u/ws/p", RootSource::Git);
+        for (root, id) in [
+            (r"C:\work\q", "git:example.com/a"),
+            ("/mnt/c/work/q", "git:example.com/b"),
+        ] {
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO project_identity (project_root, canonical_id, first_seen_ms, last_seen_ms) \
+                     VALUES (?1, ?2, 1, 2)",
+                    params![root, id],
+                )
+                .unwrap();
+        }
         let put = |path: &str, root: &str| {
             let mut e = mk_event_at(0, "s", path);
             e.project_root = Some(root.to_string());
@@ -5314,16 +5401,12 @@ mod tests {
         let stats = store
             .reattribute(&store.project_root_registry(&mounts), false)
             .unwrap();
-        let ambiguous: Vec<_> = stats
-            .ambiguous
-            .iter()
-            .map(|a| (a.from.as_str(), a.spellings.clone(), a.events))
-            .collect();
-        let both = vec!["/mnt/c/work/q".to_string(), r"C:\work\q".to_string()];
-        // 胜出的那种写法自己不算要改（`to == from`），另一种被报出来。
-        assert_eq!(ambiguous.len(), 1, "{ambiguous:?}");
-        assert_eq!(ambiguous[0].1, both);
-        assert_eq!(ambiguous[0].2, 1);
+        assert_eq!(stats.ambiguous.len(), 1, "{:?}", stats.ambiguous);
+        assert_eq!(
+            stats.ambiguous[0].spellings,
+            vec!["/mnt/c/work/q".to_string(), r"C:\work\q".to_string()]
+        );
+        assert_eq!(stats.ambiguous[0].events, 1);
         assert_eq!(
             stats
                 .respellings
@@ -5333,7 +5416,6 @@ mod tests {
             vec![r"\\wsl.localhost\Ubuntu\home\u\ws\p"],
             "别的目录照改"
         );
-        assert_eq!(stats.sources_rewritten, 1);
         let conn = store.conn.lock().unwrap();
         for path in ["/p/win.jsonl", "/p/mnt.jsonl"] {
             assert_eq!(

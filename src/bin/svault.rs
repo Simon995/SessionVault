@@ -180,7 +180,7 @@ enum Command {
     /// 受影响的来源各写一代新投影（不读源文件），消费方经 `changes` 收到替换。只改写法、不改归属。
     ///
     /// 默认只预览（只读打开，不迁移）；`--apply` 才写，写之前要确认没有别的进程开着库
-    /// （先退出 QuotaBar / TumeFlow）。注册表里同一个目录不止一种写法的不改，单列报出；
+    /// （先退出 QuotaBar / TumeFlow）。同一个目录的几种登记写法带着不同项目身份的不改，单列报出；
     /// 有这种写法或有来源没改成时退出码为 2，逐个列出。
     #[cfg(feature = "store")]
     Reattribute {
@@ -813,7 +813,7 @@ enum Out<'a> {
         events: u64,
         sources: u64,
     },
-    /// `reattribute` 没改的写法，每种一行：注册表里这个目录不止一种写法（`spellings`），要人先定用哪种。
+    /// `reattribute` 没改的写法，每种一行：注册表里这个目录的几种写法（`spellings`）带着不同的项目身份，不猜。
     #[cfg(feature = "store")]
     ReattributeAmbiguous {
         from: String,

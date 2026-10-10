@@ -115,6 +115,29 @@ pub fn canonical_wsl_to_unc(path: &str) -> Option<String> {
     Some(format!("\\\\wsl.localhost\\{distro}\\{windows_tail}"))
 }
 
+/// 同一条路径不需要挂载表就推得出的其它写法：规范形 ⇄ UNC。
+///
+/// `/mnt/<盘>/…` 那一族要挂载表（[`mnt_to_windows`]），不在这里 —— 取不到表时按盘符猜就是编造。
+pub fn alias_forms(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(unc) = canonical_wsl_to_unc(path) {
+        out.push(unc);
+    }
+    if let Some(canonical) = canonical_wsl_unc(path) {
+        out.push(canonical);
+    }
+    out
+}
+
+/// `X:\…` / `X:/…` / `X:` —— Windows 盘符写法。
+pub fn is_windows_drive_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || b[2] == b'\\' || b[2] == b'/')
+}
+
 #[cfg(test)]
 // 测试要造 fixture（建目录、写文件、再核一遍），允许直接碰盘 —— 文件系统边界
 // 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
