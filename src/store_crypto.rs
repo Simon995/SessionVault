@@ -20,6 +20,9 @@ pub enum CryptoError {
     MissingKey,
     #[error("key file {0}")]
     KeyFile(String),
+    /// 本机已经有另一把主密钥：装上新的会让旧钥匙加密的数据再也打不开。换钥还没做。
+    #[error("this machine already has a different total-store key; importing would orphan data encrypted under it (re-keying is not supported yet)")]
+    KeyConflict,
     #[error("invalid total-store key")]
     InvalidKey,
     #[error("OS keychain: {0}")]
@@ -59,6 +62,14 @@ impl StoreKey {
 
     pub fn from_encoded(value: &str) -> Result<Self, CryptoError> {
         Self::decode(value)
+    }
+
+    pub(crate) fn same_as(&self, other: &StoreKey) -> bool {
+        *self.0 == *other.0
+    }
+
+    pub(crate) fn duplicate(&self) -> StoreKey {
+        Self(Zeroizing::new(*self.0))
     }
 }
 
@@ -240,20 +251,25 @@ impl KeySource {
     }
 
     pub(crate) fn create(&self) -> Result<StoreKey, CryptoError> {
+        let key = StoreKey::generate();
+        self.install(&key)?;
+        Ok(key)
+    }
+
+    /// 把给定的钥匙放进这个来源。文件来源只新建、不覆盖；密钥链来源由调用方先确认里面没有别的钥匙。
+    pub(crate) fn install(&self, key: &StoreKey) -> Result<(), CryptoError> {
         match self {
-            Self::OsKeychain => create_os_key(),
-            Self::File(path) => {
-                let key = StoreKey::generate();
-                crate::probe::create_private_file(path, key.encode())
-                    .map_err(|e| CryptoError::KeyFile(format!("{}: {e}", path.display())))?;
-                Ok(key)
-            }
+            Self::OsKeychain => keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .and_then(|entry| entry.set_password(&key.encode()))
+                .map_err(|e| CryptoError::Keychain(e.to_string())),
+            Self::File(path) => crate::probe::create_private_file(path, key.encode())
+                .map_err(|e| CryptoError::KeyFile(format!("{}: {e}", path.display()))),
         }
     }
 }
 
 /// 文件不在是 `Ok(None)`；对组或其他用户开放了权限就拒绝，不读。
-fn load_key_file(path: &std::path::Path) -> Result<Option<StoreKey>, CryptoError> {
+pub(crate) fn load_key_file(path: &std::path::Path) -> Result<Option<StoreKey>, CryptoError> {
     use crate::probe::Probed;
     let refuse = |why: String| CryptoError::KeyFile(format!("{}: {why}", path.display()));
     match crate::probe::open_to_others(path) {
@@ -277,14 +293,4 @@ pub(crate) fn load_os_key() -> Result<Option<StoreKey>, CryptoError> {
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(CryptoError::Keychain(e.to_string())),
     }
-}
-
-pub(crate) fn create_os_key() -> Result<StoreKey, CryptoError> {
-    let key = StoreKey::generate();
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| CryptoError::Keychain(e.to_string()))?;
-    entry
-        .set_password(&key.encode())
-        .map_err(|e| CryptoError::Keychain(e.to_string()))?;
-    Ok(key)
 }
