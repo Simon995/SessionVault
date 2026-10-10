@@ -1117,7 +1117,6 @@ fn main() {
     std::process::exit(code);
 }
 
-#[cfg(feature = "store")]
 /// 枚举 Class-B 来源并同步进总库。
 ///
 /// 判据与 `run_snapshots`（读侧）一致：**先把「没问成」说出来，再报数字**。
