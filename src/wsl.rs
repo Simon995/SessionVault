@@ -607,6 +607,106 @@ fn parse_stat_many(
         .collect()
 }
 
+/// [`read_many`] 读到的一个文件：全文与读它那一刻的 mtime。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRead {
+    pub bytes: Vec<u8>,
+    pub mtime: i64,
+}
+
+/// [`read_many`] 对一条路径的答案：`Ok(Some)` 读到了，`Ok(None)` 确认不是普通文件（含不存在），
+/// `Err` 这一条没在批里读（超过上限、读失败）—— 调用方退回单独读。
+pub type ReadAnswer = Result<Option<FileRead>, String>;
+
+/// 单个文件超过它就不在批里读，留给调用方单独读。
+pub const READ_MANY_MAX_EACH: u64 = 8 * 1024 * 1024;
+/// 一批累计超过它，余下的文件不在批里读。
+pub const READ_MANY_MAX_TOTAL: u64 = 32 * 1024 * 1024;
+
+/// 一次 `wsl.exe` 读完一批文件的全文与 mtime。
+///
+/// 快照文件每轮都要整份读来比对内容；逐个读时每个文件一次 `wsl.exe`（本机实测 319 个约
+/// 60 s）。内容经 `base64` 传回，文件里的任意字节都不会打乱分隔。每条请求的路径都有答案；
+/// 整批没读成返回外层 `Err`。
+#[cfg(windows)]
+pub fn read_many(
+    distro: &str,
+    paths: &[String],
+    deadline: crate::deadline::Deadline,
+) -> Result<std::collections::HashMap<String, ReadAnswer>, String> {
+    if paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut script = String::from("T=0\n");
+    for path in paths {
+        let esc = shell_escape(path);
+        script.push_str(&format!(
+            "F=\"{esc}\"\n\
+             if [ ! -f \"$F\" ]; then printf 'M\\t%s\\0' \"$F\"\n\
+             elif set -- $(stat -c '%s %Y' -- \"$F\" 2>/dev/null) && [ -n \"${{2:-}}\" ]; then\n\
+             T=$((T + $1))\n\
+             if [ \"$1\" -gt {READ_MANY_MAX_EACH} ] || [ \"$T\" -gt {READ_MANY_MAX_TOTAL} ]; then printf 'B\\t%s\\0' \"$F\"\n\
+             else printf 'F\\t%s\\t%s\\t' \"$2\" \"$F\"; base64 -w0 -- \"$F\" || printf '!'; printf '\\0'; fi\n\
+             fi\n"
+        ));
+    }
+    let out = run_bash_stdin(distro, &script, deadline)?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl read_many {distro} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_read_many(&out.stdout, paths))
+}
+
+/// 解析 [`read_many`] 的输出：`M\t<路径>\0` 不是普通文件，`B\t<路径>\0` 超过上限，
+/// `F\t<mtime>\t<路径>\t<base64>\0` 读到了。路径里带制表符也认得出（mtime 在前、base64 在后）。
+#[cfg(any(windows, test))]
+fn parse_read_many(
+    bytes: &[u8],
+    requested: &[String],
+) -> std::collections::HashMap<String, ReadAnswer> {
+    use base64::Engine;
+    let mut answers = std::collections::HashMap::new();
+    for record in bytes.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let text = String::from_utf8_lossy(record);
+        if let Some(path) = text.strip_prefix("M\t") {
+            answers.insert(path.to_string(), Ok(None));
+        } else if let Some(path) = text.strip_prefix("B\t") {
+            answers.insert(
+                path.to_string(),
+                Err("larger than the batch read limit".to_string()),
+            );
+        } else if let Some(rest) = text.strip_prefix("F\t") {
+            let Some((mtime, rest)) = rest.split_once('\t') else {
+                continue;
+            };
+            let Some((path, encoded)) = rest.rsplit_once('\t') else {
+                continue;
+            };
+            let answer = match (
+                mtime.parse::<i64>(),
+                base64::engine::general_purpose::STANDARD.decode(encoded),
+            ) {
+                (Ok(mtime), Ok(bytes)) => Ok(Some(FileRead { bytes, mtime })),
+                _ => Err(format!("wsl read_many {path}: bad record")),
+            };
+            answers.insert(path.to_string(), answer);
+        }
+    }
+    requested
+        .iter()
+        .map(|p| {
+            let answer = answers
+                .remove(p)
+                .unwrap_or_else(|| Err(format!("wsl read_many: no answer for {p}")));
+            (p.clone(), answer)
+        })
+        .collect()
+}
+
 /// 发行版内一条路径上**有什么东西**。
 ///
 /// 🔴 **与 [`stat`] 的分工是「问什么」，不是「怎么问」。** 那个问 `[ -f ]` ——
@@ -714,6 +814,12 @@ stub_on_non_windows! {
         paths: &[String],
         deadline: crate::deadline::Deadline,
     ) -> Result<std::collections::HashMap<String, StatAnswer>, String>;
+
+    pub fn read_many(
+        distro: &str,
+        paths: &[String],
+        deadline: crate::deadline::Deadline,
+    ) -> Result<std::collections::HashMap<String, ReadAnswer>, String>;
 
     pub fn find_project_root(
         distro: &str,
@@ -1057,6 +1163,49 @@ mod tests {
         );
         assert!(parse_nul_paths(b"").is_empty());
         assert!(parse_nul_paths(b"\0\0").is_empty());
+    }
+
+    /// 每条请求的路径都有答案：读到了 / 不是普通文件 / 超过上限 / 没读成（坏记录、输出里没有它）。
+    /// 内容是任意字节（含 NUL、制表符），路径里带制表符也认得出。
+    #[test]
+    fn parse_read_many_answers_every_requested_path() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        let requested: Vec<String> = [
+            "/a/CLAUDE.md",
+            "/b/gone.md",
+            "/c/huge.jsonl",
+            "/d/t\tab.md",
+            "/e/bad.md",
+            "/f/silent.md",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut out = Vec::new();
+        out.extend(format!("F\t1700000000\t/a/CLAUDE.md\t{}\0", b64(b"# hi\n\0\tx")).bytes());
+        out.extend(b"M\t/b/gone.md\0B\t/c/huge.jsonl\0");
+        out.extend(format!("F\t1700000001\t/d/t\tab.md\t{}\0", b64(b"tab")).bytes());
+        out.extend(b"F\t1700000002\t/e/bad.md\tnot base64!\0");
+        let answers = parse_read_many(&out, &requested);
+        assert_eq!(answers.len(), requested.len());
+        assert_eq!(
+            answers["/a/CLAUDE.md"],
+            Ok(Some(FileRead {
+                bytes: b"# hi\n\0\tx".to_vec(),
+                mtime: 1_700_000_000
+            }))
+        );
+        assert_eq!(answers["/b/gone.md"], Ok(None));
+        assert!(answers["/c/huge.jsonl"].is_err(), "超过上限不是「不在」");
+        assert_eq!(
+            answers["/d/t\tab.md"],
+            Ok(Some(FileRead {
+                bytes: b"tab".to_vec(),
+                mtime: 1_700_000_001
+            }))
+        );
+        assert!(answers["/e/bad.md"].is_err(), "坏记录不是答案");
+        assert!(answers["/f/silent.md"].is_err(), "输出里没有 ≠ 不在");
     }
 
     /// 每条请求的路径都有答案：有 / 确认不是普通文件 / 没问成（坏记录、输出里没有它）。

@@ -37,7 +37,7 @@ pub fn scan_source(
                 scan_append_log_observed(source, cursor_in, None, profile, roots, deadline);
             obs.into_scan_result(report)
         }
-        SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile),
+        SourceMode::SnapshotFile => scan_snapshot_file(source, cursor_in, profile, None),
         SourceMode::SqliteStore | SourceMode::OpaqueFamily => scan_unimplemented(source, cursor_in),
     }
 }
@@ -227,10 +227,71 @@ pub(crate) fn snapshot_mtime(source: &SourceRef) -> Option<i64> {
     }
 }
 
+/// 一轮开始时按发行版批量读到的 WSL 快照文件，喂给 [`scan_snapshot_prefetched`]。
+///
+/// 快照每轮都要整份读来比对内容；逐个读时每个文件一次 `wsl.exe`（本机实测 319 个约 60 s），
+/// 批量读时每个发行版一次。只改怎么读：读到的字节、UTF-8 校验、内容比对与逐个读时一样。
+#[derive(Debug, Default)]
+pub struct SnapshotPrefetch {
+    reads: std::collections::HashMap<(String, String), crate::wsl::ReadAnswer>,
+}
+
+impl SnapshotPrefetch {
+    /// 给这批来源里 WSL 上的快照来源预读，每个发行版一次。整批没读成的发行版不留答案，照旧逐个读。
+    pub fn for_sources(sources: &[SourceRef], deadline: crate::deadline::Deadline) -> Self {
+        let mut by_distro: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for s in sources {
+            if let (SourceMode::SnapshotFile, SourceLocation::Wsl(distro)) =
+                (s.source_mode, &s.source_location)
+            {
+                by_distro
+                    .entry(distro)
+                    .or_default()
+                    .push(s.path.to_string_lossy().into_owned());
+            }
+        }
+        let mut reads = std::collections::HashMap::new();
+        for (distro, paths) in by_distro {
+            match crate::wsl::read_many(distro, &paths, deadline) {
+                Ok(batch) => reads.extend(
+                    batch
+                        .into_iter()
+                        .map(|(path, answer)| ((distro.to_string(), path), answer)),
+                ),
+                Err(e) => log::warn!(
+                    target: tag::WSL,
+                    "batch read failed for {distro} ({} snapshots fall back to one wsl.exe each): {e}",
+                    paths.len()
+                ),
+            }
+        }
+        Self { reads }
+    }
+
+    fn get(&self, source: &SourceRef) -> Option<&crate::wsl::ReadAnswer> {
+        let SourceLocation::Wsl(distro) = &source.source_location else {
+            return None;
+        };
+        self.reads
+            .get(&(distro.clone(), source.path.to_string_lossy().into_owned()))
+    }
+}
+
+/// 快照来源的扫描，但 WSL 文件先查 `prefetch`：批里读到了就不再起 `wsl.exe`。
+pub fn scan_snapshot_prefetched(
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    profile: Profile,
+    prefetch: &SnapshotPrefetch,
+) -> ScanResult {
+    scan_snapshot_file(source, cursor_in, profile, prefetch.get(source))
+}
+
 fn scan_snapshot_file(
     source: &SourceRef,
     cursor_in: Option<Cursor>,
     profile: Profile,
+    prefetched: Option<&crate::wsl::ReadAnswer>,
 ) -> ScanResult {
     use sha2::{Digest, Sha256};
 
@@ -242,13 +303,27 @@ fn scan_snapshot_file(
         cursor_kind: Some(CursorKind::Fingerprint),
         ..Default::default()
     };
-    let read = match &source.source_location {
-        SourceLocation::Local => match crate::probe::read_bytes(&source.path, None) {
+    let batch_mtime = match prefetched {
+        Some(Ok(Some(file))) => Some(file.mtime),
+        _ => None,
+    };
+    let read = match (&source.source_location, prefetched) {
+        (SourceLocation::Local, _) => match crate::probe::read_bytes(&source.path, None) {
             crate::probe::Probed::Found(v) => Ok(v),
             crate::probe::Probed::Absent => Err("snapshot file disappeared".to_string()),
             crate::probe::Probed::Unknown(e) => Err(e.to_string()),
         },
-        SourceLocation::Wsl(distro) => crate::wsl::read_file_at(
+        // 与 `read_file_at` 同一条规矩：不是合法 UTF-8 就是没读成。
+        (SourceLocation::Wsl(distro), Some(Ok(Some(file)))) => std::str::from_utf8(&file.bytes)
+            .map(|_| file.bytes.clone())
+            .map_err(|e| {
+                format!(
+                    "wsl read {distro}:{} not valid UTF-8: {e}",
+                    report.source_path
+                )
+            }),
+        (SourceLocation::Wsl(_), Some(Ok(None))) => Err("snapshot file disappeared".to_string()),
+        (SourceLocation::Wsl(distro), Some(Err(_)) | None) => crate::wsl::read_file_at(
             distro,
             &source.path.to_string_lossy(),
             crate::deadline::Deadline::unbounded(),
@@ -305,7 +380,9 @@ fn scan_snapshot_file(
     // 🔴 **问不到就是 `None`，不折进任何一个值。** 三条路径各自可能失败
     // （本机 stat 报 Unknown / WSL 桥不可用 / 非 Windows 构建没有那座桥），
     // 而「没问出来」与「这个文件没有 mtime」在下游的处置不同。
-    let modified_at = snapshot_mtime(source).map(|s| s.to_string());
+    let modified_at = batch_mtime
+        .or_else(|| snapshot_mtime(source))
+        .map(|s| s.to_string());
     let event = RawEvent {
         schema_version: SCHEMA_VERSION,
         source_type: source.source_type,
@@ -1658,6 +1735,182 @@ mod tests {
         assert_eq!(obs.source_change, SourceChange::RollbackOrRewrite);
         assert_eq!(obs.events.len(), 1, "{:?}", obs.quality);
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // ── 快照预读（SnapshotPrefetch）：同样用不存在的发行版，退回逐个读必然读不成。─────────
+
+    const SNAPSHOT_PATH: &str = "/home/u/.claude/CLAUDE.md";
+
+    fn wsl_snapshot() -> SourceRef {
+        SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Wsl(NO_SUCH_DISTRO.into()),
+            source_mode: SourceMode::SnapshotFile,
+            path: PathBuf::from(SNAPSHOT_PATH),
+            project_root: None,
+            artifact_kind: Some("instruction".into()),
+        }
+    }
+
+    fn snapshot_with(
+        answer: crate::wsl::ReadAnswer,
+        cursor: Option<crate::cursor::Cursor>,
+    ) -> crate::cursor::ScanResult {
+        let mut prefetch = super::SnapshotPrefetch::default();
+        prefetch
+            .reads
+            .insert((NO_SUCH_DISTRO.into(), SNAPSHOT_PATH.into()), answer);
+        super::scan_snapshot_prefetched(&wsl_snapshot(), cursor, Profile::Full, &prefetch)
+    }
+
+    fn file(bytes: &[u8]) -> crate::wsl::ReadAnswer {
+        Ok(Some(crate::wsl::FileRead {
+            bytes: bytes.to_vec(),
+            mtime: 1_700_000_000,
+        }))
+    }
+
+    /// 批里读到了：发一版快照，内容与 mtime 都取自批，不再单独读、单独 stat；
+    /// 内容没变时不发。
+    #[test]
+    fn a_prefetched_snapshot_is_scanned_without_a_wsl_call() {
+        let res = snapshot_with(file(b"# rules\n"), None);
+        assert_eq!(res.status, ScanStatus::Ok, "{:?}", res.report.warnings);
+        assert_eq!(res.events.len(), 1);
+        assert_eq!(res.events[0].modified_at.as_deref(), Some("1700000000"));
+
+        let res = snapshot_with(file(b"# rules\n"), Some(res.cursor_out));
+        assert_eq!(res.status, ScanStatus::Ok);
+        assert!(res.events.is_empty(), "内容没变却又发了一版");
+
+        let control = super::scan_snapshot_prefetched(
+            &wsl_snapshot(),
+            None,
+            Profile::Full,
+            &super::SnapshotPrefetch::default(),
+        );
+        assert_eq!(
+            control.status,
+            ScanStatus::Error,
+            "对照失效：没有预读时应当单独去读、并且读不成"
+        );
+    }
+
+    /// 批里确认不在：照逐个读时的说法报「消失」；批里没读成：单独再读；不是 UTF-8：与逐个读一样算没读成。
+    #[test]
+    fn snapshot_batch_answers_keep_the_per_file_semantics() {
+        let res = snapshot_with(Ok(None), None);
+        assert_eq!(res.status, ScanStatus::Error);
+        assert!(
+            res.report
+                .warnings
+                .iter()
+                .any(|w| w.contains("disappeared")),
+            "{:?}",
+            res.report.warnings
+        );
+
+        let batch_error = "batch could not read this one";
+        let res = snapshot_with(Err(batch_error.into()), None);
+        assert_eq!(res.status, ScanStatus::Error);
+        assert!(
+            !res.report.warnings.iter().any(|w| w.contains(batch_error)),
+            "没有单独再读，直接把批量的错误当了答案：{:?}",
+            res.report.warnings
+        );
+
+        // 逐个读时不是 UTF-8 就读失败 —— 哪怕内容与上一版相同（不走到比对那一步）。
+        let not_utf8 = [0xff, 0xfe, b'x'];
+        let mut cursor = crate::cursor::Cursor::new_fingerprint();
+        cursor.content_hash = Some(format!(
+            "sha256:{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(not_utf8)
+        ));
+        let res = snapshot_with(file(&not_utf8), Some(cursor));
+        assert_eq!(
+            res.status,
+            ScanStatus::Error,
+            "批量读放过了不是 UTF-8 的内容"
+        );
+        assert!(res.events.is_empty());
+    }
+
+    /// 实机：快照预读每个发行版一次 `wsl.exe`，结果与逐个读一致；超过单文件上限的照旧单独读。
+    /// 需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，单独跑（`--test-threads=1`）。
+    #[test]
+    #[cfg(windows)]
+    fn snapshot_prefetch_reads_a_distro_in_one_call_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let distro = crate::wsl::list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| crate::wsl::is_user_distro(d))
+            .expect("need a user distro");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("svault-it-snapshots-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let win = dir.to_string_lossy().into_owned();
+        let (drive, rest) = win.split_once(":\\").expect("drive-letter temp dir");
+        let mnt = format!("/mnt/{}/{}", drive.to_lowercase(), rest.replace('\\', "/"));
+
+        let mut names: Vec<String> = (0..10).map(|i| format!("m{i}.md")).collect();
+        for (i, name) in names.iter().enumerate() {
+            std::fs::write(dir.join(name), format!("# memory {i}\n\tline\n")).unwrap();
+        }
+        let big = "big.md".to_string();
+        let line = "x".repeat(1023) + "\n";
+        std::fs::write(
+            dir.join(&big),
+            line.repeat((crate::wsl::READ_MANY_MAX_EACH / 1024 + 1) as usize),
+        )
+        .unwrap();
+        names.push(big);
+        let sources: Vec<SourceRef> = names
+            .iter()
+            .map(|name| SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Wsl(distro.clone()),
+                source_mode: SourceMode::SnapshotFile,
+                path: PathBuf::from(format!("{mnt}/{name}")),
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            })
+            .collect();
+        // `observed_at` 是扫描那一刻的钟，两次扫描必然不同；其余字段都要一致。
+        let comparable = |res: &crate::cursor::ScanResult| {
+            let mut v = serde_json::to_value(&res.events).unwrap();
+            for e in v.as_array_mut().unwrap() {
+                e.as_object_mut().unwrap().remove("observed_at");
+            }
+            (res.status, v, res.cursor_out.content_hash.clone())
+        };
+
+        let before = crate::wsl::spawn_count();
+        let prefetch = super::SnapshotPrefetch::for_sources(&sources, unbounded());
+        let batched: Vec<_> = sources
+            .iter()
+            .map(|s| super::scan_snapshot_prefetched(s, None, Profile::Full, &prefetch))
+            .collect();
+        let spawned = crate::wsl::spawn_count() - before;
+        // 1 次批量 + 超限那一个单独读 1 次、单独 stat 1 次。
+        assert!(spawned <= 3, "11 个快照起了 {spawned} 次 wsl.exe");
+        assert!(
+            matches!(prefetch.get(&sources[10]), Some(Err(_))),
+            "超过单文件上限的文件进了批"
+        );
+
+        for (s, res) in sources.iter().zip(&batched) {
+            assert_eq!(res.status, ScanStatus::Ok, "{:?}", res.report.warnings);
+            let plain = super::scan_source(s, None, Profile::Full, no_roots(), unbounded());
+            assert_eq!(comparable(res), comparable(&plain), "{}", s.path.display());
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
