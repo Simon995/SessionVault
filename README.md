@@ -39,7 +39,7 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | `wsl`                        | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码）                             | ✅ 实机实测                                   |
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
-| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `key-export` / `key-import` / `changes` / `gc` / `erase`；跨运行游标持久化 | ✅ 2026-09-29 核 |
+| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `key-export` / `key-import` / `changes` / `gc` / `erase`；跨运行游标持久化 | ✅ 2026-09-29 核 |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
 | 总库（持久化输出库）         | append-only RawEvent 库                                                                      | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak）    |
 | snapshot_file                | Claude/Codex memory、rules、项目 instruction 状态快照                                        | ✅ experimental（Windows/WSL + 最新快照查询） |

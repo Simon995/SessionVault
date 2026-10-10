@@ -528,6 +528,24 @@ impl EncryptedRow {
     }
 }
 
+/// 一个会话（`?1`–`?4` = type / location / path / session）在当前投影里、没被墓碑盖住的行。
+/// 读会话与数会话共用这一份：两处各写一遍，多库合读就会按一种口径挑库、按另一种口径读。
+const SESSION_CURRENT_ROWS: &str = r#"FROM raw_events r
+     LEFT JOIN current_head h
+            ON h.source_type = r.source_type
+           AND h.source_location = r.source_location
+           AND h.source_path = r.source_path
+    WHERE r.source_type = ?1 AND r.source_location = ?2
+      AND r.source_path = ?3 AND r.source_session_id = ?4
+      AND r.source_revision = COALESCE(h.source_revision, 0)
+      AND r.projection_revision = COALESCE(h.projection_revision, 0)
+      AND NOT EXISTS (
+          SELECT 1 FROM tombstones t
+           WHERE (t.scope = 'session'      AND t.key = r.source_session_id)
+              OR (t.scope = 'source_path'  AND t.key = r.source_path)
+              OR (t.scope = 'project_root' AND t.key = r.project_root)
+      )"#;
+
 /// [`EncryptedRow::from_sql`] 期望的列与顺序。所有 SELECT 都必须用它，否则列序对不上时
 /// 不会报错，只会把 `projection_revision` 读成 `aad_version` 之类 —— 静默且难查。
 const ENCRYPTED_ROW_COLUMNS: &str = "r.offset, r.source_type, r.source_location, r.source_path, \
@@ -3298,6 +3316,22 @@ impl TotalStore {
     /// ⚠️ `after_seq` 是**每个会话各自的** seq。传多个会话时它对所有会话生效 ——
     /// 那几乎总是调用方搞错了，所以 CLI 那一层**只在恰好一个 `--session` 时**
     /// 接受它（让错误的组合根本表达不出来，而不是写在注释里）。
+    /// 一个会话在当前投影里有多少条事件（墓碑已排除）—— 与 [`Self::read_sessions_resumable`]
+    /// 读的是同一批行。多库合读时据它挑哪个库的那份最全。
+    pub fn count_session_events(
+        &self,
+        session: &(String, String, String, String),
+    ) -> StoreResult<u64> {
+        let (st, loc, path, sid) = session;
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            &format!("SELECT count(*) {SESSION_CURRENT_ROWS}"),
+            params![st, loc, path, sid],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
     pub fn read_sessions_resumable(
         &self,
         sessions: &[(String, String, String, String)],
@@ -3323,22 +3357,7 @@ impl TotalStore {
                 continue;
             }
             let mut stmt = conn.prepare(&format!(
-                r#"SELECT {ENCRYPTED_ROW_COLUMNS}
-                     FROM raw_events r
-                     LEFT JOIN current_head h
-                            ON h.source_type = r.source_type
-                           AND h.source_location = r.source_location
-                           AND h.source_path = r.source_path
-                    WHERE r.source_type = ?1 AND r.source_location = ?2
-                      AND r.source_path = ?3 AND r.source_session_id = ?4
-                      AND r.source_revision = COALESCE(h.source_revision, 0)
-                      AND r.projection_revision = COALESCE(h.projection_revision, 0)
-                      AND NOT EXISTS (
-                          SELECT 1 FROM tombstones t
-                           WHERE (t.scope = 'session'      AND t.key = r.source_session_id)
-                              OR (t.scope = 'source_path'  AND t.key = r.source_path)
-                              OR (t.scope = 'project_root' AND t.key = r.project_root)
-                      )
+                r#"SELECT {ENCRYPTED_ROW_COLUMNS} {SESSION_CURRENT_ROWS}
                       AND (?6 IS NULL OR r.seq > ?6)
                     ORDER BY r.seq ASC, r.offset ASC
                     LIMIT ?5"#
@@ -4553,6 +4572,44 @@ mod tests {
     ///
     /// 判例（2026-09-02，真库）：一个 58,786 事件的会话在 `read_sessions` 下**永远
     /// 读不完** —— 每轮都从头取同样的前 N 条，没有任何办法跳过已处理的部分。
+    /// 数会话与读会话是同一批行：只数当前投影（重建之后只剩新的那一代），墓碑盖住的数成 0。
+    #[test]
+    fn counting_a_session_matches_what_reading_it_returns() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let spec = (
+            "claude_code".to_string(),
+            "local".to_string(),
+            "/p/file.jsonl".to_string(),
+            "s".to_string(),
+        );
+        let read_all = |store: &TotalStore| {
+            store
+                .read_sessions_resumable(std::slice::from_ref(&spec), 1000, None)
+                .unwrap()[0]
+                .events
+                .len() as u64
+        };
+        let evs: Vec<RawEvent> = (0..6).map(|i| mk_event(i, "s", Some("x"))).collect();
+        store.append_events(&evs, Projection::Append).unwrap();
+        assert_eq!(
+            (store.count_session_events(&spec).unwrap(), read_all(&store)),
+            (6, 6)
+        );
+
+        let rebuilt: Vec<RawEvent> = (0..2).map(|i| mk_event(i, "s", Some("y"))).collect();
+        store.append_events(&rebuilt, Projection::Rollback).unwrap();
+        assert_eq!(
+            (store.count_session_events(&spec).unwrap(), read_all(&store)),
+            (2, 2)
+        );
+
+        store.tombstone(TombstoneScope::Session, "s").unwrap();
+        assert_eq!(
+            (store.count_session_events(&spec).unwrap(), read_all(&store)),
+            (0, 0)
+        );
+    }
+
     /// 而**会话是长大的**：消费方报这个数时它还是 58,514。
     #[test]
     fn an_oversized_session_can_be_read_to_the_end_in_pages() {
