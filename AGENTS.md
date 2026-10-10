@@ -88,7 +88,7 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 - `\\wsl.localhost\…` 上宿主的答案只有 `Dir` / `File` / `Absent` 是事实；`Found(Other)` 与 `Unknown` 几乎总是宿主跟不进的符号链接，改用 `probe::WslUncBackend`。判据是「这条路径归谁管」，不是「UNC 通不通」。
 - `wsl::stat` 问的是 `[ -f ]`，每个目录都会被它报成不存在；问目录用 `stat_kind`。
 - 「该问谁」只有 `pathnorm::reach_of` 一处实现；`RootReach::Unknown` 不是本机。
-- 「是不是同一个目录」只有 `attribution::registry_key` 一处：UNC 写法 → 规范形、发行版里的 `/mnt/<盘>` → 盘本身、再按挂载表收敛。归属与按项目根删除都靠它；别在调用点自己比字符串。
+- 「是不是同一个目录」只有 `attribution::registry_key` 一处：UNC 写法 → 规范形、发行版里的 `/mnt/<盘>` → 盘本身、再按挂载表收敛。归属与按项目根删除都靠它；别在调用点自己比字符串。同一目录登记了几种写法时取哪种，只有 `attribution::spelling_order` 一处（归属与 `roots` 共用，与行序无关）。
 - 身份是根的属性：`project_identity` 主键不带 `source_type` / `source_location`；身份由注册表驱动，不由事件驱动；别改注册表的多写法，也别给 `path:` 加兜底。
 - 细节与判例见 `docs/project-identity.md`，以及存档「宿主答不了发行版内部的事」「身份是根的属性」。
 

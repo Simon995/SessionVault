@@ -171,7 +171,8 @@ impl RootRegistry {
         registry_key(path, &self.mounts)
     }
 
-    /// 从 `(路径, 来源)` 构建。重复路径按**后来者覆盖**，与注册表写入语义一致。
+    /// 从 `(路径, 来源)` 构建。同一写法重复出现按**后来者覆盖**，与注册表写入语义一致；
+    /// 同一目录的不同写法按 [`spelling_order`] 取一种，与顺序无关（见 [`Self::insert`]）。
     ///
     /// 不叫 `from_iter` —— 那个名字会与 `std::iter::FromIterator` 混淆，而这里
     /// **不是**那个语义（它带覆盖规则，不是纯收集）。
@@ -187,6 +188,15 @@ impl RootRegistry {
         reg
     }
 
+    /// 登记一个根。比较键已有时：
+    ///
+    /// - **同一写法** ⇒ 后来者覆盖（来源以后来者为准）。
+    /// - **同一目录的另一种写法**（有挂载表时 `C:\X` 与 `/mnt/c/X`）⇒ 写法按 [`spelling_order`]
+    ///   取一种，来源有一边是 `git` 就记 `git`（与 `roots` 出口的合并同一规则）。
+    ///
+    /// 🔴 第二条从前也是「后来者覆盖」，而读注册表的 SQL 没有 `ORDER BY`：归属写哪种写法
+    /// 取决于行序 —— 实测（2026-10-10）扫描器给 Windows 本机会话写 `/mnt/c/…`，而 `roots`
+    /// 给同一个项目的主写法是 `C:\…`，同一个 svault 的两个出口给了两个答案。
     pub fn insert(&mut self, path: &str, source: RootSource) {
         let path = path.trim();
         if path.is_empty() {
@@ -197,7 +207,30 @@ impl RootRegistry {
             .roots
             .binary_search_by(|(k, _, _)| k.as_str().cmp(key.as_str()))
         {
-            Ok(i) => self.roots[i] = (key, path.to_string(), source),
+            Ok(i) => {
+                let (_, kept, kept_source) = &self.roots[i];
+                let order = spelling_order(path, kept, crate::pathnorm::HostPlatform::current());
+                let entry = match order {
+                    std::cmp::Ordering::Equal => (key, path.to_string(), source),
+                    _ => {
+                        let source = if source == RootSource::Git || *kept_source == RootSource::Git
+                        {
+                            RootSource::Git
+                        } else if order == std::cmp::Ordering::Less {
+                            source
+                        } else {
+                            *kept_source
+                        };
+                        let path = if order == std::cmp::Ordering::Less {
+                            path.to_string()
+                        } else {
+                            kept.clone()
+                        };
+                        (key, path, source)
+                    }
+                };
+                self.roots[i] = entry;
+            }
             Err(i) => self.roots.insert(i, (key, path.to_string(), source)),
         }
     }
@@ -248,6 +281,36 @@ pub fn attribute(path: Option<&str>, registry: &RootRegistry) -> Attribution {
     Attribution::Unattributed {
         path: raw.to_string(),
     }
+}
+
+/// 同一个目录有几种写法时取哪一种 —— 归属（[`RootRegistry::insert`]）与 `roots` 出口的合并
+/// 共用**这一处**。`Less` = `a` 更该当这个目录的写法。
+///
+/// 1. 宿主打得开的优先（[`crate::project_dir::host_openable_form`]）：Windows 上 `C:\X` 胜 `/mnt/c/X`。
+/// 2. 写法类别：盘符 > 规范形 > POSIX > UNC > 其它。规范形是存储写法；UNC 是宿主的访问路径，
+///    在 Windows 上也打得开，只按 1 和字典序它会胜过规范形（`\` 排在 `w` 前）。
+/// 3. 字典序 —— 全序，结果与读入顺序无关。
+pub fn spelling_order(a: &str, b: &str, host: crate::pathnorm::HostPlatform) -> std::cmp::Ordering {
+    let openable = |p: &str| {
+        crate::project_dir::host_openable_form(p, &crate::pathnorm::alias_forms(p), host).is_some()
+    };
+    let class = |p: &str| -> u8 {
+        if crate::pathnorm::is_windows_drive_path(p) {
+            0
+        } else if crate::pathnorm::split_canonical_wsl(p).is_some() {
+            1
+        } else if p.starts_with('/') {
+            2
+        } else if crate::pathnorm::canonical_wsl_unc(p).is_some() {
+            3
+        } else {
+            4
+        }
+    };
+    openable(b)
+        .cmp(&openable(a))
+        .then_with(|| class(a).cmp(&class(b)))
+        .then_with(|| a.cmp(b))
 }
 
 /// 注册表存储用的比较键 —— **归一化规则的唯一出口**。
@@ -1375,6 +1438,75 @@ mod tests {
             }
         }
         assert!(attribute(Some(r"C:\Users\u\ws\proj"), &with).is_attributed());
+    }
+
+    /// 同一个目录几种写法的优先序（归属与 `roots` 共用）：Windows 上盘符胜 `/mnt`；
+    /// 规范形胜 UNC（两者在 Windows 上都打得开，只按字典序 UNC 会赢）；全序。
+    #[test]
+    fn spelling_order_prefers_the_host_form_then_the_canonical_form() {
+        use crate::pathnorm::HostPlatform::Windows;
+        use std::cmp::Ordering::{Greater, Less};
+        let drive = r"C:\work\q";
+        let mnt = "/mnt/c/work/q";
+        let canonical = "wsl:Ubuntu:/home/u/p";
+        let unc = r"\\wsl.localhost\Ubuntu\home\u\p";
+        assert_eq!(spelling_order(drive, mnt, Windows), Less);
+        assert_eq!(spelling_order(mnt, drive, Windows), Greater);
+        assert_eq!(spelling_order(canonical, unc, Windows), Less);
+        assert_eq!(spelling_order(unc, canonical, Windows), Greater);
+        assert_eq!(
+            spelling_order(drive, drive, Windows),
+            std::cmp::Ordering::Equal
+        );
+        // 同类按字典序：大小写不同的两种盘符写法也有确定的先后。
+        assert_eq!(spelling_order(r"C:\Work\q", r"c:\work\q", Windows), Less);
+    }
+
+    /// 同一个目录的两种写法：结果与登记顺序无关（从前是后来者覆盖，而读注册表的 SQL
+    /// 没有 `ORDER BY`）；来源有一边是 `git` 就记 `git`。同一写法仍是后来者覆盖。
+    #[test]
+    fn two_spellings_of_one_directory_resolve_the_same_in_either_order() {
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        let drive = r"C:\work\q";
+        let mnt = "/mnt/c/work/q";
+        let resolve = |first: (&str, RootSource), second: (&str, RootSource)| {
+            let mut reg = RootRegistry::with_mounts(mounts.clone());
+            reg.insert(first.0, first.1);
+            reg.insert(second.0, second.1);
+            assert_eq!(reg.len(), 1);
+            attribute(Some(r"C:\work\q\src"), &reg)
+        };
+        let a = resolve((drive, RootSource::Marker), (mnt, RootSource::Git));
+        let b = resolve((mnt, RootSource::Git), (drive, RootSource::Marker));
+        assert_eq!(a, b, "结果取决于登记顺序");
+        let expected = if spelling_order(drive, mnt, crate::pathnorm::HostPlatform::current())
+            == std::cmp::Ordering::Less
+        {
+            drive
+        } else {
+            mnt
+        };
+        assert_eq!(
+            a,
+            Attribution::Root {
+                path: expected.to_string(),
+                source: RootSource::Git,
+            }
+        );
+        #[cfg(windows)]
+        assert_eq!(expected, drive, "Windows 上取盘符写法，与 roots 一致");
+
+        // 同一写法：后来者覆盖（来源以后来者为准）。
+        let mut reg = RootRegistry::with_mounts(mounts);
+        reg.insert(drive, RootSource::Git);
+        reg.insert(drive, RootSource::Marker);
+        assert_eq!(
+            attribute(Some(drive), &reg),
+            Attribution::Root {
+                path: drive.to_string(),
+                source: RootSource::Marker,
+            }
+        );
     }
 
     /// 反面：有挂载表时同一条查询该**认出来**，而不是报「可能是挂载表的锅」。
