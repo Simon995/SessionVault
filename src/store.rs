@@ -4141,6 +4141,50 @@ impl TotalStore {
         })
     }
 
+    /// 本库的全部删除记录（按作用域、键排序）。认不出作用域的行报错，不跳过 —— 跳过就等于
+    /// 把一次删除说成没删。
+    pub fn tombstones(&self) -> StoreResult<Vec<Tombstone>> {
+        let conn = self.conn.lock().unwrap();
+        let rows: Vec<(String, String, i64)> = conn
+            .prepare("SELECT scope, key, tombstoned_at FROM tombstones ORDER BY scope, key")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        rows.into_iter()
+            .map(|(scope, key, tombstoned_at)| {
+                let scope = TombstoneScope::from_key(&scope).ok_or_else(|| {
+                    StoreError::Io(std::io::Error::other(format!(
+                        "unknown tombstone scope {scope:?}"
+                    )))
+                })?;
+                Ok(Tombstone {
+                    scope,
+                    key,
+                    tombstoned_at,
+                })
+            })
+            .collect()
+    }
+
+    /// 把别的库（别的机器）的删除记录接收进本库：本库没有的，照 [`Self::tombstone`] 记下并删掉
+    /// 本库里命中的正文；已有的不动。删除跨库传播（ADR-027）：会话所属的机器经此删掉原文。
+    pub fn adopt_tombstones(&self, foreign: &[Tombstone]) -> StoreResult<AdoptStats> {
+        let local: HashSet<(TombstoneScope, String)> = self
+            .tombstones()?
+            .into_iter()
+            .map(|t| (t.scope, t.key))
+            .collect();
+        let mut stats = AdoptStats::default();
+        for t in foreign {
+            if local.contains(&(t.scope, t.key.clone())) {
+                stats.already += 1;
+                continue;
+            }
+            stats.deleted_events += self.tombstone(t.scope, &t.key)?.deleted_events;
+            stats.adopted += 1;
+        }
+        Ok(stats)
+    }
+
     /// 回填标志（写者侧 catch-up 用，见 QuotaBar `refresh_index`）：宿主据此判断总库是否已与
     /// 索引一致。新建库默认 `false` → 宿主触发一次 force 全量回填；任一 append 失败时宿主 `set` 回
     /// `false`，下轮再 force 重发（dedup 幂等补回丢失批）。
@@ -4165,8 +4209,27 @@ impl TotalStore {
     }
 }
 
+/// 一条删除记录（不含正文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tombstone {
+    pub scope: TombstoneScope,
+    pub key: String,
+    pub tombstoned_at: i64,
+}
+
+/// [`TotalStore::adopt_tombstones`] 的结果。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdoptStats {
+    /// 本库原来没有、这次记下并照删的。
+    pub adopted: u64,
+    /// 本库早已有的。
+    pub already: u64,
+    /// 照删时从本库物理删掉的事件数。
+    pub deleted_events: u64,
+}
+
 /// 墓碑作用域（`read_since` 按此精确匹配）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TombstoneScope {
     Session,
     SourcePath,
@@ -4174,11 +4237,20 @@ pub enum TombstoneScope {
 }
 
 impl TombstoneScope {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             TombstoneScope::Session => "session",
             TombstoneScope::SourcePath => "source_path",
             TombstoneScope::ProjectRoot => "project_root",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "session" => Some(Self::Session),
+            "source_path" => Some(Self::SourcePath),
+            "project_root" => Some(Self::ProjectRoot),
+            _ => None,
         }
     }
 
@@ -4572,6 +4644,46 @@ mod tests {
     ///
     /// 判例（2026-09-02，真库）：一个 58,786 事件的会话在 `read_sessions` 下**永远
     /// 读不完** —— 每轮都从头取同样的前 N 条，没有任何办法跳过已处理的部分。
+    /// 别的库的删除记录：本库没有的记下并删掉命中的正文，已有的不动；重跑什么都不做。
+    #[test]
+    fn foreign_tombstones_are_adopted_once_and_erase_local_copies() {
+        let here = TotalStore::open_in_memory().unwrap();
+        let evs: Vec<RawEvent> = (0..3).map(|i| mk_event(i, "gone", Some("x"))).collect();
+        here.append_events(&evs, Projection::Append).unwrap();
+        let kept: Vec<RawEvent> = (0..2).map(|i| mk_event(i, "kept", Some("x"))).collect();
+        here.append_events(&kept, Projection::Append).unwrap();
+        here.tombstone(TombstoneScope::SourcePath, "/elsewhere.jsonl")
+            .unwrap();
+
+        let there = TotalStore::open_in_memory().unwrap();
+        there.tombstone(TombstoneScope::Session, "gone").unwrap();
+        there
+            .tombstone(TombstoneScope::SourcePath, "/elsewhere.jsonl")
+            .unwrap();
+        let foreign = there.tombstones().unwrap();
+        assert_eq!(foreign.len(), 2);
+
+        let stats = here.adopt_tombstones(&foreign).unwrap();
+        assert_eq!(
+            (stats.adopted, stats.already, stats.deleted_events),
+            (1, 1, 3)
+        );
+        assert_eq!(here.tombstones().unwrap().len(), 2);
+        assert_eq!(
+            here.status().unwrap().count,
+            2,
+            "该删的没删干净，或者删多了"
+        );
+        assert_eq!(
+            here.adopt_tombstones(&foreign).unwrap(),
+            AdoptStats {
+                adopted: 0,
+                already: 2,
+                deleted_events: 0
+            }
+        );
+    }
+
     /// 数会话与读会话是同一批行：只数当前投影（重建之后只剩新的那一代），墓碑盖住的数成 0。
     #[test]
     fn counting_a_session_matches_what_reading_it_returns() {

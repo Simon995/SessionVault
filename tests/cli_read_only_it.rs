@@ -45,7 +45,8 @@ fn every_read_subcommand_leaves_an_older_store_unmigrated() {
         .unwrap();
 
     let store = db.to_str().unwrap();
-    let reads: [&[&str]; 8] = [
+    let reads: [&[&str]; 9] = [
+        &["erasures"],
         &["store-info"],
         &["pull", "--since", "0"],
         &["changes", "--since-seq", "0"],
@@ -70,7 +71,8 @@ fn every_read_subcommand_leaves_an_older_store_unmigrated() {
         );
     }
     // 多库的读命令把打不开的库报成 unavailable、照常退出 0 —— 但同样不许迁移它。
-    let multi: [&[&str]; 3] = [
+    let multi: [&[&str]; 4] = [
+        &["erasures", "--all-stores"],
         &["stores"],
         &[
             "sessions-read",
