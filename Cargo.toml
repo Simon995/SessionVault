@@ -38,7 +38,6 @@ parity = []
 # 保住「解析内核无状态」（§14）；QuotaBar 作总库默认写者时开此 feature。
 store = [
     "dep:aes-gcm",
-    "dep:base64",
     "dep:keyring",
     "dep:rusqlite",
     "dep:zeroize",
@@ -65,7 +64,8 @@ env_logger = "0.11"
 # `event_json`，改任意一列都要重写整条记录）。解析规则仍只有 Rust 那一处实现。
 rusqlite = { version = "0.32", features = ["bundled", "functions"], optional = true }
 aes-gcm = { version = "0.10", features = ["std"], optional = true }
-base64 = { version = "0.22", optional = true }
+# 不门控：WSL 快照批量读用它解码（`wsl::read_many`），扫描在默认构建里也要用。
+base64 = "0.22"
 keyring = { version = "2.3", optional = true }
 zeroize = { version = "1.8", optional = true }
 

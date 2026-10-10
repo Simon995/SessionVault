@@ -3725,22 +3725,25 @@ impl TotalStore {
         let mut stats = SnapshotSyncStats::default();
         // 🔴 一次读、循环内复用 —— 理由与实测数字见 `snapshot_cursor` 的注释。
         let mut latest = self.read_latest_snapshots()?;
+        // WSL 上的快照每个发行版一次 `wsl.exe` 读完，不再每个文件起一次。
+        // 快照同步是一次性维护动作，不属于宿主任何一轮刷新的预算。
+        let prefetch = crate::scan::SnapshotPrefetch::for_sources(
+            sources,
+            crate::deadline::Deadline::unbounded(),
+        );
         for source in sources {
             if source.source_mode != SourceMode::SnapshotFile {
                 continue;
             }
             stats.sources += 1;
             let cursor = Self::snapshot_cursor(&latest, source, &crate::scan::snapshot_mtime);
-            // 空注册表在这条路上是**惰性**的，不是降级：快照（Class-B）的
-            // `project_root` 由宿主直接填在 `SourceRef` 上，不从 cwd 归属而来 ——
-            // `scan_snapshot_file` 压根不碰 `roots`。给非空的反而会让人以为它参与了判定。
-            let result = crate::scan::scan_source(
+            // 快照（Class-B）的 `project_root` 由宿主直接填在 `SourceRef` 上，不从 cwd 归属而来，
+            // 所以这条路不需要注册表。
+            let result = crate::scan::scan_snapshot_prefetched(
                 source,
                 Some(cursor),
                 Profile::Full,
-                std::sync::Arc::new(crate::attribution::RootRegistry::new()),
-                // 快照同步是一次性维护动作，不属于宿主任何一轮刷新的预算。
-                crate::deadline::Deadline::unbounded(),
+                &prefetch,
             );
             if result.status == ScanStatus::Error {
                 stats.failed += 1;
@@ -4765,6 +4768,64 @@ mod tests {
         let ro = TotalStore::open_read_only_with_key(&db, source.load().unwrap().unwrap()).unwrap();
         assert_eq!(ro.read_latest_snapshots().unwrap().len(), 1);
         drop(ro);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 实机：`sync_snapshots`（QuotaBar 的快照同步入口）每轮每个发行版只起一次 `wsl.exe`，
+    /// 首次、没变、有一个变了都一样，且照常认出变化。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，
+    /// 单独跑（`--test-threads=1`）。夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读。
+    #[test]
+    #[cfg(windows)]
+    fn sync_snapshots_reads_a_distro_in_one_wsl_call_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let distro = crate::wsl::list_distros(crate::deadline::Deadline::unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| crate::wsl::is_user_distro(d))
+            .expect("need a user distro");
+        let dir = std::env::temp_dir().join(format!(
+            "svault-it-sync-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let win = dir.to_string_lossy().into_owned();
+        let (drive, rest) = win.split_once(":\\").expect("drive-letter temp dir");
+        let mnt = format!("/mnt/{}/{}", drive.to_lowercase(), rest.replace('\\', "/"));
+        let sources: Vec<SourceRef> = (0..5)
+            .map(|i| {
+                std::fs::write(dir.join(format!("m{i}.md")), format!("# m{i}\n")).unwrap();
+                SourceRef {
+                    source_type: SourceType::ClaudeCode,
+                    source_location: SourceLocation::Wsl(distro.clone()),
+                    source_mode: SourceMode::SnapshotFile,
+                    path: format!("{mnt}/m{i}.md").into(),
+                    project_root: None,
+                    artifact_kind: Some("memory".into()),
+                }
+            })
+            .collect();
+        let store =
+            TotalStore::open_with_key(&dir.join("total_store.db"), StoreKey::from_bytes([7; 32]))
+                .unwrap();
+        let round = || {
+            let before = crate::wsl::spawn_count();
+            let stats = store.sync_snapshots(&sources).unwrap();
+            (
+                crate::wsl::spawn_count() - before,
+                stats.changed,
+                stats.failed,
+            )
+        };
+        assert_eq!(round(), (1, 5, 0), "首次：1 次 wsl.exe、5 个都是新版本");
+        assert_eq!(round(), (1, 0, 0), "没变：1 次 wsl.exe、0 个新版本");
+        std::fs::write(dir.join("m2.md"), "# m2 changed\n").unwrap();
+        assert_eq!(round(), (1, 1, 0), "一个变了：1 次 wsl.exe、1 个新版本");
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

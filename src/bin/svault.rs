@@ -1267,6 +1267,13 @@ fn next_state(scanned: Scanned, prev: Option<&SourceState>, write_store: bool) -
     }
 }
 
+/// 一轮开头按发行版批量问到的 WSL 事实：会话日志的 stat、快照的全文。
+#[derive(Default)]
+struct Prefetched {
+    stats: session_vault::scan::StatPrefetch,
+    snapshots: session_vault::scan::SnapshotPrefetch,
+}
+
 /// 扫一个来源。**append-log 走权威入口并带上一版指纹**，其余走既有的 `scan_source`。
 fn scan_one(
     s: &SourceRef,
@@ -1274,7 +1281,7 @@ fn scan_one(
     prior_fingerprint: Option<session_vault::observation::SourceFingerprint>,
     profile: Profile,
     roots: std::sync::Arc<session_vault::attribution::RootRegistry>,
-    prefetch: &session_vault::scan::StatPrefetch,
+    prefetch: &Prefetched,
 ) -> (Scanned, session_vault::report::SourceReport) {
     match s.source_mode {
         SourceMode::AppendLog => {
@@ -1285,9 +1292,24 @@ fn scan_one(
                 profile,
                 roots,
                 session_vault::deadline::Deadline::unbounded(),
-                prefetch,
+                &prefetch.stats,
             );
             (Scanned::Observed(obs), report)
+        }
+        SourceMode::SnapshotFile => {
+            let res = session_vault::scan::scan_snapshot_prefetched(
+                s,
+                cursor_in,
+                profile,
+                &prefetch.snapshots,
+            );
+            (
+                Scanned::Projected {
+                    events: res.events,
+                    cursor_out: res.cursor_out,
+                },
+                res.report,
+            )
         }
         _ => {
             let res = session_vault::scan(s, cursor_in, profile, roots);
@@ -1545,12 +1567,18 @@ fn run_scan_all(
     #[cfg_attr(not(feature = "store"), allow(unused_mut))]
     let mut snapshot_sources = 0u64;
 
-    // 没变化的 WSL 来源只需要 stat：每个发行版一次 `wsl.exe` 问完，不再每个文件起一次。
+    // WSL 上没变化的会话日志只需要 stat、快照每轮要整份读：都按发行版一次 `wsl.exe` 问完。
     let spawns_before = session_vault::wsl::spawn_count();
-    let prefetch = session_vault::scan::StatPrefetch::for_sources(
-        &sources,
-        session_vault::deadline::Deadline::unbounded(),
-    );
+    let prefetch = Prefetched {
+        stats: session_vault::scan::StatPrefetch::for_sources(
+            &sources,
+            session_vault::deadline::Deadline::unbounded(),
+        ),
+        snapshots: session_vault::scan::SnapshotPrefetch::for_sources(
+            &sources,
+            session_vault::deadline::Deadline::unbounded(),
+        ),
+    };
 
     for s in &sources {
         let key = source_key(s);
