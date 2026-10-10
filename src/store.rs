@@ -27,10 +27,19 @@ use crate::discover::SourceRef;
 use crate::probe::{ProbeBackend, Probed};
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
 use crate::store_crypto::{
-    data_key_id, is_envelope, new_data_key_id, new_store_id, CryptoError, KeySource, StoreCipher,
-    StoreKey,
+    data_key_id, is_envelope, load_key_file, new_data_key_id, new_store_id, CryptoError, KeySource,
+    StoreCipher, StoreKey,
 };
 use crate::Profile;
+
+/// [`TotalStore::import_master_key`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyImport {
+    /// 本机原来没有钥匙，装上了。
+    Installed,
+    /// 本机已经是这把钥匙，什么都没做。
+    AlreadyPresent,
+}
 
 /// 总库错误。
 #[derive(Debug, thiserror::Error)]
@@ -1146,6 +1155,46 @@ impl TotalStore {
         let conn = Connection::open(path)?;
         restrict_permissions(path, 0o600);
         Self::from_conn(conn, key)
+    }
+
+    /// 把本机主密钥写进一个**新建**的受保护文件（已存在就拒绝），给同一个用户的另一台设备导入。
+    /// 密钥只落到这个文件里，不经 stdout 或日志。
+    pub fn export_master_key(to: &Path) -> StoreResult<()> {
+        Self::export_master_key_from(&KeySource::from_env(), to)
+    }
+
+    pub(crate) fn export_master_key_from(source: &KeySource, to: &Path) -> StoreResult<()> {
+        let key = source.load()?.ok_or(CryptoError::MissingKey)?;
+        KeySource::File(to.to_path_buf()).install(&key)?;
+        Ok(())
+    }
+
+    /// 把 `from` 里的主密钥装进本机的钥匙来源（OS 密钥链，或 `SVAULT_KEY_FILE`）。
+    ///
+    /// 本机已有**另一把**钥匙时拒绝（[`CryptoError::KeyConflict`]）：装上新的，旧钥匙加密的数据
+    /// 就再也打不开。给了 `store` 时先确认这把钥匙打得开它，打不开就不装 —— 调用方只在库确实
+    /// 存在时传它。
+    pub fn import_master_key(from: &Path, store: Option<&Path>) -> StoreResult<KeyImport> {
+        Self::import_master_key_into(&KeySource::from_env(), from, store)
+    }
+
+    pub(crate) fn import_master_key_into(
+        source: &KeySource,
+        from: &Path,
+        store: Option<&Path>,
+    ) -> StoreResult<KeyImport> {
+        let key = load_key_file(from)?
+            .ok_or_else(|| CryptoError::KeyFile(format!("{}: not found", from.display())))?;
+        match source.load()? {
+            Some(current) if current.same_as(&key) => return Ok(KeyImport::AlreadyPresent),
+            Some(_) => return Err(CryptoError::KeyConflict.into()),
+            None => {}
+        }
+        if let Some(db) = store {
+            Self::open_read_only_with_key(db, key.duplicate())?;
+        }
+        source.install(&key)?;
+        Ok(KeyImport::Installed)
     }
 
     /// 本库的标识：写入方第一次打开时生成（32 位十六进制），此后不变；镜像副本带着源库的标识。
@@ -4717,6 +4766,80 @@ mod tests {
         assert_eq!(ro.read_latest_snapshots().unwrap().len(), 1);
         drop(ro);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 导出写进一个新文件，里面就是本机那把钥匙；同一路径再导出一次被拒，不覆盖。
+    #[test]
+    fn exporting_writes_the_key_to_a_new_file_and_never_overwrites() {
+        let (dir, _db, key) = key_file_store("export");
+        let out = dir.join("exported.key");
+        let source = KeySource::File(key);
+        TotalStore::export_master_key_from(&source, &out).unwrap();
+        let exported = load_key_file(&out).unwrap().unwrap();
+        assert!(exported.same_as(&source.load().unwrap().unwrap()));
+        assert!(TotalStore::export_master_key_from(&source, &out).is_err());
+        #[cfg(unix)]
+        assert_eq!(
+            crate::probe::open_to_others(&out),
+            crate::probe::Probed::Found(false)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 新设备（本机还没有钥匙）：导入后这把钥匙打得开那个库；再导入一次什么都不做。
+    #[test]
+    fn importing_into_an_empty_machine_installs_the_key_that_opens_the_store() {
+        let (dir, db, key) = key_file_store("import");
+        let fresh = KeySource::File(dir.join("new-machine.key"));
+        assert_eq!(
+            TotalStore::import_master_key_into(&fresh, &key, Some(&db)).unwrap(),
+            KeyImport::Installed
+        );
+        assert_eq!(
+            TotalStore::open_with_source(&db, &fresh)
+                .unwrap()
+                .read_latest_snapshots()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            TotalStore::import_master_key_into(&fresh, &key, Some(&db)).unwrap(),
+            KeyImport::AlreadyPresent
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 本机已有另一把钥匙：拒绝，原来那把原样留着。
+    #[test]
+    fn importing_over_a_different_key_is_refused_and_keeps_the_old_one() {
+        let (dir_a, _db_a, key_a) = key_file_store("conflict-a");
+        let (dir_b, _db_b, key_b) = key_file_store("conflict-b");
+        let here = KeySource::File(key_a.clone());
+        let before = here.load().unwrap().unwrap();
+        let err = TotalStore::import_master_key_into(&here, &key_b, None).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Crypto(CryptoError::KeyConflict)),
+            "{err}"
+        );
+        assert!(
+            here.load().unwrap().unwrap().same_as(&before),
+            "原来的钥匙被换掉了"
+        );
+        std::fs::remove_dir_all(dir_a).unwrap();
+        std::fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    /// 钥匙打不开给定的库：不装。
+    #[test]
+    fn a_key_that_cannot_open_the_store_is_not_installed() {
+        let (dir_a, db_a, _key_a) = key_file_store("wrong-a");
+        let (dir_b, _db_b, key_b) = key_file_store("wrong-b");
+        let fresh = KeySource::File(dir_a.join("new-machine.key"));
+        assert!(TotalStore::import_master_key_into(&fresh, &key_b, Some(&db_a)).is_err());
+        assert!(fresh.load().unwrap().is_none(), "打不开库的钥匙被装上了");
+        std::fs::remove_dir_all(dir_a).unwrap();
+        std::fs::remove_dir_all(dir_b).unwrap();
     }
 
     /// 库里已有加密数据而密钥文件丢了：拒绝打开，且不悄悄生成一把新的 ——

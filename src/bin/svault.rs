@@ -193,6 +193,26 @@ enum Command {
     /// 🔴 **不做命名空间翻译。** 给出的是注册表里的原始形式（可能是 `C:\…`，也可能
     /// 是 `wsl:<distro>:/…`）。翻译成「消费方能打开的物理路径」是它自己的事 ——
     /// 在这里替它猜，等于把宿主视野的假设烧进一个跨进程接口。
+    /// 把本机总库主密钥写进一个**新建**的受保护文件（已存在就拒绝），给同一个用户的另一台设备
+    /// 导入（多机同步：同一个用户的设备共用一把主密钥）。密钥只落进这个文件，不上屏、不进日志；
+    /// 导入完请删掉它。
+    #[cfg(feature = "store")]
+    KeyExport {
+        #[arg(long)]
+        to: PathBuf,
+    },
+    /// 把 `key-export` 导出的主密钥装进本机：OS 密钥链；设了 `SVAULT_KEY_FILE` 则新建那个文件。
+    ///
+    /// 本机已有**另一把**钥匙时拒绝：装上新的，旧钥匙加密的数据就再也打不开（换钥还没做）。
+    /// 本机总库（或 `--store` 指的库）存在时，先确认这把钥匙打得开它；输出里
+    /// `verified_against_store` 说明这一步做没做。
+    #[cfg(feature = "store")]
+    KeyImport {
+        #[arg(long)]
+        from: PathBuf,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 本库的标识（多机同步用，见 `docs/linux-replica.md` 第四部分）：
     /// `{"kind":"store_info","store_id":"<32 位十六进制>"}`。
     ///
@@ -430,6 +450,15 @@ enum Out<'a> {
     Event { event: &'a RawEvent },
     /// `store-path` 的唯一一行：本机总库的默认路径。
     StorePath { path: &'a str },
+    /// `key-export` 的唯一一行：钥匙写到了哪个文件（不含钥匙本身）。
+    #[cfg(feature = "store")]
+    KeyExported { path: String },
+    /// `key-import` 的唯一一行。`verified_against_store = false` = 没有库可验，不是验过了。
+    #[cfg(feature = "store")]
+    KeyImported {
+        outcome: &'static str,
+        verified_against_store: bool,
+    },
     /// `store-info` 的唯一一行。`store_id` 缺失时输出 `null`，不省略这个键。
     #[cfg(feature = "store")]
     StoreInfo { store_id: Option<String> },
@@ -900,6 +929,10 @@ fn main() {
         Command::SyncSnapshots { store } => run_sync_snapshots(store),
         #[cfg(feature = "store")]
         Command::StoreInfo { store } => run_store_info(store),
+        #[cfg(feature = "store")]
+        Command::KeyExport { to } => run_key_export(to),
+        #[cfg(feature = "store")]
+        Command::KeyImport { from, store } => run_key_import(from, store),
         #[cfg(feature = "store")]
         Command::Roots { store, duplicates } => run_roots(store, duplicates),
         #[cfg(feature = "store")]
@@ -3164,6 +3197,61 @@ fn run_memory_roots(userprofile: Option<String>, timeout_secs: u64) -> i32 {
     // 🔴 退出码 0 **即使有 unreachable**：那不是本命令的失败，它诚实地报告了。
     // 非零会让调用方走「命令挂了」那条路，把一份有效的部分答案整个丢掉。
     0
+}
+
+#[cfg(feature = "store")]
+fn run_key_export(to: PathBuf) -> i32 {
+    match session_vault::TotalStore::export_master_key(&to) {
+        Ok(()) => {
+            emit(&Out::KeyExported {
+                path: to.to_string_lossy().into_owned(),
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "key export failed: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(feature = "store")]
+fn run_key_import(from: PathBuf, store_arg: Option<PathBuf>) -> i32 {
+    // 显式给的库必须在；没给就验本机默认的库 —— 在才验。探不动不是「没有库」：那样会跳过
+    // 验证、把一把打不开本机数据的钥匙装进去。
+    let explicit = store_arg.is_some();
+    let store = match resolve_store_path(store_arg) {
+        Some(path) => match total_store_present(&path) {
+            Ok(true) => Some(path),
+            Ok(false) if !explicit => None,
+            Ok(false) => {
+                log::error!(target: tag::CLI, "total store not found: {}", path.display());
+                return 1;
+            }
+            Err(why) => {
+                log::error!(target: tag::CLI, "key import aborted: {why}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    match session_vault::TotalStore::import_master_key(&from, store.as_deref()) {
+        Ok(outcome) => {
+            emit(&Out::KeyImported {
+                outcome: match outcome {
+                    session_vault::KeyImport::Installed => "installed",
+                    session_vault::KeyImport::AlreadyPresent => "already_present",
+                },
+                verified_against_store: store.is_some()
+                    && outcome == session_vault::KeyImport::Installed,
+            });
+            0
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "key import failed: {e}");
+            1
+        }
+    }
 }
 
 #[cfg(feature = "store")]
