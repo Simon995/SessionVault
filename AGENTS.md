@@ -13,7 +13,9 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 - 公开仓闸：`uv run python scripts/check-public-safe.py`（扫整个工作区和 `origin/main..HEAD` 的 commit message，先自检再扫）。
 - 体量闸：`uv run python scripts/check-agents-budget.py`（本文件 ≤200 行、≤24 KB、单行 ≤320 字符；`CLAUDE.md` 只能是 `@AGENTS.md` 导入壳）。
 - 发布 svault：`uv run python scripts/release.py <tag>` 试运行，加 `--publish` 才打标签、发 GitHub Release、装到 `%LOCALAPPDATA%\svault\bin`；二进制里嵌着本机家目录就拒绝发布。
-- 变异验证用 `scripts/mutate.py`：变异要打在生产实际走的路径上，脚本自己备份、自己还原并核字节一致。
+- 变异验证用 `scripts/mutate.py`：变异要打在生产实际走的路径上，脚本自己备份、自己还原并核字节一致。工作区里有的文件是 CRLF（检出遗留，入库仍是 LF），按字节匹配目标时按文件实际的换行写。
+- 实机测试默认不跑，单独开、`--test-threads=1`：`SVAULT_WSL_IT=1`（真 WSL，夹具建在 Windows 临时目录、经 `/mnt/<盘>` 读）、`SVAULT_KEYCHAIN_IT=1`（真钥匙链，测试专用服务名，只删自己建的条目）。
+- 改了非 Windows 分支（`wsl.rs` 的桩、Unix 文件权限）要在 WSL 里用 Linux 工具链编、跑一次：本仓没有 CI，开发机编不到那一支。
 - 「没问成」在 `src/` 里的规模现查，不写进文档：`grep -rc 没问成 src/ --include=*.rs | awk -F: '{s+=$2} END {print s}'`。
 
 ### 提交与分支（不依赖全局指令：只读本文件的环境也要照做）
@@ -35,12 +37,13 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 | --- | --- | --- |
 | QuotaBar | Rust 库编进去（`features = ["store"]`）；也是总库会话正文的写入者 | 它的子模块指针 |
 | TumeFlow | 子模块 + 把 `svault` 内嵌进 PyInstaller onefile；也经 `svault sync-snapshots` 做快照同步 | 它重新冻结时子模块指针钉住的那一版（不 bump 指针，重冻也还是旧版） |
-| TumeChat | 只读 CLI（`pull` / `changes` / `sessions-read`） | 本仓发布的那份 svault（2026-10-09 定） |
+| TumeChat | 只读 CLI（`pull` / `changes` / `sessions-read`；多机时 `stores`、`--all-stores`、`erasures`） | 本仓发布的那份 svault（2026-10-09 定） |
 
 - 本仓的测试只证明本仓自洽。动 `pub` 项前问「另一个消费者编不编得过」，能编就去那个仓编一次，编不了就明说没验。
 - 优先只加不删、不改签名。给公开结构体加字段：字面量构造会编不过，逐字段读取会安静少报一格；收紧 `#[cfg(feature)]` 等于删。
 - 不替消费方 bump 它们的子模块指针。
-- 运行时会有不止一份 svault 同时打开同一个总库（`<data_local_dir>/svault/total_store.db`），子模块指针拦不住。写入类打开都跑 `migrate()`；只读子命令走 `TotalStore::open_read_only`（不建库、不迁移，库缺表列时报 `SchemaBehind`），新的只读子命令也必须走它。
+- 运行时会有不止一份 svault 同时打开同一个总库（`<data_local_dir>/svault/total_store.db`），子模块指针拦不住。写入类打开都跑 `migrate()`；只读子命令与 `open_existing` 走 `TotalStore::open_read_only`（不建库、不迁移，库缺表列时报 `SchemaBehind`），新的读路径也必须走它。
+- 多机（`docs/linux-replica.md`）：每台只写自己的库，副本目录 `<data_local_dir>/svault/replicas/<store_id>.db` 只读；合读走 `--all-stores`，挑哪份只看内容与 `store_id`、不看哪个是本机；删除跨库传播走 `erasures` / `adopt-erasures`。
 - 改 schema 前必须回答「落后一版的消费者读不读得动」：核心表做过整表重建，「旧版还读得动」是纪律，不是构造。
 - 判断一份 svault 是哪一版看 `svault --version` 括号里的提交（`build.rs` 写入，`-dirty` = 构建时有未提交改动，`unknown` = 构建时没有 git）；`0.0.0` 本身不带信息。消费方应正向断言版本与子命令，不靠「没报错」。
 - 新增消费者只有两种姿势：复用已有的一份 svault，或自带一份并同时给出版本协调方案。场景推演见存档「新增一个消费者」那一节。
@@ -85,6 +88,7 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 - `\\wsl.localhost\…` 上宿主的答案只有 `Dir` / `File` / `Absent` 是事实；`Found(Other)` 与 `Unknown` 几乎总是宿主跟不进的符号链接，改用 `probe::WslUncBackend`。判据是「这条路径归谁管」，不是「UNC 通不通」。
 - `wsl::stat` 问的是 `[ -f ]`，每个目录都会被它报成不存在；问目录用 `stat_kind`。
 - 「该问谁」只有 `pathnorm::reach_of` 一处实现；`RootReach::Unknown` 不是本机。
+- 「是不是同一个目录」只有 `attribution::registry_key` 一处：UNC 写法 → 规范形、发行版里的 `/mnt/<盘>` → 盘本身、再按挂载表收敛。归属与按项目根删除都靠它；别在调用点自己比字符串。
 - 身份是根的属性：`project_identity` 主键不带 `source_type` / `source_location`；身份由注册表驱动，不由事件驱动；别改注册表的多写法，也别给 `path:` 加兜底。
 - 细节与判例见 `docs/project-identity.md`，以及存档「宿主答不了发行版内部的事」「身份是根的属性」。
 
@@ -93,5 +97,6 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 - 是什么：`README.md`；设计契约：`docs/INGEST_KERNEL.md`；字段对账：`docs/rawevent-reconciliation.md`；扫描 / 投影状态模型：`docs/scan-state-model.md`。
 - 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
 - 总库体积与待优化项（存了什么、哪些可回收，只记录未动手）：`docs/storage-growth.md`。
-- 总库在多台机器之间同步（前提、2026-10-09 / 10-10 的决定、方案与未决项）：`docs/linux-replica.md`。
+- 总库在多台机器之间同步（现状、决定、方案、实测记录）：`docs/linux-replica.md`。
+- **待做清单**（各项做到哪、谁来做，做完划掉写提交号）：`docs/backlog.md`。
 - 存档：本文件 2026-10-09 瘦身前的全文（判例、历史、细节），`docs/agents-full-2026-10-09.md`，不再维护。
