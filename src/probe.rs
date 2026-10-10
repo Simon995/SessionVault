@@ -547,6 +547,37 @@ pub fn open_to_others(path: &Path) -> Probed<bool> {
     }
 }
 
+/// 此刻有没有别的进程开着这个文件。换钥前问：开着总库的进程手里还是旧钥匙。
+///
+/// 只有 Windows 答得上来（不共享地打开，被拒就是有人开着）；别处一律 `Unknown`，不当作「没人开着」。
+#[allow(clippy::disallowed_methods)]
+pub fn held_open_elsewhere(path: &Path) -> Probed<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(_) => Probed::Found(false),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Probed::Found(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Probed::Absent,
+            Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Probed::Unknown(ProbeError::new(
+            path,
+            std::io::Error::other(
+                "only Windows can tell whether another process holds a file open",
+            ),
+        ))
+    }
+}
+
 /// 写文件。**变更操作，透传 `Result`**。
 #[allow(clippy::disallowed_methods)]
 pub fn write_bytes(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {

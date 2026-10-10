@@ -76,9 +76,83 @@ pub enum StoreError {
     /// 只读打开不迁移，只能报出来，由写入方先升级。
     #[error("store schema lacks {missing:?} that this svault reads; upgrade the writer first")]
     SchemaBehind { missing: Vec<String> },
+    /// 换钥拒绝动手（库正被别的进程开着、有数据密钥哪把钥匙都解不开……）。拒绝时库与钥匙都原样。
+    #[error("rekey refused: {0}")]
+    Rekey(String),
 }
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
+
+/// [`TotalStore::rekey`] 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rekeyed {
+    /// 这一次从旧钥匙改包到新钥匙的数据密钥数。
+    pub rewrapped: usize,
+    /// 本来就在新钥匙下的数据密钥数（上一次换到一半，或早已换过）。
+    pub already: usize,
+    /// 旧钥匙备份在哪（位置，不含钥匙本身）。本机原本就是这把钥匙时为 `None`。
+    pub previous_key_backup: Option<String>,
+}
+
+/// 把库里每把数据密钥改包到 `new` 下：已在 `new` 下的不动，在 `old` 下的改包，两者都不是就整个回滚。
+/// 一个写事务；`record_backup` 是旧钥匙备份的位置，同一事务记进 `store_meta`。
+fn rewrap_data_keys(
+    conn: &mut Connection,
+    old: Option<&StoreKey>,
+    new: &StoreKey,
+    record_backup: Option<&str>,
+) -> StoreResult<(usize, usize)> {
+    let new_cipher = StoreCipher::new(new.duplicate());
+    let old_cipher = old.map(|k| StoreCipher::new(k.duplicate()));
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let rows: Vec<(String, String, DataKeyGroup)> = tx
+        .prepare(
+            "SELECT key_id, wrapped_key, source_type, source_location, source_path, project_root
+               FROM data_keys",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                DataKeyGroup {
+                    source_type: r.get(2)?,
+                    source_location: r.get(3)?,
+                    source_path: r.get(4)?,
+                    project_root: r.get(5)?,
+                },
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let (mut rewrapped, mut already) = (0, 0);
+    for (key_id, wrapped, group) in rows {
+        let aad = data_key_aad(&key_id, &group);
+        if new_cipher.unwrap_key(&wrapped, &aad).is_ok() {
+            already += 1;
+            continue;
+        }
+        let key = old_cipher
+            .as_ref()
+            .and_then(|c| c.unwrap_key(&wrapped, &aad).ok())
+            .ok_or_else(|| {
+                StoreError::Rekey(format!(
+                    "data key {key_id} opens with neither the new key nor the previous one"
+                ))
+            })?;
+        tx.execute(
+            "UPDATE data_keys SET wrapped_key = ?1 WHERE key_id = ?2",
+            params![new_cipher.wrap_key(&key, &aad)?, key_id],
+        )?;
+        rewrapped += 1;
+    }
+    if let Some(locator) = record_backup {
+        tx.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('rekey_previous_key', ?1)",
+            [locator],
+        )?;
+    }
+    tx.commit()?;
+    Ok((rewrapped, already))
+}
 
 /// 一批事件相对该文件既有事件的关系 —— 决定它们落在**哪一代**。
 ///
@@ -1195,6 +1269,104 @@ impl TotalStore {
         }
         source.install(&key)?;
         Ok(KeyImport::Installed)
+    }
+
+    /// 把本机总库换到 `from` 里的主密钥（多台设备共用一把；本机已有另一把时用它）。
+    ///
+    /// 顺序保证任何一步断掉都不丢东西：确认没有别的进程开着库（它们手里是旧钥匙）→ 旧钥匙
+    /// 备份到旁边（密钥链另一个条目 / 密钥文件旁另一个文件）→ 一个事务里把每把数据密钥从旧钥匙
+    /// 改包到新钥匙、并记下备份位置 → 最后才换掉本机的钥匙。正文不动。
+    ///
+    /// 断了重跑即可：已在新钥匙下的数据密钥不再动。本机已经是这把钥匙时，若还有旧钥匙包着的
+    /// 数据密钥（换钥时有写入方没退出），用记下的备份把它们改包过来。
+    pub fn rekey(from: &Path, store: &Path) -> StoreResult<Rekeyed> {
+        Self::rekey_with_source(&KeySource::from_env(), from, store)
+    }
+
+    pub(crate) fn rekey_with_source(
+        source: &KeySource,
+        from: &Path,
+        store: &Path,
+    ) -> StoreResult<Rekeyed> {
+        use crate::probe::Probed;
+        let new = load_key_file(from)?
+            .ok_or_else(|| CryptoError::KeyFile(format!("{}: not found", from.display())))?;
+        let current = source.load()?.ok_or(CryptoError::MissingKey)?;
+        match crate::probe::held_open_elsewhere(store) {
+            Probed::Found(false) => {}
+            Probed::Found(true) => {
+                return Err(StoreError::Rekey(
+                    "the store is open in another process (QuotaBar / TumeFlow?); quit it first"
+                        .into(),
+                ))
+            }
+            Probed::Absent => {
+                return Err(StoreError::Rekey(format!("{} not found", store.display())))
+            }
+            Probed::Unknown(e) => log::warn!(
+                target: crate::logging::tag::SQLITE,
+                "cannot tell whether another process has the store open ({e}); \
+                 make sure QuotaBar / TumeFlow are not running"
+            ),
+        }
+        let mut conn = Connection::open(store)?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        let version: Option<String> = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'encryption_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if version.as_deref() != Some("2") {
+            return Err(StoreError::Rekey(format!(
+                "store encryption version is {version:?}, not \"2\"; open it once with a current svault first"
+            )));
+        }
+
+        if current.same_as(&new) {
+            let previous: Option<String> = conn
+                .query_row(
+                    "SELECT v FROM store_meta WHERE k = 'rekey_previous_key'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let old = match previous.as_deref().and_then(KeySource::from_locator) {
+                Some(slot) => slot.load()?,
+                None => None,
+            };
+            let (rewrapped, already) = rewrap_data_keys(&mut conn, old.as_ref(), &new, None)?;
+            return Ok(Rekeyed {
+                rewrapped,
+                already,
+                previous_key_backup: None,
+            });
+        }
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
+        let backup = source.backup_slot(&stamp);
+        backup.install(&current)?;
+        if !backup.load()?.is_some_and(|k| k.same_as(&current)) {
+            return Err(StoreError::Rekey(format!(
+                "backup of the current key at {} does not read back",
+                backup.locator()
+            )));
+        }
+        let locator = backup.locator();
+        let (rewrapped, already) =
+            rewrap_data_keys(&mut conn, Some(&current), &new, Some(&locator))?;
+        drop(conn);
+        source.replace(&new)?;
+        Ok(Rekeyed {
+            rewrapped,
+            already,
+            previous_key_backup: Some(locator),
+        })
     }
 
     /// 本库的标识：写入方第一次打开时生成（32 位十六进制），此后不变；镜像副本带着源库的标识。
@@ -4771,7 +4943,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 实机：`sync_snapshots`（QuotaBar 的快照同步入口）每轮每个发行版只起一次 `wsl.exe`，
+    /// 实机：`sync_snapshots`（`svault sync-snapshots` 的入口，TumeFlow 经它同步快照）每轮每个发行版只起一次 `wsl.exe`，
     /// 首次、没变、有一个变了都一样，且照常认出变化。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，
     /// 单独跑（`--test-threads=1`）。夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读。
     #[test]
@@ -4901,6 +5073,292 @@ mod tests {
         assert!(fresh.load().unwrap().is_none(), "打不开库的钥匙被装上了");
         std::fs::remove_dir_all(dir_a).unwrap();
         std::fs::remove_dir_all(dir_b).unwrap();
+    }
+
+    // ── 换钥 ─────────────────────────────────────────────────────────────────────
+
+    /// 一个有两把数据密钥的库（钥匙 A，密钥文件），外加一个装着钥匙 B 的文件。
+    fn rekey_fixture(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        KeySource,
+        std::path::PathBuf,
+    ) {
+        let (dir, db, key_a) = key_file_store(tag);
+        let second = dir.join("second.md");
+        std::fs::write(&second, "# second\n").unwrap();
+        TotalStore::open_with_source(&db, &KeySource::File(key_a.clone()))
+            .unwrap()
+            .sync_snapshots(&[SourceRef {
+                source_type: SourceType::Codex,
+                source_location: SourceLocation::Local,
+                source_mode: SourceMode::SnapshotFile,
+                path: second,
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            }])
+            .unwrap();
+        let key_b = dir.join("b.key");
+        KeySource::File(key_b.clone()).create().unwrap();
+        (dir, db, KeySource::File(key_a), key_b)
+    }
+
+    fn data_keys(db: &Path) -> Vec<(String, String)> {
+        Connection::open(db)
+            .unwrap()
+            .prepare("SELECT key_id, wrapped_key FROM data_keys ORDER BY key_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// 换钥：每把数据密钥改到新钥匙下、旧钥匙备份在旁边、本机钥匙最后换；库用新钥匙读得出、
+    /// 用旧钥匙打不开了。再跑一次什么都不改。
+    #[test]
+    fn rekey_rewraps_every_data_key_and_swaps_the_key_last() {
+        let (dir, db, source, key_b) = rekey_fixture("rekey");
+        let a = source.load().unwrap().unwrap();
+        let b = load_key_file(&key_b).unwrap().unwrap();
+        let done = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap();
+        assert_eq!((done.rewrapped, done.already), (2, 0));
+        let backup = KeySource::from_locator(done.previous_key_backup.as_deref().unwrap()).unwrap();
+        assert!(
+            backup.load().unwrap().unwrap().same_as(&a),
+            "旧钥匙没备份对"
+        );
+        assert!(source.load().unwrap().unwrap().same_as(&b), "本机钥匙没换");
+        let reopened = TotalStore::open_with_source(&db, &source).unwrap();
+        assert_eq!(reopened.read_latest_snapshots().unwrap().len(), 2);
+        drop(reopened);
+        assert!(
+            TotalStore::open_read_only_with_key(&db, a).is_err(),
+            "旧钥匙还打得开"
+        );
+
+        let again = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap();
+        assert_eq!(
+            (again.rewrapped, again.already, again.previous_key_backup),
+            (0, 2, None)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 改包已提交、本机钥匙还没换就断了：重跑把剩下的一步做完，不再改包。
+    #[test]
+    fn a_rekey_cut_short_after_the_rewrap_finishes_on_the_next_run() {
+        let (dir, db, source, key_b) = rekey_fixture("rekey-cut");
+        let a = source.load().unwrap().unwrap();
+        let b = load_key_file(&key_b).unwrap().unwrap();
+        rewrap_data_keys(&mut Connection::open(&db).unwrap(), Some(&a), &b, None).unwrap();
+        let done = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap();
+        assert_eq!((done.rewrapped, done.already), (0, 2));
+        assert!(source.load().unwrap().unwrap().same_as(&b));
+        assert_eq!(
+            TotalStore::open_with_source(&db, &source)
+                .unwrap()
+                .read_latest_snapshots()
+                .unwrap()
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 换钥之后又冒出一把旧钥匙包着的数据密钥（换钥时有写入方没退出）：重跑用记下的备份改包过来。
+    #[test]
+    fn a_straggler_under_the_previous_key_is_healed_on_rerun() {
+        let (dir, db, source, key_b) = rekey_fixture("rekey-heal");
+        let a = source.load().unwrap().unwrap();
+        TotalStore::rekey_with_source(&source, &key_b, &db).unwrap();
+        let group = DataKeyGroup {
+            source_type: "claude_code".into(),
+            source_location: "local".into(),
+            source_path: "/straggler.jsonl".into(),
+            project_root: String::new(),
+        };
+        let wrapped = StoreCipher::new(a)
+            .wrap_key(&StoreKey::generate(), &data_key_aad("straggler", &group))
+            .unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO data_keys (key_id, source_type, source_location, source_path,
+                                        project_root, wrapped_key, created_at)
+                 VALUES ('straggler', ?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    group.source_type,
+                    group.source_location,
+                    group.source_path,
+                    group.project_root,
+                    wrapped
+                ],
+            )
+            .unwrap();
+        let healed = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap();
+        assert_eq!(
+            (healed.rewrapped, healed.already, healed.previous_key_backup),
+            (1, 2, None)
+        );
+        let b = load_key_file(&key_b).unwrap().unwrap();
+        assert!(rewrap_data_keys(&mut Connection::open(&db).unwrap(), None, &b, None).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 有一把数据密钥哪把钥匙都解不开：整个拒绝，所有数据密钥原样，本机钥匙不换。
+    #[test]
+    fn a_data_key_under_neither_key_refuses_the_whole_rekey() {
+        let (dir, db, source, key_b) = rekey_fixture("rekey-foreign");
+        let group = DataKeyGroup {
+            source_type: "claude_code".into(),
+            source_location: "local".into(),
+            source_path: "/foreign.jsonl".into(),
+            project_root: String::new(),
+        };
+        let wrapped = StoreCipher::new(StoreKey::generate())
+            .wrap_key(&StoreKey::generate(), &data_key_aad("foreign", &group))
+            .unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO data_keys (key_id, source_type, source_location, source_path,
+                                        project_root, wrapped_key, created_at)
+                 VALUES ('foreign', ?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    group.source_type,
+                    group.source_location,
+                    group.source_path,
+                    group.project_root,
+                    wrapped
+                ],
+            )
+            .unwrap();
+        let before = data_keys(&db);
+        let a = source.load().unwrap().unwrap();
+        let err = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap_err();
+        assert!(matches!(err, StoreError::Rekey(_)), "{err}");
+        assert_eq!(data_keys(&db), before, "拒绝了却改了数据密钥");
+        assert!(
+            source.load().unwrap().unwrap().same_as(&a),
+            "拒绝了却换了钥匙"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 实机：经 OS 密钥链换钥（家里那台 Windows 走的就是这条）。用测试专用的服务名，不碰
+    /// `session-vault` 的真条目；只删本测试建的两个条目。需置 `SVAULT_KEYCHAIN_IT=1`。
+    #[test]
+    fn rekey_through_the_os_keychain_it() {
+        if std::env::var("SVAULT_KEYCHAIN_IT").is_err() {
+            return;
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let service = format!("session-vault-it-{nanos}");
+        let source = KeySource::Keychain {
+            service: service.clone(),
+            account: "master".into(),
+        };
+        let dir = std::env::temp_dir().join(format!("svault-it-keychain-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, memory, key_b) = (
+            dir.join("total_store.db"),
+            dir.join("m.md"),
+            dir.join("b.key"),
+        );
+        std::fs::write(&memory, "# m\n").unwrap();
+        TotalStore::open_with_source(&db, &source)
+            .unwrap()
+            .sync_snapshots(&[SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Local,
+                source_mode: SourceMode::SnapshotFile,
+                path: memory,
+                project_root: None,
+                artifact_kind: Some("memory".into()),
+            }])
+            .unwrap();
+        let a = source.load().unwrap().unwrap();
+        KeySource::File(key_b.clone()).create().unwrap();
+        let b = load_key_file(&key_b).unwrap().unwrap();
+
+        let done = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap();
+        let locator = done.previous_key_backup.unwrap();
+        let backup = KeySource::from_locator(&locator).unwrap();
+        let result = (
+            backup.load().unwrap().unwrap().same_as(&a),
+            source.load().unwrap().unwrap().same_as(&b),
+            TotalStore::open_with_source(&db, &source).is_ok(),
+        );
+        for slot in [&source, &backup] {
+            if let KeySource::Keychain { service, account } = slot {
+                keyring::Entry::new(service, account)
+                    .unwrap()
+                    .delete_password()
+                    .unwrap();
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            locator.starts_with(&format!("keychain:{service}/master.previous-")),
+            "{locator}"
+        );
+        assert_eq!(
+            result,
+            (true, true, true),
+            "（备份是旧钥匙, 本机已换新钥匙, 新钥匙打得开库）"
+        );
+    }
+
+    /// 库还没迁到「数据密钥」格式（有正文直接用主密钥加密）：换钥会把它们留在旧钥匙下，拒绝。
+    #[test]
+    fn a_store_not_yet_on_data_keys_is_not_rekeyed() {
+        let (dir, db, source, key_b) = rekey_fixture("rekey-legacy");
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE store_meta SET v = '1' WHERE k = 'encryption_version'",
+                [],
+            )
+            .unwrap();
+        let before = data_keys(&db);
+        let err = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap_err();
+        assert!(matches!(err, StoreError::Rekey(_)), "{err}");
+        assert_eq!(data_keys(&db), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Windows：库被别的句柄开着（就像 QuotaBar 在跑）：拒绝，连备份都不做。
+    #[test]
+    #[cfg(windows)]
+    fn rekey_refuses_while_the_store_is_open_elsewhere() {
+        let (dir, db, source, key_b) = rekey_fixture("rekey-busy");
+        let a = source.load().unwrap().unwrap();
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .query_row("SELECT count(*) FROM data_keys", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        let err = TotalStore::rekey_with_source(&source, &key_b, &db).unwrap_err();
+        assert!(matches!(err, StoreError::Rekey(_)), "{err}");
+        assert!(source.load().unwrap().unwrap().same_as(&a));
+        let backups = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".previous-")
+            })
+            .count();
+        assert_eq!(backups, 0, "拒绝了却做了备份");
+        drop(holder);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// 库里已有加密数据而密钥文件丢了：拒绝打开，且不悄悄生成一把新的 ——
