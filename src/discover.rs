@@ -418,8 +418,8 @@ fn home_rel_base(source_type: SourceType) -> Option<&'static str> {
 
 /// 发现各 WSL 用户发行版内的来源（`Wsl(distro)` 标记）。
 ///
-/// Windows 专属：经 `wsl::list_distros` 枚举发行版，对每个 provider 的每个子目录
-/// 在发行版内 `find *.jsonl`。非 Windows 构建为 no-op（见 `wsl` 的桩）。
+/// Windows 专属：经 `wsl::list_distros` 枚举发行版，每个发行版**一次** `wsl.exe` 列完
+/// 各 provider 各子目录下的文件（`wsl::list_files_many`）。非 Windows 构建为 no-op（见 `wsl` 的桩）。
 /// append_log 与 snapshot_file 均经 WSL bridge 读取；sqlite_store 仍未实现。
 #[cfg(windows)]
 fn discover_wsl(
@@ -439,8 +439,12 @@ fn discover_wsl(
             return;
         }
     };
+    let descriptors = catalog::builtin_descriptors();
     for distro in distros.iter().filter(|d| crate::wsl::is_user_distro(d)) {
-        for desc in catalog::builtin_descriptors() {
+        // 先按原来的顺序列出这个发行版要问的各族，再一次问完、按同一顺序处理 ——
+        // 产出的来源顺序因此与逐族问时逐字节相同（QuotaBar 的判据）。
+        let mut families = Vec::new();
+        for desc in &descriptors {
             let Some(base) = home_rel_base(desc.source_type) else {
                 continue;
             };
@@ -465,61 +469,79 @@ fn discover_wsl(
                     log::warn!(target: tag::DISCOVER, "unsupported artifact glob: {}", art.glob);
                     continue;
                 };
-                let mut files =
-                    match crate::wsl::list_files_under_home(distro, &rel, suffix, deadline) {
-                        Ok(f) => f,
-                        Err(e) => {
-                            // 这个发行版的这一族没问成 ⇒ 整个位置都不能据本轮结果删存量。
-                            // 「这一族空」与「这一族问不到」在返回值上一模一样。
-                            log::warn!(
-                                target: tag::DISCOVER,
-                                "wsl find failed: distro={distro} rel={rel} err={e}"
-                            );
-                            let key = format!("wsl:{distro}");
-                            if !unreachable.contains(&key) {
-                                unreachable.push(key);
-                            }
-                            continue;
-                        }
-                    };
-                if !art.recursive {
-                    files.retain(|p| {
-                        p.rsplit_once('/')
-                            .is_some_and(|(parent, _)| parent.ends_with(&rel))
-                    });
+                families.push((desc, art, rel, suffix));
+            }
+        }
+        let queries: Vec<(String, String)> = families
+            .iter()
+            .map(|(_, _, rel, suffix)| (rel.clone(), suffix.to_string()))
+            .collect();
+        let key = format!("wsl:{distro}");
+        // 🔴 整批没问成 ⇒ 这个发行版**每一族**都没问成：位置记进 `unreachable`，一个来源也不报。
+        // 逐族问时其余族还能各自报出来；但位置已标没问成，调用方本就不会据本轮结果删存量。
+        let answers = match crate::wsl::list_files_many(distro, &queries, deadline) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!(target: tag::DISCOVER, "wsl find failed: distro={distro} err={e}");
+                if !unreachable.contains(&key) {
+                    unreachable.push(key);
                 }
-                // 与本机侧同一条规则：不含通配符 ⇒ 精确文件名。
-                // ⚠️ 两侧各写一份是这段代码的既有形状（一个走 std 遍历、一个走
-                // `wsl find`），**改一处要记得改另一处** —— 全局指令文件正是
-                // 两侧都要扫的那类（用户在 Windows 与 WSL 各有一份）。
-                if !art.glob.contains('*') {
-                    files.retain(|p| {
-                        p.rsplit_once('/')
-                            .map(|(_, name)| name == art.glob)
-                            .unwrap_or(p == &art.glob)
-                    });
+                continue;
+            }
+        };
+        for ((desc, art, rel, _), answer) in families.iter().zip(answers) {
+            let mut files = match answer {
+                Ok(f) => f,
+                Err(e) => {
+                    // 这个发行版的这一族没问成 ⇒ 整个位置都不能据本轮结果删存量。
+                    // 「这一族空」与「这一族问不到」在返回值上一模一样。
+                    log::warn!(
+                        target: tag::DISCOVER,
+                        "wsl find failed: distro={distro} rel={rel} err={e}"
+                    );
+                    if !unreachable.contains(&key) {
+                        unreachable.push(key.clone());
+                    }
+                    continue;
                 }
-                if art.glob == "**/memory/*.md" {
-                    files.retain(|p| {
-                        p.rsplit_once('/')
-                            .is_some_and(|(parent, _)| parent.ends_with("/memory"))
-                    });
-                }
-                log::debug!(
-                    target: tag::DISCOVER,
-                    "wsl scanned: distro={distro} rel={rel} files={}",
-                    files.len()
-                );
-                for p in files {
-                    out.push(SourceRef {
-                        source_type: desc.source_type,
-                        source_location: SourceLocation::Wsl(distro.clone()),
-                        source_mode: art.source_mode,
-                        path: PathBuf::from(p),
-                        project_root: None,
-                        artifact_kind: artifact_kind(art),
-                    });
-                }
+            };
+            if !art.recursive {
+                files.retain(|p| {
+                    p.rsplit_once('/')
+                        .is_some_and(|(parent, _)| parent.ends_with(rel.as_str()))
+                });
+            }
+            // 与本机侧同一条规则：不含通配符 ⇒ 精确文件名。
+            // ⚠️ 两侧各写一份是这段代码的既有形状（一个走 std 遍历、一个走
+            // `wsl find`），**改一处要记得改另一处** —— 全局指令文件正是
+            // 两侧都要扫的那类（用户在 Windows 与 WSL 各有一份）。
+            if !art.glob.contains('*') {
+                files.retain(|p| {
+                    p.rsplit_once('/')
+                        .map(|(_, name)| name == art.glob)
+                        .unwrap_or(p == &art.glob)
+                });
+            }
+            if art.glob == "**/memory/*.md" {
+                files.retain(|p| {
+                    p.rsplit_once('/')
+                        .is_some_and(|(parent, _)| parent.ends_with("/memory"))
+                });
+            }
+            log::debug!(
+                target: tag::DISCOVER,
+                "wsl scanned: distro={distro} rel={rel} files={}",
+                files.len()
+            );
+            for p in files {
+                out.push(SourceRef {
+                    source_type: desc.source_type,
+                    source_location: SourceLocation::Wsl(distro.clone()),
+                    source_mode: art.source_mode,
+                    path: PathBuf::from(p),
+                    project_root: None,
+                    artifact_kind: artifact_kind(art),
+                });
             }
         }
     }
@@ -1012,5 +1034,46 @@ mod tests {
             found.unreachable
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 实机：发现会话来源时，一个发行版只起一次 `wsl.exe`（另加一次列发行版）——
+    /// QuotaBar 按规则 2 提的【3】（2026-10-10）。只读真实的会话目录，不建也不删任何东西。
+    /// 需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，单独跑（`--test-threads=1`）：数的是全进程的启动次数。
+    #[test]
+    #[cfg(windows)]
+    fn transcript_discovery_spawns_one_wsl_call_per_distro_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let user_distros = crate::wsl::list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .filter(|d| crate::wsl::is_user_distro(d))
+            .count();
+        let before = crate::wsl::spawn_count();
+        let found = super::discover_transcripts_reported(unbounded()).unwrap();
+        let spawns = crate::wsl::spawn_count() - before;
+        assert!(found.unreachable.is_empty(), "{:?}", found.unreachable);
+        assert_eq!(spawns, 1 + user_distros, "列发行版一次 + 每个发行版一次");
+        // 一次问完之后答案要对回各自那一族：每个 WSL 来源的路径都落在它那个 provider 的配置根下。
+        let wsl: Vec<_> = found
+            .sources
+            .iter()
+            .filter(|s| matches!(s.source_location, SourceLocation::Wsl(_)))
+            .collect();
+        assert!(
+            !wsl.is_empty(),
+            "本机 WSL 里应当有会话，否则下面的核对是空的"
+        );
+        for s in wsl {
+            let base = super::home_rel_base(s.source_type).unwrap();
+            let path = s.path.to_string_lossy();
+            assert!(
+                path.contains(&format!("/{base}/")),
+                "{:?} {path}",
+                s.source_type
+            );
+        }
     }
 }

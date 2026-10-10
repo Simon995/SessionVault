@@ -292,22 +292,94 @@ pub fn list_files_under_home(
     Ok(parse_nul_paths(&output.stdout))
 }
 
-#[cfg(not(windows))]
-pub fn list_jsonl_under_home(
-    _distro: &str,
-    _rel_subpath: &str,
-    _deadline: crate::deadline::Deadline,
-) -> Result<Vec<String>, String> {
-    Ok(Vec::new())
+/// [`list_files_many`] 对一族文件的答案，与 [`list_files_under_home`] 同语义：
+/// `Ok(路径)`（目录不存在时为空），`Err` 这一族没问成。
+pub type ListAnswer = Result<Vec<String>, String>;
+
+/// 一次 `wsl.exe` 列完一个发行版 `$HOME` 下的几族文件；`queries` 是 `(相对子目录, 后缀)`，
+/// 每族与 [`list_files_under_home`] 跑同一条 `find`。
+///
+/// 发现阶段逐族问时，一个发行版要起 4 次 `wsl.exe`（QuotaBar 实测，2026-10-10）。
+/// 返回与 `queries` 一一对应；每族带着自己 `find` 的退出码，一族失败不连累别族。
+/// 整批没问成（进程起不来、超时、`bash` 本身失败）返回外层 `Err`。
+#[cfg(windows)]
+pub fn list_files_many(
+    distro: &str,
+    queries: &[(String, String)],
+    deadline: crate::deadline::Deadline,
+) -> Result<Vec<ListAnswer>, String> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let out = run_bash_stdin(distro, &list_many_script(queries), deadline)?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl list_files_many {distro} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_list_many(
+        &out.stdout,
+        queries,
+        String::from_utf8_lossy(&out.stderr).trim(),
+    ))
 }
 
-#[cfg(not(windows))]
-pub fn list_files_under_home(
-    _distro: &str,
-    _rel_subpath: &str,
-    _suffix: &str,
-) -> Result<Vec<String>, String> {
-    Ok(Vec::new())
+/// [`list_files_many`] 的脚本：每族先打 `B\t<序号>\0`，再是 `find -print0` 的路径，
+/// 最后 `E\t<序号>\t<退出码>\0`。路径都以 `$HOME` 开头（绝对路径），不会被认成标记。
+/// 目录不存在时与 [`list_files_under_home`] 一样算「问了、没有」（退出码 0）。
+#[cfg(any(windows, test))]
+fn list_many_script(queries: &[(String, String)]) -> String {
+    let mut script = String::from("set -u\n");
+    for (i, (rel, suffix)) in queries.iter().enumerate() {
+        script.push_str(&format!(
+            "DIR=\"$HOME/{rel}\"\nprintf 'B\\t{i}\\0'\n\
+             if [ -d \"$DIR\" ]; then if find \"$DIR\" -type f -name \"{pattern}\" -print0; then rc=0; else rc=$?; fi; else rc=0; fi\n\
+             printf 'E\\t{i}\\t%s\\0' \"$rc\"\n",
+            rel = shell_escape(rel),
+            pattern = shell_escape(&format!("*{suffix}")),
+        ));
+    }
+    script
+}
+
+/// 解析 [`list_files_many`] 的输出。一族的 `E` 标记没出现（输出被截断）就是「没问成」，
+/// 已收到的那部分路径不作数 —— 半份列表会被调用方当成「其余的文件不在了」。
+#[cfg(any(windows, test))]
+fn parse_list_many(bytes: &[u8], queries: &[(String, String)], stderr: &str) -> Vec<ListAnswer> {
+    let mut answers: Vec<Option<ListAnswer>> = vec![None; queries.len()];
+    let mut current: Option<(usize, Vec<String>)> = None;
+    for record in bytes.split(|b| *b == 0) {
+        let text = String::from_utf8_lossy(record);
+        if let Some(idx) = text.strip_prefix("B\t") {
+            current = idx.parse::<usize>().ok().map(|i| (i, Vec::new()));
+        } else if let Some(rest) = text.strip_prefix("E\t") {
+            let Some((idx, rc)) = rest.split_once('\t') else {
+                continue;
+            };
+            let (Ok(idx), Some((open, paths))) = (idx.parse::<usize>(), current.take()) else {
+                continue;
+            };
+            if idx != open || idx >= answers.len() {
+                continue;
+            }
+            answers[idx] = Some(if rc == "0" {
+                Ok(paths)
+            } else {
+                Err(format!("find {} exited {rc}: {stderr}", queries[idx].0))
+            });
+        } else if let (Some((_, paths)), Some(path)) = (current.as_mut(), nul_record_path(record)) {
+            paths.push(path);
+        }
+    }
+    answers
+        .into_iter()
+        .zip(queries)
+        .map(|(answer, (rel, _))| {
+            answer.unwrap_or_else(|| Err(format!("wsl list_files_many: no answer for {rel}")))
+        })
+        .collect()
 }
 
 /// 取发行版内**绝对路径**文件的 `(size, mtime_secs)`；`Ok(None)` = 文件不存在（exit 7）。
@@ -792,6 +864,25 @@ macro_rules! stub_on_non_windows {
 
 #[cfg(not(windows))]
 stub_on_non_windows! {
+    pub fn list_jsonl_under_home(
+        distro: &str,
+        rel_subpath: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Vec<String>, String>;
+
+    pub fn list_files_under_home(
+        distro: &str,
+        rel_subpath: &str,
+        suffix: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Vec<String>, String>;
+
+    pub fn list_files_many(
+        distro: &str,
+        queries: &[(String, String)],
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Vec<ListAnswer>, String>;
+
     pub fn home_of(
         distro: &str,
         deadline: crate::deadline::Deadline,
@@ -1018,19 +1109,24 @@ fn parse_distros(text: &str) -> Vec<String> {
 fn parse_nul_paths(bytes: &[u8]) -> Vec<String> {
     bytes
         .split(|b| *b == 0)
-        .filter_map(|chunk| {
-            if chunk.is_empty() {
-                return None;
-            }
-            let s = String::from_utf8_lossy(chunk);
-            let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        })
+        .filter_map(nul_record_path)
         .collect()
+}
+
+/// `find -print0` 的一条记录 → 路径（去空白、UTF-8 lossy；空记录为 `None`）。
+/// [`parse_nul_paths`] 与 [`parse_list_many`] 共用：两条路必须给出逐字节相同的路径。
+#[cfg(any(windows, test))]
+fn nul_record_path(chunk: &[u8]) -> Option<String> {
+    if chunk.is_empty() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(chunk);
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 /// 为嵌入双引号 bash 串转义 segment：只转义在双引号内仍生效的四个字符（`\ " $ ` `）。
@@ -1163,6 +1259,141 @@ mod tests {
         );
         assert!(parse_nul_paths(b"").is_empty());
         assert!(parse_nul_paths(b"\0\0").is_empty());
+    }
+
+    fn families(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!(".claude/f{i}"), ".jsonl".to_string()))
+            .collect()
+    }
+
+    /// 每族各有答案：有文件 / 目录空或不在 / `find` 失败（只这一族）/ 输出里没有它。
+    #[test]
+    fn parse_list_many_answers_each_family_on_its_own() {
+        let bytes = b"B\t0\0/h/a.jsonl\0/h/b c.jsonl\0E\t0\t0\0\
+                      B\t1\0E\t1\t0\0\
+                      B\t2\0/h/x.jsonl\0E\t2\t1\0";
+        let answers = parse_list_many(bytes, &families(4), "find: denied");
+        assert_eq!(
+            answers[0],
+            Ok(vec!["/h/a.jsonl".to_string(), "/h/b c.jsonl".to_string()])
+        );
+        assert_eq!(answers[1], Ok(Vec::new()));
+        let failed = answers[2].as_ref().unwrap_err();
+        assert!(
+            failed.contains("exited 1") && failed.contains("find: denied"),
+            "{failed}"
+        );
+        assert!(answers[3].as_ref().unwrap_err().contains("no answer"));
+    }
+
+    /// 输出在一族中途断掉：已收到的路径不作数 —— 半份列表会被当成「其余文件不在了」。
+    #[test]
+    fn a_family_cut_off_mid_list_is_not_a_short_list() {
+        let bytes = b"B\t0\0/h/a.jsonl\0E\t0\t0\0B\t1\0/h/b.jsonl\0";
+        let answers = parse_list_many(bytes, &families(2), "");
+        assert_eq!(answers[0], Ok(vec!["/h/a.jsonl".to_string()]));
+        assert!(answers[1].is_err(), "{:?}", answers[1]);
+        // 结束标记的序号对不上正在收的那族：同样不作数。
+        let answers = parse_list_many(b"B\t0\0/h/a.jsonl\0E\t1\t0\0", &families(2), "");
+        assert!(answers.iter().all(Result::is_err), "{answers:?}");
+    }
+
+    /// 同一段 `find -print0` 输出，批量与单族两条路给出逐字节相同的路径（空白、空记录、非 ASCII）。
+    #[test]
+    fn list_many_paths_match_the_single_family_parser() {
+        let find_output = "/h/ a.jsonl \0\0/h/中文 b.jsonl\0  \0/h/c.jsonl\0".as_bytes();
+        let mut bytes = b"B\t0\0".to_vec();
+        bytes.extend_from_slice(find_output);
+        bytes.extend_from_slice(b"E\t0\t0\0");
+        assert_eq!(
+            parse_list_many(&bytes, &families(1), ""),
+            vec![Ok(parse_nul_paths(find_output))]
+        );
+    }
+
+    /// 脚本里每族一段、序号与 `queries` 对齐，子目录与后缀照单族那条转义。
+    #[test]
+    fn list_many_script_has_one_numbered_section_per_family() {
+        let script = list_many_script(&[
+            (".claude/projects".to_string(), ".jsonl".to_string()),
+            ("odd$dir".to_string(), ".md".to_string()),
+        ]);
+        assert!(script.contains("DIR=\"$HOME/.claude/projects\"\nprintf 'B\\t0\\0'"));
+        assert!(script.contains("DIR=\"$HOME/odd\\$dir\"\nprintf 'B\\t1\\0'"));
+        assert!(script.contains("-name \"*.md\" -print0"));
+        assert!(script.contains("printf 'E\\t1\\t%s\\0' \"$rc\""));
+    }
+
+    /// 实机：批量的每族答案与逐族单独问逐字节相同，且整批只起一次 `wsl.exe`；一族 `find` 失败
+    /// 不连累别族。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，单独跑（`--test-threads=1`）。
+    ///
+    /// 夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读 —— 不往发行版里写，也不从这边删它的文件。
+    #[test]
+    #[cfg(windows)]
+    fn list_files_many_agrees_with_one_call_per_family_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let distro = list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| is_user_distro(d))
+            .expect("need a user distro");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("svault-it-listmany-{nanos}"));
+        std::fs::create_dir_all(dir.join("a").join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        for f in ["a/x.jsonl", "a/sub/y z.jsonl", "a/中文.jsonl", "a/n.md"] {
+            std::fs::write(dir.join(f), b"{}\n").unwrap();
+        }
+        let win = dir.to_string_lossy().into_owned();
+        let (drive, rest) = win.split_once(":\\").expect("drive-letter temp dir");
+        let mnt = format!("{}/{}", drive.to_lowercase(), rest.replace('\\', "/"));
+        // `queries` 相对 `$HOME`：从家目录退到根，再进 `/mnt/<盘>`。
+        let home = home_of(&distro, unbounded()).unwrap();
+        let up = "../".repeat(home.trim_matches('/').split('/').count());
+        let q = |rel: &str, suffix: &str| (format!("{up}{rel}"), suffix.to_string());
+        let queries = vec![
+            q(&format!("mnt/{mnt}/a"), ".jsonl"),
+            q(&format!("mnt/{mnt}/b"), ".jsonl"),
+            q(&format!("mnt/{mnt}/missing"), ".jsonl"),
+            q(&format!("mnt/{mnt}/a"), ".md"),
+            // 普通用户读不了 `/root` ⇒ 这一族 `find` 失败；以 root 跑的发行版则两边都成功。
+            q("root", ".jsonl"),
+        ];
+        let single: Vec<ListAnswer> = queries
+            .iter()
+            .map(|(rel, suffix)| list_files_under_home(&distro, rel, suffix, unbounded()))
+            .collect();
+        let before = spawn_count();
+        let batch = list_files_many(&distro, &queries, unbounded()).expect("batch");
+        let spawns = spawn_count() - before;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(spawns, 1, "整批应只起一次 wsl.exe");
+        assert_eq!(batch.len(), queries.len());
+        for (i, (s, b)) in single.iter().zip(&batch).enumerate() {
+            match (s, b) {
+                (Ok(s), Ok(b)) => assert_eq!(s, b, "family {i}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("family {i}: single={s:?} batch={b:?}"),
+            }
+        }
+        let mut a = batch[0].clone().unwrap();
+        a.sort();
+        let expected: Vec<String> = ["a/sub/y z.jsonl", "a/x.jsonl", "a/中文.jsonl"]
+            .iter()
+            .map(|f| format!("{home}/{}mnt/{mnt}/{f}", up))
+            .collect();
+        assert_eq!(a, expected);
+        assert_eq!(batch[1], Ok(Vec::new()), "空目录");
+        assert_eq!(batch[2], Ok(Vec::new()), "目录不在 = 问了、没有");
+        assert_eq!(batch[3].as_ref().unwrap().len(), 1);
     }
 
     /// 每条请求的路径都有答案：读到了 / 不是普通文件 / 超过上限 / 没读成（坏记录、输出里没有它）。
