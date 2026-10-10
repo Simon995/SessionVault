@@ -325,6 +325,48 @@ pub struct GcStats {
     pub dry_run: bool,
 }
 
+/// [`TotalStore::reattribute`] 改的一种写法：当前投影里的 `from` → 注册表里同一个目录的 `to`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Respelling {
+    pub from: String,
+    pub to: String,
+    /// 改写前当前投影里用 `from` 的事件数与来源数。
+    pub events: u64,
+    pub sources: u64,
+}
+
+/// [`TotalStore::reattribute`] 没动的一个来源：它的当前投影原样保留，`reason` 写明为什么。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReattributeSkip {
+    pub source_type: String,
+    pub source_location: String,
+    pub source_path: String,
+    pub reason: String,
+}
+
+/// [`TotalStore::reattribute`] 没改的一种写法：注册表里这个目录不止一种写法（`spellings`），
+/// 「注册表的写法」取决于读出顺序，不是一个答案。要先由人定下这个目录用哪种写法。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AmbiguousSpelling {
+    pub from: String,
+    pub spellings: Vec<String>,
+    /// 当前投影里用 `from` 的事件数与来源数。
+    pub events: u64,
+    pub sources: u64,
+}
+
+/// [`TotalStore::reattribute`] 的结果。`dry_run` 时 `sources_rewritten` / `events_written` 是「将会」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReattributeStats {
+    pub respellings: Vec<Respelling>,
+    pub ambiguous: Vec<AmbiguousSpelling>,
+    /// 写了新一代的来源数，与这些新代里的事件数（含写法没变、随来源一起搬过去的）。
+    pub sources_rewritten: u64,
+    pub events_written: u64,
+    pub skipped: Vec<ReattributeSkip>,
+    pub dry_run: bool,
+}
+
 /// [`TotalStore::recent_sessions`] 的一行。
 ///
 /// `last_occurred_at_unix_ms` 为 `None` = 这个会话的事件全都没有可解析的时间。它排在
@@ -3547,6 +3589,251 @@ impl TotalStore {
         Ok(stats)
     }
 
+    /// 把当前投影里「同一个目录的旧写法」的 `project_root` 改成注册表现在给的写法。
+    ///
+    /// **只改写法，不改归属**：`from` 与 `to` 在 `registry` 下比较键相同才改（UNC 写法与规范形、
+    /// 发行版里的 `/mnt/<盘>` 与盘本身……）。归到另一个根（注册表长出了更深的根）是重扫的事，不在这里。
+    ///
+    /// 受影响的来源整代重写：解密当前投影 → 改写 `project_root` / `project_root_source` /
+    /// `workspace_location`（同解析器的算法）→ 作为同一份字节的新投影版本写回（[`Projection::Reparse`]，
+    /// 与「注册表变了 ⇒ 同一份字节重算归属」同一个模式）。不读源文件，所以源文件已被清理的会话
+    /// 也改得到；消费方经 change-feed 收到「这个来源的当前投影被换掉了」。
+    ///
+    /// 🔴 注册表里这个目录不止一种写法时不改，记进 `ambiguous`：那时「注册表的写法」取决于读出顺序。
+    /// `registry` 必须来自本库（[`Self::project_root_registry`]），歧义按本库的注册表判。
+    ///
+    /// 🔴 一个来源里只要有一条事件解不开，这个来源整个不动：新的一代会少掉它，而旧的一代随之被取代。
+    ///
+    /// 🔴 并发：调用方先确认没有别的写入方开着库（同 [`Self::rekey`]）。读与写之间仍有别的进程追加了
+    /// 事件时，新一代比旧一代少 —— [`Self::apply_projection`] 报 `loses_events` 并保留旧代，这里把它
+    /// 报成跳过。
+    pub fn reattribute(
+        &self,
+        registry: &crate::attribution::RootRegistry,
+        dry_run: bool,
+    ) -> StoreResult<ReattributeStats> {
+        use crate::attribution::{attribute, Attribution};
+        type SourceRow = (String, String, String);
+
+        let current_rows = r#"FROM raw_events r
+              LEFT JOIN current_head h
+                     ON h.source_type = r.source_type
+                    AND h.source_location = r.source_location
+                    AND h.source_path = r.source_path
+             WHERE r.source_revision = COALESCE(h.source_revision, 0)
+               AND r.projection_revision = COALESCE(h.projection_revision, 0)"#;
+
+        // 1. 哪些写法要改：同一个目录（比较键相同）、注册表给的写法不同。
+        //
+        // 🔴 注册表里同一个目录登记了几种写法时（有挂载表时 `C:\X` 与 `/mnt/c/X` 比较键相同），
+        // `RootRegistry` 留下的是后读到的那条 —— 「注册表的写法」取决于行序，不是一个答案。
+        // 这种不改，单列报出来。
+        let (values, registered): (Vec<String>, Vec<String>) = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT project_root FROM raw_events WHERE project_root <> ''")?;
+            let values = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            let mut stmt = conn.prepare("SELECT root_path FROM project_root_registry")?;
+            let registered = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            (values, registered)
+        };
+        let mut spellings_of: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+        for root in registered {
+            spellings_of
+                .entry(registry.key(&root))
+                .or_default()
+                .insert(root);
+        }
+        let mut respell: HashMap<String, (String, String)> = HashMap::new();
+        let mut undecided: HashMap<String, Vec<String>> = HashMap::new();
+        for from in values {
+            let Attribution::Root { path: to, source } = attribute(Some(&from), registry) else {
+                continue;
+            };
+            let key = registry.key(&to);
+            if to == from || key != registry.key(&from) {
+                continue;
+            }
+            match spellings_of.get(&key) {
+                Some(spellings) if spellings.len() > 1 => {
+                    undecided.insert(from, spellings.iter().cloned().collect());
+                }
+                _ => {
+                    respell.insert(from, (to, source.as_str().to_string()));
+                }
+            }
+        }
+
+        // 2. 用这些写法的当前投影在哪些来源里。
+        let mut respellings = Vec::new();
+        let mut ambiguous = Vec::new();
+        let mut sources: std::collections::BTreeSet<SourceRow> = std::collections::BTreeSet::new();
+        {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(&format!(
+                "SELECT r.source_type, r.source_location, r.source_path, COUNT(*) {current_rows} \
+                   AND r.project_root = ?1 GROUP BY 1, 2, 3"
+            ))?;
+            let mut users_of = |from: &str| -> StoreResult<(u64, Vec<SourceRow>)> {
+                let rows = stmt.query_map(params![from], |r| {
+                    Ok((
+                        (r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?),
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?;
+                let (mut events, mut found) = (0u64, Vec::new());
+                for row in rows {
+                    let (source, n) = row?;
+                    events += n as u64;
+                    found.push(source);
+                }
+                Ok((events, found))
+            };
+            let mut froms: Vec<&String> = respell.keys().collect();
+            froms.sort();
+            for from in froms {
+                let (events, found) = users_of(from)?;
+                if found.is_empty() {
+                    continue;
+                }
+                respellings.push(Respelling {
+                    from: from.clone(),
+                    to: respell[from].0.clone(),
+                    events,
+                    sources: found.len() as u64,
+                });
+                sources.extend(found);
+            }
+            let mut froms: Vec<&String> = undecided.keys().collect();
+            froms.sort();
+            for from in froms {
+                let (events, found) = users_of(from)?;
+                if found.is_empty() {
+                    continue;
+                }
+                ambiguous.push(AmbiguousSpelling {
+                    from: from.clone(),
+                    spellings: undecided[from].clone(),
+                    events,
+                    sources: found.len() as u64,
+                });
+            }
+        }
+
+        // 3. 逐个来源整代重写。
+        let attribution_revision = self.attribution_revision();
+        let host = crate::pathnorm::HostPlatform::current();
+        let mut stats = ReattributeStats {
+            respellings,
+            ambiguous,
+            sources_rewritten: 0,
+            events_written: 0,
+            skipped: Vec::new(),
+            dry_run,
+        };
+        for (st, loc, path) in sources {
+            let skip = |reason: String| ReattributeSkip {
+                source_type: st.clone(),
+                source_location: loc.clone(),
+                source_path: path.clone(),
+                reason,
+            };
+            let (head, parser_revision, mut events, undecodable) = {
+                let conn = self.conn.lock().unwrap();
+                let head = head_of(&conn, &st, &loc, &path)?;
+                let parser_revision: Option<u32> = conn
+                    .query_row(
+                        "SELECT parser_revision FROM projections
+                          WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                            AND source_revision = ?4 AND projection_revision = ?5",
+                        params![st, loc, path, head.0, head.1],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {ENCRYPTED_ROW_COLUMNS} {current_rows} \
+                       AND r.source_type = ?1 AND r.source_location = ?2 AND r.source_path = ?3 \
+                     ORDER BY r.seq ASC, r.offset ASC"
+                ))?;
+                let rows = stmt.query_map(params![st, loc, path], EncryptedRow::from_sql)?;
+                let mut key_cache = HashMap::new();
+                let (mut events, mut undecodable) = (Vec::new(), 0usize);
+                for row in rows {
+                    match self.decode_event_on(&conn, &mut key_cache, &row?) {
+                        Ok(ev) => events.push(ev),
+                        Err(_) => undecodable += 1,
+                    }
+                }
+                (head, parser_revision, events, undecodable)
+            };
+            if undecodable > 0 {
+                stats.skipped.push(skip(format!(
+                    "{undecodable} event(s) in the current projection cannot be decrypted; rewriting would drop them"
+                )));
+                continue;
+            }
+            if events.is_empty() {
+                // 第 2 步之后这个来源的当前投影没了（期间被删除）—— 没有可改的。
+                stats
+                    .skipped
+                    .push(skip("no current events any more".to_string()));
+                continue;
+            }
+            for ev in &mut events {
+                let Some((to, source)) = ev.project_root.as_ref().and_then(|p| respell.get(p))
+                else {
+                    continue;
+                };
+                ev.workspace_location = Some(crate::pathnorm::workspace_location(
+                    to,
+                    &ev.source_location,
+                    host,
+                ));
+                ev.project_root = Some(to.clone());
+                ev.project_root_source = Some(source.clone());
+            }
+            let n = events.len() as u64;
+            if dry_run {
+                stats.sources_rewritten += 1;
+                stats.events_written += n;
+                continue;
+            }
+            let key = SourceKey::from_event(&events[0]);
+            let token = crate::token::ProjectionToken::new(
+                &key,
+                Some(&format!("reattribute:{}.{}", head.0, head.1)),
+                parser_revision.unwrap_or(0),
+                attribution_revision,
+                (0, n),
+            );
+            let applied = self.apply_projection(FileProjectionBatch {
+                source: key,
+                parser_revision,
+                mode: Projection::Reparse,
+                events,
+                token: Some(token),
+            })?;
+            if let Some((before, after)) = applied.loses_events {
+                stats.skipped.push(skip(format!(
+                    "the new projection has fewer events ({before} -> {after}); the old one was kept"
+                )));
+            } else if !applied.head_moved {
+                stats
+                    .skipped
+                    .push(skip("already rewritten by an earlier run".to_string()));
+            } else {
+                stats.sources_rewritten += 1;
+                stats.events_written += applied.appended;
+            }
+        }
+        Ok(stats)
+    }
+
     /// 最近活跃的 N 个会话，按各自最后一条事件的**真实时间**降序。
     ///
     /// 🔴 存在的理由：消费者此前用 `[max_offset - N, max_offset]` 当「最近窗口」，而
@@ -4768,6 +5055,293 @@ mod tests {
             .iter()
             .all(|(_, e)| e.source_session_id.starts_with("other")));
         assert_eq!(pulled.len(), 4);
+    }
+
+    /// `reattribute`：同一目录的旧写法改成注册表的写法、整代重写，正文与 seq 原样；别的一概不动。
+    /// 预览不写库；第二次运行什么都不做。
+    #[test]
+    fn reattribute_respells_the_same_directory_and_nothing_else() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        store.register_project_root("wsl:Ubuntu:/home/u/ws/p", RootSource::Git);
+        let put = |path: &str, roots: &[Option<&str>]| {
+            let evs: Vec<RawEvent> = roots
+                .iter()
+                .enumerate()
+                .map(|(i, root)| {
+                    let mut e = mk_event_at(i as u64, "s", path);
+                    e.content = Some(format!("m{i}"));
+                    e.project_root = root.map(str::to_string);
+                    e.project_root_source = Some("unattributed".to_string());
+                    e.workspace_location = Some("local".to_string());
+                    e
+                })
+                .collect();
+            store.append_events(&evs, Projection::Append).unwrap();
+        };
+        let unc = r"\\wsl.localhost\Ubuntu\home\u\ws\p";
+        let canonical = "wsl:Ubuntu:/home/u/ws/p";
+        put("/p/a.jsonl", &[Some(unc), None, Some(unc)]);
+        put("/p/b.jsonl", &[Some(canonical)]);
+        put("/p/c.jsonl", &[Some(r"\\wsl.localhost\Debian\home\u\ws\p")]);
+        put(
+            "/p/d.jsonl",
+            &[Some(r"\\wsl.localhost\Ubuntu\home\u\ws\p\sub")],
+        );
+        let registry = store.project_root_registry(&Vec::new());
+        let read = |path: &str| {
+            store
+                .read_session(SourceType::ClaudeCode, &SourceLocation::Local, path, "s")
+                .unwrap()
+        };
+        let head = |path: &str| {
+            let conn = store.conn.lock().unwrap();
+            head_of(&conn, "claude_code", "local", path).unwrap()
+        };
+
+        let preview = store.reattribute(&registry, true).unwrap();
+        assert_eq!(
+            preview.respellings,
+            vec![Respelling {
+                from: unc.to_string(),
+                to: canonical.to_string(),
+                events: 2,
+                sources: 1,
+            }]
+        );
+        assert_eq!((preview.sources_rewritten, preview.events_written), (1, 3));
+        assert!(preview.skipped.is_empty() && preview.dry_run);
+        assert_eq!(head("/p/a.jsonl"), (0, 0), "预览不写库");
+        assert_eq!(
+            read("/p/a.jsonl").events[0].project_root.as_deref(),
+            Some(unc)
+        );
+
+        let applied = store.reattribute(&registry, false).unwrap();
+        assert!(applied.skipped.is_empty(), "{:?}", applied.skipped);
+        assert_eq!((applied.sources_rewritten, applied.events_written), (1, 3));
+        assert_eq!(head("/p/a.jsonl"), (0, 1), "同一份字节的新投影版本");
+        let a = read("/p/a.jsonl");
+        assert_eq!(a.skipped, 0);
+        let got: Vec<_> = a
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    e.seq,
+                    e.content.as_deref(),
+                    e.project_root.as_deref(),
+                    e.project_root_source.as_deref(),
+                    e.workspace_location.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    0,
+                    Some("m0"),
+                    Some(canonical),
+                    Some("git"),
+                    Some("wsl:Ubuntu")
+                ),
+                (1, Some("m1"), None, Some("unattributed"), Some("local")),
+                (
+                    2,
+                    Some("m2"),
+                    Some(canonical),
+                    Some("git"),
+                    Some("wsl:Ubuntu")
+                ),
+            ]
+        );
+        // 旧代删掉了，change-feed 记下了这次替换。
+        let rows: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE source_path = '/p/a.jsonl'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 3);
+        let replaced: Vec<_> = store
+            .read_projection_changes(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.source_path == "/p/a.jsonl")
+            .map(|c| {
+                (
+                    c.reason,
+                    c.old_projection_revision,
+                    c.new_projection_revision,
+                )
+            })
+            .collect();
+        assert_eq!(replaced, vec![("reparse".to_string(), Some(0), 1)]);
+        // 不动：已是规范形 / 别的发行版 / 更深的未登记目录（归到 p 是改归属，不是改写法）。
+        for path in ["/p/b.jsonl", "/p/c.jsonl", "/p/d.jsonl"] {
+            assert_eq!(head(path), (0, 0), "{path}");
+        }
+        assert_eq!(
+            read("/p/d.jsonl").events[0].project_root.as_deref(),
+            Some(r"\\wsl.localhost\Ubuntu\home\u\ws\p\sub")
+        );
+
+        let again = store.reattribute(&registry, false).unwrap();
+        assert!(again.respellings.is_empty(), "{:?}", again.respellings);
+        assert_eq!((again.sources_rewritten, again.events_written), (0, 0));
+    }
+
+    /// 一个来源里有一条事件解不开：整个来源不动（重写会让它随旧代一起消失），原因报出来。
+    #[test]
+    fn reattribute_leaves_a_source_alone_when_an_event_cannot_be_decrypted() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        store.register_project_root("wsl:Ubuntu:/home/u/ws/p", RootSource::Git);
+        let unc = r"\\wsl.localhost\Ubuntu\home\u\ws\p";
+        let evs: Vec<RawEvent> = (0..3)
+            .map(|i| {
+                let mut e = mk_event(i, "s", Some("x"));
+                e.project_root = Some(unc.to_string());
+                e
+            })
+            .collect();
+        store.append_events(&evs, Projection::Append).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE raw_events SET event_json = 'sv2:broken' WHERE seq = 1",
+                [],
+            )
+            .unwrap();
+        let stats = store
+            .reattribute(&store.project_root_registry(&Vec::new()), false)
+            .unwrap();
+        assert_eq!(stats.sources_rewritten, 0);
+        assert_eq!(stats.skipped.len(), 1, "{:?}", stats.skipped);
+        assert!(
+            stats.skipped[0].reason.contains("cannot be decrypted"),
+            "{:?}",
+            stats.skipped
+        );
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap(),
+            (0, 0)
+        );
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE project_root = ?1",
+                params![unc],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 3);
+    }
+
+    /// 有挂载表时，发行版里的 `/mnt/<盘>` 与它的 UNC 写法都收敛到注册表里的盘符写法（与扫描器同一份
+    /// 注册表）；没有挂载表时一条都不改。
+    #[test]
+    fn reattribute_converges_a_drive_mount_only_with_the_mount_table() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        store.register_project_root(r"C:\work\q", RootSource::Git);
+        let wsl = SourceLocation::Wsl("Ubuntu".to_string());
+        let put = |path: &str, root: &str| {
+            let mut e = mk_event_at(0, "s", path);
+            e.source_location = wsl.clone();
+            e.project_root = Some(root.to_string());
+            store.append_events(&[e], Projection::Append).unwrap();
+        };
+        put("/p/m.jsonl", "/mnt/c/work/q");
+        put("/p/u.jsonl", r"\\wsl.localhost\Ubuntu\mnt\c\work\q");
+        let none = store
+            .reattribute(&store.project_root_registry(&Vec::new()), true)
+            .unwrap();
+        assert!(none.respellings.is_empty(), "{:?}", none.respellings);
+
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        let stats = store
+            .reattribute(&store.project_root_registry(&mounts), false)
+            .unwrap();
+        let pairs: Vec<_> = stats
+            .respellings
+            .iter()
+            .map(|r| (r.from.as_str(), r.to.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("/mnt/c/work/q", r"C:\work\q"),
+                (r"\\wsl.localhost\Ubuntu\mnt\c\work\q", r"C:\work\q"),
+            ]
+        );
+        assert_eq!(stats.sources_rewritten, 2);
+        for path in ["/p/m.jsonl", "/p/u.jsonl"] {
+            let ev = &store
+                .read_session(SourceType::ClaudeCode, &wsl, path, "s")
+                .unwrap()
+                .events[0];
+            assert_eq!(ev.project_root.as_deref(), Some(r"C:\work\q"), "{path}");
+            assert_eq!(ev.workspace_location.as_deref(), Some("local"), "{path}");
+        }
+    }
+
+    /// 注册表里同一个目录有两种写法（有挂载表时 `C:\X` 与 `/mnt/c/X`）：谁胜出取决于读出顺序，
+    /// 不是一个答案 ⇒ 不改，单列报出两种写法与涉及的事件；别的目录照改。
+    #[test]
+    fn reattribute_does_not_pick_between_two_registered_spellings() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        store.register_project_root(r"C:\work\q", RootSource::Git);
+        store.register_project_root("/mnt/c/work/q", RootSource::Git);
+        store.register_project_root("wsl:Ubuntu:/home/u/ws/p", RootSource::Git);
+        let put = |path: &str, root: &str| {
+            let mut e = mk_event_at(0, "s", path);
+            e.project_root = Some(root.to_string());
+            store.append_events(&[e], Projection::Append).unwrap();
+        };
+        put("/p/win.jsonl", r"C:\work\q");
+        put("/p/mnt.jsonl", "/mnt/c/work/q");
+        put("/p/unc.jsonl", r"\\wsl.localhost\Ubuntu\home\u\ws\p");
+        let mounts = vec![("/mnt/c".to_string(), r"C:\".to_string())];
+        let stats = store
+            .reattribute(&store.project_root_registry(&mounts), false)
+            .unwrap();
+        let ambiguous: Vec<_> = stats
+            .ambiguous
+            .iter()
+            .map(|a| (a.from.as_str(), a.spellings.clone(), a.events))
+            .collect();
+        let both = vec!["/mnt/c/work/q".to_string(), r"C:\work\q".to_string()];
+        // 胜出的那种写法自己不算要改（`to == from`），另一种被报出来。
+        assert_eq!(ambiguous.len(), 1, "{ambiguous:?}");
+        assert_eq!(ambiguous[0].1, both);
+        assert_eq!(ambiguous[0].2, 1);
+        assert_eq!(
+            stats
+                .respellings
+                .iter()
+                .map(|r| r.from.as_str())
+                .collect::<Vec<_>>(),
+            vec![r"\\wsl.localhost\Ubuntu\home\u\ws\p"],
+            "别的目录照改"
+        );
+        assert_eq!(stats.sources_rewritten, 1);
+        let conn = store.conn.lock().unwrap();
+        for path in ["/p/win.jsonl", "/p/mnt.jsonl"] {
+            assert_eq!(
+                head_of(&conn, "claude_code", "local", path).unwrap(),
+                (0, 0),
+                "{path}"
+            );
+        }
     }
 
     /// 带上挂载表时，`<盘>:\…` 与 `/mnt/<盘>/…`（含经发行版看的）也是同一目录；不带时不互认。

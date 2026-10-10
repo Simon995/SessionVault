@@ -190,6 +190,46 @@ MUTATIONS: list[Mutation] = [
         must_fail=["a_family_cut_off_mid_list_is_not_a_short_list"],
         why="结束标记对不上正在收的那族也收 ⇒ 输出断在一族中途时，上一族的半份路径被记到下一族名下",
     ),
+    Mutation(
+        name="reattribute-moves-events-to-another-directory",
+        rel_path="src/store.rs",
+        old="            if to == from || key != registry.key(&from) {",
+        new="            if to == from {",
+        must_fail=["reattribute_respells_the_same_directory_and_nothing_else"],
+        why="不核「同一个目录」⇒ 更深的未登记目录也被改到上层根下：那是改归属，不是改写法",
+    ),
+    Mutation(
+        name="reattribute-picks-a-spelling-by-row-order",
+        rel_path="src/store.rs",
+        old="                Some(spellings) if spellings.len() > 1 => {",
+        new="                Some(spellings) if spellings.len() > 99 => {",
+        must_fail=["reattribute_does_not_pick_between_two_registered_spellings"],
+        why="注册表里同一目录两种写法时照改 ⇒ 改成哪种取决于读出顺序（真库上会把 4 万条本机事件改成 /mnt/c 写法）",
+    ),
+    Mutation(
+        name="reattribute-rewrites-a-source-it-cannot-fully-read",
+        rel_path="src/store.rs",
+        old="            if undecodable > 0 {",
+        new="            if undecodable > 99 {",
+        must_fail=["reattribute_leaves_a_source_alone_when_an_event_cannot_be_decrypted"],
+        why="有事件解不开也重写 ⇒ 新的一代少了它，而它随旧代一起被取代",
+    ),
+    Mutation(
+        name="reattribute-keeps-the-stale-workspace-location",
+        rel_path="src/store.rs",
+        old="                ev.workspace_location = Some(crate::pathnorm::workspace_location(",
+        new="                let _ = Some(crate::pathnorm::workspace_location(",
+        must_fail=["reattribute_respells_the_same_directory_and_nothing_else"],
+        why="只改路径不重算位置 ⇒ 规范形的 WSL 路径配着 local（UNC 写法当初被算成了 local）",
+    ),
+    Mutation(
+        name="reattribute-preview-writes",
+        rel_path="src/store.rs",
+        old="            if dry_run {",
+        new="            if false {",
+        must_fail=["reattribute_respells_the_same_directory_and_nothing_else"],
+        why="预览也写库 ⇒ 人还没看就改了，而默认就是预览",
+    ),
 ]
 
 

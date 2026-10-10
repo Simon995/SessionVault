@@ -39,7 +39,7 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | `wsl`                        | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码）                             | ✅ 实机实测                                   |
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
-| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase`；跨运行游标持久化 | ✅ 2026-09-29 核 |
+| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute`；跨运行游标持久化 | ✅ 2026-09-29 核（`reattribute` 2026-10-10 加） |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
 | 总库（持久化输出库）         | append-only RawEvent 库                                                                      | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak）    |
 | snapshot_file                | Claude/Codex memory、rules、项目 instruction 状态快照                                        | ✅ experimental（Windows/WSL + 最新快照查询） |
@@ -122,6 +122,8 @@ project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并�
   分组均作为 AAD 防调换。`svault erase` 同事务写无正文墓碑、物理删除并回收孤立数据密钥，
   后续 `append_events` 按墓碑拒绝重扫复活。合成隔离跨进程 E2E 10/10 PASS；正式构建不包含
   fixture 密钥入口。TumeFlow 删除传播与 QuotaBar 双重确认已同步落地。
+
+`svault reattribute`：把当前投影里「同一个目录的旧写法」的 `project_root`（如旧注册表留下的 UNC 写法）改成注册表现在的写法，受影响的来源各写一代新投影（不读源文件），消费方经 `changes` 收到替换。只改写法、不改归属；注册表里同一个目录有不止一种写法时不改、单列报出。默认只预览，`--apply` 才写（先退出 QuotaBar / TumeFlow）。
 
 ## 构建
 

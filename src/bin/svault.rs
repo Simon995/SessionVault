@@ -176,6 +176,20 @@ enum Command {
         #[arg(long)]
         replicas: Option<PathBuf>,
     },
+    /// 把当前投影里「同一个目录的旧写法」的 `project_root`（如 UNC 写法）改成注册表现在的写法。
+    /// 受影响的来源各写一代新投影（不读源文件），消费方经 `changes` 收到替换。只改写法、不改归属。
+    ///
+    /// 默认只预览（只读打开，不迁移）；`--apply` 才写，写之前要确认没有别的进程开着库
+    /// （先退出 QuotaBar / TumeFlow）。注册表里同一个目录不止一种写法的不改，单列报出；
+    /// 有这种写法或有来源没改成时退出码为 2，逐个列出。
+    #[cfg(feature = "store")]
+    Reattribute {
+        /// 真的写；不加只预览。
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 列出本机能读的总库：本机库与副本目录里的每一个（多机同步，见 `docs/linux-replica.md`
     /// 第四部分）。打不开的也列出来（`store_unavailable`），不当作不存在。
     #[cfg(feature = "store")]
@@ -791,6 +805,40 @@ enum Out<'a> {
         replicas_searched: usize,
         replicas_unavailable: usize,
     },
+    /// `reattribute` 每种要改的写法一行：改写前用它的当前事件数与来源数。
+    #[cfg(feature = "store")]
+    Respelling {
+        from: String,
+        to: String,
+        events: u64,
+        sources: u64,
+    },
+    /// `reattribute` 没改的写法，每种一行：注册表里这个目录不止一种写法（`spellings`），要人先定用哪种。
+    #[cfg(feature = "store")]
+    ReattributeAmbiguous {
+        from: String,
+        spellings: Vec<String>,
+        events: u64,
+        sources: u64,
+    },
+    /// `reattribute` 没改成的来源，每个一行；它的当前投影原样保留。
+    #[cfg(feature = "store")]
+    ReattributeSkip {
+        source_type: String,
+        source_location: String,
+        source_path: String,
+        reason: String,
+    },
+    /// `reattribute` 的最后一行。`dry_run` 时后两个数是「将会」。
+    #[cfg(feature = "store")]
+    ReattributeSummary {
+        respellings: usize,
+        ambiguous: usize,
+        sources_rewritten: u64,
+        events_written: u64,
+        skipped: usize,
+        dry_run: bool,
+    },
     /// `session-origin` 每个会话一行。
     SessionOrigin {
         /// 原样回显入参 `--session`。
@@ -1072,6 +1120,8 @@ fn main() {
         Command::Erasures { store, stores } => run_erasures(store, stores),
         #[cfg(feature = "store")]
         Command::AdoptErasures { store, replicas } => run_adopt_erasures(store, replicas),
+        #[cfg(feature = "store")]
+        Command::Reattribute { apply, store } => run_reattribute(apply, store),
         Command::SessionOrigin { sessions } => run_session_origin(sessions),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
@@ -2442,6 +2492,100 @@ fn run_erasures(store_arg: Option<PathBuf>, stores: AllStoresArgs) -> i32 {
         stores_unavailable: unavailable,
     });
     0
+}
+
+/// `reattribute`：见 [`session_vault::TotalStore::reattribute`]。注册表与 `scan-all` 用同一份
+/// （本机挂载表下的 `project_root_registry`），改出来的写法与重扫给的一致。
+#[cfg(feature = "store")]
+fn run_reattribute(apply: bool, store_arg: Option<PathBuf>) -> i32 {
+    use session_vault::probe::Probed;
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
+    }
+    // 写之前确认没有别的写入方：读与写之间它追加的事件不在新的一代里（同 `key-import --rekey`）。
+    if apply {
+        match session_vault::probe::held_open_elsewhere(&store_path) {
+            Probed::Found(false) => {}
+            Probed::Found(true) => {
+                log::error!(
+                    target: tag::CLI,
+                    "the store is open in another process (QuotaBar / TumeFlow?); quit it first"
+                );
+                return 1;
+            }
+            Probed::Absent => {
+                log::error!(target: tag::CLI, "{} not found", store_path.display());
+                return 1;
+            }
+            Probed::Unknown(e) => log::warn!(
+                target: tag::CLI,
+                "cannot tell whether another process has the store open ({e}); \
+                 make sure QuotaBar / TumeFlow are not running"
+            ),
+        }
+    }
+    let opened = if apply {
+        open_total_store(&store_path)
+    } else {
+        open_total_store_read_only(&store_path)
+    };
+    let store = match opened {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    let registry =
+        session_vault::project_root_registry(&store, &session_vault::host_drive_mounts());
+    let stats = match store.reattribute(&registry, !apply) {
+        Ok(stats) => stats,
+        Err(e) => {
+            log::error!(target: tag::CLI, "reattribute failed: {e}");
+            return 1;
+        }
+    };
+    for r in &stats.respellings {
+        emit(&Out::Respelling {
+            from: r.from.clone(),
+            to: r.to.clone(),
+            events: r.events,
+            sources: r.sources,
+        });
+    }
+    for a in &stats.ambiguous {
+        emit(&Out::ReattributeAmbiguous {
+            from: a.from.clone(),
+            spellings: a.spellings.clone(),
+            events: a.events,
+            sources: a.sources,
+        });
+    }
+    for s in &stats.skipped {
+        emit(&Out::ReattributeSkip {
+            source_type: s.source_type.clone(),
+            source_location: s.source_location.clone(),
+            source_path: s.source_path.clone(),
+            reason: s.reason.clone(),
+        });
+    }
+    emit(&Out::ReattributeSummary {
+        respellings: stats.respellings.len(),
+        ambiguous: stats.ambiguous.len(),
+        sources_rewritten: stats.sources_rewritten,
+        events_written: stats.events_written,
+        skipped: stats.skipped.len(),
+        dry_run: stats.dry_run,
+    });
+    if stats.skipped.is_empty() && stats.ambiguous.is_empty() {
+        0
+    } else {
+        2
+    }
 }
 
 #[cfg(feature = "store")]
