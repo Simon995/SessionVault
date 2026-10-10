@@ -193,6 +193,15 @@ enum Command {
     /// 🔴 **不做命名空间翻译。** 给出的是注册表里的原始形式（可能是 `C:\…`，也可能
     /// 是 `wsl:<distro>:/…`）。翻译成「消费方能打开的物理路径」是它自己的事 ——
     /// 在这里替它猜，等于把宿主视野的假设烧进一个跨进程接口。
+    /// 本库的标识（多机同步用，见 `docs/linux-replica.md` 第四部分）：
+    /// `{"kind":"store_info","store_id":"<32 位十六进制>"}`。
+    ///
+    /// `store_id` 为 `null` = 这份库还没被认识标识的写入方打开过；只读打开不补写它。
+    #[cfg(feature = "store")]
+    StoreInfo {
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     #[cfg(feature = "store")]
     Roots {
         #[arg(long)]
@@ -421,6 +430,9 @@ enum Out<'a> {
     Event { event: &'a RawEvent },
     /// `store-path` 的唯一一行：本机总库的默认路径。
     StorePath { path: &'a str },
+    /// `store-info` 的唯一一行。`store_id` 缺失时输出 `null`，不省略这个键。
+    #[cfg(feature = "store")]
+    StoreInfo { store_id: Option<String> },
     /// `memory-roots` 的一行：一个 agent home 对 + 宿主到它的前缀。
     MemoryRoot {
         location: &'a str,
@@ -886,6 +898,8 @@ fn main() {
         Command::Snapshots { store } => run_snapshots(store),
         #[cfg(feature = "store")]
         Command::SyncSnapshots { store } => run_sync_snapshots(store),
+        #[cfg(feature = "store")]
+        Command::StoreInfo { store } => run_store_info(store),
         #[cfg(feature = "store")]
         Command::Roots { store, duplicates } => run_roots(store, duplicates),
         #[cfg(feature = "store")]
@@ -3149,6 +3163,26 @@ fn run_memory_roots(userprofile: Option<String>, timeout_secs: u64) -> i32 {
     });
     // 🔴 退出码 0 **即使有 unreachable**：那不是本命令的失败，它诚实地报告了。
     // 非零会让调用方走「命令挂了」那条路，把一份有效的部分答案整个丢掉。
+    0
+}
+
+#[cfg(feature = "store")]
+fn run_store_info(store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
+    }
+    let store_id = match open_total_store_read_only(&store_path).and_then(|s| s.store_id()) {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!(target: tag::CLI, "read store id failed: {e}");
+            return 1;
+        }
+    };
+    emit(&Out::StoreInfo { store_id });
     0
 }
 
