@@ -34,7 +34,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 | 消费者 | 怎么用本仓 | 它拿到的版本由什么决定 |
 | --- | --- | --- |
 | QuotaBar | Rust 库编进去（`features = ["store"]`）；也是总库会话正文的写入者 | 它的子模块指针 |
-| TumeFlow | 子模块 + 把 `svault` 内嵌进 PyInstaller onefile | 它上一次重新冻结的时刻 |
+| TumeFlow | 子模块 + 把 `svault` 内嵌进 PyInstaller onefile；也经 `svault sync-snapshots` 做快照同步 | 它重新冻结时子模块指针钉住的那一版（不 bump 指针，重冻也还是旧版） |
 | TumeChat | 只读 CLI（`pull` / `changes` / `sessions-read`） | 本仓发布的那份 svault（2026-10-09 定） |
 
 - 本仓的测试只证明本仓自洽。动 `pub` 项前问「另一个消费者编不编得过」，能编就去那个仓编一次，编不了就明说没验。
