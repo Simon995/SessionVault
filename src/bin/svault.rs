@@ -25,9 +25,10 @@ use session_vault::rawevent::{RawEvent, SourceLocation, SourceMode, SourceType};
 use session_vault::store::{ExclusionReason, Projection};
 use session_vault::SourceRef;
 
-/// `0.0.0 (<提交>)` —— 版本号本身不携带信息，提交才分得出是哪个构建。
+/// `<发布号> (<提交>)`：发布版是 `2026.10.10.1 (…)`，从源码自己编的是 `dev (…)`（见 `build.rs`）。
+/// 判断是哪个构建只看括号里的提交 —— 消费方的检查依赖的是它。
 const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
+    env!("SVAULT_RELEASE"),
     " (",
     env!("SVAULT_BUILD_COMMIT"),
     ")"
