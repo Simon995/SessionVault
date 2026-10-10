@@ -40,6 +40,11 @@ fn claude_lines(session: &str, texts: &[&str]) -> String {
 
 /// 把一个会话文件整份扫进库里，返回 `sessions-read --session` 用的标识。
 fn ingest(store: &TotalStore, file: &Path) -> String {
+    ingest_under(store, file, None)
+}
+
+/// 同上，但事件归到给定的项目根下（注册表按 cwd 归属会随平台的路径写法变，这里直接定）。
+fn ingest_under(store: &TotalStore, file: &Path, project_root: Option<&str>) -> String {
     let source = SourceRef {
         source_type: SourceType::ClaudeCode,
         source_location: SourceLocation::Local,
@@ -54,10 +59,19 @@ fn ingest(store: &TotalStore, file: &Path) -> String {
         Profile::Full,
         std::sync::Arc::new(RootRegistry::new()),
     );
-    store
-        .append_events(&res.events, Projection::Append)
-        .unwrap();
-    let ev = &res.events[0];
+    let events: Vec<session_vault::RawEvent> = res
+        .events
+        .iter()
+        .map(|ev| {
+            let mut v = serde_json::to_value(ev).unwrap();
+            if let Some(root) = project_root {
+                v["project_root"] = Value::from(root);
+            }
+            serde_json::from_value(v).unwrap()
+        })
+        .collect();
+    store.append_events(&events, Projection::Append).unwrap();
+    let ev = &events[0];
     format!(
         "claude_code/local/{}/{}",
         ev.source_path, ev.source_session_id
@@ -243,6 +257,126 @@ fn union_reads_pick_the_same_copy_on_every_machine() {
     assert_eq!(
         of_kind(&pulled, "pull_summary")[0]["store_id"],
         id_a.as_str()
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 删除跨库传播：在 A 上删了 B 的内容 —— A 的合读立刻看不到；B 收下 A 的删除记录后，
+/// 自己库里的原文也删掉；再收一次什么都不做。
+#[test]
+fn an_erasure_on_one_machine_hides_then_removes_the_content_on_the_other() {
+    let dir = std::env::temp_dir().join(format!("svault-it-erase-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = || StoreKey::from_encoded(TEST_KEY).unwrap();
+    let (db_a, db_b) = (dir.join("a.db"), dir.join("b.db"));
+    let (f1, f2, f4, f5) = (
+        dir.join("s1.jsonl"),
+        dir.join("s2.jsonl"),
+        dir.join("s4.jsonl"),
+        dir.join("s5.jsonl"),
+    );
+    std::fs::write(&f1, claude_lines("s1", &["a1", "a2"])).unwrap();
+    std::fs::write(&f2, claude_lines("s2", &["b1", "b2"])).unwrap();
+    std::fs::write(&f4, claude_lines("s4", &["d1", "d2"])).unwrap();
+    std::fs::write(&f5, claude_lines("s5", &["e1", "e2"])).unwrap();
+    let store_a = TotalStore::open_with_key(&db_a, key()).unwrap();
+    ingest(&store_a, &f1);
+    drop(store_a);
+    let store_b = TotalStore::open_with_key(&db_b, key()).unwrap();
+    let s2 = ingest(&store_b, &f2);
+    let s4 = ingest_under(&store_b, &f4, Some("/w/gone"));
+    let s5 = ingest(&store_b, &f5);
+    let id_b = store_b.store_id().unwrap().unwrap();
+    drop(store_b);
+    let (a, b) = (db_a.to_str().unwrap(), db_b.to_str().unwrap());
+
+    // 在 A 上删：B 的会话 s2、B 上的项目根 /w/gone、B 上 s5 那个文件。
+    let path = [
+        "erase",
+        "--scope",
+        "source-path",
+        "--key",
+        f5.to_str().unwrap(),
+    ];
+    svault(&[&path[..], &["--confirm", "ERASE", "--store", a]].concat());
+    svault(&[
+        "erase",
+        "--scope",
+        "session",
+        "--key",
+        "s2",
+        "--confirm",
+        "ERASE",
+        "--store",
+        a,
+    ]);
+    let root = ["erase", "--scope", "project-root", "--key", "/w/gone"];
+    svault(&[&root[..], &["--confirm", "ERASE", "--store", a]].concat());
+
+    let replicas_on_a = dir.join("replicas-on-a");
+    std::fs::create_dir_all(&replicas_on_a).unwrap();
+    copy_store(&db_b, &replicas_on_a.join(format!("{id_b}.db")));
+    let on_a = |extra: &[&str]| {
+        let mut args = extra.to_vec();
+        args.extend(["--store", a, "--replicas", replicas_on_a.to_str().unwrap()]);
+        svault(&args)
+    };
+    let cursor = |lines: &[Value]| of_kind(lines, "session_cursor")[0].clone();
+
+    // A 的合读：B 的镜像里还在，但 A 删过 —— 不发事件，并说清是「删了」。
+    let read = on_a(&["sessions-read", "--all-stores", "--session", &s2]);
+    assert!(events(&read).is_empty());
+    assert_eq!(cursor(&read)["erased"], true);
+    assert_eq!(cursor(&read)["found_in"], 1);
+    let read = on_a(&["sessions-read", "--all-stores", "--session", &s4]);
+    assert!(events(&read).is_empty(), "按项目根删的事件还在发");
+    let read = on_a(&["sessions-read", "--all-stores", "--session", &s5]);
+    assert!(events(&read).is_empty(), "按文件路径删的会话还在发");
+    assert_eq!(cursor(&read)["erased"], true);
+    let recent = on_a(&["sessions-recent", "--all-stores"]);
+    assert!(of_kind(&recent, "recent_session")
+        .iter()
+        .all(|r| r["session_id"] != "s2"));
+    let erasures = on_a(&["erasures", "--all-stores"]);
+    assert_eq!(of_kind(&erasures, "erasure").len(), 3);
+    assert!(svault(&["erasures", "--store", b])
+        .iter()
+        .all(|l| l["kind"] != "erasure"));
+
+    // B 收下 A 的删除记录：自己库里的 s2、s4 原文删掉；再收一次什么都不做。
+    let replicas_on_b = dir.join("replicas-on-b");
+    std::fs::create_dir_all(&replicas_on_b).unwrap();
+    let id_a = svault(&["store-info", "--store", a])[0]["store_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    copy_store(&db_a, &replicas_on_b.join(format!("{id_a}.db")));
+    let adopt = || {
+        svault(&[
+            "adopt-erasures",
+            "--store",
+            b,
+            "--replicas",
+            replicas_on_b.to_str().unwrap(),
+        ])
+        .pop()
+        .unwrap()
+    };
+    let first = adopt();
+    assert_eq!(
+        (first["adopted"].clone(), first["deleted_events"].clone()),
+        (Value::from(3), Value::from(6))
+    );
+    assert_eq!(first["replicas_searched"], 1);
+    for spec in [&s2, &s4, &s5] {
+        assert!(events(&svault(&["sessions-read", "--session", spec, "--store", b])).is_empty());
+    }
+    let again = adopt();
+    assert_eq!(
+        (again["adopted"].clone(), again["already"].clone()),
+        (Value::from(0), Value::from(3))
     );
 
     std::fs::remove_dir_all(&dir).unwrap();

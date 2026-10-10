@@ -106,7 +106,10 @@ File」§1.2，2026-10-10 查证）；同步原始会话文件 —— 会话工�
   ③ 读命令把本机库与副本合起来读（已做：`stores` 列出本机库与副本目录 `<data_local_dir>/svault/replicas/*.db`；
   `pull` / `changes` 仍一次读一个库（`--store`），摘要带 `store_id`，游标按它分开记；`sessions-read` /
   `sessions-recent` 加 `--all-stores`，同一会话取当前投影事件最多的那份、一样多取 `store_id` 小的，
-  输出写明 `found_in` 与 `stores_searched` / `stores_unavailable`；没有 `store_id` 的库不参与合读）；④ 跨库删除；
+  输出写明 `found_in` 与 `stores_searched` / `stores_unavailable`；没有 `store_id` 的库不参与合读）；④ 跨库删除
+  （已做：合读遵守所有库的删除记录 —— 按会话 / 文件路径删的整个不发、游标标 `erased`，按项目根删的事件滤掉；
+  `erasures [--all-stores]` 列出删除记录给消费方删自己的索引；`adopt-erasures` 由同步脚本每轮拉完副本后跑，
+  把别的机器的删除记录收进本机库并删掉本机原文，可重跑。路径类的删除记录按字符串在每台机器上照删）；
   ⑤ 同步脚本与各机定时任务（中转服务器只需 SSH 账号与 `sqlite3_rsync`）。
   - 换钥（2026-10-10 人定：三台共用一把，家里已有库的两台换过来，而不是各用各的）：先确认库没被别的
     进程开着 → 旧钥匙备份到旁边 → 一个事务里改包全部数据密钥并记下备份位置 → 最后换本机钥匙；正文

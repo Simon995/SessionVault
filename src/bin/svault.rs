@@ -157,6 +157,25 @@ enum Command {
         #[command(flatten)]
         stores: AllStoresArgs,
     },
+    /// 列出删除记录（`erase` 留下的墓碑，不含正文）。消费方据它把自己索引里命中的内容删掉；
+    /// 加 `--all-stores` 时合并本机库与所有副本的（删除跨库传播，ADR-027）。
+    #[cfg(feature = "store")]
+    Erasures {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        #[command(flatten)]
+        stores: AllStoresArgs,
+    },
+    /// 把副本里（别的机器）的删除记录接收进本机库，并删掉本机库里命中的正文。
+    /// 同步脚本每轮拉完副本后跑它：会话所属的机器经此删掉原文。可重复执行。
+    #[cfg(feature = "store")]
+    AdoptErasures {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// 副本目录（默认 `<data_local_dir>/svault/replicas`）。
+        #[arg(long)]
+        replicas: Option<PathBuf>,
+    },
     /// 列出本机能读的总库：本机库与副本目录里的每一个（多机同步，见 `docs/linux-replica.md`
     /// 第四部分）。打不开的也列出来（`store_unavailable`），不当作不存在。
     #[cfg(feature = "store")]
@@ -723,6 +742,10 @@ enum Out<'a> {
         /// 只在 `--all-stores` 时出现：几个库里有这个会话。
         #[serde(skip_serializing_if = "Option::is_none")]
         found_in: Option<usize>,
+        /// 只在 `--all-stores` 时出现：某个库里有删除记录盖住了它（按会话或文件路径）——
+        /// 这时不发它的事件。与「找不到」「原文变了」都是不同的事。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        erased: Option<bool>,
     },
     /// `stores` 的一行：一个打开了的库（本机库或副本）。
     #[cfg(feature = "store")]
@@ -742,6 +765,32 @@ enum Out<'a> {
     },
     #[cfg(feature = "store")]
     StoresSummary { stores: usize, unavailable: usize },
+    /// `erasures` 的一行：一条删除记录。`--all-stores` 时同一 `(scope, key)` 只发一行，
+    /// 取最早删的那条，`store_id` 是它所在的库。
+    #[cfg(feature = "store")]
+    Erasure {
+        scope: &'static str,
+        key: String,
+        tombstoned_at: i64,
+        store_id: Option<String>,
+    },
+    #[cfg(feature = "store")]
+    ErasuresSummary {
+        erasures: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stores_searched: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stores_unavailable: Option<usize>,
+    },
+    /// `adopt-erasures` 的唯一一行。`replicas_unavailable > 0` 时这一轮没收全，下一轮再收。
+    #[cfg(feature = "store")]
+    AdoptErasuresSummary {
+        adopted: u64,
+        already: u64,
+        deleted_events: u64,
+        replicas_searched: usize,
+        replicas_unavailable: usize,
+    },
     /// `session-origin` 每个会话一行。
     SessionOrigin {
         /// 原样回显入参 `--session`。
@@ -1019,6 +1068,10 @@ fn main() {
         } => run_sessions_read(sessions, max_events, after_seq, store, stores),
         #[cfg(feature = "store")]
         Command::Stores { store, replicas } => run_stores(store, replicas),
+        #[cfg(feature = "store")]
+        Command::Erasures { store, stores } => run_erasures(store, stores),
+        #[cfg(feature = "store")]
+        Command::AdoptErasures { store, replicas } => run_adopt_erasures(store, replicas),
         Command::SessionOrigin { sessions } => run_session_origin(sessions),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
@@ -2258,6 +2311,160 @@ fn run_stores(store_arg: Option<PathBuf>, replicas_arg: Option<PathBuf>) -> i32 
     emit(&Out::StoresSummary {
         stores,
         unavailable,
+    });
+    0
+}
+
+/// 几个库的删除记录合在一起（删除跨库传播，ADR-027）：任何一个库里删了，合读时就不发。
+#[cfg(feature = "store")]
+#[derive(Default)]
+struct Erased {
+    /// `(scope, key)` → 最早删的那条与它所在的库。
+    all: std::collections::BTreeMap<(session_vault::TombstoneScope, String), (i64, Option<String>)>,
+}
+
+#[cfg(feature = "store")]
+impl Erased {
+    fn gather<'a>(
+        stores: impl IntoIterator<Item = (Option<&'a str>, &'a session_vault::TotalStore)>,
+    ) -> session_vault::store::StoreResult<Self> {
+        let mut erased = Self::default();
+        for (store_id, store) in stores {
+            for t in store.tombstones()? {
+                let seen = erased
+                    .all
+                    .entry((t.scope, t.key))
+                    .or_insert((t.tombstoned_at, store_id.map(str::to_string)));
+                if t.tombstoned_at < seen.0 {
+                    *seen = (t.tombstoned_at, store_id.map(str::to_string));
+                }
+            }
+        }
+        Ok(erased)
+    }
+
+    fn has(&self, scope: session_vault::TombstoneScope, key: &str) -> bool {
+        self.all.contains_key(&(scope, key.to_string()))
+    }
+
+    /// 整个会话被盖住（按会话或按文件路径）。
+    fn covers_session(&self, (_, _, path, session_id): &(String, String, String, String)) -> bool {
+        self.has(session_vault::TombstoneScope::Session, session_id)
+            || self.has(session_vault::TombstoneScope::SourcePath, path)
+    }
+
+    /// 一条事件被盖住（它所在的项目根被删了）。
+    fn covers_root(&self, project_root: Option<&str>) -> bool {
+        project_root.is_some_and(|root| self.has(session_vault::TombstoneScope::ProjectRoot, root))
+    }
+
+    fn tombstones(&self) -> Vec<session_vault::Tombstone> {
+        self.all
+            .iter()
+            .map(|((scope, key), (at, _))| session_vault::Tombstone {
+                scope: *scope,
+                key: key.clone(),
+                tombstoned_at: *at,
+            })
+            .collect()
+    }
+}
+
+#[cfg(feature = "store")]
+fn run_erasures(store_arg: Option<PathBuf>, stores: AllStoresArgs) -> i32 {
+    let (erased, searched, unavailable) = if stores.all_stores {
+        let slots = match open_all_stores(store_arg, stores.replicas) {
+            Ok(slots) => slots,
+            Err(why) => {
+                log::error!(target: tag::CLI, "{why}");
+                return 1;
+            }
+        };
+        let (readable, unavailable) = readable_stores(&slots);
+        match Erased::gather(readable.iter().map(|(id, s)| (Some(*id), *s))) {
+            Ok(e) => (e, Some(readable.len()), Some(unavailable)),
+            Err(e) => {
+                log::error!(target: tag::CLI, "read tombstones failed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        let Some(store_path) = resolve_store_path(store_arg) else {
+            log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+            return 1;
+        };
+        if let Some(code) = bail_unless_store_present(&store_path, 1) {
+            return code;
+        }
+        let gathered = open_total_store_read_only(&store_path).and_then(|store| {
+            let id = store.store_id()?;
+            Erased::gather([(id.as_deref(), &store)])
+        });
+        match gathered {
+            Ok(e) => (e, None, None),
+            Err(e) => {
+                log::error!(target: tag::CLI, "read tombstones failed: {e}");
+                return 1;
+            }
+        }
+    };
+    for ((scope, key), (at, store_id)) in &erased.all {
+        emit(&Out::Erasure {
+            scope: scope.as_str(),
+            key: key.clone(),
+            tombstoned_at: *at,
+            store_id: store_id.clone(),
+        });
+    }
+    emit(&Out::ErasuresSummary {
+        erasures: erased.all.len(),
+        stores_searched: searched,
+        stores_unavailable: unavailable,
+    });
+    0
+}
+
+#[cfg(feature = "store")]
+fn run_adopt_erasures(store_arg: Option<PathBuf>, replicas: Option<PathBuf>) -> i32 {
+    let slots = match open_all_stores(store_arg.clone(), replicas) {
+        Ok(slots) => slots,
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            return 1;
+        }
+    };
+    // `open_all_stores` 的第一个是本机库，其余是副本；只收副本的。
+    let (readable, unavailable) = readable_stores(&slots[1..]);
+    let searched = readable.len();
+    let foreign = match Erased::gather(readable.iter().map(|(id, s)| (Some(*id), *s))) {
+        Ok(e) => e.tombstones(),
+        Err(e) => {
+            log::error!(target: tag::CLI, "read tombstones failed: {e}");
+            return 1;
+        }
+    };
+    drop(readable);
+    drop(slots);
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
+    }
+    let stats = match open_total_store(&store_path).and_then(|s| s.adopt_tombstones(&foreign)) {
+        Ok(stats) => stats,
+        Err(e) => {
+            log::error!(target: tag::CLI, "adopt tombstones failed: {e}");
+            return 1;
+        }
+    };
+    emit(&Out::AdoptErasuresSummary {
+        adopted: stats.adopted,
+        already: stats.already,
+        deleted_events: stats.deleted_events,
+        replicas_searched: searched,
+        replicas_unavailable: unavailable,
     });
     0
 }
@@ -3537,6 +3744,13 @@ fn run_sessions_recent_all(
         }
     };
     let (readable, unavailable) = readable_stores(&slots);
+    let erased = match Erased::gather(readable.iter().map(|(id, s)| (Some(*id), *s))) {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!(target: tag::CLI, "read tombstones failed: {e}");
+            return 1;
+        }
+    };
     type Key = (String, String, String, String);
     let mut copies: std::collections::BTreeMap<Key, Vec<(usize, session_vault::RecentSession)>> =
         Default::default();
@@ -3560,6 +3774,11 @@ fn run_sessions_recent_all(
     }
     let mut rows = Vec::new();
     for (key, mut found) in copies {
+        // 别的库里按会话或文件路径删了它：不列。（按项目根删的，这一层没有项目根可比，
+        // 列出来时 `sessions-read --all-stores` 会把命中的事件滤掉。）
+        if erased.covers_session(&key) {
+            continue;
+        }
         let chosen = if found.len() == 1 {
             0
         } else {
@@ -4183,6 +4402,7 @@ fn run_sessions_read(
                     decode_failed: page.decode_failed,
                     store_id: None,
                     found_in: None,
+                    erased: None,
                 });
             }
             emit(&Out::SessionsReadSummary {
@@ -4223,6 +4443,13 @@ fn run_sessions_read_all(
         }
     };
     let (readable, unavailable) = readable_stores(&slots);
+    let erased = match Erased::gather(readable.iter().map(|(id, s)| (Some(*id), *s))) {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!(target: tag::CLI, "read tombstones failed: {e}");
+            return 1;
+        }
+    };
     let mut remaining = max_events;
     let mut results = Vec::new();
     for session in sessions {
@@ -4237,7 +4464,9 @@ fn run_sessions_read_all(
             }
         }
         let found_in = counts.iter().filter(|(n, _)| *n > 0).count();
-        let page = match pick_store(&counts) {
+        // 别的库里删了它（副本还没跟上）：不发它的事件。
+        let session_erased = erased.covers_session(session);
+        let page = match pick_store(&counts).filter(|_| !session_erased) {
             None => None,
             Some(k) => {
                 let (id, store) = readable[k];
@@ -4247,8 +4476,10 @@ fn run_sessions_read_all(
                     after_seq,
                 ) {
                     Ok(mut pages) => {
-                        let page = pages.remove(0);
+                        let mut page = pages.remove(0);
                         remaining -= page.events.len();
+                        page.events
+                            .retain(|(_, ev)| !erased.covers_root(ev.project_root.as_deref()));
                         Some((id, page))
                     }
                     Err(e) => {
@@ -4258,10 +4489,10 @@ fn run_sessions_read_all(
                 }
             }
         };
-        results.push((page, found_in));
+        results.push((page, found_in, session_erased));
     }
     let mut total = 0u64;
-    for (id, page) in results.iter().filter_map(|(p, _)| p.as_ref()) {
+    for (id, page) in results.iter().filter_map(|(p, _, _)| p.as_ref()) {
         for (offset, ev) in &page.events {
             emit(&Out::Pulled {
                 offset: *offset,
@@ -4271,7 +4502,7 @@ fn run_sessions_read_all(
         }
         total += page.events.len() as u64;
     }
-    for (spec, (page, found_in)) in specs.iter().zip(&results) {
+    for (spec, (page, found_in, session_erased)) in specs.iter().zip(&results) {
         emit(&match page {
             Some((id, page)) => Out::SessionCursor {
                 session: spec.clone(),
@@ -4282,6 +4513,7 @@ fn run_sessions_read_all(
                 decode_failed: page.decode_failed,
                 store_id: Some(Some(id.to_string())),
                 found_in: Some(*found_in),
+                erased: Some(false),
             },
             None => Out::SessionCursor {
                 session: spec.clone(),
@@ -4291,14 +4523,15 @@ fn run_sessions_read_all(
                 last_occurred_at: None,
                 decode_failed: 0,
                 store_id: Some(None),
-                found_in: Some(0),
+                found_in: Some(*found_in),
+                erased: Some(*session_erased),
             },
         });
     }
     emit(&Out::SessionsReadSummary {
         sessions: sessions.len(),
         events: total,
-        truncated: results.iter().any(|(p, _)| {
+        truncated: results.iter().any(|(p, _, _)| {
             p.as_ref()
                 .is_some_and(|(_, page)| page.has_more == Some(true))
         }),
