@@ -45,7 +45,8 @@ fn every_read_subcommand_leaves_an_older_store_unmigrated() {
         .unwrap();
 
     let store = db.to_str().unwrap();
-    let reads: [&[&str]; 7] = [
+    let reads: [&[&str]; 8] = [
+        &["store-info"],
         &["pull", "--since", "0"],
         &["changes", "--since-seq", "0"],
         &["sessions-recent"],
@@ -68,5 +69,30 @@ fn every_read_subcommand_leaves_an_older_store_unmigrated() {
             args[0]
         );
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `store-info` 报出的就是库里记的那个标识（不是现场生成的一个）。
+#[test]
+fn store_info_reports_the_id_the_store_minted() {
+    let dir = std::env::temp_dir().join(format!("svault-it-id-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("total_store.db");
+    let minted = TotalStore::open_with_key(&db, StoreKey::from_encoded(TEST_KEY).unwrap())
+        .unwrap()
+        .store_id()
+        .unwrap()
+        .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_svault"))
+        .env("SVAULT_ACCEPTANCE_KEY", TEST_KEY)
+        .args(["store-info", "--store", db.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let line: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(line["kind"], "store_info");
+    assert_eq!(line["store_id"], minted.as_str());
     std::fs::remove_dir_all(&dir).unwrap();
 }

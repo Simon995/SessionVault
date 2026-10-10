@@ -27,7 +27,8 @@ use crate::discover::SourceRef;
 use crate::probe::{ProbeBackend, Probed};
 use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
 use crate::store_crypto::{
-    data_key_id, is_envelope, new_data_key_id, CryptoError, KeySource, StoreCipher, StoreKey,
+    data_key_id, is_envelope, new_data_key_id, new_store_id, CryptoError, KeySource, StoreCipher,
+    StoreKey,
 };
 use crate::Profile;
 
@@ -1147,6 +1148,18 @@ impl TotalStore {
         Self::from_conn(conn, key)
     }
 
+    /// 本库的标识：写入方第一次打开时生成（32 位十六进制），此后不变；镜像副本带着源库的标识。
+    ///
+    /// `None` = 这份库还没被认识 `store_id` 的写入方打开过 —— 只读打开不补写它。
+    pub fn store_id(&self) -> StoreResult<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT v FROM store_meta WHERE k = 'store_id'", [], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     /// 内存库（测试用）。
     pub fn open_in_memory() -> StoreResult<Self> {
         Self::from_conn(Connection::open_in_memory()?, StoreKey::generate())
@@ -1303,6 +1316,21 @@ impl TotalStore {
             );
             "#,
         )?;
+
+        // 本库的标识（多机读时合并用，见 docs/linux-replica.md 第四部分）：缺失时生成一次，此后不变。
+        // 镜像副本整库复制、带着源库的标识 —— 它标识「哪台机器写的这份库」，不是这个文件。
+        let has_store_id = conn
+            .query_row("SELECT 1 FROM store_meta WHERE k = 'store_id'", [], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some();
+        if !has_store_id {
+            conn.execute(
+                "INSERT OR IGNORE INTO store_meta (k, v) VALUES ('store_id', ?1)",
+                [new_store_id()],
+            )?;
+        }
 
         // ── project_identity：去掉观察者列（2026-08-14） ─────────────────────────
         //
@@ -4567,6 +4595,84 @@ mod tests {
             TotalStore::open_read_only_with_key(&absent, StoreKey::from_bytes([7; 32])).is_err()
         );
         assert!(!absent.exists(), "只读打开建出了一个库");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 标识建库时生成一次，重开、只读打开、整库复制出的副本看到的都是同一个；两个库的标识不同。
+    #[test]
+    fn a_store_id_is_minted_once_and_travels_with_a_copy() {
+        let key = || StoreKey::from_bytes([7; 32]);
+        let (dir, db) = file_store_with_snapshot("id");
+        let id = TotalStore::open_with_key(&db, key())
+            .unwrap()
+            .store_id()
+            .unwrap()
+            .expect("写入方打开后应当有标识");
+        assert!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            TotalStore::open_with_key(&db, key())
+                .unwrap()
+                .store_id()
+                .unwrap(),
+            Some(id.clone()),
+            "重开换了标识"
+        );
+
+        let replica = dir.join("replica.db");
+        Connection::open(&db)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [replica.to_str().unwrap()])
+            .unwrap();
+        let ro = TotalStore::open_read_only_with_key(&replica, key()).unwrap();
+        assert_eq!(
+            ro.store_id().unwrap(),
+            Some(id.clone()),
+            "副本没带着源库的标识"
+        );
+
+        let (other_dir, other) = file_store_with_snapshot("id2");
+        assert_ne!(
+            TotalStore::open_with_key(&other, key())
+                .unwrap()
+                .store_id()
+                .unwrap(),
+            Some(id),
+            "两个库撞了标识"
+        );
+        drop(ro);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(other_dir).unwrap();
+    }
+
+    /// 没有标识的旧库：只读打开如实报 `None`、不补写；下一次写入方打开时补上。
+    #[test]
+    fn an_older_store_gets_its_id_from_the_next_writer_not_from_a_reader() {
+        let key = || StoreKey::from_bytes([7; 32]);
+        let (dir, db) = file_store_with_snapshot("old-id");
+        Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM store_meta WHERE k = 'store_id'", [])
+            .unwrap();
+        let ro = TotalStore::open_read_only_with_key(&db, key()).unwrap();
+        assert_eq!(ro.store_id().unwrap(), None);
+        drop(ro);
+        let has_row = || {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM store_meta WHERE k = 'store_id'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(has_row(), 0, "只读打开补写了标识");
+        assert!(TotalStore::open_with_key(&db, key())
+            .unwrap()
+            .store_id()
+            .unwrap()
+            .is_some());
+        assert_eq!(has_row(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

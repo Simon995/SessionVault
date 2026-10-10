@@ -210,6 +210,14 @@ pub(crate) fn new_data_key_id() -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
+/// 总库标识：16 字节随机数的十六进制 —— 中转服务器上直接拿它当文件名。
+pub(crate) fn new_store_id() -> String {
+    use aes_gcm::aead::rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// 主密钥从哪来：OS 密钥链，或 [`KEY_FILE_ENV`] 指定的文件。
 pub(crate) enum KeySource {
     OsKeychain,
