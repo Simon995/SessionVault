@@ -41,6 +41,24 @@ pub fn default_distro(distros: &[String]) -> Option<String> {
     }
 }
 
+/// 本进程至今启动过几次 `wsl.exe`。
+///
+/// 每次约 150 ms 的进程与跨 VM 固定开销（QuotaBar 实测，2026-10-10），一轮扫描的耗时
+/// 主要由这个数决定 —— 给调用方记日志、给测试断言「一轮最多起几次」。
+pub fn spawn_count() -> usize {
+    WSL_SPAWNS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static WSL_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 所有 `wsl.exe` 都经这里启动，计数才不漏。
+#[cfg(windows)]
+fn spawn(cmd: &mut std::process::Command) -> Result<std::process::Child, String> {
+    WSL_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cmd.spawn()
+        .map_err(|e| format!("spawn wsl.exe failed: {e}"))
+}
+
 // ───────────────────────────── 实时层（Windows 专属） ─────────────────────────────
 
 /// 枚举已安装的 WSL 发行版（`wsl.exe -l -q`，按声明顺序）。
@@ -65,11 +83,7 @@ pub fn list_distros(deadline: crate::deadline::Deadline) -> Result<Vec<String>, 
     let budget = deadline
         .budget_for(WSL_LIST_TIMEOUT)
         .ok_or_else(|| "wsl -l -q: round budget exhausted before the call".to_string())?;
-    let output = wait_with_deadline(
-        cmd.spawn()
-            .map_err(|e| format!("spawn wsl.exe failed: {e}"))?,
-        budget,
-    )?;
+    let output = wait_with_deadline(spawn(&mut cmd)?, budget)?;
 
     if !output.status.success() {
         let err = decode_utf16le(&output.stderr)
@@ -117,9 +131,7 @@ fn run_bash_stdin(
         .stderr(Stdio::piped());
     configure_no_window(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn wsl.exe failed: {e}"))?;
+    let mut child = spawn(&mut cmd)?;
     {
         let stdin = child
             .stdin
@@ -521,6 +533,80 @@ pub fn stat(
     }
 }
 
+/// [`stat_many`] 对一条路径的答案，与 [`stat`] 同语义：`Ok(Some((size, mtime)))` 有，
+/// `Ok(None)` 确认不是普通文件（含不存在），`Err` 这一条没问成 —— 调用方退回单独问。
+pub type StatAnswer = Result<Option<(u64, i64)>, String>;
+
+/// 一次 `wsl.exe` 问完一批文件的 `(size, mtime)`。
+///
+/// 增量扫描里没变化的文件只需要这个；逐个问时每个文件一次 `wsl.exe`（QuotaBar 实测一轮
+/// 354 个约 50 s）。每条请求的路径都有答案；整批没问成（进程起不来、超时）返回外层 `Err`。
+/// 用 GNU `stat --printf`；发行版里没有它时这一批全是 `Err`，调用方逐个问，与以前一样。
+#[cfg(windows)]
+pub fn stat_many(
+    distro: &str,
+    paths: &[String],
+    deadline: crate::deadline::Deadline,
+) -> Result<std::collections::HashMap<String, StatAnswer>, String> {
+    if paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut script = String::from("A=()\n");
+    for path in paths {
+        let esc = shell_escape(path);
+        script.push_str(&format!(
+            "if [ -f \"{esc}\" ]; then A+=(\"{esc}\"); else printf 'M\\t%s\\0' \"{esc}\"; fi\n"
+        ));
+    }
+    script.push_str(
+        "[ ${#A[@]} -eq 0 ] || stat --printf 'S\\t%Y\\t%s\\t%n\\0' -- \"${A[@]}\" || true\n",
+    );
+    let out = run_bash_stdin(distro, &script, deadline)?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl stat_many {distro} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_stat_many(&out.stdout, paths))
+}
+
+/// 解析 [`stat_many`] 的输出：`M\t<路径>\0` = 不是普通文件，`S\t<mtime>\t<size>\t<路径>\0` = 有。
+/// 请求了却没出现在输出里的路径（`[ -f ]` 之后被删、`stat` 不支持 `--printf`）是「没问成」。
+#[cfg(any(windows, test))]
+fn parse_stat_many(
+    bytes: &[u8],
+    requested: &[String],
+) -> std::collections::HashMap<String, StatAnswer> {
+    let mut answers = std::collections::HashMap::new();
+    for record in bytes.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let text = String::from_utf8_lossy(record);
+        if let Some(path) = text.strip_prefix("M\t") {
+            answers.insert(path.to_string(), Ok(None));
+        } else if let Some(rest) = text.strip_prefix("S\t") {
+            let mut parts = rest.splitn(3, '\t');
+            let (Some(m), Some(sz), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let answer = match (m.parse::<i64>(), sz.parse::<u64>()) {
+                (Ok(mtime), Ok(size)) => Ok(Some((size, mtime))),
+                _ => Err(format!("wsl stat_many bad record: {text:?}")),
+            };
+            answers.insert(path.to_string(), answer);
+        }
+    }
+    requested
+        .iter()
+        .map(|p| {
+            let answer = answers
+                .remove(p)
+                .unwrap_or_else(|| Err(format!("wsl stat_many: no answer for {p}")));
+            (p.clone(), answer)
+        })
+        .collect()
+}
+
 /// 发行版内一条路径上**有什么东西**。
 ///
 /// 🔴 **与 [`stat`] 的分工是「问什么」，不是「怎么问」。** 那个问 `[ -f ]` ——
@@ -623,6 +709,12 @@ stub_on_non_windows! {
         deadline: crate::deadline::Deadline,
     ) -> Result<Option<PathKind>, String>;
 
+    pub fn stat_many(
+        distro: &str,
+        paths: &[String],
+        deadline: crate::deadline::Deadline,
+    ) -> Result<std::collections::HashMap<String, StatAnswer>, String>;
+
     pub fn find_project_root(
         distro: &str,
         abs_path: &str,
@@ -718,11 +810,7 @@ pub fn read_file_at(
     let budget = deadline
         .budget_for(WSL_CALL_TIMEOUT)
         .ok_or_else(|| format!("wsl read {distro}: round budget exhausted before the call"))?;
-    let output = wait_with_deadline(
-        cmd.spawn()
-            .map_err(|e| format!("spawn wsl.exe failed: {e}"))?,
-        budget,
-    )?;
+    let output = wait_with_deadline(spawn(&mut cmd)?, budget)?;
 
     match output.status.code() {
         Some(0) => String::from_utf8(output.stdout)
@@ -969,6 +1057,29 @@ mod tests {
         );
         assert!(parse_nul_paths(b"").is_empty());
         assert!(parse_nul_paths(b"\0\0").is_empty());
+    }
+
+    /// 每条请求的路径都有答案：有 / 确认不是普通文件 / 没问成（坏记录、输出里没有它）。
+    /// 路径里带制表符也认得出（只按前两个制表符切）。
+    #[test]
+    fn parse_stat_many_answers_every_requested_path() {
+        let requested: Vec<String> = [
+            "/a/s1.jsonl",
+            "/b/gone.jsonl",
+            "/c/t\tab.jsonl",
+            "/d/bad.jsonl",
+            "/e/silent.jsonl",
+        ]
+        .map(String::from)
+        .to_vec();
+        let out = b"S\t1700000000\t42\t/a/s1.jsonl\0M\t/b/gone.jsonl\0S\t1700000001\t7\t/c/t\tab.jsonl\0S\tnot-a-number\t1\t/d/bad.jsonl\0";
+        let answers = parse_stat_many(out, &requested);
+        assert_eq!(answers.len(), requested.len());
+        assert_eq!(answers["/a/s1.jsonl"], Ok(Some((42, 1_700_000_000))));
+        assert_eq!(answers["/b/gone.jsonl"], Ok(None));
+        assert_eq!(answers["/c/t\tab.jsonl"], Ok(Some((7, 1_700_000_001))));
+        assert!(answers["/d/bad.jsonl"].is_err(), "坏记录不是答案");
+        assert!(answers["/e/silent.jsonl"].is_err(), "输出里没有 ≠ 不在");
     }
 
     #[test]

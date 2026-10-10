@@ -1274,16 +1274,18 @@ fn scan_one(
     prior_fingerprint: Option<session_vault::observation::SourceFingerprint>,
     profile: Profile,
     roots: std::sync::Arc<session_vault::attribution::RootRegistry>,
+    prefetch: &session_vault::scan::StatPrefetch,
 ) -> (Scanned, session_vault::report::SourceReport) {
     match s.source_mode {
         SourceMode::AppendLog => {
-            let (obs, report) = session_vault::scan::scan_append_log_observed(
+            let (obs, report) = session_vault::scan::scan_append_log_prefetched(
                 s,
                 cursor_in,
                 prior_fingerprint,
                 profile,
                 roots,
                 session_vault::deadline::Deadline::unbounded(),
+                prefetch,
             );
             (Scanned::Observed(obs), report)
         }
@@ -1543,6 +1545,13 @@ fn run_scan_all(
     #[cfg_attr(not(feature = "store"), allow(unused_mut))]
     let mut snapshot_sources = 0u64;
 
+    // 没变化的 WSL 来源只需要 stat：每个发行版一次 `wsl.exe` 问完，不再每个文件起一次。
+    let spawns_before = session_vault::wsl::spawn_count();
+    let prefetch = session_vault::scan::StatPrefetch::for_sources(
+        &sources,
+        session_vault::deadline::Deadline::unbounded(),
+    );
+
     for s in &sources {
         let key = source_key(s);
         let prev = cursors.get(&key).cloned();
@@ -1628,7 +1637,14 @@ fn run_scan_all(
             )
         });
 
-        let (scanned, report) = scan_one(s, cursor_in, prior_fingerprint, profile, roots.clone());
+        let (scanned, report) = scan_one(
+            s,
+            cursor_in,
+            prior_fingerprint,
+            profile,
+            roots.clone(),
+            &prefetch,
+        );
         total_events += report.events_emitted;
 
         // 不写库时逐条吐事件（TumeFlow 依赖的既有事件流契约）。
@@ -1726,6 +1742,13 @@ fn run_scan_all(
             cursors.insert(key, next_state(scanned, prev.as_ref(), write_store));
         }
     }
+
+    log::info!(
+        target: tag::CLI,
+        "wsl.exe spawned {} times while scanning {} sources",
+        session_vault::wsl::spawn_count() - spawns_before,
+        sources.len()
+    );
 
     // 状态持久化结果：None=stateless；Some(true/false)=尝试落盘的成败。
     let state_saved = match &state_path {
@@ -3052,7 +3075,14 @@ mod tests {
             path: path.clone(),
             ..mk_source()
         };
-        let (scanned, _) = scan_one(&src, None, None, Profile::Full, roots());
+        let (scanned, _) = scan_one(
+            &src,
+            None,
+            None,
+            Profile::Full,
+            roots(),
+            &Default::default(),
+        );
         assert!(
             matches!(scanned, Scanned::Observed(_)),
             "append-log 必须走观察入口 —— ScanStatus 压掉的四种含义正是写库要用的"
@@ -3068,7 +3098,14 @@ mod tests {
             source_mode: SourceMode::SnapshotFile,
             ..src
         };
-        let (scanned, _) = scan_one(&snap, None, None, Profile::Full, roots());
+        let (scanned, _) = scan_one(
+            &snap,
+            None,
+            None,
+            Profile::Full,
+            roots(),
+            &Default::default(),
+        );
         assert!(matches!(scanned, Scanned::Projected { .. }));
         assert!(scanned.fingerprint().is_none(), "投影那条给不出指纹");
     }
