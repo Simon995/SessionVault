@@ -288,6 +288,16 @@ fn an_erasure_on_one_machine_hides_then_removes_the_content_on_the_other() {
     let s2 = ingest(&store_b, &f2);
     let s4 = ingest_under(&store_b, &f4, Some("/w/gone"));
     let s5 = ingest(&store_b, &f5);
+    // B 上同一项目根的 UNC 写法（还没被重投影成规范形），和别的发行版的同名路径（对照）。
+    let (f6, f7) = (dir.join("s6.jsonl"), dir.join("s7.jsonl"));
+    std::fs::write(&f6, claude_lines("s6", &["f1", "f2"])).unwrap();
+    std::fs::write(&f7, claude_lines("s7", &["g1", "g2"])).unwrap();
+    let s6 = ingest_under(&store_b, &f6, Some(r"\\wsl.localhost\Ubuntu\home\u\gone2"));
+    let s7 = ingest_under(&store_b, &f7, Some(r"\\wsl.localhost\Debian\home\u\gone2"));
+    // B 上 /mnt/c 写法的项目根；A 用盘符写法删它 —— 要靠本机挂载表才认得出是同一目录。
+    let f8 = dir.join("s8.jsonl");
+    std::fs::write(&f8, claude_lines("s8", &["h1", "h2"])).unwrap();
+    let s8 = ingest_under(&store_b, &f8, Some("/mnt/c/Users/u/gone3"));
     let id_b = store_b.store_id().unwrap().unwrap();
     drop(store_b);
     let (a, b) = (db_a.to_str().unwrap(), db_b.to_str().unwrap());
@@ -314,6 +324,27 @@ fn an_erasure_on_one_machine_hides_then_removes_the_content_on_the_other() {
     ]);
     let root = ["erase", "--scope", "project-root", "--key", "/w/gone"];
     svault(&[&root[..], &["--confirm", "ERASE", "--store", a]].concat());
+    // 用规范形删 B 上那个以 UNC 写法记着的项目根（A 库里没有这个项目的事件）。
+    let canon = [
+        "erase",
+        "--scope",
+        "project-root",
+        "--key",
+        "wsl:Ubuntu:/home/u/gone2",
+    ];
+    svault(&[&canon[..], &["--confirm", "ERASE", "--store", a]].concat());
+    let drive = [
+        "erase",
+        "--scope",
+        "project-root",
+        "--key",
+        r"C:\Users\u\gone3",
+    ];
+    svault(&[&drive[..], &["--confirm", "ERASE", "--store", a]].concat());
+    // 本机挂载表里有 /mnt/c 才收得到 /mnt/c 写法；没有就该原样留着（两种情况都断言，不跳过）。
+    let converges = session_vault::host_drive_mounts()
+        .iter()
+        .any(|(mount_point, _)| mount_point == "/mnt/c");
 
     let replicas_on_a = dir.join("replicas-on-a");
     std::fs::create_dir_all(&replicas_on_a).unwrap();
@@ -335,12 +366,16 @@ fn an_erasure_on_one_machine_hides_then_removes_the_content_on_the_other() {
     let read = on_a(&["sessions-read", "--all-stores", "--session", &s5]);
     assert!(events(&read).is_empty(), "按文件路径删的会话还在发");
     assert_eq!(cursor(&read)["erased"], true);
+    let read = on_a(&["sessions-read", "--all-stores", "--session", &s6]);
+    assert!(events(&read).is_empty(), "同一项目根的 UNC 写法还在发");
+    let read = on_a(&["sessions-read", "--all-stores", "--session", &s7]);
+    assert_eq!(events(&read).len(), 2, "别的发行版的同名路径被误挡");
     let recent = on_a(&["sessions-recent", "--all-stores"]);
     assert!(of_kind(&recent, "recent_session")
         .iter()
         .all(|r| r["session_id"] != "s2"));
     let erasures = on_a(&["erasures", "--all-stores"]);
-    assert_eq!(of_kind(&erasures, "erasure").len(), 3);
+    assert_eq!(of_kind(&erasures, "erasure").len(), 5);
     assert!(svault(&["erasures", "--store", b])
         .iter()
         .all(|l| l["kind"] != "erasure"));
@@ -367,16 +402,56 @@ fn an_erasure_on_one_machine_hides_then_removes_the_content_on_the_other() {
     let first = adopt();
     assert_eq!(
         (first["adopted"].clone(), first["deleted_events"].clone()),
-        (Value::from(3), Value::from(6))
+        (Value::from(5), Value::from(if converges { 10 } else { 8 }))
     );
     assert_eq!(first["replicas_searched"], 1);
-    for spec in [&s2, &s4, &s5] {
+    for spec in [&s2, &s4, &s5, &s6] {
         assert!(events(&svault(&["sessions-read", "--session", spec, "--store", b])).is_empty());
     }
+    let s7_left = svault(&["sessions-read", "--session", &s7, "--store", b]);
+    assert_eq!(events(&s7_left).len(), 2, "别的发行版的同名路径被误删");
+    let s8_left = events(&svault(&["sessions-read", "--session", &s8, "--store", b])).len();
+    assert_eq!(
+        s8_left,
+        if converges { 0 } else { 2 },
+        "挂载表 /mnt/c = {converges}"
+    );
+    // B 自己的删除记录里多了那条 UNC 写法：消费方按字符串对也删得到它的索引条目。
+    let b_erasures = svault(&["erasures", "--store", b]);
+    assert!(of_kind(&b_erasures, "erasure")
+        .iter()
+        .any(|l| l["key"] == r"\\wsl.localhost\Ubuntu\home\u\gone2"));
+    assert_eq!(
+        of_kind(&b_erasures, "erasure").len(),
+        if converges { 7 } else { 6 }
+    );
     let again = adopt();
     assert_eq!(
         (again["adopted"].clone(), again["already"].clone()),
-        (Value::from(0), Value::from(3))
+        (Value::from(0), Value::from(5))
+    );
+
+    // 单库：本库里就有 /mnt/c 写法的事件，`erase` 用盘符写法删 —— 带本机挂载表才删得到。
+    let db_c = dir.join("c.db");
+    let f9 = dir.join("s9.jsonl");
+    std::fs::write(&f9, claude_lines("s9", &["i1", "i2"])).unwrap();
+    let store_c = TotalStore::open_with_key(&db_c, key()).unwrap();
+    let s9 = ingest_under(&store_c, &f9, Some("/mnt/c/Users/u/gone4"));
+    drop(store_c);
+    let c = db_c.to_str().unwrap();
+    let drive4 = [
+        "erase",
+        "--scope",
+        "project-root",
+        "--key",
+        r"C:\Users\u\gone4",
+    ];
+    svault(&[&drive4[..], &["--confirm", "ERASE", "--store", c]].concat());
+    let s9_left = events(&svault(&["sessions-read", "--session", &s9, "--store", c])).len();
+    assert_eq!(
+        s9_left,
+        if converges { 0 } else { 2 },
+        "挂载表 /mnt/c = {converges}"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
