@@ -25,6 +25,24 @@ fn main() {
     };
     println!("cargo:rustc-env=SVAULT_BUILD_COMMIT={commit}");
 
+    // 发布号由 `scripts/release.py` 经 `SVAULT_RELEASE_TAG` 传进来（`v2026.10.10.1` → `2026.10.10.1`）。
+    // 从源码自己编的（开发克隆、消费方的子模块）没有它，记成 `dev`：它不是哪一次发布，是哪一个
+    // 构建只看括号里的提交。
+    println!("cargo:rerun-if-env-changed=SVAULT_RELEASE_TAG");
+    let release = match std::env::var("SVAULT_RELEASE_TAG") {
+        Ok(tag) if !tag.trim().is_empty() => {
+            let tag = tag.trim().trim_start_matches('v').to_string();
+            assert!(
+                tag.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+                "SVAULT_RELEASE_TAG 只能含字母、数字、点和横线：{tag:?}"
+            );
+            tag
+        }
+        _ => "dev".to_string(),
+    };
+    println!("cargo:rustc-env=SVAULT_RELEASE={release}");
+
     for input in BUILD_INPUTS {
         println!("cargo:rerun-if-changed={input}");
     }

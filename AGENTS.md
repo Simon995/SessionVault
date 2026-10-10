@@ -45,7 +45,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 - 运行时会有不止一份 svault 同时打开同一个总库（`<data_local_dir>/svault/total_store.db`），子模块指针拦不住。写入类打开都跑 `migrate()`；只读子命令与 `open_existing` 走 `TotalStore::open_read_only`（不建库、不迁移，库缺表列时报 `SchemaBehind`），新的读路径也必须走它。
 - 多机（`docs/linux-replica.md`）：每台只写自己的库，副本目录 `<data_local_dir>/svault/replicas/<store_id>.db` 只读；合读走 `--all-stores`，挑哪份只看内容与 `store_id`、不看哪个是本机；删除跨库传播走 `erasures` / `adopt-erasures`。
 - 改 schema 前必须回答「落后一版的消费者读不读得动」：核心表做过整表重建，「旧版还读得动」是纪律，不是构造。
-- 判断一份 svault 是哪一版看 `svault --version` 括号里的提交（`build.rs` 写入，`-dirty` = 构建时有未提交改动，`unknown` = 构建时没有 git）；`0.0.0` 本身不带信息。消费方应正向断言版本与子命令，不靠「没报错」。
+- 判断一份 svault 是哪一版看 `svault --version` 括号里的提交（`build.rs` 写入，`-dirty` = 构建时有未提交改动，`unknown` = 构建时没有 git）；前面是发布号（`release.py` 传入）或 `dev`（从源码自己编的），只供人看。消费方应正向断言提交与子命令，不靠「没报错」。
 - 新增消费者只有两种姿势：复用已有的一份 svault，或自带一份并同时给出版本协调方案。场景推演见存档「新增一个消费者」那一节。
 
 ## 4. 跨会话分工（本节是正文，消费者仓只放指针）

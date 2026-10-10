@@ -52,7 +52,8 @@ def preflight(tag: str, publish: bool) -> str:
 
 def build_windows(dist: pathlib.Path, tag: str) -> pathlib.Path:
     env = dict(os.environ, CARGO_TARGET_DIR=str(ROOT / "target" / "dist-build"),
-               RUSTFLAGS=f"--remap-path-prefix={os.environ['USERPROFILE']}=~")
+               RUSTFLAGS=f"--remap-path-prefix={os.environ['USERPROFILE']}=~",
+               SVAULT_RELEASE_TAG=tag)
     sh("cargo", "build", "--release", "--locked", "--bin", "svault", "--features", "store", env=env)
     out = dist / f"svault-{tag}-x86_64-windows.exe"
     shutil.copyfile(ROOT / "target" / "dist-build" / "release" / "svault.exe", out)
@@ -67,6 +68,7 @@ def build_linux(dist: pathlib.Path, tag: str) -> pathlib.Path:
         "\n".join([
             "set -eu",
             'export PATH="$HOME/.cargo/bin:$PATH"',
+            f"export SVAULT_RELEASE_TAG='{tag}'",
             f"cd '{repo}'",
             f"export RUSTFLAGS=\"--remap-path-prefix=$HOME=~ --remap-path-prefix={repo}=svault\"",
             'CARGO_TARGET_DIR="$HOME/svault-dist-target" cargo build --release --locked --bin svault --features store',
@@ -93,7 +95,7 @@ def main() -> int:
         sys.exit(__doc__)
     tag, publish = args[0], "--publish" in args[1:]
     head = preflight(tag, publish)
-    want = f"0.0.0 ({head[:12]})"
+    want = f"{tag.removeprefix('v')} ({head[:12]})"  # build.rs 把发布号写进 --version
     dist = ROOT / "target" / "dist" / tag
     shutil.rmtree(dist, ignore_errors=True)
     dist.mkdir(parents=True)
