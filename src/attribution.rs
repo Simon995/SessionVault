@@ -262,6 +262,17 @@ pub fn attribute(path: Option<&str>, registry: &RootRegistry) -> Attribution {
 /// 它持有那份表；本函数直接调用只用于存储层算行键。
 pub fn registry_key(path: &str, mounts: &DriveMounts) -> String {
     let p = path.trim();
+    // UNC 写法的 WSL 路径（`\\wsl.localhost\<distro>\…`）与规范形 `wsl:<distro>:/…` 是同一个目录。
+    // 不先换成规范形，用 UNC 写法来问的路径永远对不上登记成规范形的根（QuotaBar 2026-10-10 实测：
+    // 发现每轮都探到同一批根、登记了、却归属不上，下一轮又当候选重探）。
+    let canonical = crate::pathnorm::canonical_wsl_unc(p);
+    let p = canonical.as_deref().unwrap_or(p);
+    // 发行版里挂的 Windows 盘（`wsl:<distro>:/mnt/<drive>/…`）就是那块盘，与经哪个发行版看无关：
+    // 归到裸 `/mnt/<drive>/…`，再与它的宿主形式一起按挂载表收敛。
+    let p = match crate::pathnorm::split_canonical_wsl(p) {
+        Some((_, linux)) if crate::pathnorm::is_windows_drive_mount(linux) => linux,
+        _ => p,
+    };
     match mnt_to_windows(p, mounts) {
         Some(host) => normalize(&host).into_owned(),
         None => normalize(p).into_owned(),
@@ -1326,6 +1337,44 @@ mod tests {
             PathIdentity::Unknown { mounts_needed, .. } => assert!(mounts_needed),
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
+
+    /// UNC 写法问的路径要归到登记成规范形的根（QuotaBar 2026-10-10 实测：发现探到根、登记了，
+    /// 用 UNC 写法再问却归属不上，下一轮又当候选重探）。别的发行版、大小写不同的 Linux 路径不归进来。
+    #[test]
+    fn a_unc_path_attributes_to_a_root_registered_in_canonical_form() {
+        let reg = RootRegistry::from_roots([("wsl:Ubuntu:/home/u/ws/proj", RootSource::Git)]);
+        for path in [
+            r"\\wsl.localhost\Ubuntu\home\u\ws\proj",
+            r"\\wsl$\Ubuntu\home\u\ws\proj\sub",
+            "//wsl.localhost/Ubuntu/home/u/ws/proj",
+        ] {
+            assert!(attribute(Some(path), &reg).is_attributed(), "{path}");
+        }
+        for path in [
+            r"\\wsl.localhost\Debian\home\u\ws\proj",
+            r"\\wsl.localhost\Ubuntu\home\u\ws\Proj",
+        ] {
+            assert!(!attribute(Some(path), &reg).is_attributed(), "{path}");
+        }
+    }
+
+    /// 发行版里挂的 Windows 盘：UNC 写法、规范形、裸 `/mnt` 写法是同一个目录；有挂载表时与宿主写法也是。
+    #[test]
+    fn a_drive_mount_seen_through_a_distro_is_the_same_directory() {
+        let mounts: DriveMounts = vec![("/mnt/c".to_string(), "C:".to_string())];
+        let mut with = RootRegistry::with_mounts(mounts);
+        with.insert("/mnt/c/Users/u/ws/proj", RootSource::Git);
+        let without = RootRegistry::from_roots([("/mnt/c/Users/u/ws/proj", RootSource::Git)]);
+        for reg in [&with, &without] {
+            for path in [
+                r"\\wsl.localhost\Ubuntu\mnt\c\Users\u\ws\proj",
+                "wsl:Ubuntu:/mnt/c/Users/u/ws/proj/x",
+            ] {
+                assert!(attribute(Some(path), reg).is_attributed(), "{path}");
+            }
+        }
+        assert!(attribute(Some(r"C:\Users\u\ws\proj"), &with).is_attributed());
     }
 
     /// 反面：有挂载表时同一条查询该**认出来**，而不是报「可能是挂载表的锅」。
