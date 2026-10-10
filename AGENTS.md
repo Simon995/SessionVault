@@ -93,5 +93,5 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 - 是什么：`README.md`；设计契约：`docs/INGEST_KERNEL.md`；字段对账：`docs/rawevent-reconciliation.md`；扫描 / 投影状态模型：`docs/scan-state-model.md`。
 - 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
 - 总库体积与待优化项（存了什么、哪些可回收，只记录未动手）：`docs/storage-growth.md`。
-- 总库同步到 Linux 主机（前提、2026-10-09 的决定、方案与未决项）：`docs/linux-replica.md`。
+- 总库在多台机器之间同步（前提、2026-10-09 / 10-10 的决定、方案与未决项）：`docs/linux-replica.md`。
 - 存档：本文件 2026-10-09 瘦身前的全文（判例、历史、细节），`docs/agents-full-2026-10-09.md`，不再维护。
