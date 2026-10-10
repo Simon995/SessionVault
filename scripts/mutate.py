@@ -174,6 +174,22 @@ MUTATIONS: list[Mutation] = [
         must_fail=["the_project_carries_the_identity_but_reads_the_physical_path"],
         why="算了身份却不存 ⇒ 事件照旧携带物理路径。⚠️ 这条**接线**错误此前没有任何测试挡得住（只测函数的那几条一条都不红），是把构造抽成 `snapshot_project` 之后才有地方钉它",
     ),
+    Mutation(
+        name="list-many-ignores-find-failure",
+        rel_path="src/wsl.rs",
+        old='            answers[idx] = Some(if rc == "0" {',
+        new="            answers[idx] = Some(if !rc.is_empty() {",
+        must_fail=["parse_list_many_answers_each_family_on_its_own"],
+        why="一族 `find` 失败也当成功 ⇒ 读到一半的列表被当成全部，QuotaBar 据此删掉其余文件的索引行",
+    ),
+    Mutation(
+        name="list-many-accepts-a-mismatched-end",
+        rel_path="src/wsl.rs",
+        old="            if idx != open || idx >= answers.len() {",
+        new="            if idx >= answers.len() {",
+        must_fail=["a_family_cut_off_mid_list_is_not_a_short_list"],
+        why="结束标记对不上正在收的那族也收 ⇒ 输出断在一族中途时，上一族的半份路径被记到下一族名下",
+    ),
 ]
 
 
