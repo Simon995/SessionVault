@@ -127,6 +127,8 @@ enum Command {
         since_ms: Option<i64>,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[command(flatten)]
+        stores: AllStoresArgs,
     },
     /// 按会话身份读它们的**当前投影全部事件**。
     ///
@@ -152,6 +154,18 @@ enum Command {
         after_seq: Option<u64>,
         #[arg(long)]
         store: Option<PathBuf>,
+        #[command(flatten)]
+        stores: AllStoresArgs,
+    },
+    /// 列出本机能读的总库：本机库与副本目录里的每一个（多机同步，见 `docs/linux-replica.md`
+    /// 第四部分）。打不开的也列出来（`store_unavailable`），不当作不存在。
+    #[cfg(feature = "store")]
+    Stores {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// 副本目录（默认 `<data_local_dir>/svault/replicas`）。
+        #[arg(long)]
+        replicas: Option<PathBuf>,
     },
     /// 会话自己记下的仓库远端及其 `git:` 身份 —— 目录搬走之后仍拿得到。
     ///
@@ -357,6 +371,20 @@ enum Command {
         #[arg(long)]
         store: PathBuf,
     },
+}
+
+/// `sessions-read` / `sessions-recent` 的多库合读开关。
+#[cfg(feature = "store")]
+#[derive(clap::Args, Default)]
+struct AllStoresArgs {
+    /// 在本机库与副本目录里的每个库中找（多机同步，见 `docs/linux-replica.md` 第四部分）。
+    /// 同一会话出现在几个库里时，取当前投影事件最多的那份，一样多取 `store_id` 小的 ——
+    /// 只看内容与库标识，在哪台机器上读都挑出同一份。
+    #[arg(long)]
+    all_stores: bool,
+    /// 副本目录（默认 `<data_local_dir>/svault/replicas`）。只在 `--all-stores` 时用。
+    #[arg(long)]
+    replicas: Option<PathBuf>,
 }
 
 /// `pull --projection` 的取值。
@@ -600,8 +628,15 @@ enum Out<'a> {
     /// `pull` 产出的一条带 `offset` 的总库事件（P3-③）。`offset` 是消费者（TumeFlow）
     /// 持久化的**游标 token**：下次 `pull --since <offset>` 从此续拉。比 `Event` 多 `offset`，
     /// 因为增量同步靠 offset 定位，而 `scan` 的事件流靠各来源游标、无全局 offset。
+    ///
+    /// `store_id` 只在多库合读（`--all-stores`）时出现：`offset` 是那个库自己的。
     #[cfg(feature = "store")]
-    Pulled { offset: i64, event: &'a RawEvent },
+    Pulled {
+        offset: i64,
+        event: &'a RawEvent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store_id: Option<&'a str>,
+    },
     /// `pull` 收尾摘要。消费者据 `last_offset` 持久化游标、据 `caught_up` 判断是否已追平总库尾。
     /// `caught_up=false` 仅因 `--limit` 截断（可能还有），消费者据此决定是否再拉一轮。
     #[cfg(feature = "store")]
@@ -616,6 +651,8 @@ enum Out<'a> {
         store_max_offset: i64,
         /// 是否已读尽 `since` 之后的可读事件（`false` = 被 `--limit` 截断，需再拉）。
         caught_up: bool,
+        /// 读的是哪个库（多机时游标按它分开记）。`null` = 这个库还没被认识标识的写入方打开过。
+        store_id: Option<String>,
     },
     /// `sessions-recent` 的一行。`last_occurred_at_unix_ms = null` = 这个会话的事件
     /// 全都没有可解析的时间 —— 它排在最后但**照常返回**，因为「不知道什么时候发生」
@@ -629,9 +666,19 @@ enum Out<'a> {
         last_occurred_at_unix_ms: Option<i64>,
         first_occurred_at_unix_ms: Option<i64>,
         events: u64,
+        /// 只在 `--all-stores` 时出现：这一行取自哪个库。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store_id: Option<String>,
     },
+    /// `stores_searched` / `stores_unavailable` 只在 `--all-stores` 时出现。
     #[cfg(feature = "store")]
-    RecentSessionsSummary { sessions: usize },
+    RecentSessionsSummary {
+        sessions: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stores_searched: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stores_unavailable: Option<usize>,
+    },
     /// `sessions-read` 的收尾摘要。`truncated = true` 说明撞到了 `--max-events`
     /// 上界，**还有事件没发** —— 消费者必须据此判断结果是否完整，而不是默认它完整。
     #[cfg(feature = "store")]
@@ -641,6 +688,12 @@ enum Out<'a> {
         /// ⚠️ **全局的**「有没有任何会话被截断」，保留原语义不动（既有消费方在读它）。
         /// 要知道**哪个**会话没读完、以及从哪接着读，看 `session_cursor` 行。
         truncated: bool,
+        /// 只在 `--all-stores` 时出现：找了几个库、几个库打不开。`stores_unavailable > 0` 时，
+        /// 某个会话 `found_in = 0` 说的是「这台机器这一轮核不了」，不是「没有这个会话」。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stores_searched: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stores_unavailable: Option<usize>,
     },
     /// `sessions-read` 里**每个会话各一行**：它这一轮读到哪、还有没有、怎么接着读。
     ///
@@ -664,7 +717,31 @@ enum Out<'a> {
         /// 🔴 取到了但**解不开**的行数。与「没有这些行」是两件事 ——
         /// 不报的话，一段密钥异常会被读成一段空历史。
         decode_failed: usize,
+        /// 只在 `--all-stores` 时出现：读的是哪个库（`null` = 哪个库里都没有它）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        store_id: Option<Option<String>>,
+        /// 只在 `--all-stores` 时出现：几个库里有这个会话。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        found_in: Option<usize>,
     },
+    /// `stores` 的一行：一个打开了的库（本机库或副本）。
+    #[cfg(feature = "store")]
+    Store {
+        role: &'static str,
+        path: String,
+        store_id: Option<String>,
+        max_offset: i64,
+        events: u64,
+    },
+    /// `stores` 的一行：一个打不开的库。**不是「没有这个库」**：它在那儿，这一轮读不了。
+    #[cfg(feature = "store")]
+    StoreUnavailable {
+        role: &'static str,
+        path: String,
+        reason: String,
+    },
+    #[cfg(feature = "store")]
+    StoresSummary { stores: usize, unavailable: usize },
     /// `session-origin` 每个会话一行。
     SessionOrigin {
         /// 原样回显入参 `--session`。
@@ -874,6 +951,8 @@ enum Out<'a> {
         changes: u64,
         /// `false` = 被 `--limit` 截断，还有记录没发 —— 消费者必须再拉一轮。
         caught_up: bool,
+        /// 读的是哪个库（多机时 `--since-seq` 按它分开记）。`null` 见 `PullSummary.store_id`。
+        store_id: Option<String>,
     },
     #[cfg(feature = "store")]
     GcSummary {
@@ -928,14 +1007,18 @@ fn main() {
             limit,
             since_ms,
             store,
-        } => run_sessions_recent(limit, since_ms, store),
+            stores,
+        } => run_sessions_recent(limit, since_ms, store, stores),
         #[cfg(feature = "store")]
         Command::SessionsRead {
             sessions,
             max_events,
             after_seq,
             store,
-        } => run_sessions_read(sessions, max_events, after_seq, store),
+            stores,
+        } => run_sessions_read(sessions, max_events, after_seq, store, stores),
+        #[cfg(feature = "store")]
+        Command::Stores { store, replicas } => run_stores(store, replicas),
         Command::SessionOrigin { sessions } => run_session_origin(sessions),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
@@ -1910,8 +1993,9 @@ fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option
             return 1;
         }
     };
-    let store_max_offset = match store.status() {
-        Ok(s) => s.max_offset,
+    let (store_max_offset, store_id) = match store.status().and_then(|s| Ok((s, store.store_id()?)))
+    {
+        Ok((s, id)) => (s.max_offset, id),
         Err(e) => {
             log::error!(target: tag::CLI, "store status failed: {e}");
             return 1;
@@ -1929,7 +2013,11 @@ fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option
         since,
         limit,
         |offset, ev| {
-            emit(&Out::Pulled { offset, event: ev });
+            emit(&Out::Pulled {
+                offset,
+                event: ev,
+                store_id: None,
+            });
             last_offset = offset;
             events += 1;
         },
@@ -1948,6 +2036,7 @@ fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option
         events,
         store_max_offset,
         caught_up,
+        store_id,
     });
     log::info!(
         target: tag::CLI,
@@ -2034,6 +2123,143 @@ fn open_total_store_read_only(
         return session_vault::TotalStore::open_read_only_with_key(path, key);
     }
     session_vault::TotalStore::open_read_only(path)
+}
+
+/// 多库合读时的一个库：打开了的，或打不开的 —— 后者带原因报出去，不当作没有这个库。
+#[cfg(feature = "store")]
+enum StoreSlot {
+    Open {
+        role: &'static str,
+        path: PathBuf,
+        store_id: Option<String>,
+        store: Box<session_vault::TotalStore>,
+    },
+    Unavailable {
+        role: &'static str,
+        path: PathBuf,
+        reason: String,
+    },
+}
+
+#[cfg(feature = "store")]
+fn open_slot(role: &'static str, path: PathBuf) -> StoreSlot {
+    let opened = match total_store_present(&path) {
+        Ok(true) => open_total_store_read_only(&path)
+            .and_then(|store| Ok((store.store_id()?, store)))
+            .map_err(|e| e.to_string()),
+        Ok(false) => Err("not found".to_string()),
+        Err(why) => Err(why),
+    };
+    match opened {
+        Ok((store_id, store)) => StoreSlot::Open {
+            role,
+            path,
+            store_id,
+            store: Box::new(store),
+        },
+        Err(reason) => StoreSlot::Unavailable { role, path, reason },
+    }
+}
+
+/// 本机库，加上副本目录里的每个 `*.db`（按路径排序）。副本目录不存在 = 没有副本；
+/// **列不出来**是另一回事 —— 报错，不当作没有副本。
+#[cfg(feature = "store")]
+fn open_all_stores(
+    store_arg: Option<PathBuf>,
+    replicas_arg: Option<PathBuf>,
+) -> Result<Vec<StoreSlot>, String> {
+    use session_vault::probe::{FileKind, Probed};
+    let local = resolve_store_path(store_arg).ok_or("no data_local_dir; pass --store")?;
+    let replicas = match replicas_arg {
+        Some(dir) => dir,
+        None => local
+            .parent()
+            .map(|dir| dir.join("replicas"))
+            .ok_or("cannot derive the replicas directory; pass --replicas")?,
+    };
+    let mut paths = match session_vault::probe::read_dir_entries(&replicas, None) {
+        Probed::Absent => Vec::new(),
+        Probed::Unknown(e) => return Err(format!("cannot list replicas: {e}")),
+        Probed::Found(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("cannot list replicas: {e}"))?;
+                let is_db = entry.file_name.to_string_lossy().ends_with(".db");
+                if is_db && matches!(entry.kind, Probed::Found(FileKind::File)) {
+                    paths.push(entry.path);
+                }
+            }
+            paths
+        }
+    };
+    paths.sort();
+    let mut slots = vec![open_slot("local", local)];
+    slots.extend(paths.into_iter().map(|p| open_slot("replica", p)));
+    Ok(slots)
+}
+
+/// 同一会话在几个库里都有时挑哪一份：`(事件数, store_id)` 里事件数最多的，一样多取 `store_id`
+/// 小的；事件数为 0 的不算有。只看内容与库标识、不看哪个是本机库 —— 每台机器看到的是同一组库，
+/// 于是挑出同一份（TumeChat 2026-10-10 的判据）。
+#[cfg(feature = "store")]
+fn pick_store(candidates: &[(u64, &str)]) -> Option<usize> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, (events, _))| *events > 0)
+        .max_by(|(_, (ea, ia)), (_, (eb, ib))| ea.cmp(eb).then_with(|| ib.cmp(ia)))
+        .map(|(i, _)| i)
+}
+
+#[cfg(feature = "store")]
+fn run_stores(store_arg: Option<PathBuf>, replicas_arg: Option<PathBuf>) -> i32 {
+    let slots = match open_all_stores(store_arg, replicas_arg) {
+        Ok(slots) => slots,
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            return 1;
+        }
+    };
+    let (mut stores, mut unavailable) = (0, 0);
+    for slot in &slots {
+        match slot {
+            StoreSlot::Open {
+                role,
+                path,
+                store_id,
+                store,
+            } => {
+                let status = match store.status() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!(target: tag::CLI, "store status failed: {e}");
+                        return 1;
+                    }
+                };
+                stores += 1;
+                emit(&Out::Store {
+                    role,
+                    path: path.to_string_lossy().into_owned(),
+                    store_id: store_id.clone(),
+                    max_offset: status.max_offset,
+                    events: status.count,
+                });
+            }
+            StoreSlot::Unavailable { role, path, reason } => {
+                unavailable += 1;
+                emit(&Out::StoreUnavailable {
+                    role,
+                    path: path.to_string_lossy().into_owned(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+    }
+    emit(&Out::StoresSummary {
+        stores,
+        unavailable,
+    });
+    0
 }
 
 #[cfg(all(feature = "acceptance-fixtures", debug_assertions))]
@@ -2528,7 +2754,7 @@ mod tests {
             "claude_code/local/p/b".to_string(),
         ];
         assert_eq!(
-            run_sessions_read(two.clone(), 100, Some(5), None),
+            run_sessions_read(two.clone(), 100, Some(5), None, AllStoresArgs::default()),
             2,
             "多会话 + --after-seq 必须退 2"
         );
@@ -2536,7 +2762,13 @@ mod tests {
         // 只写正面的话，「一律退 2」也能让上面那条绿。
         // （这里只验它**没在校验这一步**退 2；后续因缺 store 退 1 是另一回事。）
         assert_ne!(
-            run_sessions_read(two, 100, None, Some(PathBuf::from("/nonexistent/x.db"))),
+            run_sessions_read(
+                two,
+                100,
+                None,
+                Some(PathBuf::from("/nonexistent/x.db")),
+                AllStoresArgs::default()
+            ),
             2,
             "没给 --after-seq 的多会话不该被这道闸拦"
         );
@@ -2574,17 +2806,38 @@ mod tests {
         );
     }
 
+    /// 挑库：事件最多的胜；一样多时 `store_id` 小的胜；都没有就是没有；与候选的先后无关。
+    #[test]
+    #[cfg(feature = "store")]
+    fn pick_store_depends_on_content_and_id_only() {
+        assert_eq!(pick_store(&[]), None);
+        assert_eq!(pick_store(&[(0, "a"), (0, "b")]), None);
+        assert_eq!(pick_store(&[(2, "a"), (4, "b")]), Some(1));
+        assert_eq!(pick_store(&[(3, "b"), (3, "a"), (0, "c")]), Some(1));
+        let candidates = [(3, "c"), (5, "b"), (5, "a"), (1, "d")];
+        let winner = candidates[pick_store(&candidates).unwrap()].1;
+        let mut reversed = candidates;
+        reversed.reverse();
+        assert_eq!(reversed[pick_store(&reversed).unwrap()].1, winner);
+        assert_eq!(winner, "a");
+    }
+
     #[test]
     fn pull_ndjson_wire_shape_is_stable() {
         let ev = mk_event(0, "s");
         let pulled = serde_json::to_value(Out::Pulled {
             offset: 42,
             event: &ev,
+            store_id: None,
         })
         .unwrap();
         assert_eq!(pulled["kind"], "pulled");
         assert_eq!(pulled["offset"], 42);
         assert_eq!(pulled["event"]["source_session_id"], "s");
+        assert!(
+            pulled.get("store_id").is_none(),
+            "单库时 pulled 行多了一个键"
+        );
 
         let summary = serde_json::to_value(Out::PullSummary {
             since: 10,
@@ -2592,8 +2845,10 @@ mod tests {
             events: 5,
             store_max_offset: 42,
             caught_up: true,
+            store_id: Some("abc".into()),
         })
         .unwrap();
+        assert_eq!(summary["store_id"], "abc");
         assert_eq!(summary["kind"], "pull_summary");
         assert_eq!(summary["since"], 10);
         assert_eq!(summary["last_offset"], 42);
@@ -3187,7 +3442,15 @@ mod tests {
 
 /// `sessions-recent`：按事件真实时间列出最近活跃的会话。
 #[cfg(feature = "store")]
-fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<PathBuf>) -> i32 {
+fn run_sessions_recent(
+    limit: usize,
+    since_ms: Option<i64>,
+    store_arg: Option<PathBuf>,
+    stores: AllStoresArgs,
+) -> i32 {
+    if stores.all_stores {
+        return run_sessions_recent_all(limit, since_ms, store_arg, stores.replicas);
+    }
     let Some(store_path) = resolve_store_path(store_arg) else {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
@@ -3218,10 +3481,132 @@ fn run_sessions_recent(limit: usize, since_ms: Option<i64>, store_arg: Option<Pa
             last_occurred_at_unix_ms: s.last_occurred_at_unix_ms,
             first_occurred_at_unix_ms: s.first_occurred_at_unix_ms,
             events: s.event_count,
+            store_id: None,
         });
     }
     emit(&Out::RecentSessionsSummary {
         sessions: sessions.len(),
+        stores_searched: None,
+        stores_unavailable: None,
+    });
+    0
+}
+
+/// 多库合读用得上的库：打开了、并且有标识的（挑库要靠标识决胜负，没有标识的挑不出确定的一份）。
+/// 其余记一条日志，计入「打不开」。
+#[cfg(feature = "store")]
+fn readable_stores(slots: &[StoreSlot]) -> (Vec<(&str, &session_vault::TotalStore)>, usize) {
+    let mut readable = Vec::new();
+    let mut unavailable = 0;
+    for slot in slots {
+        match slot {
+            StoreSlot::Open {
+                store_id: Some(id),
+                store,
+                ..
+            } => readable.push((id.as_str(), store.as_ref())),
+            StoreSlot::Open { path, .. } => {
+                unavailable += 1;
+                log::warn!(
+                    target: tag::CLI,
+                    "{} has no store_id yet (open it once with a current svault writer); skipped",
+                    path.display()
+                );
+            }
+            StoreSlot::Unavailable { path, reason, .. } => {
+                unavailable += 1;
+                log::warn!(target: tag::CLI, "{} unavailable: {reason}", path.display());
+            }
+        }
+    }
+    (readable, unavailable)
+}
+
+#[cfg(feature = "store")]
+fn run_sessions_recent_all(
+    limit: usize,
+    since_ms: Option<i64>,
+    store_arg: Option<PathBuf>,
+    replicas: Option<PathBuf>,
+) -> i32 {
+    let slots = match open_all_stores(store_arg, replicas) {
+        Ok(slots) => slots,
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            return 1;
+        }
+    };
+    let (readable, unavailable) = readable_stores(&slots);
+    type Key = (String, String, String, String);
+    let mut copies: std::collections::BTreeMap<Key, Vec<(usize, session_vault::RecentSession)>> =
+        Default::default();
+    for (i, (_, store)) in readable.iter().enumerate() {
+        let sessions = match store.recent_sessions(limit, since_ms) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(target: tag::CLI, "recent_sessions failed: {e}");
+                return 1;
+            }
+        };
+        for s in sessions {
+            let key = (
+                s.source_type.clone(),
+                s.source_location.clone(),
+                s.source_path.clone(),
+                s.session_id.clone(),
+            );
+            copies.entry(key).or_default().push((i, s));
+        }
+    }
+    let mut rows = Vec::new();
+    for (key, mut found) in copies {
+        let chosen = if found.len() == 1 {
+            0
+        } else {
+            let mut counts = Vec::new();
+            for (i, _) in &found {
+                match readable[*i].1.count_session_events(&key) {
+                    Ok(n) => counts.push((n, readable[*i].0)),
+                    Err(e) => {
+                        log::error!(target: tag::CLI, "count_session_events failed: {e}");
+                        return 1;
+                    }
+                }
+            }
+            pick_store(&counts).unwrap_or(0)
+        };
+        let (i, session) = found.swap_remove(chosen);
+        rows.push((readable[i].0, session));
+    }
+    // 与单库时同序：有时间的按最近在前，没有时间的排最后；同一时刻按身份排，输出才确定。
+    rows.sort_by(|(_, a), (_, b)| {
+        (
+            a.last_occurred_at_unix_ms.is_none(),
+            std::cmp::Reverse(a.last_occurred_at_unix_ms),
+        )
+            .cmp(&(
+                b.last_occurred_at_unix_ms.is_none(),
+                std::cmp::Reverse(b.last_occurred_at_unix_ms),
+            ))
+            .then_with(|| (&a.source_path, &a.session_id).cmp(&(&b.source_path, &b.session_id)))
+    });
+    rows.truncate(limit);
+    for (store_id, s) in &rows {
+        emit(&Out::RecentSession {
+            source_type: s.source_type.clone(),
+            source_location: s.source_location.clone(),
+            source_path: s.source_path.clone(),
+            session_id: s.session_id.clone(),
+            last_occurred_at_unix_ms: s.last_occurred_at_unix_ms,
+            first_occurred_at_unix_ms: s.first_occurred_at_unix_ms,
+            events: s.event_count,
+            store_id: Some(store_id.to_string()),
+        });
+    }
+    emit(&Out::RecentSessionsSummary {
+        sessions: rows.len(),
+        stores_searched: Some(readable.len()),
+        stores_unavailable: Some(unavailable),
     });
     0
 }
@@ -3727,6 +4112,7 @@ fn run_sessions_read(
     max_events: usize,
     after_seq: Option<u64>,
     store_arg: Option<PathBuf>,
+    stores: AllStoresArgs,
 ) -> i32 {
     // 🔴 **让错的组合执行不了，而不是在文档里叮嘱。** `seq` 是每个会话各自的，
     // 拿一个 seq 去过滤多个会话几乎总是调用方搞错了 —— 而它错得很安静：
@@ -3739,13 +4125,6 @@ fn run_sessions_read(
         );
         return 2;
     }
-    let Some(store_path) = resolve_store_path(store_arg) else {
-        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
-        return 1;
-    };
-    if let Some(code) = bail_unless_store_present(&store_path, 1) {
-        return code;
-    }
     let mut sessions = Vec::new();
     for spec in &specs {
         let Some(s) = parse_session_spec(spec) else {
@@ -3753,6 +4132,23 @@ fn run_sessions_read(
             return 2;
         };
         sessions.push(s);
+    }
+    if stores.all_stores {
+        return run_sessions_read_all(
+            &specs,
+            &sessions,
+            max_events,
+            after_seq,
+            store_arg,
+            stores.replicas,
+        );
+    }
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
     }
     let store = match open_total_store_read_only(&store_path) {
         Ok(s) => s,
@@ -3769,6 +4165,7 @@ fn run_sessions_read(
                     emit(&Out::Pulled {
                         offset: *offset,
                         event: ev,
+                        store_id: None,
                     });
                 }
                 total += page.events.len() as u64;
@@ -3784,6 +4181,8 @@ fn run_sessions_read(
                     last_seq: page.last_seq,
                     last_occurred_at: page.last_occurred_at.clone(),
                     decode_failed: page.decode_failed,
+                    store_id: None,
+                    found_in: None,
                 });
             }
             emit(&Out::SessionsReadSummary {
@@ -3792,6 +4191,8 @@ fn run_sessions_read(
                 // ⚠️ 旧字段**语义不动**（既有消费方在读它）：只说「有没有任何会话
                 // 还有剩」。`None`（没查过）不算 —— 它没资格说「还有」。
                 truncated: pages.iter().any(|p| p.has_more == Some(true)),
+                stores_searched: None,
+                stores_unavailable: None,
             });
             0
         }
@@ -3800,6 +4201,111 @@ fn run_sessions_read(
             1
         }
     }
+}
+
+/// `sessions-read --all-stores`：每个会话在所有库里数一遍，按 [`pick_store`] 挑一份读。
+/// 哪个库里都没有的会话也发一行游标（`found_in = 0`、`store_id = null`），不省略 ——
+/// 消费方要据它说「这台机器暂时核不了」，而不是把它和「原文变了」混在一起。
+#[cfg(feature = "store")]
+fn run_sessions_read_all(
+    specs: &[String],
+    sessions: &[(String, String, String, String)],
+    max_events: usize,
+    after_seq: Option<u64>,
+    store_arg: Option<PathBuf>,
+    replicas: Option<PathBuf>,
+) -> i32 {
+    let slots = match open_all_stores(store_arg, replicas) {
+        Ok(slots) => slots,
+        Err(why) => {
+            log::error!(target: tag::CLI, "{why}");
+            return 1;
+        }
+    };
+    let (readable, unavailable) = readable_stores(&slots);
+    let mut remaining = max_events;
+    let mut results = Vec::new();
+    for session in sessions {
+        let mut counts = Vec::new();
+        for (id, store) in &readable {
+            match store.count_session_events(session) {
+                Ok(n) => counts.push((n, *id)),
+                Err(e) => {
+                    log::error!(target: tag::CLI, "count_session_events failed: {e}");
+                    return 1;
+                }
+            }
+        }
+        let found_in = counts.iter().filter(|(n, _)| *n > 0).count();
+        let page = match pick_store(&counts) {
+            None => None,
+            Some(k) => {
+                let (id, store) = readable[k];
+                match store.read_sessions_resumable(
+                    std::slice::from_ref(session),
+                    remaining,
+                    after_seq,
+                ) {
+                    Ok(mut pages) => {
+                        let page = pages.remove(0);
+                        remaining -= page.events.len();
+                        Some((id, page))
+                    }
+                    Err(e) => {
+                        log::error!(target: tag::CLI, "read_sessions failed: {e}");
+                        return 1;
+                    }
+                }
+            }
+        };
+        results.push((page, found_in));
+    }
+    let mut total = 0u64;
+    for (id, page) in results.iter().filter_map(|(p, _)| p.as_ref()) {
+        for (offset, ev) in &page.events {
+            emit(&Out::Pulled {
+                offset: *offset,
+                event: ev,
+                store_id: Some(id),
+            });
+        }
+        total += page.events.len() as u64;
+    }
+    for (spec, (page, found_in)) in specs.iter().zip(&results) {
+        emit(&match page {
+            Some((id, page)) => Out::SessionCursor {
+                session: spec.clone(),
+                events: page.events.len() as u64,
+                has_more: page.has_more,
+                last_seq: page.last_seq,
+                last_occurred_at: page.last_occurred_at.clone(),
+                decode_failed: page.decode_failed,
+                store_id: Some(Some(id.to_string())),
+                found_in: Some(*found_in),
+            },
+            None => Out::SessionCursor {
+                session: spec.clone(),
+                events: 0,
+                has_more: Some(false),
+                last_seq: None,
+                last_occurred_at: None,
+                decode_failed: 0,
+                store_id: Some(None),
+                found_in: Some(0),
+            },
+        });
+    }
+    emit(&Out::SessionsReadSummary {
+        sessions: sessions.len(),
+        events: total,
+        truncated: results.iter().any(|(p, _)| {
+            p.as_ref()
+                .is_some_and(|(_, page)| page.has_more == Some(true))
+        }),
+        stores_searched: Some(readable.len()),
+        stores_unavailable: Some(unavailable),
+    });
+    0
 }
 
 /// `<type>/<location>/<path>/<session>`：path 可能含 `/`，所以从两端切 —— 前两段
@@ -3895,8 +4401,11 @@ fn run_changes(since_seq: i64, limit: usize, store_arg: Option<PathBuf>) -> i32 
             return 1;
         }
     };
-    match store.read_projection_changes(since_seq, limit) {
-        Ok(changes) => {
+    match store
+        .read_projection_changes(since_seq, limit)
+        .and_then(|c| Ok((c, store.store_id()?)))
+    {
+        Ok((changes, store_id)) => {
             let mut last_seq = since_seq;
             for c in &changes {
                 last_seq = c.seq;
@@ -3918,6 +4427,7 @@ fn run_changes(since_seq: i64, limit: usize, store_arg: Option<PathBuf>) -> i32 
                 last_seq,
                 changes: changes.len() as u64,
                 caught_up: changes.len() < limit,
+                store_id,
             });
             0
         }

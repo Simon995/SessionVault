@@ -69,6 +69,47 @@ fn every_read_subcommand_leaves_an_older_store_unmigrated() {
             args[0]
         );
     }
+    // 多库的读命令把打不开的库报成 unavailable、照常退出 0 —— 但同样不许迁移它。
+    let multi: [&[&str]; 3] = [
+        &["stores"],
+        &[
+            "sessions-read",
+            "--all-stores",
+            "--session",
+            "codex/local/p/s",
+        ],
+        &["sessions-recent", "--all-stores"],
+    ];
+    let no_replicas = dir.join("no-replicas");
+    for args in multi {
+        let out = Command::new(env!("CARGO_BIN_EXE_svault"))
+            .env("SVAULT_ACCEPTANCE_KEY", TEST_KEY)
+            .args(args)
+            .args([
+                "--store",
+                store,
+                "--replicas",
+                no_replicas.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("\"store_unavailable\"") || stdout.contains("\"stores_unavailable\":1"),
+            "{}: 打不开的库没有报出来：{stdout}",
+            args[0]
+        );
+        assert!(
+            !has_table(&db, "projection_log"),
+            "{}: 打开时迁移了库",
+            args[0]
+        );
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
