@@ -55,6 +55,79 @@ pub fn scan_append_log_observed(
     roots: Arc<RootRegistry>,
     deadline: crate::deadline::Deadline,
 ) -> (AppendLogObservation, SourceReport) {
+    scan_append_log_prefetched(
+        source,
+        cursor_in,
+        prior_fingerprint,
+        profile,
+        roots,
+        deadline,
+        &StatPrefetch::default(),
+    )
+}
+
+/// 一轮开始时按发行版批量问到的 WSL 文件 `(size, mtime)`，喂给 [`scan_append_log_prefetched`]。
+///
+/// 没变化的文件只需要 stat。逐个问时每个文件一次 `wsl.exe`（约 150 ms 固定开销，QuotaBar
+/// 实测一轮 354 个约 50 s）；预取时每个发行版一次，没变化的文件不再起进程。
+///
+/// 答案会过期：问完之后文件又追加了，这一轮按旧大小读、多出的留到下一轮（与逐个问时
+/// 晚一点问等价）；问完之后被截断，`read_range` 短读即报错 —— 这一轮记读失败、游标不动，
+/// 下一轮重新问时认出回退。不会读出错位的字节。
+#[derive(Debug, Default)]
+pub struct StatPrefetch {
+    answers: std::collections::HashMap<(String, String), crate::wsl::StatAnswer>,
+}
+
+impl StatPrefetch {
+    /// 给这批来源里 WSL 上的 append-log 来源预取，每个发行版问一次。本机来源不预取（本来就便宜）。
+    ///
+    /// 某个发行版整批没问成，就不给它留答案：那些来源照旧逐个问，与没有预取时一样。
+    pub fn for_sources(sources: &[SourceRef], deadline: crate::deadline::Deadline) -> Self {
+        let mut by_distro: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+        for s in sources {
+            if let (SourceMode::AppendLog, SourceLocation::Wsl(distro)) =
+                (s.source_mode, &s.source_location)
+            {
+                by_distro
+                    .entry(distro)
+                    .or_default()
+                    .push(s.path.to_string_lossy().into_owned());
+            }
+        }
+        let mut answers = std::collections::HashMap::new();
+        for (distro, paths) in by_distro {
+            match crate::wsl::stat_many(distro, &paths, deadline) {
+                Ok(batch) => answers.extend(
+                    batch
+                        .into_iter()
+                        .map(|(path, answer)| ((distro.to_string(), path), answer)),
+                ),
+                Err(e) => log::warn!(
+                    target: tag::WSL,
+                    "batch stat failed for {distro} ({} sources fall back to one wsl.exe each): {e}",
+                    paths.len()
+                ),
+            }
+        }
+        Self { answers }
+    }
+
+    fn get(&self, distro: &str, abs: &str) -> Option<&crate::wsl::StatAnswer> {
+        self.answers.get(&(distro.to_string(), abs.to_string()))
+    }
+}
+
+/// [`scan_append_log_observed`]，但 WSL 来源的 stat 先查 `prefetch`：有答案就不再起 `wsl.exe`。
+pub fn scan_append_log_prefetched(
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    prior_fingerprint: Option<SourceFingerprint>,
+    profile: Profile,
+    roots: Arc<RootRegistry>,
+    deadline: crate::deadline::Deadline,
+    prefetch: &StatPrefetch,
+) -> (AppendLogObservation, SourceReport) {
     match &source.source_location {
         SourceLocation::Local => scan_append_log(
             &LocalSource { path: &source.path },
@@ -71,6 +144,7 @@ pub fn scan_append_log_observed(
                     distro,
                     abs: &abs,
                     deadline,
+                    prefetched: prefetch.get(distro, &abs),
                 },
                 source,
                 cursor_in,
@@ -330,11 +404,17 @@ struct WslSource<'a> {
     /// 🔴 **持有整轮 deadline**，不各自新建 —— `ByteSource` 的 `stat`/`read_range`
     /// 没有参数位，而「每次调用重新拿 60 秒」正是这次要修的（ADR-051 §4）。
     deadline: crate::deadline::Deadline,
+    /// 本轮预取到的答案（[`StatPrefetch`]）。批量里这一条没问成（`Err`）就单独再问。
+    prefetched: Option<&'a crate::wsl::StatAnswer>,
 }
 
 impl ByteSource for WslSource<'_> {
     fn stat(&self) -> Result<(u64, Option<i64>), String> {
-        match crate::wsl::stat(self.distro, self.abs, self.deadline)? {
+        let answer = match self.prefetched {
+            Some(Ok(answer)) => *answer,
+            Some(Err(_)) | None => crate::wsl::stat(self.distro, self.abs, self.deadline)?,
+        };
+        match answer {
             Some((size, mtime)) => Ok((size, Some(mtime))),
             None => Err(format!("wsl file missing: {}:{}", self.distro, self.abs)),
         }
@@ -1356,5 +1436,228 @@ mod tests {
             artifact_kind: Some("memory".to_string()),
         };
         assert_eq!(super::snapshot_mtime(&src), None);
+    }
+
+    // ── 预取（StatPrefetch）────────────────────────────────────────────────────────
+    //
+    // 发行版名故意不存在：预取答案被用上时不会去问它；退回逐个问时一定问不成
+    // （Windows 上 wsl.exe 报错，别处是桩）—— 所以「有没有退回去问」从结果上看得出来。
+
+    const NO_SUCH_DISTRO: &str = "svault-test-no-such-distro";
+    const WSL_PATH: &str = "/home/u/.claude/projects/p/s.jsonl";
+
+    fn wsl_source() -> SourceRef {
+        SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Wsl(NO_SUCH_DISTRO.into()),
+            source_mode: SourceMode::AppendLog,
+            path: PathBuf::from(WSL_PATH),
+            project_root: None,
+            artifact_kind: None,
+        }
+    }
+
+    fn caught_up_cursor() -> crate::cursor::Cursor {
+        let mut cursor = crate::cursor::Cursor::new_byte_offset();
+        cursor.safe_offset = 100;
+        cursor.size = 100;
+        cursor.mtime = Some(1_700_000_000);
+        cursor
+    }
+
+    fn prefetch_with(answer: crate::wsl::StatAnswer) -> super::StatPrefetch {
+        let mut prefetch = super::StatPrefetch::default();
+        prefetch
+            .answers
+            .insert((NO_SUCH_DISTRO.into(), WSL_PATH.into()), answer);
+        prefetch
+    }
+
+    fn scan_with(prefetch: &super::StatPrefetch) -> crate::observation::AppendLogObservation {
+        super::scan_append_log_prefetched(
+            &wsl_source(),
+            Some(caught_up_cursor()),
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+            prefetch,
+        )
+        .0
+    }
+
+    /// 没变化的文件：预取答案就够了，不再起 `wsl.exe`；不给预取时要单独问（这里问不成）。
+    #[test]
+    fn an_unchanged_wsl_file_is_answered_by_the_prefetch_without_a_wsl_call() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        // 不断言全进程的 `spawn_count`：并行跑的别的测试也会起 wsl.exe。退回逐个问必然
+        // 问不成，所以结果是 `Clean` 本身就证明没有退回去问。
+        let obs = scan_with(&prefetch_with(Ok(Some((100, 1_700_000_000)))));
+        assert!(
+            matches!(obs.quality, ParseQuality::Clean { .. }),
+            "{:?}",
+            obs.quality
+        );
+        assert!(obs.events.is_empty());
+
+        let obs = scan_with(&super::StatPrefetch::default());
+        assert!(
+            matches!(obs.quality, ParseQuality::Unavailable(ScanFailure::Stat(_))),
+            "对照失效：没有预取时应当单独去问、并且问不成：{:?}",
+            obs.quality
+        );
+    }
+
+    /// 批量确认文件不在：与逐个问时一样报 stat 失败，不再单独问；批量里这一条没问成：单独再问。
+    #[test]
+    fn a_batch_miss_is_final_but_a_batch_failure_falls_back_to_asking_alone() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        // 「missing」只出自预取答案；退回单独问会带着 wsl.exe（或桩）的报错回来。
+        let obs = scan_with(&prefetch_with(Ok(None)));
+        let ParseQuality::Unavailable(ScanFailure::Stat(why)) = &obs.quality else {
+            panic!("{:?}", obs.quality);
+        };
+        assert!(
+            why.contains("missing"),
+            "批量已确认不在，却又单独问了：{why}"
+        );
+
+        let batch_error = "batch could not answer this one";
+        let obs = scan_with(&prefetch_with(Err(batch_error.into())));
+        let ParseQuality::Unavailable(ScanFailure::Stat(why)) = &obs.quality else {
+            panic!("{:?}", obs.quality);
+        };
+        assert!(
+            !why.contains(batch_error),
+            "没有单独再问，直接把批量的错误当了答案：{why}"
+        );
+    }
+
+    /// 实机：QuotaBar 按规则 2 提的三条判据（2026-10-10）。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`。
+    ///
+    /// 夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读 —— 不往发行版里写，也不从这边删它的文件。
+    /// 单独跑（`--test-threads=1`）：数的是全进程的 `wsl.exe` 启动次数。
+    #[test]
+    #[cfg(windows)]
+    fn prefetch_meets_the_wsl_spawn_budget_it() {
+        use crate::observation::{ParseQuality, ScanFailure, SourceChange};
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let line = |session: &str, text: &str| format!("{}\n", claude_line(session, text));
+        let distro = crate::wsl::list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| crate::wsl::is_user_distro(d))
+            .expect("need a user distro");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("svault-it-prefetch-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let win = dir.to_string_lossy().into_owned();
+        let (drive, rest) = win.split_once(":\\").expect("drive-letter temp dir");
+        let mnt = format!("/mnt/{}/{}", drive.to_lowercase(), rest.replace('\\', "/"));
+
+        let files: Vec<PathBuf> = (0..20).map(|i| dir.join(format!("s{i}.jsonl"))).collect();
+        for (i, f) in files.iter().enumerate() {
+            let body: String = (0..3)
+                .map(|n| line(&format!("s{i}"), &format!("m{n}")))
+                .collect();
+            std::fs::write(f, body).unwrap();
+        }
+        let sources: Vec<SourceRef> = (0..files.len())
+            .map(|i| SourceRef {
+                source_type: SourceType::ClaudeCode,
+                source_location: SourceLocation::Wsl(distro.clone()),
+                source_mode: SourceMode::AppendLog,
+                path: PathBuf::from(format!("{mnt}/s{i}.jsonl")),
+                project_root: None,
+                artifact_kind: None,
+            })
+            .collect();
+        let scan = |i: usize, cursor: &crate::cursor::Cursor, prefetch: &super::StatPrefetch| {
+            super::scan_append_log_prefetched(
+                &sources[i],
+                Some(cursor.clone()),
+                None,
+                Profile::Full,
+                no_roots(),
+                unbounded(),
+                prefetch,
+            )
+            .0
+        };
+
+        // 第 1 轮：逐个全读，拿到游标。
+        let mut cursors: Vec<_> = sources
+            .iter()
+            .map(|s| {
+                let obs = super::scan_append_log_observed(
+                    s,
+                    None,
+                    None,
+                    Profile::Full,
+                    no_roots(),
+                    unbounded(),
+                )
+                .0;
+                assert_eq!(obs.events.len(), 3, "{:?}", obs.quality);
+                obs.cursor
+            })
+            .collect();
+
+        // 判据 1：20 个来源里 2 个有新增，wsl.exe 启动次数 ≤ 发行版数 + 有变化的来源数。
+        append(&files[3], &line("s3", "new"));
+        append(&files[7], &line("s7", "new"));
+        let before = crate::wsl::spawn_count();
+        let prefetch = super::StatPrefetch::for_sources(&sources, unbounded());
+        let round: Vec<_> = (0..sources.len())
+            .map(|i| scan(i, &cursors[i], &prefetch))
+            .collect();
+        let spawned = crate::wsl::spawn_count() - before;
+        assert!(
+            spawned <= 1 + 2,
+            "20 个来源、2 个有变化，起了 {spawned} 次 wsl.exe"
+        );
+        for (i, obs) in round.iter().enumerate() {
+            let want = if i == 3 || i == 7 { 1 } else { 0 };
+            assert_eq!(obs.events.len(), want, "来源 {i}：{:?}", obs.quality);
+        }
+
+        // 判据 2：有变化的来源，预取与逐个问的结果逐字节一致。
+        let plain = scan(3, &cursors[3], &super::StatPrefetch::default());
+        assert_eq!(
+            serde_json::to_value(&plain.events).unwrap(),
+            serde_json::to_value(&round[3].events).unwrap()
+        );
+        assert_eq!(plain.cursor.safe_offset, round[3].cursor.safe_offset);
+        for (cursor, obs) in cursors.iter_mut().zip(round) {
+            *cursor = obs.cursor;
+        }
+
+        // 答案过期：预取之后文件被改短。这一轮读失败、游标不动；下一轮重新预取，认出回退、从头读。
+        append(&files[5], &line("s5", "grown"));
+        let stale = super::StatPrefetch::for_sources(&sources, unbounded());
+        std::fs::write(&files[5], line("s5", "rewritten")).unwrap();
+        let obs = scan(5, &cursors[5], &stale);
+        assert!(
+            matches!(obs.quality, ParseQuality::Unavailable(ScanFailure::Read(_))),
+            "{:?}",
+            obs.quality
+        );
+        assert!(obs.events.is_empty());
+        assert_eq!(
+            obs.cursor.safe_offset, cursors[5].safe_offset,
+            "过期答案推进了游标"
+        );
+        let fresh = super::StatPrefetch::for_sources(&sources, unbounded());
+        let obs = scan(5, &cursors[5], &fresh);
+        assert_eq!(obs.source_change, SourceChange::RollbackOrRewrite);
+        assert_eq!(obs.events.len(), 1, "{:?}", obs.quality);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
