@@ -77,6 +77,64 @@ pub fn scan_append_log_observed(
 #[derive(Debug, Default)]
 pub struct StatPrefetch {
     answers: std::collections::HashMap<(String, String), crate::wsl::StatAnswer>,
+    /// [`Self::reading_whole`] 规划的整份读。批在第一次用到时才读（`&self` 上读，所以要锁）。
+    whole: std::sync::Mutex<WholeReads>,
+}
+
+/// 整份读的批与已读到的内容。
+#[derive(Debug, Default)]
+struct WholeReads {
+    /// 每批：一个发行版、按调用方给的顺序装、`stat` 到的大小合计 ≤ `READ_MANY_MAX_TOTAL`。
+    batches: Vec<(String, Vec<String>)>,
+    batch_of: std::collections::HashMap<(String, String), usize>,
+    /// 已读的批（读过就不再读，没读成也一样 —— 那批的来源退回逐个读）。
+    fetched_batches: std::collections::HashSet<usize>,
+    /// 读到、还没交出去的内容。交出去就删，同时占着的内存约一批。
+    contents: std::collections::HashMap<(String, String), Vec<u8>>,
+    deadline: Option<crate::deadline::Deadline>,
+}
+
+/// [`StatPrefetch::reading_whole`] 的分批：按 `sources` 的顺序，同一发行版的接着往当前批里装，
+/// 装不下（合计会超过 `READ_MANY_MAX_TOTAL`）就另起一批。只收 WSL 上的 append-log、`stat` 到了、
+/// 大小在 `(0, READ_MANY_MAX_EACH]` 里的；其余照旧逐个读。
+///
+/// 按调用方的顺序装而不是按大小排：调用方按这个顺序逐个扫，一批读回来很快就交完，
+/// 不会把几百 MB 同时留在内存里（QuotaBar 是托盘程序）。
+fn plan_whole_batches(
+    sources: &[SourceRef],
+    answers: &std::collections::HashMap<(String, String), crate::wsl::StatAnswer>,
+) -> Vec<(String, Vec<String>)> {
+    let mut batches: Vec<(String, Vec<String>, u64)> = Vec::new();
+    let mut open: std::collections::HashMap<String, usize> = Default::default();
+    for s in sources {
+        let (SourceMode::AppendLog, SourceLocation::Wsl(distro)) =
+            (s.source_mode, &s.source_location)
+        else {
+            continue;
+        };
+        let path = s.path.to_string_lossy().into_owned();
+        let Some(Ok(Some((size, _)))) = answers.get(&(distro.clone(), path.clone())) else {
+            continue;
+        };
+        let size = *size;
+        if size == 0 || size > crate::wsl::READ_MANY_MAX_EACH {
+            continue;
+        }
+        let fits = open
+            .get(distro)
+            .is_some_and(|&i| batches[i].2 + size <= crate::wsl::READ_MANY_MAX_TOTAL);
+        if !fits {
+            open.insert(distro.clone(), batches.len());
+            batches.push((distro.clone(), Vec::new(), 0));
+        }
+        let i = open[distro];
+        batches[i].1.push(path);
+        batches[i].2 += size;
+    }
+    batches
+        .into_iter()
+        .map(|(distro, paths, _)| (distro, paths))
+        .collect()
 }
 
 impl StatPrefetch {
@@ -110,12 +168,77 @@ impl StatPrefetch {
                 ),
             }
         }
-        Self { answers }
+        Self {
+            answers,
+            whole: Default::default(),
+        }
+    }
+
+    /// 这些来源这一轮会**从头整份读**（宿主强制重读、首次回填）：其中 WSL 上不超过单文件上限的，
+    /// 按发行版分批读（每批一次 `wsl.exe`、合计 ≤ 32 MiB），扫描时直接用读到的字节。
+    ///
+    /// 逐个读时每个文件一次 `wsl.exe`：QuotaBar 实测（2026-10-10）重建索引一轮 305 个文件起了
+    /// 306 次、120 s。批在第一次用到时才读，读完一份交出去一份。只用于从 0 开始的读；大小取本预取
+    /// `stat` 到的，没问成的不规划。整批没读成、或读到的比 `stat` 时短（中途被截断），那个来源照旧
+    /// 逐个读 —— 截断由逐个读的短读报错处理，与没有预取时一样。
+    pub fn reading_whole(self, sources: &[SourceRef], deadline: crate::deadline::Deadline) -> Self {
+        let batches = plan_whole_batches(sources, &self.answers);
+        let mut batch_of = std::collections::HashMap::new();
+        for (i, (distro, paths)) in batches.iter().enumerate() {
+            for p in paths {
+                batch_of.insert((distro.clone(), p.clone()), i);
+            }
+        }
+        Self {
+            whole: std::sync::Mutex::new(WholeReads {
+                batches,
+                batch_of,
+                deadline: Some(deadline),
+                ..Default::default()
+            }),
+            ..self
+        }
     }
 
     fn get(&self, distro: &str, abs: &str) -> Option<&crate::wsl::StatAnswer> {
         self.answers.get(&(distro.to_string(), abs.to_string()))
     }
+
+    /// 这个来源整份读到的字节（交出去就不再留）。没规划、批没读成、这一条没读到 ⇒ `None`。
+    fn take_whole(&self, distro: &str, abs: &str) -> Option<Vec<u8>> {
+        let mut w = self.whole.lock().ok()?;
+        let key = (distro.to_string(), abs.to_string());
+        let i = *w.batch_of.get(&key)?;
+        if w.fetched_batches.insert(i) {
+            let (batch_distro, paths) = w.batches[i].clone();
+            let deadline = w.deadline?;
+            match crate::wsl::read_many(&batch_distro, &paths, deadline) {
+                Ok(answers) => {
+                    for (path, answer) in answers {
+                        if let Ok(Some(read)) = answer {
+                            w.contents.insert((batch_distro.clone(), path), read.bytes);
+                        }
+                    }
+                }
+                Err(e) => log::warn!(
+                    target: tag::WSL,
+                    "batch read failed for {batch_distro} ({} sources fall back to one wsl.exe each): {e}",
+                    paths.len()
+                ),
+            }
+        }
+        w.contents.remove(&key)
+    }
+}
+
+/// 整份读到的字节里取 `[0, end)`；读到的比 `end` 短（`stat` 之后被截断）⇒ `None`，调用方逐个读。
+fn whole_prefix(mut bytes: Vec<u8>, end: u64) -> Option<Vec<u8>> {
+    let end = usize::try_from(end).ok()?;
+    if bytes.len() < end {
+        return None;
+    }
+    bytes.truncate(end);
+    Some(bytes)
 }
 
 /// [`scan_append_log_observed`]，但 WSL 来源的 stat 先查 `prefetch`：有答案就不再起 `wsl.exe`。
@@ -145,6 +268,7 @@ pub fn scan_append_log_prefetched(
                     abs: &abs,
                     deadline,
                     prefetched: prefetch.get(distro, &abs),
+                    whole: prefetch,
                 },
                 source,
                 cursor_in,
@@ -483,6 +607,8 @@ struct WslSource<'a> {
     deadline: crate::deadline::Deadline,
     /// 本轮预取到的答案（[`StatPrefetch`]）。批量里这一条没问成（`Err`）就单独再问。
     prefetched: Option<&'a crate::wsl::StatAnswer>,
+    /// 整份读的批（[`StatPrefetch::reading_whole`]）；从 0 开始读时先查它。
+    whole: &'a StatPrefetch,
 }
 
 impl ByteSource for WslSource<'_> {
@@ -498,6 +624,15 @@ impl ByteSource for WslSource<'_> {
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        if start == 0 {
+            if let Some(bytes) = self
+                .whole
+                .take_whole(self.distro, self.abs)
+                .and_then(|bytes| whole_prefix(bytes, end))
+            {
+                return Ok(bytes);
+            }
+        }
         crate::wsl::read_range(self.distro, self.abs, start, end, self.deadline)
     }
 }
@@ -1734,6 +1869,245 @@ mod tests {
         let obs = scan(5, &cursors[5], &fresh);
         assert_eq!(obs.source_change, SourceChange::RollbackOrRewrite);
         assert_eq!(obs.events.len(), 1, "{:?}", obs.quality);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn wsl_log(distro: &str, path: &str) -> SourceRef {
+        SourceRef {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Wsl(distro.to_string()),
+            source_mode: SourceMode::AppendLog,
+            path: PathBuf::from(path),
+            project_root: None,
+            artifact_kind: None,
+        }
+    }
+
+    /// 整份读的分批：按调用方顺序、同一发行版接着装、合计超 32 MiB 另起一批；只收 WSL 上
+    /// `stat` 到了、大小在 `(0, 8 MiB]` 的 append-log。
+    #[test]
+    fn whole_reads_are_batched_per_distro_in_caller_order() {
+        const MIB: u64 = 1024 * 1024;
+        let mut answers = std::collections::HashMap::new();
+        let mut put = |distro: &str, path: &str, answer: crate::wsl::StatAnswer| {
+            answers.insert((distro.to_string(), path.to_string()), answer);
+        };
+        for (i, path) in ["/a0", "/a1", "/a2", "/a3", "/a4"].iter().enumerate() {
+            put("U", path, Ok(Some((7 * MIB, i as i64))));
+        }
+        put("D", "/d0", Ok(Some((MIB, 0))));
+        put("U", "/big", Ok(Some((8 * MIB + 1, 0))));
+        put("U", "/empty", Ok(Some((0, 0))));
+        put("U", "/gone", Ok(None));
+        put("U", "/failed", Err("no answer".to_string()));
+        let mut snapshot = wsl_log("U", "/snap");
+        snapshot.source_mode = SourceMode::SnapshotFile;
+        put("U", "/snap", Ok(Some((MIB, 0))));
+        let mut local = wsl_log("U", "/local");
+        local.source_location = SourceLocation::Local;
+        let sources: Vec<SourceRef> = vec![
+            wsl_log("U", "/a0"),
+            wsl_log("D", "/d0"),
+            wsl_log("U", "/big"),
+            wsl_log("U", "/a1"),
+            wsl_log("U", "/empty"),
+            wsl_log("U", "/a2"),
+            wsl_log("U", "/gone"),
+            wsl_log("U", "/a3"),
+            wsl_log("U", "/failed"),
+            snapshot,
+            local,
+            wsl_log("U", "/a4"),
+            wsl_log("U", "/unknown"),
+        ];
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::plan_whole_batches(&sources, &answers),
+            vec![
+                ("U".to_string(), s(&["/a0", "/a1", "/a2", "/a3"])),
+                ("D".to_string(), s(&["/d0"])),
+                ("U".to_string(), s(&["/a4"])),
+            ]
+        );
+    }
+
+    /// 读到的比 `stat` 时短（之后被截断）不能当成整份：交回调用方逐个读，由短读报错。
+    #[test]
+    fn a_whole_read_shorter_than_the_stat_is_not_used() {
+        assert_eq!(
+            super::whole_prefix(b"abcdef".to_vec(), 4),
+            Some(b"abcd".to_vec())
+        );
+        assert_eq!(
+            super::whole_prefix(b"abcd".to_vec(), 4),
+            Some(b"abcd".to_vec())
+        );
+        assert_eq!(super::whole_prefix(b"abc".to_vec(), 4), None);
+    }
+
+    /// 实机：强制重读时整份读分批 —— 结果与逐个读逐字节一致，`wsl.exe` 次数 = 1 次 stat +
+    /// 每批 1 次 + 每个超过单文件上限的文件 1 次（QuotaBar 按规则 2 提的判据，2026-10-12）；
+    /// 读之后被截断的文件退回逐个读、照旧报读失败。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，
+    /// 单独跑（`--test-threads=1`）。夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读。
+    #[test]
+    #[cfg(windows)]
+    fn whole_reads_are_batched_and_match_one_by_one_it() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let distro = crate::wsl::list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| crate::wsl::is_user_distro(d))
+            .expect("need a user distro");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("svault-it-whole-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let win = dir.to_string_lossy().into_owned();
+        let (drive, rest) = win.split_once(":\\").expect("drive-letter temp dir");
+        let mnt = format!("/mnt/{}/{}", drive.to_lowercase(), rest.replace('\\', "/"));
+        // 每行约 2 KiB；`mib` 给出文件大小（MiB）。
+        let filler = "x".repeat(2000);
+        let body = |name: &str, mib: f64| -> String {
+            let lines = (mib * 1024.0 * 1024.0 / 2100.0) as usize;
+            (0..lines.max(3))
+                .map(|n| format!("{}\n", claude_line(name, &format!("{n}-{filler}"))))
+                .collect()
+        };
+        // 顺序即扫描顺序：7 MiB × 5（前四个装一批、第五个另起一批）+ 9 MiB 一个 + 小文件三个。
+        let plan: [(&str, f64); 9] = [
+            ("m0", 7.0),
+            ("t0", 0.0),
+            ("m1", 7.0),
+            ("m2", 7.0),
+            ("t1", 0.0),
+            ("big", 9.0),
+            ("m3", 7.0),
+            ("m4", 7.0),
+            ("t2", 0.0),
+        ];
+        for (name, mib) in plan {
+            std::fs::write(dir.join(format!("{name}.jsonl")), body(name, mib)).unwrap();
+        }
+        let sources: Vec<SourceRef> = plan
+            .iter()
+            .map(|(name, _)| wsl_log(&distro, &format!("{mnt}/{name}.jsonl")))
+            .collect();
+        let scan_all = |prefetch: &super::StatPrefetch| -> Vec<_> {
+            sources
+                .iter()
+                .map(|s| {
+                    super::scan_append_log_prefetched(
+                        s,
+                        None,
+                        None,
+                        Profile::Full,
+                        no_roots(),
+                        unbounded(),
+                        prefetch,
+                    )
+                    .0
+                })
+                .collect()
+        };
+
+        let before = crate::wsl::spawn_count();
+        let one_by_one = scan_all(&super::StatPrefetch::for_sources(&sources, unbounded()));
+        let spawned_plain = crate::wsl::spawn_count() - before;
+
+        let before = crate::wsl::spawn_count();
+        let prefetch = super::StatPrefetch::for_sources(&sources, unbounded())
+            .reading_whole(&sources, unbounded());
+        let batched = scan_all(&prefetch);
+        let spawned_batched = crate::wsl::spawn_count() - before;
+
+        assert_eq!(
+            spawned_plain,
+            1 + sources.len(),
+            "逐个读：1 次 stat + 每个文件 1 次"
+        );
+        assert_eq!(spawned_batched, 1 + 2 + 1, "1 次 stat + 2 批 + 1 个大文件");
+        for (i, (a, b)) in one_by_one.iter().zip(&batched).enumerate() {
+            assert!(!a.events.is_empty(), "来源 {i} 没读到事件：{:?}", a.quality);
+            assert_eq!(
+                serde_json::to_value(&a.events).unwrap(),
+                serde_json::to_value(&b.events).unwrap(),
+                "来源 {i}"
+            );
+            assert_eq!(a.cursor.safe_offset, b.cursor.safe_offset, "来源 {i}");
+            assert_eq!(
+                format!("{:?}", a.quality),
+                format!("{:?}", b.quality),
+                "来源 {i}"
+            );
+        }
+
+        // 规划了整份读、实际却是接着读（调用方带了游标）：整份读到的字节不能拿来顶 `[k, size)`。
+        let tail = std::slice::from_ref(&sources[8]);
+        let cursor = batched[8].cursor.clone();
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("t2.jsonl"))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut appended,
+            format!("{}\n", claude_line("t2", "tail")).as_bytes(),
+        )
+        .unwrap();
+        drop(appended);
+        let incremental = |prefetch: &super::StatPrefetch| {
+            super::scan_append_log_prefetched(
+                &sources[8],
+                Some(cursor.clone()),
+                None,
+                Profile::Full,
+                no_roots(),
+                unbounded(),
+                prefetch,
+            )
+            .0
+        };
+        let plain = incremental(&super::StatPrefetch::for_sources(tail, unbounded()));
+        let planned = incremental(
+            &super::StatPrefetch::for_sources(tail, unbounded()).reading_whole(tail, unbounded()),
+        );
+        assert_eq!(plain.events.len(), 1, "{:?}", plain.quality);
+        assert_eq!(
+            serde_json::to_value(&plain.events).unwrap(),
+            serde_json::to_value(&planned.events).unwrap(),
+            "接着读时用了整份读到的字节"
+        );
+
+        // 规划之后、读之前文件被截断：读到的比 stat 短 ⇒ 不用它，逐个读短读报错（与没有预取时一样）。
+        let short = std::slice::from_ref(&sources[1]);
+        let stale =
+            super::StatPrefetch::for_sources(short, unbounded()).reading_whole(short, unbounded());
+        std::fs::write(
+            dir.join("t0.jsonl"),
+            body("t0", 0.0).lines().next().unwrap(),
+        )
+        .unwrap();
+        let obs = super::scan_append_log_prefetched(
+            &sources[1],
+            None,
+            None,
+            Profile::Full,
+            no_roots(),
+            unbounded(),
+            &stale,
+        )
+        .0;
+        assert!(
+            matches!(obs.quality, ParseQuality::Unavailable(ScanFailure::Read(_))),
+            "{:?}",
+            obs.quality
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -246,6 +246,22 @@ MUTATIONS: list[Mutation] = [
         must_fail=["reattribute_respells_the_same_directory_and_nothing_else"],
         why="预览也写库 ⇒ 人还没看就改了，而默认就是预览",
     ),
+    Mutation(
+        name="whole-batch-ignores-the-total-cap",
+        rel_path="src/scan.rs",
+        old="            .is_some_and(|&i| batches[i].2 + size <= crate::wsl::READ_MANY_MAX_TOTAL);",
+        new="            .is_some_and(|&i| batches[i].2 + size <= u64::MAX);",
+        must_fail=["whole_reads_are_batched_per_distro_in_caller_order"],
+        why="一个发行版的小文件全装进一批 ⇒ 一次把几百 MB 经 base64 拉进托盘进程（10-12 实测小文件合计 373 MiB）",
+    ),
+    Mutation(
+        name="whole-read-used-after-truncation",
+        rel_path="src/scan.rs",
+        old="    if bytes.len() < end {",
+        new="    if false {",
+        must_fail=["a_whole_read_shorter_than_the_stat_is_not_used"],
+        why="读到的比 stat 时短也照用 ⇒ 截断后的半份内容当成 [0, size) 交给解析，游标按 stat 的大小推进",
+    ),
 ]
 
 
