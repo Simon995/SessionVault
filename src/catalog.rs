@@ -58,6 +58,13 @@ pub struct Artifact {
     /// ⚠️ `AppendLog` 没有类别（它是会话流，不是状态快照）⇒ `None`。
     #[serde(default)]
     pub kind: Option<ArtifactKind>,
+    /// 这一族的文件会不会被写入方**就地压成 `<名>.zst`**（Codex 的冷会话，2026-10-15 起）。
+    ///
+    /// 🔴 压缩只换了存放形态，没换来源：发现时 `X.jsonl.zst` 报成逻辑路径 `X.jsonl`，
+    /// 读的时候再找它此刻是哪种形态（[`crate::compressed`]）。不认它的话，压缩一次在
+    /// 消费方眼里就是「这个来源消失了」—— QuotaBar 据此 prune 掉了 88 个会话的历史。
+    #[serde(default)]
+    pub may_be_compressed: bool,
 }
 
 /// 状态快照的类别。**与 `RawEvent.artifact_kind` 的取值一一对应**，
@@ -178,6 +185,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Stable,
                     recursive: true,
                     kind: None,
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "sessions".to_string(),
@@ -186,6 +194,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Stable,
                     recursive: true,
                     kind: None,
+                    may_be_compressed: false,
                 },
                 Artifact {
                     // 🔴 **配置根下那份全局 `CLAUDE.md`**（2026-08-26 加）。
@@ -202,6 +211,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Instruction),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "projects".to_string(),
@@ -210,6 +220,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: true,
                     kind: Some(ArtifactKind::Memory),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     // 🔴 **只取 `.md`**：同树下还有 `.py` / `.pyc`（`__pycache__`）。
@@ -220,6 +231,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: true,
                     kind: Some(ArtifactKind::Skill),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     // ⚠️ **只取 `.json`**：同目录下的 `.lock` 是运行时锁（可能正被
@@ -231,6 +243,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: true,
                     kind: Some(ArtifactKind::Task),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "plans".to_string(),
@@ -239,6 +252,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Plan),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     // 🔴 **形态是有意降级的，这里留痕**（2026-09-02）。
@@ -265,6 +279,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::History),
+                    may_be_compressed: false,
                 },
             ],
         },
@@ -280,6 +295,9 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Stable,
                     recursive: true,
                     kind: None,
+                    // 新版 Codex 把 mtime 超过 7 天的会话就地压成 `.jsonl.zst`，
+                    // 续聊要追加时再还原（见 `compressed` 模块的出处）。
+                    may_be_compressed: true,
                 },
                 Artifact {
                     subdir: "archived_sessions".to_string(),
@@ -288,6 +306,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: true,
                     kind: None,
+                    may_be_compressed: true,
                 },
                 Artifact {
                     // 🔴 **配置根下那份全局 `AGENTS.md`** —— 与 Claude 那条同理。
@@ -298,6 +317,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Instruction),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "memories".to_string(),
@@ -306,6 +326,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Memory),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "memories/rollout_summaries".to_string(),
@@ -314,6 +335,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Memory),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "memories/extensions/ad_hoc/notes".to_string(),
@@ -322,6 +344,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Memory),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     subdir: "rules".to_string(),
@@ -330,6 +353,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: false,
                     kind: Some(ArtifactKind::Rules),
+                    may_be_compressed: false,
                 },
                 Artifact {
                     // 🔴 **只取 `.md`**：实测本机 60 个文件里 md 只有 23 个，其余是
@@ -341,6 +365,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                     status: Status::Experimental,
                     recursive: true,
                     kind: Some(ArtifactKind::Skill),
+                    may_be_compressed: false,
                 },
             ],
         },
@@ -361,6 +386,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                 recursive: true,
                 // AppendLog 是会话流，不是状态快照 ⇒ 没有类别。
                 kind: None,
+                may_be_compressed: false,
             }],
         },
     ]
@@ -449,6 +475,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 会被就地压缩的只有 Codex 的两处会话目录，且只能是 append-log：压缩形态按逻辑路径报、
+    /// 按解压后的字节偏移读，这套只对会话流成立（快照按整份内容比，没有「逻辑路径」一说）。
+    #[test]
+    fn only_codex_session_logs_are_declared_compressible() {
+        let mut declared = Vec::new();
+        for d in builtin_descriptors() {
+            for art in d.artifacts {
+                if art.may_be_compressed {
+                    assert_eq!(art.source_mode, SourceMode::AppendLog, "{}", art.subdir);
+                    declared.push((d.source_type, art.subdir));
+                }
+            }
+        }
+        assert_eq!(
+            declared,
+            vec![
+                (SourceType::Codex, "sessions".to_string()),
+                (SourceType::Codex, "archived_sessions".to_string()),
+            ]
+        );
     }
 
     /// 🔴 **加一个内置 provider 会改变每个消费者的行为 —— 除非它默认不存在。**

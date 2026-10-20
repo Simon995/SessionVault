@@ -38,6 +38,7 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | `pathnorm`                   | 宿主感知路径规范化（`HostPlatform`、UNC↔规范形、`workspace_location`）                       | ✅                                            |
 | `wsl`                        | WSL 访问桥（`wsl.exe` 枚举/`find`/`stat`/`tail`，UTF-16LE 解码）                             | ✅ 实机实测                                   |
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
+| `compressed`                 | Codex 就地压缩的 `*.jsonl.zst`：按逻辑路径 `*.jsonl` 发现，偏移按解压后的字节算（纯 Rust 解压） | ✅ 2026-10-20 本机 88 个实测                  |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
 | `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute`；跨运行游标持久化 | ✅ 2026-09-29 核（`reattribute` 2026-10-10 加） |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
@@ -127,8 +128,8 @@ project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并�
 
 ## 构建
 
-Windows 上用 **GNU 工具链**（`stable-x86_64-pc-windows-gnu`，**MSRV 1.85**——
-依赖 `clap_builder` 用 edition 2024）。GNU target 编 `windows-sys` 需 `dlltool.exe`
+Windows 上用 **GNU 工具链**（`stable-x86_64-pc-windows-gnu`，**MSRV 1.87**——
+解压 Codex 压缩会话用的 `ruzstd` 0.8.3 要求它，见 `Cargo.toml`）。GNU target 编 `windows-sys` 需 `dlltool.exe`
 （WinLibs 提供）在 PATH 上。
 
 ```sh

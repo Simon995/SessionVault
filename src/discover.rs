@@ -365,8 +365,7 @@ fn discover_by_mode(
                     continue;
                 }
             }
-            let (files, walk_failed) =
-                collect_artifact_files_reported(&dir, &art.glob, art.recursive);
+            let (files, walk_failed) = collect_artifact_sources(&dir, art);
             if walk_failed && !unreachable.contains(&LOCAL_LOCATION.to_string()) {
                 unreachable.push(LOCAL_LOCATION.to_string());
             }
@@ -472,10 +471,20 @@ fn discover_wsl(
                 families.push((desc, art, rel, suffix));
             }
         }
-        let queries: Vec<(String, String)> = families
-            .iter()
-            .map(|(_, _, rel, suffix)| (rel.clone(), suffix.to_string()))
-            .collect();
+        // 每族一条；声明了 `may_be_compressed` 的族再加一条问 `<后缀>.zst`，随后折成逻辑路径。
+        // 都在同一次 `wsl.exe` 里问，不多起进程。
+        let mut queries: Vec<(String, String)> = Vec::new();
+        let mut query_of: Vec<(usize, Option<usize>)> = Vec::new();
+        for (_, art, rel, suffix) in &families {
+            queries.push((rel.clone(), suffix.to_string()));
+            let plain = queries.len() - 1;
+            let compressed = art.may_be_compressed.then(|| {
+                let zst = format!("{suffix}{}", crate::compressed::SUFFIX);
+                queries.push((rel.clone(), zst));
+                queries.len() - 1
+            });
+            query_of.push((plain, compressed));
+        }
         let key = format!("wsl:{distro}");
         // 🔴 整批没问成 ⇒ 这个发行版**每一族**都没问成：位置记进 `unreachable`，一个来源也不报。
         // 逐族问时其余族还能各自报出来；但位置已标没问成，调用方本就不会据本轮结果删存量。
@@ -489,7 +498,19 @@ fn discover_wsl(
                 continue;
             }
         };
-        for ((desc, art, rel, _), answer) in families.iter().zip(answers) {
+        let answer_to = |i: usize| {
+            answers
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no answer #{i}")))
+        };
+        for ((desc, art, rel, _), (plain, compressed)) in families.iter().zip(&query_of) {
+            // 两条里有一条没问成，这一族就是没问成 —— 半份列表会被当成「其余的文件不在了」。
+            let answer = match (answer_to(*plain), compressed.map(answer_to)) {
+                (Ok(plain), None) => Ok(plain),
+                (Ok(plain), Some(Ok(zst))) => Ok(fold_compressed_wsl(plain, zst)),
+                (Err(e), _) | (_, Some(Err(e))) => Err(e),
+            };
             let mut files = match answer {
                 Ok(f) => f,
                 Err(e) => {
@@ -545,6 +566,21 @@ fn discover_wsl(
             }
         }
     }
+}
+
+/// 发行版里一族的两份列表合成来源路径：原文件照 `find` 的顺序在前，压缩件折成逻辑路径
+/// （[`crate::compressed`]）接在后面，与原文件同名的不再报。
+fn fold_compressed_wsl(plain: Vec<String>, compressed: Vec<String>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = plain.iter().cloned().collect();
+    let mut out = plain;
+    for path in compressed {
+        if let Some(logical) = path.strip_suffix(crate::compressed::SUFFIX) {
+            if seen.insert(logical.to_string()) {
+                out.push(logical.to_string());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(not(windows))]
@@ -605,12 +641,50 @@ pub fn collect_artifact_files_reported(
     glob: &str,
     recursive: bool,
 ) -> (Vec<PathBuf>, bool) {
+    collect_matching(dir, glob, recursive, false)
+}
+
+/// 一族制品在本机的来源路径。声明了 `may_be_compressed` 的族，被就地压成 `<名>.zst` 的文件
+/// 按逻辑路径报（[`crate::compressed`]）；两种形态并存时只报一次。
+fn collect_artifact_sources(dir: &Path, art: &crate::catalog::Artifact) -> (Vec<PathBuf>, bool) {
+    collect_matching(dir, &art.glob, art.recursive, art.may_be_compressed)
+}
+
+fn collect_matching(
+    dir: &Path,
+    glob: &str,
+    recursive: bool,
+    fold_compressed: bool,
+) -> (Vec<PathBuf>, bool) {
     let mut out = Vec::new();
     let mut failed = false;
     let Some(suffix) = artifact_suffix(glob) else {
         return (out, false);
     };
-    collect_files_into(dir, recursive, suffix, &mut out, &mut failed);
+    let compressed = format!("{suffix}{}", crate::compressed::SUFFIX);
+    let mut suffixes = vec![suffix];
+    if fold_compressed {
+        suffixes.push(&compressed);
+    }
+    collect_files_into(dir, recursive, &suffixes, &mut out, &mut failed);
+    if fold_compressed {
+        out = out
+            .into_iter()
+            .filter_map(|p| {
+                if !p.to_string_lossy().ends_with(&compressed) {
+                    return Some(p);
+                }
+                let logical = crate::compressed::logical_path(&p);
+                if logical.is_none() {
+                    // 文件名不是 UTF-8：认不出逻辑名，当原文读又是乱码。Codex 的名字恒为 ASCII。
+                    log::warn!(target: tag::DISCOVER, "skip compressed file with a non-UTF-8 name: {}", p.display());
+                }
+                logical
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+    }
     // 🔴 **不含通配符的 glob 就是个精确文件名。**
     //
     // 按后缀收集会把同目录下别的同后缀文件一起收走 —— 配置根下除了
@@ -639,7 +713,7 @@ pub fn collect_jsonl(dir: &Path, recursive: bool) -> Vec<PathBuf> {
 fn collect_files_into(
     dir: &Path,
     recursive: bool,
-    suffix: &str,
+    suffixes: &[&str],
     out: &mut Vec<PathBuf>,
     failed: &mut bool,
 ) {
@@ -675,9 +749,9 @@ fn collect_files_into(
         let path = entry.path;
         if is_dir {
             if recursive {
-                collect_files_into(&path, recursive, suffix, out, failed);
+                collect_files_into(&path, recursive, suffixes, out, failed);
             }
-        } else if path.to_string_lossy().ends_with(suffix) {
+        } else if suffixes.iter().any(|s| path.to_string_lossy().ends_with(s)) {
             out.push(path);
         }
     }
@@ -1075,5 +1149,86 @@ mod tests {
                 s.source_type
             );
         }
+    }
+
+    /// 就地压缩的会话按逻辑路径报，两种形态并存只报一次；没声明会被压缩的族不认 `.zst`。
+    /// Codex 压缩时的临时文件（`rollout-compress-*.tmp`）与别的 `.zst` 都不是来源。
+    #[test]
+    fn compressed_sessions_are_reported_by_their_logical_path() {
+        let base = std::env::temp_dir().join(format!(
+            "sv-zst-discover-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for (rel, body) in [
+            ("2026/04/rollout-a.jsonl", "a"),
+            ("2026/04/rollout-b.jsonl.zst", "b"),
+            ("2026/05/rollout-c.jsonl", "c"),
+            ("2026/05/rollout-c.jsonl.zst", "c"),
+            ("2026/05/rollout-compress-x.tmp", "t"),
+            ("2026/05/notes.zst", "n"),
+        ] {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        let art = |may_be_compressed| crate::catalog::Artifact {
+            subdir: String::new(),
+            glob: "**/*.jsonl".to_string(),
+            source_mode: crate::rawevent::SourceMode::AppendLog,
+            status: crate::catalog::Status::Stable,
+            recursive: true,
+            kind: None,
+            may_be_compressed,
+        };
+        let names = |art| {
+            let (files, failed) = super::collect_artifact_sources(&base, &art);
+            assert!(!failed);
+            files
+                .into_iter()
+                .map(|p| {
+                    p.strip_prefix(&base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(art(true)),
+            [
+                "2026/04/rollout-a.jsonl",
+                "2026/04/rollout-b.jsonl",
+                "2026/05/rollout-c.jsonl"
+            ]
+        );
+        assert_eq!(
+            names(art(false)),
+            ["2026/04/rollout-a.jsonl", "2026/05/rollout-c.jsonl"]
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// 发行版那一侧：原文件照 `find` 的顺序在前，压缩件折成逻辑路径接在后面，同名不重复。
+    #[test]
+    fn compressed_wsl_listings_fold_into_logical_paths() {
+        let s = |v: &[&str]| v.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::fold_compressed_wsl(
+                s(&["/h/.codex/sessions/b.jsonl", "/h/.codex/sessions/a.jsonl"]),
+                s(&[
+                    "/h/.codex/sessions/c.jsonl.zst",
+                    "/h/.codex/sessions/a.jsonl.zst"
+                ]),
+            ),
+            s(&[
+                "/h/.codex/sessions/b.jsonl",
+                "/h/.codex/sessions/a.jsonl",
+                "/h/.codex/sessions/c.jsonl"
+            ])
+        );
     }
 }

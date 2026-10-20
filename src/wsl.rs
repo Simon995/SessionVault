@@ -938,6 +938,29 @@ stub_on_non_windows! {
     ) -> Result<std::collections::HashSet<String>, String>;
 }
 
+/// 读发行版内一个文件的全部字节与 mtime。`Ok(None)` = 不是普通文件（含不存在）。
+///
+/// 不超过 [`READ_MANY_MAX_EACH`] 的一次 `wsl.exe`（[`read_many`]，base64 传回，任意字节都不走样；
+/// [`read_file_at`] 返回 `String`，二进制会被改坏）；更大的先 `stat` 再 [`read_range`]，两次。
+/// 只由已有的桥组成，非 Windows 构建上它们是桩，这里不必另写一份。
+pub fn read_whole(
+    distro: &str,
+    abs_path: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<Option<FileRead>, String> {
+    let mut answers = read_many(distro, &[abs_path.to_string()], deadline)?;
+    if let Some(Ok(answer)) = answers.remove(abs_path) {
+        return Ok(answer);
+    }
+    match stat(distro, abs_path, deadline)? {
+        None => Ok(None),
+        Some((size, mtime)) => Ok(Some(FileRead {
+            bytes: read_range(distro, abs_path, 0, size, deadline)?,
+            mtime,
+        })),
+    }
+}
+
 /// 读发行版内绝对路径文件的字节区间 `[start, end)`（对应本地 `read_range`/`Seek`）。
 ///
 /// `tail -c +K`（1-indexed）取 `[start, EOF)`，再 `head -c (end-start)` 截到 `end`——

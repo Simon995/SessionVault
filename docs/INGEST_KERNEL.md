@@ -128,6 +128,8 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 
 平台配置根：Windows `%USERPROFILE%\.codex\`；macOS / Linux `~/.codex/`；WSL 发行版内 `~/.codex/`。
 
+> **就地压缩的会话**（2026-10-20 加）：新版 Codex 把 mtime 超过 7 天的 rollout 就地压成 `rollout-*.jsonl.zst`，续聊要追加时再还原成 `.jsonl`（出处与实测见 `src/compressed.rs` 开头）。两处会话目录都认它，且它与 `X.jsonl` 是**同一个逻辑来源**：发现报逻辑路径 `X.jsonl`（两种形态并存只报一次），`source_path`、字节偏移、大小、指纹都按解压后的字节算，与原文逐字节相同，游标在两种形态之间照样接得上。读时 `X.jsonl` 在就读它，不在才读 `.zst`。所以 append-log 来源的 `path` 不保证磁盘上就有这个文件 —— 读它走本仓（`scan` / `session-origin`），别在消费方直接开。
+
 > **session glob 降级**：上表 `sessions/YYYY/MM/DD/rollout-*.jsonl` 应视为**已观察实现**而非公开稳定契约——官方只承诺 `CODEX_HOME` 下有 sessions、不承诺分桶层级。归到"sessions 来源族 + 探测后 schema 解析"，当前 rollout JSONL 作一个 parser 候选。
 
 **控制面 / 状态面来源（补充）**——`<root>`=`CODEX_HOME`（默认 `~/.codex`），项目层在 `./.codex/` 下：

@@ -12,6 +12,8 @@ pub mod catalog;
 /// Class-B（状态制品）快照来源的枚举 —— 2026-08-16 从 QuotaBar 搬来，
 /// 因为它用到的每个原语本来就在这里，宿主只是在外面拼。
 pub mod class_b;
+/// 被写入方就地压缩的 append-log（Codex 的 `.jsonl.zst`）：同一个逻辑来源的另一种存放形态。
+pub mod compressed;
 pub mod cursor;
 pub mod deadline;
 pub mod discover;

@@ -253,7 +253,7 @@ pub fn scan_append_log_prefetched(
 ) -> (AppendLogObservation, SourceReport) {
     match &source.source_location {
         SourceLocation::Local => scan_append_log(
-            &LocalSource { path: &source.path },
+            &LocalSource::new(&source.path),
             source,
             cursor_in,
             prior_fingerprint,
@@ -269,6 +269,8 @@ pub fn scan_append_log_prefetched(
                     deadline,
                     prefetched: prefetch.get(distro, &abs),
                     whole: prefetch,
+                    stored: Default::default(),
+                    compressed: Default::default(),
                 },
                 source,
                 cursor_in,
@@ -574,9 +576,29 @@ trait ByteSource {
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String>;
 }
 
-/// 本机文件字节来源。
+/// 逻辑来源此刻以哪种形态存在（[`crate::compressed`]）。由 `stat` 认出，`read_range` 按它读：
+/// 两次调用之间换了形态（正好被压缩或还原），读那一下失败、游标不动，下一轮重认。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Stored {
+    #[default]
+    Plain,
+    /// 只有 `<path>.zst`：大小、区间都按解压后的字节算。
+    Compressed,
+}
+
+/// 本机文件字节来源。`path` 是逻辑路径：它不在、`<path>.zst` 在，就读压缩形态。
 struct LocalSource<'a> {
     path: &'a std::path::Path,
+    stored: std::cell::Cell<Stored>,
+}
+
+impl<'a> LocalSource<'a> {
+    fn new(path: &'a std::path::Path) -> Self {
+        Self {
+            path,
+            stored: Default::default(),
+        }
+    }
 }
 
 impl ByteSource for LocalSource<'_> {
@@ -584,17 +606,53 @@ impl ByteSource for LocalSource<'_> {
         // 经 `probe` 而不是直接 `std::fs::metadata` —— 见 `FileFacts` 的注释：
         // 这里从前是边界闸唯一的 carve-out，而那个 carve-out 让
         // `std::fs::metadata(p).is_ok()` 能溜过去（三轮评审 P2-2）。
-        match crate::probe::LocalBackend::unanchored()
-            .stat(self.path, crate::deadline::Deadline::unbounded())
-        {
-            crate::probe::Probed::Found(f) => Ok((f.len, f.modified_unix)),
-            crate::probe::Probed::Absent => Err(format!("{} not found", self.path.display())),
+        let stat = |p: &std::path::Path| {
+            crate::probe::LocalBackend::unanchored().stat(p, crate::deadline::Deadline::unbounded())
+        };
+        match stat(self.path) {
+            crate::probe::Probed::Found(f) => {
+                self.stored.set(Stored::Plain);
+                return Ok((f.len, f.modified_unix));
+            }
+            crate::probe::Probed::Absent => {}
+            crate::probe::Probed::Unknown(e) => return Err(e.to_string()),
+        }
+        // 原文件不在：可能被就地压缩了。两种形态都不在才是「不在」。
+        let zst = crate::compressed::compressed_path(self.path);
+        let mtime = match stat(&zst) {
+            crate::probe::Probed::Found(f) => f.modified_unix,
+            crate::probe::Probed::Absent => {
+                return Err(format!(
+                    "{} not found (nor its compressed form)",
+                    self.path.display()
+                ))
+            }
+            crate::probe::Probed::Unknown(e) => return Err(e.to_string()),
+        };
+        match crate::probe::with_reader(&zst, |r| crate::compressed::decoded_len(r)) {
+            crate::probe::Probed::Found(len) => {
+                self.stored.set(Stored::Compressed);
+                Ok((len, mtime))
+            }
+            crate::probe::Probed::Absent => Err(format!("{} vanished", zst.display())),
             crate::probe::Probed::Unknown(e) => Err(e.to_string()),
         }
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
-        read_range(self.path, start, end).map_err(|e| e.to_string())
+        match self.stored.get() {
+            Stored::Plain => read_range(self.path, start, end).map_err(|e| e.to_string()),
+            Stored::Compressed => {
+                let zst = crate::compressed::compressed_path(self.path);
+                match crate::probe::with_reader(&zst, |r| {
+                    crate::compressed::decode_range(r, start, end)
+                }) {
+                    crate::probe::Probed::Found(bytes) => Ok(bytes),
+                    crate::probe::Probed::Absent => Err(format!("{} is gone", zst.display())),
+                    crate::probe::Probed::Unknown(e) => Err(e.to_string()),
+                }
+            }
+        }
     }
 }
 
@@ -609,6 +667,33 @@ struct WslSource<'a> {
     prefetched: Option<&'a crate::wsl::StatAnswer>,
     /// 整份读的批（[`StatPrefetch::reading_whole`]）；从 0 开始读时先查它。
     whole: &'a StatPrefetch,
+    stored: std::cell::Cell<Stored>,
+    /// 压缩形态的全部字节：`stat` 要解压后的长度就得整份读回来，`read_range` 接着用它，
+    /// 不再起第二次 `wsl.exe`。
+    compressed: std::cell::RefCell<Option<Vec<u8>>>,
+}
+
+impl WslSource<'_> {
+    /// 原文件不在时问压缩形态：整份读回来（一到两次 `wsl.exe`），在本机算解压后的长度。
+    ///
+    /// ⚠️ 每轮每个压缩件都要读一次 —— 预取（`stat_many`）只问原路径，答不出解压后的长度。
+    /// 2026-10-20 本机 WSL 里一个压缩件都没有；它们多起来时按发行版分批读（见 `docs/backlog.md`）。
+    fn stat_compressed(&self) -> Result<(u64, Option<i64>), String> {
+        let zst = format!("{}{}", self.abs, crate::compressed::SUFFIX);
+        let read = crate::wsl::read_whole(self.distro, &zst, self.deadline)
+            .map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
+        let Some(read) = read else {
+            return Err(format!(
+                "wsl file missing: {}:{} (nor its compressed form)",
+                self.distro, self.abs
+            ));
+        };
+        let len = crate::compressed::decoded_len(&mut std::io::Cursor::new(&read.bytes))
+            .map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
+        self.stored.set(Stored::Compressed);
+        *self.compressed.borrow_mut() = Some(read.bytes);
+        Ok((len, Some(read.mtime)))
+    }
 }
 
 impl ByteSource for WslSource<'_> {
@@ -618,12 +703,29 @@ impl ByteSource for WslSource<'_> {
             Some(Err(_)) | None => crate::wsl::stat(self.distro, self.abs, self.deadline)?,
         };
         match answer {
-            Some((size, mtime)) => Ok((size, Some(mtime))),
-            None => Err(format!("wsl file missing: {}:{}", self.distro, self.abs)),
+            Some((size, mtime)) => {
+                self.stored.set(Stored::Plain);
+                Ok((size, Some(mtime)))
+            }
+            None => self.stat_compressed(),
         }
     }
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        if self.stored.get() == Stored::Compressed {
+            let compressed = self.compressed.borrow();
+            let bytes = compressed
+                .as_deref()
+                .ok_or_else(|| format!("{}:{} was not read", self.distro, self.abs))?;
+            return crate::compressed::decode_range(bytes, start, end).map_err(|e| {
+                format!(
+                    "{}:{}{}: {e}",
+                    self.distro,
+                    self.abs,
+                    crate::compressed::SUFFIX
+                )
+            });
+        }
         if start == 0 {
             if let Some(bytes) = self
                 .whole
@@ -1555,6 +1657,116 @@ mod tests {
                 "跳过本文件，别把瞬时失败写成持久坏记录"
             );
         }
+
+        /// 就地压缩成 `<path>.zst`（带上原文件的 mtime —— Codex 会复制元数据），删原文件。
+        fn compress_in_place(path: &Path) -> PathBuf {
+            let body = std::fs::read(path).unwrap();
+            let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+            let zst = crate::compressed::compressed_path(path);
+            let packed = ruzstd::encoding::compress_to_vec(
+                body.as_slice(),
+                ruzstd::encoding::CompressionLevel::Fastest,
+            );
+            std::fs::write(&zst, packed).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&zst)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+            zst
+        }
+
+        fn json(events: &[crate::rawevent::RawEvent]) -> serde_json::Value {
+            serde_json::to_value(events).unwrap()
+        }
+
+        /// 🔴 压缩件与原文件是**同一个来源**（Codex 就地压缩冷会话，2026-10-15 起）。
+        ///
+        /// 判据（QuotaBar 按规则 2 提的）：换了形态不报「消失」、不重复出事件。所以压缩前扫到
+        /// 哪儿，压缩后接着从哪儿 —— 没有新事件、不认成回退或原地重写；从头全读，事件、游标、
+        /// 指纹与读原文时一模一样；还原回原文、续写之后只读新增那一段，累计用量接得上。
+        #[test]
+        fn a_compressed_rollout_is_the_same_source_as_the_plain_one() {
+            let body = format!("{}\n{}\n", codex_meta("cdx"), codex_token(100, 20, 50));
+            let (path, src) = temp_source_codex("zst", &body);
+            let (plain, _) = scan_obs(&src, None);
+            assert!(!plain.events.is_empty());
+            let fp = plain.source_fingerprint.clone().expect("全读必须算出指纹");
+
+            let zst = compress_in_place(&path);
+            let (caught_up, _) = scan_obs_with(&src, Some(plain.cursor.clone()), Some(fp.clone()));
+            assert!(
+                matches!(caught_up.quality, ParseQuality::Clean { .. }),
+                "{:?}",
+                caught_up.quality
+            );
+            assert_eq!(caught_up.source_change, SourceChange::Appended);
+            assert!(caught_up.events.is_empty(), "已经读过的不再出事件");
+            assert_eq!(caught_up.cursor.safe_offset, plain.cursor.safe_offset);
+            assert_eq!(
+                caught_up.cursor.size, plain.cursor.size,
+                "大小按解压后的字节算"
+            );
+
+            let (whole, _) = scan_obs_with(&src, None, Some(fp.clone()));
+            assert_eq!(whole.source_change, SourceChange::Appended, "不是原地重写");
+            assert_eq!(json(&whole.events), json(&plain.events));
+            assert_eq!(whole.cursor.safe_offset, plain.cursor.safe_offset);
+            assert_eq!(whole.source_fingerprint, Some(fp));
+
+            // 续聊：还原成原文、删 `.zst`、再追加一行。
+            std::fs::write(&path, &body).unwrap();
+            std::fs::remove_file(&zst).unwrap();
+            append(&path, &format!("{}\n", codex_token(150, 30, 80)));
+            let (resumed, _) = scan_obs(&src, Some(whole.cursor.clone()));
+            assert_eq!(resumed.events.len(), 1, "只有新增的那一行");
+            let usage = resumed.events[0].usage.expect("续写的是一条用量");
+            assert_eq!(
+                (usage.input, usage.output, usage.cache_read),
+                (40, 30, 10),
+                "累计用量从压缩前的状态接着减"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// 两种形态并存（压缩或还原的中途）读原文件 —— 之后被追加的是它。
+        #[test]
+        fn when_both_forms_exist_the_plain_file_is_read() {
+            let (path, src) = temp_source_codex("both", &format!("{}\n", codex_meta("cdx")));
+            let zst = compress_in_place(&path);
+            std::fs::write(
+                &path,
+                format!("{}\n{}\n", codex_meta("cdx"), codex_token(100, 20, 50)),
+            )
+            .unwrap();
+            let (obs, _) = scan_obs(&src, None);
+            assert_eq!(
+                obs.cursor.safe_offset,
+                std::fs::metadata(&path).unwrap().len()
+            );
+            assert!(obs.events.iter().any(|e| e.usage.is_some()), "读的是原文件");
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&zst);
+        }
+
+        /// 压缩件读不懂（坏了、不是 zstd）不能当成空文件或「没有新内容」：问不出大小就是 `Stat`
+        /// 失败，调用方跳过本文件、不写库。
+        #[test]
+        fn an_unreadable_compressed_file_is_a_stat_failure() {
+            let (path, src) = temp_source_codex("badzst", &format!("{}\n", codex_meta("cdx")));
+            let zst = crate::compressed::compressed_path(&path);
+            std::fs::write(&zst, b"{\"not\":\"zstd\"}\n").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let (obs, _) = scan_obs(&src, None);
+            assert!(
+                matches!(obs.quality, ParseQuality::Unavailable(ScanFailure::Stat(_))),
+                "{:?}",
+                obs.quality
+            );
+            let _ = std::fs::remove_file(&zst);
+        }
     }
     // ── 快照带上源文件的 mtime（2026-08-29）────────────────────────────
 
@@ -1720,18 +1932,20 @@ mod tests {
         );
     }
 
-    /// 批量确认文件不在：与逐个问时一样报 stat 失败，不再单独问；批量里这一条没问成：单独再问。
+    /// 批量确认原文件不在：不再单独问原文件，只问它的压缩形态（可能被就地压缩了）；
+    /// 批量里这一条没问成：单独再问。
     #[test]
     fn a_batch_miss_is_final_but_a_batch_failure_falls_back_to_asking_alone() {
         use crate::observation::{ParseQuality, ScanFailure};
-        // 「missing」只出自预取答案；退回单独问会带着 wsl.exe（或桩）的报错回来。
+        // 这里问什么都问不成（发行版不存在）：报错里带着的路径就是最后问的那一个。
+        // 单独再问原文件的话，`wsl::stat` 先失败，走不到压缩形态那一步。
         let obs = scan_with(&prefetch_with(Ok(None)));
         let ParseQuality::Unavailable(ScanFailure::Stat(why)) = &obs.quality else {
             panic!("{:?}", obs.quality);
         };
         assert!(
-            why.contains("missing"),
-            "批量已确认不在，却又单独问了：{why}"
+            why.contains(".jsonl.zst:"),
+            "批量已确认原文件不在，应当只问压缩形态：{why}"
         );
 
         let batch_error = "batch could not answer this one";
@@ -2109,6 +2323,88 @@ mod tests {
             obs.quality
         );
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 实机：发行版里只剩压缩件时按逻辑路径读，结果与读原文件逐字节相同。预取只问原路径、
+    /// 答不出解压后的长度，所以压缩件多一次 `wsl.exe`（整份读回来，不超过 8 MiB 时一次）。
+    /// 两种形态都不在 ⇒ stat 失败。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，单独跑
+    /// （`--test-threads=1`）。夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读。
+    #[test]
+    #[cfg(windows)]
+    fn a_compressed_rollout_reads_the_same_over_wsl_it() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let distro = crate::wsl::list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| crate::wsl::is_user_distro(d))
+            .expect("need a user distro");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("svault-it-zst-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let win = dir.to_string_lossy().into_owned();
+        let (drive, rest) = win.split_once(":\\").expect("drive-letter temp dir");
+        let mnt = format!("/mnt/{}/{}", drive.to_lowercase(), rest.replace('\\', "/"));
+        let body: String = (0..300)
+            .map(|n| format!("{}\n", claude_line("z", &format!("line {n}"))))
+            .collect();
+        std::fs::write(dir.join("z.jsonl"), &body).unwrap();
+        let src = wsl_log(&distro, &format!("{mnt}/z.jsonl"));
+        let sources = std::slice::from_ref(&src);
+        let scan = |prefetch: &super::StatPrefetch| {
+            super::scan_append_log_prefetched(
+                &src,
+                None,
+                None,
+                Profile::Full,
+                no_roots(),
+                unbounded(),
+                prefetch,
+            )
+            .0
+        };
+        let plain = scan(&super::StatPrefetch::for_sources(sources, unbounded()));
+        assert_eq!(plain.events.len(), 300, "{:?}", plain.quality);
+
+        let packed = ruzstd::encoding::compress_to_vec(
+            body.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        std::fs::write(dir.join("z.jsonl.zst"), packed).unwrap();
+        std::fs::remove_file(dir.join("z.jsonl")).unwrap();
+        let before = crate::wsl::spawn_count();
+        let compressed = scan(&super::StatPrefetch::for_sources(sources, unbounded()));
+        let spawned = crate::wsl::spawn_count() - before;
+        assert!(
+            matches!(compressed.quality, ParseQuality::Clean { .. }),
+            "{:?}",
+            compressed.quality
+        );
+        assert_eq!(
+            serde_json::to_value(&compressed.events).unwrap(),
+            serde_json::to_value(&plain.events).unwrap()
+        );
+        assert_eq!(compressed.cursor.safe_offset, plain.cursor.safe_offset);
+        assert_eq!(compressed.source_fingerprint, plain.source_fingerprint);
+        assert_eq!(spawned, 2, "1 次批量 stat + 1 次整份读压缩件");
+
+        std::fs::remove_file(dir.join("z.jsonl.zst")).unwrap();
+        let gone = scan(&super::StatPrefetch::for_sources(sources, unbounded()));
+        assert!(
+            matches!(
+                gone.quality,
+                ParseQuality::Unavailable(ScanFailure::Stat(_))
+            ),
+            "{:?}",
+            gone.quality
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

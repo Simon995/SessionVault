@@ -2,9 +2,10 @@
 name = "session-vault"
 version = "0.0.0"
 edition = "2021"
-# 真实 MSRV 下限：clap_builder 4.6 等依赖用 edition 2024，需 rustc ≥ 1.85。
-# 已实测 `cargo +1.85.0 check --all-targets` 通过；本 crate 自身代码不依赖 >1.85 的 API。
-rust-version = "1.85"
+# 真实 MSRV 下限：ruzstd 0.8.3 声明 rust-version 1.87（2026-10-20 加依赖时；`Cargo.lock` 不入库，
+# 消费方新解析拿到的就是它）。此前 clap_builder 4.6 等要求 1.85，曾实测 `cargo +1.85.0 check
+# --all-targets` 通过；1.87 本身没有实测（本机只有 1.97）。
+rust-version = "1.87"
 description = "Shared ingestion kernel + immutable RawEvent contract for agent session data (QuotaBar / TumeFlow)"
 license = "MIT"
 repository = "https://github.com/Simon995/SessionVault"
@@ -68,5 +69,6 @@ aes-gcm = { version = "0.10", features = ["std"], optional = true }
 base64 = "0.22"
 keyring = { version = "2.3", optional = true }
 zeroize = { version = "1.8", optional = true }
+ruzstd = "0.8"
 
 [dev-dependencies]
