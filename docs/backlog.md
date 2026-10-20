@@ -52,7 +52,7 @@
   会逼出一次约 500 MB 的读取，已改正）。`StatPrefetch::reading_whole` 按调用方顺序分批、用到时才读、交出即删。
   实机夹具：逐个 10 次 → 分批 4 次，结果逐项一致。QuotaBar v0.8.15 真机重建（10-12）：上限 ⌈372.7/32⌉ + 38 = 50
   （另每轮固有约 6 次）；第 1 轮 45 次、第 2 轮 18 次，判据成立；整次重建约 10 分钟 → 2 分 31 秒（主要因它改成连跑多轮）。
-- **[本仓，分支 `feat/codex-compressed-rollouts`，待 review]** Codex 就地压缩的 `rollout-*.jsonl.zst`（10-20 QuotaBar 按规则 2
+- ~~Codex 就地压缩的会话~~ ✅ 10-20 合并（`6189b16`，等 QuotaBar 验收）：`rollout-*.jsonl.zst`（10-20 QuotaBar 按规则 2
   提出）：10-15 本机 88 个会话被压，发现阶段不认 → QuotaBar 当成消失、prune 掉了它们的索引（总库没受影响）。做法：按逻辑路径
   `X.jsonl` 发现，偏移按解压后的字节算（`compressed` 模块，纯 Rust 解压）。本机核过：88 个逐字节与 libzstd 一致；发现结果只多出
   这 88 个逻辑路径；扫出的事件逐来源等于总库当前投影（88 个来源共 89,812 条，`source_path` 串逐字相同）。
