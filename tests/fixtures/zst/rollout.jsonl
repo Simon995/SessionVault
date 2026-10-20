@@ -1,0 +1,82 @@
+{"timestamp":"2026-04-01T08:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/w/p","git":{"repository_url":"https://example.com/team/repo"}}}
+{"timestamp":"2026-04-01T08:00:01.000Z","type":"turn_context","payload":{"cwd":"/w/p","model":"m1","effort":"high"}}
+{"timestamp":"2026-04-01T08:01:00.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 0 "}]}}
+{"timestamp":"2026-04-01T08:01:00.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":5}}}}
+{"timestamp":"2026-04-01T08:01:01.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 1 word "}]}}
+{"timestamp":"2026-04-01T08:01:01.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":10,"output_tokens":10}}}}
+{"timestamp":"2026-04-01T08:01:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 2 word word "}]}}
+{"timestamp":"2026-04-01T08:01:02.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":20,"output_tokens":15}}}}
+{"timestamp":"2026-04-01T08:01:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 3 word word word "}]}}
+{"timestamp":"2026-04-01T08:01:03.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":400,"cached_input_tokens":30,"output_tokens":20}}}}
+{"timestamp":"2026-04-01T08:01:04.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 4 word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:04.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":500,"cached_input_tokens":40,"output_tokens":25}}}}
+{"timestamp":"2026-04-01T08:01:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 5 word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:05.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":600,"cached_input_tokens":50,"output_tokens":30}}}}
+{"timestamp":"2026-04-01T08:01:06.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 6 word word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:06.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":700,"cached_input_tokens":60,"output_tokens":35}}}}
+{"timestamp":"2026-04-01T08:01:07.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 7 "}]}}
+{"timestamp":"2026-04-01T08:01:07.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":800,"cached_input_tokens":70,"output_tokens":40}}}}
+{"timestamp":"2026-04-01T08:01:08.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 8 word "}]}}
+{"timestamp":"2026-04-01T08:01:08.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":80,"output_tokens":45}}}}
+{"timestamp":"2026-04-01T08:01:09.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 9 word word "}]}}
+{"timestamp":"2026-04-01T08:01:09.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":90,"output_tokens":50}}}}
+{"timestamp":"2026-04-01T08:01:10.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 10 word word word "}]}}
+{"timestamp":"2026-04-01T08:01:10.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1100,"cached_input_tokens":100,"output_tokens":55}}}}
+{"timestamp":"2026-04-01T08:01:11.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 11 word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:11.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1200,"cached_input_tokens":110,"output_tokens":60}}}}
+{"timestamp":"2026-04-01T08:01:12.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 12 word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:12.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1300,"cached_input_tokens":120,"output_tokens":65}}}}
+{"timestamp":"2026-04-01T08:01:13.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 13 word word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:13.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1400,"cached_input_tokens":130,"output_tokens":70}}}}
+{"timestamp":"2026-04-01T08:01:14.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 14 "}]}}
+{"timestamp":"2026-04-01T08:01:14.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":140,"output_tokens":75}}}}
+{"timestamp":"2026-04-01T08:01:15.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 15 word "}]}}
+{"timestamp":"2026-04-01T08:01:15.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1600,"cached_input_tokens":150,"output_tokens":80}}}}
+{"timestamp":"2026-04-01T08:01:16.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 16 word word "}]}}
+{"timestamp":"2026-04-01T08:01:16.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1700,"cached_input_tokens":160,"output_tokens":85}}}}
+{"timestamp":"2026-04-01T08:01:17.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 17 word word word "}]}}
+{"timestamp":"2026-04-01T08:01:17.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1800,"cached_input_tokens":170,"output_tokens":90}}}}
+{"timestamp":"2026-04-01T08:01:18.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 18 word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:18.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1900,"cached_input_tokens":180,"output_tokens":95}}}}
+{"timestamp":"2026-04-01T08:01:19.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 19 word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:19.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":190,"output_tokens":100}}}}
+{"timestamp":"2026-04-01T08:01:20.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 20 word word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:20.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2100,"cached_input_tokens":200,"output_tokens":105}}}}
+{"timestamp":"2026-04-01T08:01:21.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 21 "}]}}
+{"timestamp":"2026-04-01T08:01:21.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2200,"cached_input_tokens":210,"output_tokens":110}}}}
+{"timestamp":"2026-04-01T08:01:22.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 22 word "}]}}
+{"timestamp":"2026-04-01T08:01:22.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2300,"cached_input_tokens":220,"output_tokens":115}}}}
+{"timestamp":"2026-04-01T08:01:23.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 23 word word "}]}}
+{"timestamp":"2026-04-01T08:01:23.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2400,"cached_input_tokens":230,"output_tokens":120}}}}
+{"timestamp":"2026-04-01T08:01:24.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 24 word word word "}]}}
+{"timestamp":"2026-04-01T08:01:24.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2500,"cached_input_tokens":240,"output_tokens":125}}}}
+{"timestamp":"2026-04-01T08:01:25.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 25 word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:25.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2600,"cached_input_tokens":250,"output_tokens":130}}}}
+{"timestamp":"2026-04-01T08:01:26.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 26 word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:26.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2700,"cached_input_tokens":260,"output_tokens":135}}}}
+{"timestamp":"2026-04-01T08:01:27.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 27 word word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:27.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2800,"cached_input_tokens":270,"output_tokens":140}}}}
+{"timestamp":"2026-04-01T08:01:28.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 28 "}]}}
+{"timestamp":"2026-04-01T08:01:28.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2900,"cached_input_tokens":280,"output_tokens":145}}}}
+{"timestamp":"2026-04-01T08:01:29.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 29 word "}]}}
+{"timestamp":"2026-04-01T08:01:29.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3000,"cached_input_tokens":290,"output_tokens":150}}}}
+{"timestamp":"2026-04-01T08:01:30.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 30 word word "}]}}
+{"timestamp":"2026-04-01T08:01:30.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3100,"cached_input_tokens":300,"output_tokens":155}}}}
+{"timestamp":"2026-04-01T08:01:31.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 31 word word word "}]}}
+{"timestamp":"2026-04-01T08:01:31.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3200,"cached_input_tokens":310,"output_tokens":160}}}}
+{"timestamp":"2026-04-01T08:01:32.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 32 word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:32.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3300,"cached_input_tokens":320,"output_tokens":165}}}}
+{"timestamp":"2026-04-01T08:01:33.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 33 word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:33.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3400,"cached_input_tokens":330,"output_tokens":170}}}}
+{"timestamp":"2026-04-01T08:01:34.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 34 word word word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:34.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3500,"cached_input_tokens":340,"output_tokens":175}}}}
+{"timestamp":"2026-04-01T08:01:35.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 35 "}]}}
+{"timestamp":"2026-04-01T08:01:35.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3600,"cached_input_tokens":350,"output_tokens":180}}}}
+{"timestamp":"2026-04-01T08:01:36.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 36 word "}]}}
+{"timestamp":"2026-04-01T08:01:36.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3700,"cached_input_tokens":360,"output_tokens":185}}}}
+{"timestamp":"2026-04-01T08:01:37.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 37 word word "}]}}
+{"timestamp":"2026-04-01T08:01:37.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3800,"cached_input_tokens":370,"output_tokens":190}}}}
+{"timestamp":"2026-04-01T08:01:38.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"line 38 word word word "}]}}
+{"timestamp":"2026-04-01T08:01:38.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3900,"cached_input_tokens":380,"output_tokens":195}}}}
+{"timestamp":"2026-04-01T08:01:39.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"line 39 word word word word "}]}}
+{"timestamp":"2026-04-01T08:01:39.500Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4000,"cached_input_tokens":390,"output_tokens":200}}}}

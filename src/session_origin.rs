@@ -30,25 +30,31 @@ pub enum SessionOrigin {
 }
 
 /// 读一个 codex 会话的源文件，取**这个会话**记下的远端。
+///
+/// `path` 是逻辑路径：冷会话被 Codex 就地压成 `<path>.zst` 后照样读得到（[`crate::compressed`]），
+/// 两种形态都不在才是 `SourceMissing`。
 pub fn read_codex_origin(
     location: &SourceLocation,
     path: &str,
     session_id: &str,
     deadline: Deadline,
 ) -> SessionOrigin {
-    let text = match location {
-        SourceLocation::Local => match crate::probe::read_text(Path::new(path), None) {
-            Probed::Found(t) => t,
+    let bytes = match location {
+        SourceLocation::Local => match crate::compressed::read_local(Path::new(path)) {
+            Probed::Found(b) => b,
             Probed::Absent => return SessionOrigin::SourceMissing,
             Probed::Unknown(e) => return SessionOrigin::Unreadable(e.to_string()),
         },
-        SourceLocation::Wsl(distro) => match crate::wsl::read_file_at(distro, path, deadline) {
-            Ok(Some(t)) => t,
+        SourceLocation::Wsl(distro) => match crate::compressed::read_wsl(distro, path, deadline) {
+            Ok(Some(b)) => b,
             Ok(None) => return SessionOrigin::SourceMissing,
             Err(e) => return SessionOrigin::Unreadable(e),
         },
     };
-    codex_origin(&text, session_id)
+    match String::from_utf8(bytes) {
+        Ok(text) => codex_origin(&text, session_id),
+        Err(e) => SessionOrigin::Unreadable(format!("{path}: {e}")),
+    }
 }
 
 /// 在 codex rollout 全文里找这个会话的 `session_meta`。一个文件可含多个
@@ -185,6 +191,15 @@ mod tests {
         assert_eq!(read(&dir.join("gone.jsonl")), SessionOrigin::SourceMissing);
         // 目录当文件读：读失败，不是「不在」也不是「没记」。
         assert!(matches!(read(&dir), SessionOrigin::Unreadable(_)));
+
+        // Codex 把冷会话就地压成 `.zst`：照逻辑路径问，照样读得到它记下的远端。
+        let packed = ruzstd::encoding::compress_to_vec(
+            std::fs::read(&file).unwrap().as_slice(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        std::fs::write(crate::compressed::compressed_path(&file), packed).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(read(&file), SessionOrigin::Recorded { .. }));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -507,6 +507,31 @@ pub fn read_range(path: &Path, start: u64, end: u64) -> Probed<Vec<u8>> {
     }
 }
 
+/// 只能读与 seek 的句柄 —— [`with_reader`] 借出去的是它，不是 `File`。
+pub trait ReadSeek: std::io::Read + std::io::Seek {}
+impl<T: std::io::Read + std::io::Seek> ReadSeek for T {}
+
+/// 打开文件，把一个只读、可 seek 的句柄借给 `f` —— 三态。
+///
+/// 给边读边跳的读法用（解压：读帧头、按块头跳过）：用 [`read_range`] 的话每跳一次重开一次
+/// 文件。句柄只活在 `f` 里、类型是 `dyn ReadSeek`，`File` 仍不出边界（理由见 [`read_range`]）。
+/// `f` 的错误归 `Unknown`：读到了但读不懂（如压缩件坏了）也不是「那里没有」。
+#[allow(clippy::disallowed_methods)]
+pub fn with_reader<T>(
+    path: &Path,
+    f: impl FnOnce(&mut dyn ReadSeek) -> std::io::Result<T>,
+) -> Probed<T> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probed::Absent,
+        Err(e) => return Probed::Unknown(ProbeError::new(path, e)),
+    };
+    match f(&mut std::io::BufReader::with_capacity(64 * 1024, file)) {
+        Ok(v) => Probed::Found(v),
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
 fn anchor(root: Option<&Path>) -> Anchor {
     match root {
         Some(r) => Anchor::Under(r.to_path_buf()),
