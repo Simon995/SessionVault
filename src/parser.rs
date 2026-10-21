@@ -19,8 +19,8 @@ use crate::cursor::{CodexState, CodexUsage};
 use crate::pathnorm::{self, HostPlatform};
 use crate::project_root::ProjectRoot;
 use crate::rawevent::{
-    Actor, EventKey, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
-    TokenUsage, EVENT_KEY_VERSION, SCHEMA_VERSION,
+    Actor, EventAttribution, EventKey, EventType, RawEvent, SourceLocation, SourceMode, SourceType,
+    TimeConfidence, TokenUsage, EVENT_KEY_VERSION, SCHEMA_VERSION,
 };
 
 /// 解析器语义版本。**从同一份字节里能提取出什么**发生变化时 +1。
@@ -107,12 +107,7 @@ impl ParseCtx {
         pr: Option<&ProjectRoot>,
     ) -> RawEvent {
         let has_time = occurred_at.is_some();
-        // project_root 已是规范化路径（cwd 在 resolve_cached 里先过 pathnorm::normalize_cwd）。
-        // workspace_location 据此 + transcript 位置 + 宿主平台判定工程物理归属。
-        let project_root = pr.and_then(|p| p.path.as_ref().map(|x| x.display().to_string()));
-        let workspace_location = project_root
-            .as_deref()
-            .map(|root| pathnorm::workspace_location(root, &self.source_location, self.host));
+        let attribution = attribution_of(pr, &self.source_location, self.host);
         RawEvent {
             schema_version: SCHEMA_VERSION,
             source_type: self.source_type,
@@ -122,9 +117,9 @@ impl ParseCtx {
             seq,
             source_mode: SourceMode::AppendLog,
             cwd,
-            project_root,
-            project_root_source: pr.map(|p| p.source.clone()),
-            workspace_location,
+            project_root: attribution.project_root,
+            project_root_source: attribution.project_root_source,
+            workspace_location: attribution.workspace_location,
             event_type,
             actor,
             occurred_at,
@@ -961,10 +956,65 @@ fn resolve_cached(
             return Some(pr.clone());
         }
     }
-    let normalized = pathnorm::normalize_cwd(Some(cwd), host, default_distro);
-    let pr = project_root_of(attribute(normalized.as_deref(), roots));
+    let pr = resolve(cwd, host, default_distro, roots);
     *cache = Some((cwd.to_string(), pr.clone()));
     Some(pr)
+}
+
+fn resolve(
+    cwd: &str,
+    host: HostPlatform,
+    default_distro: Option<&str>,
+    roots: &RootRegistry,
+) -> ProjectRoot {
+    let normalized = pathnorm::normalize_cwd(Some(cwd), host, default_distro);
+    project_root_of(attribute(normalized.as_deref(), roots))
+}
+
+/// [`ProjectRoot`] → 事件上的归属三项。
+fn attribution_of(
+    pr: Option<&ProjectRoot>,
+    location: &SourceLocation,
+    host: HostPlatform,
+) -> EventAttribution {
+    // project_root 已是规范化路径（cwd 在 resolve 里先过 pathnorm::normalize_cwd）。
+    // workspace_location 据此 + transcript 位置 + 宿主平台判定工程物理归属。
+    let project_root = pr.and_then(|p| p.path.as_ref().map(|x| x.display().to_string()));
+    let workspace_location = project_root
+        .as_deref()
+        .map(|root| pathnorm::workspace_location(root, location, host));
+    EventAttribution {
+        project_root,
+        project_root_source: pr.map(|p| p.source.clone()),
+        workspace_location,
+    }
+}
+
+/// 一条 append-log 事件按它记下的原始 `cwd` 该有的归属三项 —— 解析器写这三项走的就是这条路
+/// （[`resolve_cached`] 缓存的也是它）。`cwd` 为 `None` 时三项皆空，同解析器。
+///
+/// `default_distro` 由调用方给，扫描器给的是 [`scan_default_distro`]。
+pub(crate) fn attribution_from_cwd(
+    cwd: Option<&str>,
+    location: &SourceLocation,
+    host: HostPlatform,
+    default_distro: Option<&str>,
+    roots: &RootRegistry,
+) -> EventAttribution {
+    let pr = cwd.map(|c| resolve(c, host, default_distro, roots));
+    attribution_of(pr.as_ref(), location, host)
+}
+
+/// 扫描器给一个来源注入的默认发行版（[`ParseCtx::default_distro`]）：WSL 来源取它自己的发行版
+/// （权威），本机来源 `None`。
+///
+/// 扫描（[`crate::scan`]）与按库重算归属（`TotalStore::recompute_attribution`）共用这一处：
+/// 后者答的是「重扫会给什么」，两边各写一份，迟早给出两个答案。
+pub(crate) fn scan_default_distro(location: &SourceLocation) -> Option<String> {
+    match location {
+        SourceLocation::Wsl(distro) => Some(distro.clone()),
+        SourceLocation::Local => None,
+    }
 }
 
 /// [`Attribution`] → [`ProjectRoot`]（落库形态）。

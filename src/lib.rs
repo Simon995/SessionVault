@@ -62,15 +62,16 @@ pub use discover::{
 pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
-    Actor, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
+    Actor, EventAttribution, EventType, RawEvent, SourceLocation, SourceMode, SourceType,
+    TimeConfidence,
 };
 pub use report::ScanReport;
 #[cfg(feature = "store")]
 pub use store::{
-    AdoptStats, AmbiguousSpelling, AppendStats, EraseStats, FileProjectionBatch, GcStats,
-    KeyImport, Projection, ProjectionChange, ProjectionStats, ReadPage, ReattributeSkip,
-    ReattributeStats, RecentSession, Rekeyed, Respelling, SessionRead, SnapshotSyncStats,
-    SourceKey, StoreStatus, Tombstone, TombstoneScope, TotalStore,
+    AdoptStats, AmbiguousSpelling, AppendStats, AttributionChange, EraseStats, FileProjectionBatch,
+    GcStats, KeyImport, Projection, ProjectionChange, ProjectionStats, ReadPage, ReattributeSkip,
+    ReattributeStats, RecentSession, RecomputeStats, Rekeyed, Respelling, SessionRead,
+    SnapshotSyncStats, SourceKey, StoreStatus, Tombstone, TombstoneScope, TotalStore,
 };
 #[cfg(feature = "store")]
 pub use store_crypto::StoreKey;

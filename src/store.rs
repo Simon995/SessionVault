@@ -25,7 +25,9 @@ use crate::cursor::{Cursor, ScanStatus};
 use crate::deadline::Deadline;
 use crate::discover::SourceRef;
 use crate::probe::{ProbeBackend, Probed};
-use crate::rawevent::{EventType, RawEvent, SourceLocation, SourceMode, SourceType};
+use crate::rawevent::{
+    EventAttribution, EventType, RawEvent, SourceLocation, SourceMode, SourceType,
+};
 use crate::store_crypto::{
     data_key_id, is_envelope, load_key_file, new_data_key_id, new_store_id, CryptoError, KeySource,
     StoreCipher, StoreKey,
@@ -367,6 +369,33 @@ pub struct ReattributeStats {
     pub dry_run: bool,
 }
 
+/// [`TotalStore::recompute_attribution`] 的一类改动：当前投影里归属为 `from` 的事件，按记下的 `cwd`
+/// 重算成了 `to`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttributionChange {
+    pub from: EventAttribution,
+    pub to: EventAttribution,
+    pub events: u64,
+    pub sources: u64,
+}
+
+/// [`TotalStore::recompute_attribution`] 的结果。`dry_run` 时 `changes` / `sources_rewritten` /
+/// `events_written` 是「将会」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecomputeStats {
+    /// 只算写了（预览时：将会写）的来源。
+    pub changes: Vec<AttributionChange>,
+    /// 写了新一代的来源数，与这些新代里的事件数（含归属没变、随来源一起搬过去的）。
+    pub sources_rewritten: u64,
+    pub events_written: u64,
+    /// 重算后一条都没变的来源：不写新代。
+    pub sources_unchanged: u64,
+    /// 没记 `cwd`、却带着归属的 append-log 事件：没有可重算的依据，原样留着。
+    pub kept_without_cwd: u64,
+    pub skipped: Vec<ReattributeSkip>,
+    pub dry_run: bool,
+}
+
 /// [`TotalStore::recent_sessions`] 的一行。
 ///
 /// `last_occurred_at_unix_ms` 为 `None` = 这个会话的事件全都没有可解析的时间。它排在
@@ -580,6 +609,22 @@ const SESSION_CURRENT_ROWS: &str = r#"FROM raw_events r
               OR (t.scope = 'source_path'  AND t.key = r.source_path)
               OR (t.scope = 'project_root' AND t.key = r.project_root)
       )"#;
+
+/// 各来源当前投影里的全部行。整代重写（`reattribute` / `recompute_attribution`）用。
+const CURRENT_ROWS: &str = r#"FROM raw_events r
+      LEFT JOIN current_head h
+             ON h.source_type = r.source_type
+            AND h.source_location = r.source_location
+            AND h.source_path = r.source_path
+     WHERE r.source_revision = COALESCE(h.source_revision, 0)
+       AND r.projection_revision = COALESCE(h.projection_revision, 0)"#;
+
+/// 一个来源解密好的当前投影，等着整代重写。
+struct CurrentProjection {
+    head: HeadRevisions,
+    parser_revision: Option<u32>,
+    events: Vec<RawEvent>,
+}
 
 /// [`EncryptedRow::from_sql`] 期望的列与顺序。所有 SELECT 都必须用它，否则列序对不上时
 /// 不会报错，只会把 `projection_revision` 读成 `aad_version` 之类 —— 静默且难查。
@@ -3007,6 +3052,20 @@ impl TotalStore {
     ///
     /// [`sweep_registered_root_identities`]: TotalStore::sweep_registered_root_identities
     pub fn apply_projection(&self, batch: FileProjectionBatch) -> StoreResult<ProjectionStats> {
+        match self.apply_projection_if(batch, None)? {
+            Some(stats) => Ok(stats),
+            None => unreachable!("没给前提就不会因前提不符而不写"),
+        }
+    }
+
+    /// 同 [`Self::apply_projection`]，另带一个前提：当前头仍是 `expect.0`、那一代仍有 `expect.1` 行，
+    /// 否则一个字都不写、返回 `None`。整代重写用：读与写之间有人追加或换了代时，拿旧读数开的新一代
+    /// 会盖掉别人的写入。前提与切头在同一事务里核。
+    fn apply_projection_if(
+        &self,
+        batch: FileProjectionBatch,
+        expect: Option<(HeadRevisions, u64)>,
+    ) -> StoreResult<Option<ProjectionStats>> {
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();
         let source_type = type_key.to_string();
@@ -3054,7 +3113,7 @@ impl TotalStore {
                     conn.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
                         r.get(0)
                     })?;
-                return Ok(ProjectionStats {
+                return Ok(Some(ProjectionStats {
                     appended: 0,
                     skipped_dup: 0,
                     skipped_erased: 0,
@@ -3067,13 +3126,32 @@ impl TotalStore {
                     superseded_removed: 0,
                     // 没做任何取代，谈不上「事件变少」。
                     loses_events: None,
-                });
+                }));
             }
         }
 
         let head = head_of(&conn, &source_type, &source_location, &source_path)?;
         let (source_revision, projection_revision) = projection.target_revisions(head);
         let tx = Self::write_tx(&mut conn)?;
+        if let Some((want_head, want_rows)) = expect {
+            let rows: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM raw_events
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                params![
+                    source_type,
+                    source_location,
+                    source_path,
+                    want_head.0,
+                    want_head.1
+                ],
+                |r| r.get(0),
+            )?;
+            let head_now = head_of(&tx, &source_type, &source_location, &source_path)?;
+            if head != want_head || head_now != want_head || rows as u64 != want_rows {
+                return Ok(None);
+            }
+        }
         // token 记账与事件写入**同一事务** —— 分开写就会造出「token 记了但事件没写」
         // （下轮短路返回一个从未存在的头）或反之（崩溃重放又开一代）的窗口。
         if let Some(token) = batch.token.as_ref() {
@@ -3305,7 +3383,7 @@ impl TotalStore {
         )?;
         tx.commit()?;
         let max_offset = max_offset_on(&conn)?;
-        Ok(ProjectionStats {
+        Ok(Some(ProjectionStats {
             appended,
             skipped_dup,
             skipped_erased,
@@ -3315,7 +3393,7 @@ impl TotalStore {
             head_moved: (source_revision, projection_revision) != head,
             superseded_removed,
             loses_events,
-        })
+        }))
     }
 
     /// 按会话身份读它的**当前投影全部事件**（seq 升序）。
@@ -3580,7 +3658,8 @@ impl TotalStore {
     /// 把当前投影里「同一个目录的旧写法」的 `project_root` 改成注册表现在给的写法。
     ///
     /// **只改写法，不改归属**：`from` 与 `to` 在 `registry` 下比较键相同才改（UNC 写法与规范形、
-    /// 发行版里的 `/mnt/<盘>` 与盘本身……）。归到另一个根（注册表长出了更深的根）是重扫的事，不在这里。
+    /// 发行版里的 `/mnt/<盘>` 与盘本身……）。归到另一个根（注册表长出了更深的根）是重扫的事，不在这里；
+    /// 源文件已不在、重扫不了的来源用 [`Self::recompute_attribution`]。
     ///
     /// 受影响的来源整代重写：解密当前投影 → 改写 `project_root` / `project_root_source` /
     /// `workspace_location`（同解析器的算法）→ 作为同一份字节的新投影版本写回（[`Projection::Reparse`]，
@@ -3592,9 +3671,8 @@ impl TotalStore {
     ///
     /// 🔴 一个来源里只要有一条事件解不开，这个来源整个不动：新的一代会少掉它，而旧的一代随之被取代。
     ///
-    /// 🔴 并发：调用方先确认没有别的写入方开着库（同 [`Self::rekey`]）。读与写之间仍有别的进程追加了
-    /// 事件时，新一代比旧一代少 —— [`Self::apply_projection`] 报 `loses_events` 并保留旧代，这里把它
-    /// 报成跳过。
+    /// 🔴 并发：调用方先确认没有别的写入方开着库（同 [`Self::rekey`]）。读与写之间这个来源仍被别人
+    /// 写过（追加、换代）时不写，报成跳过（前提与切头在同一事务里核）。
     pub fn reattribute(
         &self,
         registry: &crate::attribution::RootRegistry,
@@ -3602,14 +3680,6 @@ impl TotalStore {
     ) -> StoreResult<ReattributeStats> {
         use crate::attribution::{attribute, Attribution};
         type SourceRow = (String, String, String);
-
-        let current_rows = r#"FROM raw_events r
-              LEFT JOIN current_head h
-                     ON h.source_type = r.source_type
-                    AND h.source_location = r.source_location
-                    AND h.source_path = r.source_path
-             WHERE r.source_revision = COALESCE(h.source_revision, 0)
-               AND r.projection_revision = COALESCE(h.projection_revision, 0)"#;
 
         // 1. 哪些写法要改：同一个目录（比较键相同）、注册表给的写法不同。
         //
@@ -3685,7 +3755,7 @@ impl TotalStore {
         {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare(&format!(
-                "SELECT r.source_type, r.source_location, r.source_path, COUNT(*) {current_rows} \
+                "SELECT r.source_type, r.source_location, r.source_path, COUNT(*) {CURRENT_ROWS} \
                    AND r.project_root = ?1 GROUP BY 1, 2, 3"
             ))?;
             let mut users_of = |from: &str| -> StoreResult<(u64, Vec<SourceRow>)> {
@@ -3735,7 +3805,6 @@ impl TotalStore {
         }
 
         // 3. 逐个来源整代重写。
-        let attribution_revision = self.attribution_revision();
         let host = crate::pathnorm::HostPlatform::current();
         let mut stats = ReattributeStats {
             respellings,
@@ -3752,49 +3821,14 @@ impl TotalStore {
                 source_path: path.clone(),
                 reason,
             };
-            let (head, parser_revision, mut events, undecodable) = {
-                let conn = self.conn.lock().unwrap();
-                let head = head_of(&conn, &st, &loc, &path)?;
-                let parser_revision: Option<u32> = conn
-                    .query_row(
-                        "SELECT parser_revision FROM projections
-                          WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
-                            AND source_revision = ?4 AND projection_revision = ?5",
-                        params![st, loc, path, head.0, head.1],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let mut stmt = conn.prepare(&format!(
-                    "SELECT {ENCRYPTED_ROW_COLUMNS} {current_rows} \
-                       AND r.source_type = ?1 AND r.source_location = ?2 AND r.source_path = ?3 \
-                     ORDER BY r.seq ASC, r.offset ASC"
-                ))?;
-                let rows = stmt.query_map(params![st, loc, path], EncryptedRow::from_sql)?;
-                let mut key_cache = HashMap::new();
-                let (mut events, mut undecodable) = (Vec::new(), 0usize);
-                for row in rows {
-                    match self.decode_event_on(&conn, &mut key_cache, &row?) {
-                        Ok(ev) => events.push(ev),
-                        Err(_) => undecodable += 1,
-                    }
+            let mut current = match self.current_projection_for_rewrite(&st, &loc, &path)? {
+                Ok(current) => current,
+                Err(reason) => {
+                    stats.skipped.push(skip(reason));
+                    continue;
                 }
-                (head, parser_revision, events, undecodable)
             };
-            if undecodable > 0 {
-                stats.skipped.push(skip(format!(
-                    "{undecodable} event(s) in the current projection cannot be decrypted; rewriting would drop them"
-                )));
-                continue;
-            }
-            if events.is_empty() {
-                // 第 2 步之后这个来源的当前投影没了（期间被删除）—— 没有可改的。
-                stats
-                    .skipped
-                    .push(skip("no current events any more".to_string()));
-                continue;
-            }
-            for ev in &mut events {
+            for ev in &mut current.events {
                 let Some((to, source)) = ev.project_root.as_ref().and_then(|p| respell.get(p))
                 else {
                     continue;
@@ -3807,41 +3841,265 @@ impl TotalStore {
                 ev.project_root = Some(to.clone());
                 ev.project_root_source = Some(source.clone());
             }
-            let n = events.len() as u64;
             if dry_run {
                 stats.sources_rewritten += 1;
-                stats.events_written += n;
+                stats.events_written += current.events.len() as u64;
                 continue;
             }
-            let key = SourceKey::from_event(&events[0]);
-            let token = crate::token::ProjectionToken::new(
-                &key,
-                Some(&format!("reattribute:{}.{}", head.0, head.1)),
-                parser_revision.unwrap_or(0),
-                attribution_revision,
-                (0, n),
-            );
-            let applied = self.apply_projection(FileProjectionBatch {
-                source: key,
-                parser_revision,
-                mode: Projection::Reparse,
-                events,
-                token: Some(token),
-            })?;
-            if let Some((before, after)) = applied.loses_events {
-                stats.skipped.push(skip(format!(
-                    "the new projection has fewer events ({before} -> {after}); the old one was kept"
-                )));
-            } else if !applied.head_moved {
-                stats
-                    .skipped
-                    .push(skip("already rewritten by an earlier run".to_string()));
-            } else {
-                stats.sources_rewritten += 1;
-                stats.events_written += applied.appended;
+            match self.write_rewritten(current, "reattribute")? {
+                Ok(written) => {
+                    stats.sources_rewritten += 1;
+                    stats.events_written += written;
+                }
+                Err(reason) => stats.skipped.push(skip(reason)),
             }
         }
         Ok(stats)
+    }
+
+    /// 按事件记下的 `cwd` 与当前注册表，重算这些来源当前投影里每条事件的归属三项（`project_root` /
+    /// `project_root_source` / `workspace_location`）。与解析器同一个函数（`parser::attribution_from_cwd`，
+    /// 默认发行版同扫描器），所以结果就是「源文件还在、用这份注册表重扫」会写下的那三项；其余字段原样。
+    ///
+    /// 给源文件已不在、重扫不了的来源用（发现确认它消失了，而调用方留着它的历史）。还在的来源照旧
+    /// 重扫：解析器才是这三项的出处（库里的 `cwd` 可能是旧解析器取的），而且两条路各写一代，同一份
+    /// 正文就多存一份。这里不探源文件在不在：调用方点名哪些，就重算哪些。
+    ///
+    /// 有改动的来源整代重写（[`Projection::Reparse`]，同 [`Self::reattribute`]）：旧一代被取代，
+    /// 消费方经 change-feed（`reparse`）收到「这个来源的当前投影被换掉了」。一条都没变的来源不写。
+    ///
+    /// 只动 append-log 事件：快照事件的归属来自宿主给的项目根，不来自 `cwd`。没记 `cwd`、却带着归属的
+    /// append-log 事件不动（没有可重算的依据），数进 `kept_without_cwd`。
+    ///
+    /// 🔴 一个来源里只要有一条事件解不开，这个来源整个不动（同 `reattribute`）。
+    /// 🔴 有事件会改归到一个已删除（有墓碑）的项目根下时，这个来源整个不动、报出来：写下去，它们会从
+    /// 当前投影里消失，而旧一代为防丢事件会留着 —— 删除没删干净。要不要删由人定。
+    /// 🔴 读与写之间这个来源被别人写过（追加、换代）时不写，报成跳过（前提与切头在同一事务里核）。
+    ///
+    /// `registry` 必须来自本库（[`Self::project_root_registry`]，挂载表与扫描时同一份）。那个函数读不出
+    /// 注册表时返回空表，这里会照实把事件都算成 `unattributed` —— 与拿它扫描是同一个结果。
+    pub fn recompute_attribution(
+        &self,
+        registry: &crate::attribution::RootRegistry,
+        sources: &[SourceKey],
+        dry_run: bool,
+    ) -> StoreResult<RecomputeStats> {
+        let host = crate::pathnorm::HostPlatform::current();
+        let mut stats = RecomputeStats {
+            changes: Vec::new(),
+            sources_rewritten: 0,
+            events_written: 0,
+            sources_unchanged: 0,
+            kept_without_cwd: 0,
+            skipped: Vec::new(),
+            dry_run,
+        };
+        // (from, to) → (事件数, 来源数)。
+        let mut changes: BTreeMap<(EventAttribution, EventAttribution), (u64, u64)> =
+            BTreeMap::new();
+        let wanted: BTreeSet<(&str, String, &str)> = sources.iter().map(SourceKey::parts).collect();
+        for (st, loc, path) in wanted {
+            let skip = |reason: String| ReattributeSkip {
+                source_type: st.to_string(),
+                source_location: loc.clone(),
+                source_path: path.to_string(),
+                reason,
+            };
+            let mut current = match self.current_projection_for_rewrite(st, &loc, path)? {
+                Ok(current) => current,
+                Err(reason) => {
+                    stats.skipped.push(skip(reason));
+                    continue;
+                }
+            };
+            let mut changed: BTreeMap<(EventAttribution, EventAttribution), u64> = BTreeMap::new();
+            for ev in &mut current.events {
+                if ev.source_mode != SourceMode::AppendLog {
+                    continue;
+                }
+                let before = ev.attribution();
+                let after = crate::parser::attribution_from_cwd(
+                    ev.cwd.as_deref(),
+                    &ev.source_location,
+                    host,
+                    crate::parser::scan_default_distro(&ev.source_location).as_deref(),
+                    registry,
+                );
+                if after == before {
+                    continue;
+                }
+                if ev.cwd.is_none() {
+                    stats.kept_without_cwd += 1;
+                    continue;
+                }
+                *changed.entry((before, after.clone())).or_default() += 1;
+                ev.set_attribution(after);
+            }
+            if changed.is_empty() {
+                stats.sources_unchanged += 1;
+                continue;
+            }
+            let erased = self.erased_roots(
+                changed
+                    .keys()
+                    .filter_map(|(_, to)| to.project_root.as_deref()),
+            )?;
+            if !erased.is_empty() {
+                let n: u64 = changed
+                    .iter()
+                    .filter(|((_, to), _)| {
+                        to.project_root.as_ref().is_some_and(|r| erased.contains(r))
+                    })
+                    .map(|(_, n)| n)
+                    .sum();
+                stats.skipped.push(skip(format!(
+                    "{n} event(s) would move under an erased project root ({}); erasing them is a person's call",
+                    erased.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+                continue;
+            }
+            let written = if dry_run {
+                current.events.len() as u64
+            } else {
+                match self.write_rewritten(current, "recompute-attribution")? {
+                    Ok(written) => written,
+                    Err(reason) => {
+                        stats.skipped.push(skip(reason));
+                        continue;
+                    }
+                }
+            };
+            stats.sources_rewritten += 1;
+            stats.events_written += written;
+            for (key, n) in changed {
+                let entry = changes.entry(key).or_default();
+                entry.0 += n;
+                entry.1 += 1;
+            }
+        }
+        stats.changes = changes
+            .into_iter()
+            .map(|((from, to), (events, sources))| AttributionChange {
+                from,
+                to,
+                events,
+                sources,
+            })
+            .collect();
+        Ok(stats)
+    }
+
+    /// `roots` 里有墓碑（按项目根删过）的那些。
+    fn erased_roots<'a>(
+        &self,
+        roots: impl Iterator<Item = &'a str>,
+    ) -> StoreResult<BTreeSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT EXISTS(SELECT 1 FROM tombstones WHERE scope = ?1 AND key = ?2)")?;
+        let mut erased = BTreeSet::new();
+        for root in roots {
+            let hit: bool = stmt
+                .query_row(params![TombstoneScope::ProjectRoot.as_str(), root], |r| {
+                    r.get(0)
+                })?;
+            if hit {
+                erased.insert(root.to_string());
+            }
+        }
+        Ok(erased)
+    }
+
+    /// 读出一个来源的当前投影供整代重写。`Ok(Err(原因))` = 这个来源不能动。
+    ///
+    /// 🔴 有一条事件解不开就整个来源不动：新的一代会少掉它，而旧的一代随之被取代。
+    fn current_projection_for_rewrite(
+        &self,
+        st: &str,
+        loc: &str,
+        path: &str,
+    ) -> StoreResult<Result<CurrentProjection, String>> {
+        let conn = self.conn.lock().unwrap();
+        let head = head_of(&conn, st, loc, path)?;
+        let parser_revision: Option<u32> = conn
+            .query_row(
+                "SELECT parser_revision FROM projections
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                params![st, loc, path, head.0, head.1],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ENCRYPTED_ROW_COLUMNS} {CURRENT_ROWS} \
+               AND r.source_type = ?1 AND r.source_location = ?2 AND r.source_path = ?3 \
+             ORDER BY r.seq ASC, r.offset ASC"
+        ))?;
+        let rows = stmt.query_map(params![st, loc, path], EncryptedRow::from_sql)?;
+        let mut key_cache = HashMap::new();
+        let (mut events, mut undecodable) = (Vec::new(), 0usize);
+        for row in rows {
+            match self.decode_event_on(&conn, &mut key_cache, &row?) {
+                Ok(ev) => events.push(ev),
+                Err(_) => undecodable += 1,
+            }
+        }
+        if undecodable > 0 {
+            return Ok(Err(format!(
+                "{undecodable} event(s) in the current projection cannot be decrypted; rewriting would drop them"
+            )));
+        }
+        if events.is_empty() {
+            return Ok(Err("no current events".to_string()));
+        }
+        Ok(Ok(CurrentProjection {
+            head,
+            parser_revision,
+            events,
+        }))
+    }
+
+    /// 把改写好的当前投影作为同一份字节的新投影版本写回（[`Projection::Reparse`]），`op` 进 token。
+    /// `Ok(Ok(写入条数))`；`Ok(Err(原因))` = 没写成。
+    fn write_rewritten(
+        &self,
+        current: CurrentProjection,
+        op: &str,
+    ) -> StoreResult<Result<u64, String>> {
+        let n = current.events.len() as u64;
+        let (source_revision, projection_revision) = current.head;
+        let key = SourceKey::from_event(&current.events[0]);
+        let token = crate::token::ProjectionToken::new(
+            &key,
+            Some(&format!("{op}:{source_revision}.{projection_revision}")),
+            current.parser_revision.unwrap_or(0),
+            self.attribution_revision(),
+            (0, n),
+        );
+        let applied = self.apply_projection_if(
+            FileProjectionBatch {
+                source: key,
+                parser_revision: current.parser_revision,
+                mode: Projection::Reparse,
+                events: current.events,
+                token: Some(token),
+            },
+            Some((current.head, n)),
+        )?;
+        Ok(match applied {
+            None => Err(
+                "the source was written by someone else while it was being rewritten; left as is"
+                    .to_string(),
+            ),
+            Some(a) => match a.loses_events {
+                Some((before, after)) => Err(format!(
+                    "the new projection has fewer events ({before} -> {after}); it is current now and the old one was kept"
+                )),
+                None if !a.head_moved => Err("already rewritten by an earlier run".to_string()),
+                None => Ok(a.appended),
+            },
+        })
     }
 
     /// 最近活跃的 N 个会话，按各自最后一条事件的**真实时间**降序。
@@ -5424,6 +5682,337 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// 一个 WSL 来源里的 Claude 会话，用真解析器按 `roots` 解析（发行版同扫描器）。
+    fn parse_gone_session(roots: crate::attribution::RootRegistry) -> Vec<RawEvent> {
+        let location = SourceLocation::Wsl("Ubuntu".to_string());
+        let line = |cwd: Option<&str>, text: &str| {
+            let mut v = serde_json::json!({
+                "sessionId": "s",
+                "timestamp": "2026-04-01T00:00:00Z",
+                "message": {"role": "user", "content": text},
+            });
+            if let Some(cwd) = cwd {
+                v["cwd"] = cwd.into();
+            }
+            v.to_string()
+        };
+        let text = [
+            line(Some("/home/u/ws/p"), "at the root"),
+            line(Some("/home/u/ws/p/sub/deeper"), "below it"),
+            line(Some("/home/u/elsewhere"), "outside"),
+            line(None, "no cwd"),
+        ];
+        let lines: Vec<&str> = text.iter().map(String::as_str).collect();
+        let ctx = crate::parser::ParseCtx {
+            source_type: SourceType::ClaudeCode,
+            source_location: location.clone(),
+            source_path: "/home/u/.claude/projects/p/gone.jsonl".to_string(),
+            profile: Profile::Full,
+            host: crate::pathnorm::HostPlatform::current(),
+            default_distro: crate::parser::scan_default_distro(&location),
+            roots: std::sync::Arc::new(roots),
+        };
+        let events = crate::parser::parse_lines(&ctx, &lines, 0, None).events;
+        assert_eq!(events.len(), 4, "每行一条 message");
+        events
+    }
+
+    fn json_of(ev: &RawEvent) -> serde_json::Value {
+        serde_json::to_value(ev).unwrap()
+    }
+
+    /// `recompute_attribution`（QuotaBar 10-21 按规则 2 提的判据）：源文件已不在的来源，入库时归不到根
+    /// （`unattributed`，或 ADR-050 之前的兜底值 `wsl_cwd`）；注册表长出覆盖它的根之后，当前投影逐条
+    /// 等于拿同一份注册表重扫会写下的事件（真解析器）—— 归属三项换了，其余字段、条数、seq 原样；
+    /// 旧代被取代，change-feed 记一笔 reparse。没记 cwd 的旧归属不动；预览不写；再跑一次什么都不写。
+    #[test]
+    fn recompute_attribution_matches_a_rescan_under_the_current_registry() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        let path = "/home/u/.claude/projects/p/gone.jsonl";
+        let location = SourceLocation::Wsl("Ubuntu".to_string());
+        let key = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: location.clone(),
+            source_path: path.to_string(),
+        };
+        let mut stored = parse_gone_session(store.project_root_registry(&Vec::new()));
+        assert!(stored[..3]
+            .iter()
+            .all(|e| e.project_root_source.as_deref() == Some("unattributed")));
+        stored[1].project_root = stored[1].cwd.clone();
+        stored[1].project_root_source = Some("wsl_cwd".to_string());
+        stored[3].project_root = Some("/legacy".to_string());
+        stored[3].project_root_source = Some("cwd".to_string());
+        store.append_events(&stored, Projection::Append).unwrap();
+
+        let host = crate::pathnorm::HostPlatform::current();
+        let root =
+            crate::pathnorm::normalize_cwd(Some("/home/u/ws/p"), host, Some("Ubuntu")).unwrap();
+        store.register_project_root(&root, RootSource::Git);
+        let registry = store.project_root_registry(&Vec::new());
+        let rescan = parse_gone_session(store.project_root_registry(&Vec::new()));
+        // 对照：重扫确实把前两条归到了新根 —— 否则下面的「等于重扫」什么都没证明。
+        assert_eq!(
+            rescan
+                .iter()
+                .map(|e| e.project_root_source.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("git"), Some("git"), Some("unattributed"), None]
+        );
+        assert_eq!(rescan[1].project_root.as_deref(), Some(root.as_str()));
+        let head = || {
+            let conn = store.conn.lock().unwrap();
+            head_of(&conn, "claude_code", &location.as_key(), path).unwrap()
+        };
+
+        let preview = store
+            .recompute_attribution(&registry, std::slice::from_ref(&key), true)
+            .unwrap();
+        assert!(preview.dry_run && preview.skipped.is_empty(), "{preview:?}");
+        assert_eq!((preview.sources_rewritten, preview.events_written), (1, 4));
+        assert_eq!(head(), (0, 0), "预览不写库");
+
+        let stats = store
+            .recompute_attribution(&registry, &[key.clone(), key.clone()], false)
+            .unwrap();
+        assert!(stats.skipped.is_empty(), "{:?}", stats.skipped);
+        assert_eq!((stats.sources_rewritten, stats.events_written), (1, 4));
+        assert_eq!(stats.kept_without_cwd, 1);
+        assert_eq!(stats.changes, preview.changes);
+        let mut moved: Vec<_> = stats
+            .changes
+            .iter()
+            .map(|c| {
+                (
+                    c.from.project_root_source.as_deref(),
+                    c.to.clone(),
+                    c.events,
+                    c.sources,
+                )
+            })
+            .collect();
+        moved.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            moved,
+            vec![
+                (Some("unattributed"), rescan[0].attribution(), 1, 1),
+                (Some("wsl_cwd"), rescan[1].attribution(), 1, 1),
+            ]
+        );
+        assert_eq!(head(), (0, 1), "同一份字节的新投影版本");
+
+        let got = store
+            .read_session(SourceType::ClaudeCode, &location, path, "s")
+            .unwrap();
+        assert_eq!(got.skipped, 0);
+        assert_eq!(got.events.len(), 4);
+        for (i, (got, rescan)) in got.events.iter().zip(&rescan).take(3).enumerate() {
+            assert_eq!(json_of(got), json_of(rescan), "第 {i} 条不等于重扫");
+        }
+        assert_eq!(
+            json_of(&got.events[3]),
+            json_of(&stored[3]),
+            "没记 cwd 的旧归属不动"
+        );
+        // 其余字段原样：把归属三项换回入库时的，整条与入库时相同。
+        for (got, before) in got.events.iter().zip(&stored) {
+            let mut got = got.clone();
+            got.set_attribution(before.attribution());
+            assert_eq!(json_of(&got), json_of(before));
+        }
+        let rows: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM raw_events WHERE source_path = ?1",
+                params![path],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 4, "旧代被取代");
+        let replaced: Vec<_> = store
+            .read_projection_changes(0, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.source_path == path)
+            .map(|c| {
+                (
+                    c.reason,
+                    c.old_projection_revision,
+                    c.new_projection_revision,
+                )
+            })
+            .collect();
+        assert_eq!(replaced, vec![("reparse".to_string(), Some(0), 1)]);
+
+        let again = store
+            .recompute_attribution(&registry, &[key], false)
+            .unwrap();
+        assert_eq!(
+            (
+                again.sources_rewritten,
+                again.sources_unchanged,
+                again.changes.len()
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(head(), (0, 1), "没变就不写新代");
+    }
+
+    /// 一条事件解不开：整个来源不动、原因报出来（同 `reattribute`）。没点名的来源、快照来源、
+    /// 库里没有的来源也都不动。
+    #[test]
+    fn recompute_attribution_touches_only_named_decodable_append_log_sources() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        let host = crate::pathnorm::HostPlatform::current();
+        let root = crate::pathnorm::normalize_cwd(Some("/work"), host, None).unwrap();
+        store.register_project_root(&root, RootSource::Git);
+        let put = |path: &str| {
+            let evs: Vec<RawEvent> = (0..3)
+                .map(|i| {
+                    let mut e = mk_event_at(i, "s", path);
+                    e.cwd = Some("/work/sub".to_string());
+                    e.project_root = Some("/work/sub".to_string());
+                    e.project_root_source = Some("unattributed".to_string());
+                    e
+                })
+                .collect();
+            store.append_events(&evs, Projection::Append).unwrap();
+        };
+        put("/p/broken.jsonl");
+        put("/p/not-named.jsonl");
+        let mut snap = snap_event(Some("/work/sub"), Some("1787000000"));
+        snap.project_root_source = Some("host_identity".to_string());
+        store.append_events(&[snap], Projection::Append).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE raw_events SET event_json = 'sv2:broken' WHERE source_path = '/p/broken.jsonl' AND seq = 1",
+                [],
+            )
+            .unwrap();
+        let key = |path: &str| SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: path.to_string(),
+        };
+        let stats = store
+            .recompute_attribution(
+                &store.project_root_registry(&Vec::new()),
+                &[
+                    key("/p/broken.jsonl"),
+                    key("/p/CLAUDE.md"),
+                    key("/p/never.jsonl"),
+                ],
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            (stats.sources_rewritten, stats.sources_unchanged),
+            (0, 1),
+            "{stats:?}"
+        );
+        let reasons: Vec<(&str, &str)> = stats
+            .skipped
+            .iter()
+            .map(|s| (s.source_path.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[0].0 == "/p/broken.jsonl" && reasons[0].1.contains("cannot be decrypted"));
+        assert_eq!(reasons[1], ("/p/never.jsonl", "no current events"));
+        let conn = store.conn.lock().unwrap();
+        for path in ["/p/broken.jsonl", "/p/not-named.jsonl", "/p/CLAUDE.md"] {
+            assert_eq!(
+                head_of(&conn, "claude_code", "local", path).unwrap(),
+                (0, 0),
+                "{path}"
+            );
+        }
+    }
+
+    /// 重算会把事件改归到一个已按项目根删除的目录下：整个来源不动、报出来 —— 写下去它们会从当前投影
+    /// 消失，而旧一代为防丢事件会留着，删除没删干净。
+    #[test]
+    fn recompute_attribution_does_not_move_events_under_an_erased_root() {
+        use crate::attribution::RootSource;
+        let store = TotalStore::open_in_memory().unwrap();
+        let host = crate::pathnorm::HostPlatform::current();
+        let root = crate::pathnorm::normalize_cwd(Some("/work"), host, None).unwrap();
+        let mut e = mk_event_at(0, "s", "/p/gone.jsonl");
+        e.cwd = Some("/work/sub".to_string());
+        e.project_root = Some("/work/sub".to_string());
+        e.project_root_source = Some("unattributed".to_string());
+        store.append_events(&[e], Projection::Append).unwrap();
+        store.tombstone(TombstoneScope::ProjectRoot, &root).unwrap();
+        store.register_project_root(&root, RootSource::Git);
+        let stats = store
+            .recompute_attribution(
+                &store.project_root_registry(&Vec::new()),
+                &[SourceKey {
+                    source_type: SourceType::ClaudeCode,
+                    source_location: SourceLocation::Local,
+                    source_path: "/p/gone.jsonl".to_string(),
+                }],
+                false,
+            )
+            .unwrap();
+        assert_eq!(stats.sources_rewritten, 0);
+        assert_eq!(stats.skipped.len(), 1, "{stats:?}");
+        assert!(
+            stats.skipped[0].reason.contains("erased project root"),
+            "{stats:?}"
+        );
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(
+            head_of(&conn, "claude_code", "local", "/p/gone.jsonl").unwrap(),
+            (0, 0)
+        );
+    }
+
+    /// 整代重写的前提：读出来的那一代仍是当前头、行数没变；否则一个字都不写。
+    #[test]
+    fn a_rewrite_whose_reading_went_stale_writes_nothing() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let evs: Vec<RawEvent> = (0..3).map(|i| mk_event(i, "s", Some("x"))).collect();
+        store.append_events(&evs, Projection::Append).unwrap();
+        let batch = || FileProjectionBatch {
+            source: SourceKey::from_event(&evs[0]),
+            parser_revision: None,
+            mode: Projection::Reparse,
+            events: evs.clone(),
+            token: None,
+        };
+        let head = || {
+            let conn = store.conn.lock().unwrap();
+            head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap()
+        };
+        assert!(
+            store
+                .apply_projection_if(batch(), Some(((0, 0), 2)))
+                .unwrap()
+                .is_none(),
+            "行数变了"
+        );
+        assert!(
+            store
+                .apply_projection_if(batch(), Some(((0, 1), 3)))
+                .unwrap()
+                .is_none(),
+            "头变了"
+        );
+        assert_eq!(head(), (0, 0));
+        let applied = store
+            .apply_projection_if(batch(), Some(((0, 0), 3)))
+            .unwrap();
+        assert!(applied.is_some_and(|a| a.head_moved));
+        assert_eq!(head(), (0, 1));
     }
 
     /// 带上挂载表时，`<盘>:\…` 与 `/mnt/<盘>/…`（含经发行版看的）也是同一目录；不带时不互认。
