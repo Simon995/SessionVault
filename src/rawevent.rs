@@ -373,6 +373,30 @@ impl RawEvent {
             self.seq
         )
     }
+
+    /// 这条事件的归属三项。
+    pub fn attribution(&self) -> EventAttribution {
+        EventAttribution {
+            project_root: self.project_root.clone(),
+            project_root_source: self.project_root_source.clone(),
+            workspace_location: self.workspace_location.clone(),
+        }
+    }
+
+    pub fn set_attribution(&mut self, a: EventAttribution) {
+        self.project_root = a.project_root;
+        self.project_root_source = a.project_root_source;
+        self.workspace_location = a.workspace_location;
+    }
+}
+
+/// 一条事件的归属三项：解析器按 `cwd` 一起写下（`parser::attribution_from_cwd`），
+/// 按库重算归属时一起改（`TotalStore::recompute_attribution`）。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EventAttribution {
+    pub project_root: Option<String>,
+    pub project_root_source: Option<String>,
+    pub workspace_location: Option<String>,
 }
 
 #[cfg(test)]

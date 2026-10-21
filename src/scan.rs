@@ -882,18 +882,14 @@ fn scan_append_log<S: ByteSource>(
     let lines: Vec<&str> = complete.lines().collect();
     // default_distro：WSL 来源用其自身发行版（权威），把 distro 未知的裸 Linux cwd 打成
     // 精确 wsl:<distro>（见 parser）；本地来源为 None（裸 Linux cwd 记在 local transcript
-    // 下的边角由 host/CLI 决定是否注入 wsl::default_distro）。
-    let default_distro = match &source.source_location {
-        SourceLocation::Wsl(distro) => Some(distro.clone()),
-        SourceLocation::Local => None,
-    };
+    // 下的边角由 host/CLI 决定是否注入 wsl::default_distro）。按库重算归属用同一个函数。
     let ctx = ParseCtx {
         source_type: source.source_type,
         source_location: source.source_location.clone(),
         source_path: report.source_path.clone(),
         profile,
         host: HostPlatform::current(),
-        default_distro,
+        default_distro: crate::parser::scan_default_distro(&source.source_location),
         roots: roots.clone(),
     };
     let base_seq = cursor.next_seq;

@@ -225,10 +225,13 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         name="reattribute-rewrites-a-source-it-cannot-fully-read",
         rel_path="src/store.rs",
-        old="            if undecodable > 0 {",
-        new="            if undecodable > 99 {",
-        must_fail=["reattribute_leaves_a_source_alone_when_an_event_cannot_be_decrypted"],
-        why="有事件解不开也重写 ⇒ 新的一代少了它，而它随旧代一起被取代",
+        old="        if undecodable > 0 {",
+        new="        if undecodable > 99 {",
+        must_fail=[
+            "reattribute_leaves_a_source_alone_when_an_event_cannot_be_decrypted",
+            "recompute_attribution_touches_only_named_decodable_append_log_sources",
+        ],
+        why="有事件解不开也重写 ⇒ 新的一代少了它，而它随旧代一起被取代（reattribute 与 recompute_attribution 共用）",
     ),
     Mutation(
         name="reattribute-keeps-the-stale-workspace-location",
@@ -334,6 +337,74 @@ MUTATIONS: list[Mutation] = [
         new="        Probed::Absent => Probed::Absent,",
         must_fail=["a_missing_file_and_an_unreadable_one_are_told_apart"],
         why="冷会话被压缩后 session-origin 报「源文件不在」⇒ 搬走的项目认不回身份",
+    ),
+    # ── 按库重算归属（QuotaBar 10-21 规则 2）──────────────────────────────
+    Mutation(
+        name="recompute-ignores-the-registry",
+        rel_path="src/store.rs",
+        old="""                    crate::parser::scan_default_distro(&ev.source_location).as_deref(),
+                    registry,
+                );""",
+        new="""                    crate::parser::scan_default_distro(&ev.source_location).as_deref(),
+                    &crate::attribution::RootRegistry::new(),
+                );""",
+        must_fail=["recompute_attribution_matches_a_rescan_under_the_current_registry"],
+        why="注册表长出的根用不上 ⇒ 归档来源永远停在 unattributed",
+    ),
+    Mutation(
+        name="recompute-without-the-scanner-distro",
+        rel_path="src/store.rs",
+        old="                    crate::parser::scan_default_distro(&ev.source_location).as_deref(),",
+        new="                    None,",
+        must_fail=["recompute_attribution_matches_a_rescan_under_the_current_registry"],
+        why="WSL 来源的裸 Linux cwd 不带发行版 ⇒ 与重扫给的不是同一个根（只在 Windows 宿主上分得开）",
+    ),
+    Mutation(
+        name="recompute-erases-attribution-without-cwd",
+        rel_path="src/store.rs",
+        old="""                if ev.cwd.is_none() {
+                    stats.kept_without_cwd += 1;
+                    continue;
+                }
+""",
+        new="",
+        must_fail=["recompute_attribution_matches_a_rescan_under_the_current_registry"],
+        why="没记 cwd 的事件被抹成空归属 ⇒ 没有依据的改写",
+    ),
+    Mutation(
+        name="recompute-rewrites-what-did-not-change",
+        rel_path="src/store.rs",
+        old="            if changed.is_empty() {",
+        new="            if changed.is_empty() && false {",
+        must_fail=["recompute_attribution_matches_a_rescan_under_the_current_registry"],
+        why="没变的来源也整代重写 ⇒ 每轮多存一份正文",
+    ),
+    Mutation(
+        name="recompute-touches-snapshots",
+        rel_path="src/store.rs",
+        old="""                if ev.source_mode != SourceMode::AppendLog {
+                    continue;
+                }
+""",
+        new="",
+        must_fail=["recompute_attribution_touches_only_named_decodable_append_log_sources"],
+        why="快照事件按 cwd 重算 ⇒ 宿主给的项目根被改掉",
+    ),
+    Mutation(
+        name="recompute-moves-events-under-an-erased-root",
+        rel_path="src/store.rs",
+        old="            if !erased.is_empty() {",
+        new="            if !erased.is_empty() && false {",
+        must_fail=["recompute_attribution_does_not_move_events_under_an_erased_root"],
+        why="事件改归到删过的项目下 ⇒ 从当前投影消失、正文留在旧代里",
+    ),
+    Mutation(
+        name="rewrite-precondition-ignored",
+        rel_path="src/store.rs",
+        old="            if head != want_head || head_now != want_head || rows as u64 != want_rows {",
+        new="            if false {",
+        must_fail=["a_rewrite_whose_reading_went_stale_writes_nothing"],
+        why="读与写之间有人写过 ⇒ 拿旧读数开的新一代盖掉别人的写入",
     ),
 ]
 

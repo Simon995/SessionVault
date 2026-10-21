@@ -126,6 +126,8 @@ project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并�
 
 `svault reattribute`：把当前投影里「同一个目录的旧写法」的 `project_root`（如旧注册表留下的 UNC 写法）改成注册表现在的写法，受影响的来源各写一代新投影（不读源文件），消费方经 `changes` 收到替换。只改写法、不改归属；注册表里同一个目录有不止一种写法时不改、单列报出。默认只预览，`--apply` 才写（先退出 QuotaBar / TumeFlow）。
 
+`TotalStore::recompute_attribution`（库接口，没有 CLI）：调用方点名一批来源，按每条事件记下的 `cwd` 与当前注册表重算归属三项（`project_root` / `project_root_source` / `workspace_location`）。用的是解析器同一个函数，结果就是拿这份注册表重扫会写下的；有改动的来源各写一代新投影，经 `changes` 可见。给源文件已不在、重扫不了的来源用，还在的来源照旧重扫。
+
 ## 构建
 
 Windows 上用 **GNU 工具链**（`stable-x86_64-pc-windows-gnu`，**MSRV 1.87**——
