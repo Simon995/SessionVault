@@ -406,6 +406,54 @@ MUTATIONS: list[Mutation] = [
         must_fail=["a_rewrite_whose_reading_went_stale_writes_nothing"],
         why="读与写之间有人写过 ⇒ 拿旧读数开的新一代盖掉别人的写入",
     ),
+    # ── WSL 压缩件解压后长度的缓存（10-29）──────────────────────────────────
+    Mutation(
+        name="compressed-length-cache-ignores-ctime",
+        rel_path="src/scan.rs",
+        old="(*known == id).then_some(*len)",
+        new="(known.size == id.size && known.mtime == id.mtime).then_some(*len)",
+        must_fail=[
+            "a_compressed_wsl_file_whose_identity_is_unchanged_is_not_read",
+            "only_compressed_files_without_a_cached_length_are_planned_for_reading",
+        ],
+        why="Codex 原地改写过（大小、mtime 可能不变，ctime 必变）仍用旧长度 ⇒ 改写看不见",
+    ),
+    Mutation(
+        name="compressed-length-never-cached",
+        rel_path="src/scan.rs",
+        old="if let Some(len) = cached_compressed_len(&key, id) {",
+        new="if let Some(len) = cached_compressed_len(&key, id).filter(|_| false) {",
+        must_fail=["a_compressed_wsl_file_whose_identity_is_unchanged_is_not_read"],
+        why="缓存不查 ⇒ 每轮每个压缩件整份读一次（实测一轮 281 次 wsl.exe、约 55 s）",
+    ),
+    Mutation(
+        name="compressed-plan-ignores-the-cache",
+        rel_path="src/scan.rs",
+        old="""        cached_compressed_len(&(distro.to_string(), zst.clone()), *id)
+            .is_none()
+            .then(""",
+        new="""        cached_compressed_len(&(distro.to_string(), zst.clone()), *id)
+            .is_none_or(|_| true)
+            .then(""",
+        must_fail=["only_compressed_files_without_a_cached_length_are_planned_for_reading"],
+        why="长度已缓存的也排进整份读 ⇒ 稳态照样搬全部字节",
+    ),
+    Mutation(
+        name="confirmed-missing-compressed-still-read",
+        rel_path="src/scan.rs",
+        old="            Some(Ok(None)) => return Err(missing()),",
+        new="            Some(Ok(None)) => None,",
+        must_fail=["both_forms_confirmed_missing_is_reported_without_reading"],
+        why="两种形态都确认不在还单独去读 ⇒ 每个消失的来源每轮多起一次 wsl.exe",
+    ),
+    Mutation(
+        name="cached-length-never-reads-the-bytes",
+        rel_path="src/scan.rs",
+        old="            if self.compressed.borrow().is_none() {",
+        new="            if false && self.compressed.borrow().is_none() {",
+        must_fail=["a_cached_length_still_reads_the_bytes_when_they_are_needed"],
+        why="长度取自缓存时不补读字节 ⇒ 要读新内容的那一轮读失败",
+    ),
 ]
 
 
