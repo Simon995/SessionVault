@@ -479,6 +479,14 @@ MUTATIONS: list[Mutation] = [
         must_fail=["rollback_coverage_counts_old_events_found_in_the_current_generation"],
         why="当前代也进报告 ⇒ 当前代自己「被自己覆盖」，回收时会把当前答案删掉",
     ),
+    Mutation(
+        name="gc-reclaims-generations-left-by-a-rollback",
+        rel_path="src/store.rs",
+        old="               AND p.source_revision = COALESCE(h.source_revision, 0)\n",
+        new="",
+        must_fail=["gc_spares_rollback_history_and_rows_of_unknown_origin"],
+        why="退回 10-29 之前的候选条件 ⇒ gc --apply 删掉回退留下的旧代（作者本机 279 份、237,541 条唯一副本）",
+    ),
 ]
 
 

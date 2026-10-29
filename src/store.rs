@@ -3608,14 +3608,18 @@ impl TotalStore {
 
     /// 回收**已被取代且来源明确**的投影（ADR-044 决定 7）。
     ///
-    /// 🔴 只碰满足两个条件的行：
+    /// 🔴 只碰满足三个条件的行：
     ///
     /// 1. 它不是该源文件的当前投影（`current_head` 说了算）；
-    /// 2. 它在台账里的 `origin` 是 **`reparse`** —— 也就是「同一批字节的一份更差的
-    ///    解析」，可再生。
+    /// 2. 它在台账里的 `origin` 是 **`reparse`**；
+    /// 3. 它与当前头在**同一个源版本**里 —— 于是它是「同一批字节的一份更差的解析」，
+    ///    那批字节还在、当前头就是它们更新的解析，可再生。
     ///
-    /// **禁止**碰的两类，各有各的理由：
+    /// **禁止**碰的三类，各有各的理由：
     ///
+    /// - 比当前头**更早的源版本**里的任何投影，`origin` 是 `reparse` 也一样：回退之后那批
+    ///   字节已经不在磁盘上，那一代是它们在库里的唯一副本。2026-10-29 之前缺第 3 个条件，
+    ///   候选全是这一类 —— 作者本机 279 份、237,541 条，`gc --apply` 会把它们删掉；
     /// - `origin = 'rollback'`：那是磁盘上**已消失内容的唯一副本**，删了真没了；
     /// - `origin = 'unknown'`：本 ADR 落地**之前**产生的行。当时只有一个 `generation`
     ///   整数，无从判断某一代当初是回退还是重解析。实测作者本机 930,056 行里有
@@ -3626,7 +3630,7 @@ impl TotalStore {
     pub fn gc_superseded_projections(&self, dry_run: bool) -> StoreResult<GcStats> {
         let mut conn = self.conn.lock().unwrap();
         let tx = Self::write_tx(&mut conn)?;
-        // 候选：台账里 origin='reparse'、且不是当前头指向的那一份。
+        // 候选：台账里 origin='reparse'、与当前头同一个源版本、且不是当前头指向的那一份。
         const CANDIDATES: &str = r#"
             SELECT p.source_type, p.source_location, p.source_path,
                    p.source_revision, p.projection_revision
@@ -3636,6 +3640,7 @@ impl TotalStore {
                     AND h.source_location = p.source_location
                     AND h.source_path = p.source_path
              WHERE p.origin = 'reparse'
+               AND p.source_revision = COALESCE(h.source_revision, 0)
                AND (p.source_revision, p.projection_revision)
                    IS NOT (COALESCE(h.source_revision, 0), COALESCE(h.projection_revision, 0))
         "#;
@@ -9080,13 +9085,15 @@ mod tests {
 
     /// 🔴 **护栏 G8（ADR-044 决定 7）：GC 只碰「已被取代且来源明确」的投影。**
     ///
-    /// 三类并存，只有一类该被回收 —— 这条测试的价值全在**另外两类必须活下来**：
+    /// 四类并存，只有一类该被回收 —— 这条测试的价值全在**另外三类必须活下来**：
     ///
-    /// - `reparse` 且非当前 → 回收（同一批字节的更差解析，可再生）；
+    /// - `reparse`、非当前、与当前头同一个源版本 → 回收（同一批字节的更差解析，可再生）；
+    /// - `reparse`、但在回退之前的源版本里 → **保留**（那批字节已不在，它是唯一副本；
+    ///   2026-10-29 之前这一类被当成候选，测试也照错的那样钉着）；
     /// - `rollback`         → **保留**（磁盘上已消失内容的唯一副本）；
     /// - `unknown`          → **保留**（ADR-044 之前产生，无从判断当初是哪一种）。
     ///
-    /// 首稿计划里的「删除每个文件的非当前代」正是会把后两类一并删掉的形状。
+    /// 首稿计划里的「删除每个文件的非当前代」正是会把后三类一并删掉的形状。
     #[test]
     fn gc_spares_rollback_history_and_rows_of_unknown_origin() {
         let store = TotalStore::open_in_memory().unwrap();
@@ -9123,7 +9130,9 @@ mod tests {
 
         // ② 「来源不明」的旧代 —— 直接造出 ADR-044 之前的形态：有行、台账标 unknown、
         //    且不是当前头。迁移正是这么标的。
-        // ③ 一份历史遗留的、被取代的 reparse 投影 —— 决定 2 之后不再产生新的，
+        // ③ 回退之前那个源版本里的一份 reparse 投影（rolled.jsonl 的 (0,7)，当前头在 (1,0)）
+        //    —— 它是回退前那批字节的唯一副本，必须留下。
+        // ④ 另一个文件当前源版本里一份被取代的 reparse 投影 —— 决定 2 之后不再产生新的，
         //    GC 存在的意义正是清扫此前攒下的。
         {
             let conn = store.conn.lock().unwrap();
@@ -9147,6 +9156,19 @@ mod tests {
                     projection_revision, aad_version, event_type, occurred_at,
                     occurred_at_unix_ms, project_root, event_json)
                 VALUES (0,1,'claude_code','local','/p/rolled.jsonl','s',0,0,7,1,
+                        'message',NULL,NULL,NULL,'sv2:only-copy-before-rollback');
+
+                INSERT INTO current_head (source_type, source_location, source_path,
+                    source_revision, projection_revision, updated_at)
+                VALUES ('claude_code','local','/p/reparsed.jsonl',0,9,0);
+                INSERT INTO projections (source_type, source_location, source_path,
+                    source_revision, projection_revision, parser_revision, origin, created_at)
+                VALUES ('claude_code','local','/p/reparsed.jsonl',0,7,1,'reparse',0);
+                INSERT INTO raw_events (ingested_at, schema_version, source_type,
+                    source_location, source_path, source_session_id, seq, source_revision,
+                    projection_revision, aad_version, event_type, occurred_at,
+                    occurred_at_unix_ms, project_root, event_json)
+                VALUES (0,1,'claude_code','local','/p/reparsed.jsonl','s',0,0,7,1,
                         'message',NULL,NULL,NULL,'sv2:superseded');
                 "#,
             )
@@ -9165,20 +9187,26 @@ mod tests {
         let done = store.gc_superseded_projections(false).unwrap();
         assert_eq!((done.projections, done.events), (1, 1));
 
-        let survivors: Vec<(String, i64, i64)> = {
+        let survivors: Vec<(String, i64, i64, String)> = {
             let conn = store.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT origin, source_revision, projection_revision FROM projections
+                    "SELECT origin, source_revision, projection_revision, source_path FROM projections
                       ORDER BY source_revision, projection_revision",
                 )
                 .unwrap();
             let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .unwrap();
             rows.map(Result::unwrap).collect()
         };
-        let origins: Vec<&str> = survivors.iter().map(|(o, _, _)| o.as_str()).collect();
+        let origins: Vec<&str> = survivors.iter().map(|(o, ..)| o.as_str()).collect();
+        assert!(
+            survivors
+                .iter()
+                .any(|(o, sr, pr, p)| o == "reparse" && (*sr, *pr) == (0, 7) && p == "/p/rolled.jsonl"),
+            "回退之前那个源版本里的 reparse 投影被删了 —— 那批字节已不在，它是唯一副本。实得 {survivors:?}"
+        );
         assert!(
             origins.contains(&"rollback"),
             "rollback 历史被删了 —— 那是磁盘上已消失内容的唯一副本。实得 {survivors:?}"
@@ -9188,10 +9216,10 @@ mod tests {
             "来源不明的旧代被删了 —— 无从判断它当初是回退还是重解析，只能保守保留。实得 {survivors:?}"
         );
         assert!(
-            !survivors
-                .iter()
-                .any(|(o, sr, pr)| o == "reparse" && (*sr, *pr) == (0, 7)),
-            "被取代的 reparse 投影应已回收"
+            !survivors.iter().any(|(o, sr, pr, p)| o == "reparse"
+                && (*sr, *pr) == (0, 7)
+                && p == "/p/reparsed.jsonl"),
+            "当前源版本里被取代的 reparse 投影应已回收"
         );
     }
 
