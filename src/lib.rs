@@ -70,9 +70,9 @@ pub use report::ScanReport;
 pub use store::{
     AdoptStats, AmbiguousSpelling, AppendStats, AttributionChange, EraseStats, FileProjectionBatch,
     GcStats, GenerationCoverage, KeyImport, Projection, ProjectionChange, ProjectionStats,
-    ReadPage, ReattributeSkip, ReattributeStats, RecentSession, RecomputeStats, Rekeyed,
-    Respelling, SessionRead, SnapshotSyncStats, SourceKey, StoreStatus, Tombstone, TombstoneScope,
-    TotalStore,
+    ReadPage, ReattributeSkip, ReattributeStats, RecentSession, ReclaimStats, ReclaimedGeneration,
+    RecomputeStats, Rekeyed, Respelling, SessionRead, SnapshotSyncStats, SourceKey, StoreStatus,
+    Tombstone, TombstoneScope, TotalStore,
 };
 #[cfg(feature = "store")]
 pub use store_crypto::StoreKey;
