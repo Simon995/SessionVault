@@ -40,7 +40,7 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
 | `compressed`                 | Codex 就地压缩的 `*.jsonl.zst`：按逻辑路径 `*.jsonl` 发现，偏移按解压后的字节算（纯 Rust 解压） | ✅ 2026-10-20 本机 88 个实测                  |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
-| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute`；跨运行游标持久化 | ✅ 2026-09-29 核（`reattribute` 2026-10-10 加） |
+| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute` / `reclaim-rollbacks`；跨运行游标持久化 | ✅ 2026-09-29 核（`reattribute` 2026-10-10 加，`reclaim-rollbacks` 2026-10-29 加） |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
 | 总库（持久化输出库）         | append-only RawEvent 库                                                                      | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak）    |
 | snapshot_file                | Claude/Codex memory、rules、项目 instruction 状态快照                                        | ✅ experimental（Windows/WSL + 最新快照查询） |
@@ -127,6 +127,8 @@ project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并�
 `svault reattribute`：把当前投影里「同一个目录的旧写法」的 `project_root`（如旧注册表留下的 UNC 写法）改成注册表现在的写法，受影响的来源各写一代新投影（不读源文件），消费方经 `changes` 收到替换。只改写法、不改归属；注册表里同一个目录有不止一种写法时不改、单列报出。默认只预览，`--apply` 才写（先退出 QuotaBar / TumeFlow）。
 
 `TotalStore::recompute_attribution`（库接口，没有 CLI）：调用方点名一批来源，按每条事件记下的 `cwd` 与当前注册表重算归属三项（`project_root` / `project_root_source` / `workspace_location`）。用的是解析器同一个函数，结果就是拿这份注册表重扫会写下的；有改动的来源各写一代新投影，经 `changes` 可见。给源文件已不在、重扫不了的来源用，还在的来源照旧重扫。
+
+`svault reclaim-rollbacks`：回收回退（源文件变短、被原地改写）留下的旧代里，**每一条**都能在当前代找到内容相同事件的那些；部分覆盖的整代留着（它可能是已消失内容的唯一副本，`gc` 也不碰）。每份旧代一行、最后一行汇总。默认只预览，`--apply` 才删（先备份、先退出 QuotaBar / TumeFlow）；删完要 `VACUUM` 才缩文件。判据与实测见 `docs/storage-growth.md` 第 5 项。
 
 ## 构建
 

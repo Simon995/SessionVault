@@ -420,6 +420,30 @@ pub struct GenerationCoverage {
     pub bytes: u64,
 }
 
+/// [`TotalStore::reclaim_covered_rollbacks`] 回收（预览时：将会回收）的一份旧代。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReclaimedGeneration {
+    pub source_type: String,
+    pub source_location: String,
+    pub source_path: String,
+    pub source_revision: i64,
+    pub projection_revision: i64,
+    pub events: u64,
+    /// 这一代 `event_json` 的字节数（删了要 `VACUUM` 才还给磁盘）。
+    pub bytes: u64,
+}
+
+/// [`TotalStore::reclaim_covered_rollbacks`] 的结果。`dry_run` 时 `reclaimed` 是「将会」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReclaimStats {
+    pub reclaimed: Vec<ReclaimedGeneration>,
+    /// 没被完整覆盖、留着的旧代份数（有事件解不开的也在这里）。
+    pub kept: u64,
+    /// 统计之后、删之前，来源的当前头或这一代的行数变了：这次不删，下次重算。
+    pub changed_meanwhile: u64,
+    pub dry_run: bool,
+}
+
 /// [`TotalStore::recent_sessions`] 的一行。
 ///
 /// `last_occurred_at_unix_ms` 为 `None` = 这个会话的事件全都没有可解析的时间。它排在
@@ -4120,6 +4144,15 @@ impl TotalStore {
     ///
     /// 解不开的事件两条都算没覆盖，另报条数。每个来源的当前代只解一次。
     pub fn rollback_coverage(&self) -> StoreResult<Vec<GenerationCoverage>> {
+        Ok(self
+            .coverage_with_heads()?
+            .into_iter()
+            .map(|(g, _)| g)
+            .collect())
+    }
+
+    /// [`Self::rollback_coverage`]，另交出每份旧代统计时对照的那个当前头。
+    fn coverage_with_heads(&self) -> StoreResult<Vec<(GenerationCoverage, HeadRevisions)>> {
         use sha2::{Digest, Sha256};
         type Gen = (String, String, String, i64, i64);
         let conn = self.conn.lock().unwrap();
@@ -4183,6 +4216,7 @@ impl TotalStore {
         /// 一个来源当前代的两种索引：源记录键，内容键 → 条数。
         struct Current {
             source: (String, String, String),
+            head: HeadRevisions,
             records: HashSet<String>,
             contents: HashMap<[u8; 32], u64>,
         }
@@ -4199,12 +4233,16 @@ impl TotalStore {
                 }
                 current = Some(Current {
                     source,
+                    head,
                     records: events.iter().filter_map(record_key).collect(),
                     contents,
                 });
             }
             let Current {
-                records, contents, ..
+                head,
+                records,
+                contents,
+                ..
             } = current.as_ref().expect("set just above");
             let (events, undecodable) =
                 self.decode_generation_on(&conn, &st, &loc, &path, (sr, pr))?;
@@ -4221,22 +4259,106 @@ impl TotalStore {
                 .iter()
                 .map(|(k, n)| (*n).min(contents.get(k).copied().unwrap_or(0)))
                 .sum();
-            out.push(GenerationCoverage {
-                source_type: st,
-                source_location: loc,
-                source_path: path,
-                source_revision: sr,
-                projection_revision: pr,
-                origin,
-                events: rows,
-                keyed,
-                covered_by_key,
-                covered_by_content,
-                undecodable: undecodable as u64,
-                bytes,
-            });
+            out.push((
+                GenerationCoverage {
+                    source_type: st,
+                    source_location: loc,
+                    source_path: path,
+                    source_revision: sr,
+                    projection_revision: pr,
+                    origin,
+                    events: rows,
+                    keyed,
+                    covered_by_key,
+                    covered_by_content,
+                    undecodable: undecodable as u64,
+                    bytes,
+                },
+                *head,
+            ));
         }
         Ok(out)
+    }
+
+    /// 回收被当前代**按内容完整覆盖**的回退旧代（`docs/storage-growth.md` 第 5 项第 2 步）。
+    ///
+    /// 回退留下的旧源版本按设计不自动回收（[`Self::gc_superseded_projections`] 也不碰）：它可能是
+    /// 已消失内容的唯一副本。这里只回收**每一条**都能在当前代找到内容相同事件的那些
+    /// （[`Self::rollback_coverage`] 的 `covered_by_content == events`；解不开的事件算没覆盖），
+    /// 部分覆盖的整代留着，不做半删。只删旧代的事件行与它的台账行；当前投影不动，change-feed 不记。
+    ///
+    /// 统计要解密，不在写事务里做；删之前在同一个写事务里逐份核：来源的当前头仍是统计时那一个、
+    /// 这一代的行数没变，否则这次不删（`changed_meanwhile`）。`dry_run` 只核不删。
+    ///
+    /// 🔴 不可逆。调用方先备份、确认没有别的写入方开着库（CLI 的 `--apply` 会拒绝）。
+    pub fn reclaim_covered_rollbacks(&self, dry_run: bool) -> StoreResult<ReclaimStats> {
+        let (covered, kept): (Vec<_>, Vec<_>) = self
+            .coverage_with_heads()?
+            .into_iter()
+            .partition(|(g, _)| g.covered_by_content == g.events);
+        self.reclaim_generations(&covered, kept.len() as u64, dry_run)
+    }
+
+    /// 删这些旧代：每份删之前在同一事务里核它的来源当前头仍是统计时那一个、它的行数没变。
+    fn reclaim_generations(
+        &self,
+        covered: &[(GenerationCoverage, HeadRevisions)],
+        kept: u64,
+        dry_run: bool,
+    ) -> StoreResult<ReclaimStats> {
+        let mut stats = ReclaimStats {
+            reclaimed: Vec::new(),
+            kept,
+            changed_meanwhile: 0,
+            dry_run,
+        };
+        let mut conn = self.conn.lock().unwrap();
+        // 预览可能是只读打开的库：只开读事务。
+        let tx = if dry_run {
+            conn.transaction()?
+        } else {
+            Self::write_tx(&mut conn)?
+        };
+        for (g, head) in covered {
+            let (st, loc, path) = (&g.source_type, &g.source_location, &g.source_path);
+            let generation = params![st, loc, path, g.source_revision, g.projection_revision];
+            let rows: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM raw_events
+                  WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                    AND source_revision = ?4 AND projection_revision = ?5",
+                generation,
+                |r| r.get(0),
+            )?;
+            if head_of(&tx, st, loc, path)? != *head || rows as u64 != g.events {
+                stats.changed_meanwhile += 1;
+                continue;
+            }
+            if !dry_run {
+                tx.execute(
+                    "DELETE FROM raw_events
+                      WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                        AND source_revision = ?4 AND projection_revision = ?5",
+                    generation,
+                )?;
+                tx.execute(
+                    "DELETE FROM projections
+                      WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                        AND source_revision = ?4 AND projection_revision = ?5",
+                    generation,
+                )?;
+            }
+            stats.reclaimed.push(ReclaimedGeneration {
+                source_type: st.clone(),
+                source_location: loc.clone(),
+                source_path: path.clone(),
+                source_revision: g.source_revision,
+                projection_revision: g.projection_revision,
+                events: g.events,
+                bytes: g.bytes,
+            });
+        }
+        tx.commit()?;
+        Ok(stats)
     }
 
     /// 把改写好的当前投影作为同一份字节的新投影版本写回（[`Projection::Reparse`]），`op` 进 token。
@@ -6286,6 +6408,114 @@ mod tests {
             ),
             (5, 3, 1, 2, 1)
         );
+    }
+
+    /// 两个回退过的来源：`covered` 的旧代每一条都在当前代里，`partial` 的旧代有一条不在。
+    fn store_with_two_rolled_back_sources() -> TotalStore {
+        let store = TotalStore::open_in_memory().unwrap();
+        let roll = |path: &str, old: &[&str], new: &[&str]| {
+            let evs = |texts: &[&str]| -> Vec<RawEvent> {
+                texts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let mut e = mk_event_at(i as u64, "s", path);
+                        e.content = Some(t.to_string());
+                        e
+                    })
+                    .collect()
+            };
+            store.append_events(&evs(old), Projection::Append).unwrap();
+            let new = evs(new);
+            store
+                .apply_projection(FileProjectionBatch {
+                    source: SourceKey::from_event(&new[0]),
+                    parser_revision: None,
+                    mode: Projection::Rollback,
+                    events: new,
+                    token: None,
+                })
+                .unwrap();
+        };
+        roll("/p/covered.jsonl", &["a", "b"], &["b", "a", "c"]);
+        roll("/p/partial.jsonl", &["a", "d"], &["a"]);
+        store
+    }
+
+    fn rows_of(store: &TotalStore, path: &str, source_revision: i64) -> (i64, i64) {
+        let conn = store.conn.lock().unwrap();
+        let count = |table: &str| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE source_path = ?1 AND source_revision = ?2"
+                ),
+                params![path, source_revision],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        (count("raw_events"), count("projections"))
+    }
+
+    /// `reclaim_covered_rollbacks`：只回收被当前代按内容完整覆盖的旧代；部分覆盖的整代留着，当前代不动。
+    /// 预览不删；再跑一次没有可回收的。
+    #[test]
+    fn reclaim_removes_only_fully_covered_old_generations() {
+        let store = store_with_two_rolled_back_sources();
+        let preview = store.reclaim_covered_rollbacks(true).unwrap();
+        assert!(preview.dry_run);
+        assert_eq!(
+            preview
+                .reclaimed
+                .iter()
+                .map(|g| (g.source_path.as_str(), g.source_revision, g.events))
+                .collect::<Vec<_>>(),
+            vec![("/p/covered.jsonl", 0, 2)]
+        );
+        assert_eq!((preview.kept, preview.changed_meanwhile), (1, 0));
+        assert_eq!(rows_of(&store, "/p/covered.jsonl", 0), (2, 1), "预览不删");
+
+        let done = store.reclaim_covered_rollbacks(false).unwrap();
+        assert_eq!(done.reclaimed, preview.reclaimed);
+        assert_eq!(rows_of(&store, "/p/covered.jsonl", 0), (0, 0));
+        assert_eq!(
+            rows_of(&store, "/p/partial.jsonl", 0),
+            (2, 1),
+            "部分覆盖的整代留着"
+        );
+        for (path, current) in [("/p/covered.jsonl", 3), ("/p/partial.jsonl", 1)] {
+            assert_eq!(
+                rows_of(&store, path, 1),
+                (current, 1),
+                "{path} 的当前代不动"
+            );
+            let read = store
+                .read_session(SourceType::ClaudeCode, &SourceLocation::Local, path, "s")
+                .unwrap();
+            assert_eq!(read.events.len() as i64, current, "{path}");
+        }
+
+        let again = store.reclaim_covered_rollbacks(false).unwrap();
+        assert!(again.reclaimed.is_empty(), "{again:?}");
+        assert_eq!(again.kept, 1);
+    }
+
+    /// 统计之后、删之前来源的当前头变了：这一份不删，报出来。
+    #[test]
+    fn a_reclaim_whose_reading_went_stale_deletes_nothing() {
+        let store = store_with_two_rolled_back_sources();
+        let mut covered: Vec<_> = store
+            .coverage_with_heads()
+            .unwrap()
+            .into_iter()
+            .filter(|(g, _)| g.covered_by_content == g.events)
+            .collect();
+        assert_eq!(covered.len(), 1);
+        covered[0].1 = (5, 0);
+        let stats = store.reclaim_generations(&covered, 0, false).unwrap();
+        assert!(stats.reclaimed.is_empty());
+        assert_eq!(stats.changed_meanwhile, 1);
+        assert_eq!(rows_of(&store, "/p/covered.jsonl", 0), (2, 1));
     }
 
     /// 带上挂载表时，`<盘>:\…` 与 `/mnt/<盘>/…`（含经发行版看的）也是同一目录；不带时不互认。

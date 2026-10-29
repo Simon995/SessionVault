@@ -487,6 +487,41 @@ MUTATIONS: list[Mutation] = [
         must_fail=["gc_spares_rollback_history_and_rows_of_unknown_origin"],
         why="退回 10-29 之前的候选条件 ⇒ gc --apply 删掉回退留下的旧代（作者本机 279 份、237,541 条唯一副本）",
     ),
+    # ── 回收被完整覆盖的回退旧代（storage-growth 第 5 项第 2 步）──────────────
+    Mutation(
+        name="reclaim-takes-partial-coverage",
+        rel_path="src/store.rs",
+        old=".partition(|(g, _)| g.covered_by_content == g.events);",
+        new=".partition(|(g, _)| g.covered_by_content > 0);",
+        must_fail=["reclaim_removes_only_fully_covered_old_generations"],
+        why="部分覆盖的整代也删 ⇒ 当前代里找不到的那几条随之没了，它们是唯一副本",
+    ),
+    Mutation(
+        name="reclaim-ignores-a-stale-reading",
+        rel_path="src/store.rs",
+        old="            if head_of(&tx, st, loc, path)? != *head || rows as u64 != g.events {",
+        new="            if false {",
+        must_fail=["a_reclaim_whose_reading_went_stale_deletes_nothing"],
+        why="统计之后库变了照删 ⇒ 按旧读数删掉的旧代可能已不再被覆盖",
+    ),
+    Mutation(
+        name="reclaim-preview-deletes",
+        rel_path="src/store.rs",
+        old="""            if !dry_run {
+                tx.execute(
+                    "DELETE FROM raw_events
+                      WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                        AND source_revision = ?4 AND projection_revision = ?5",
+                    generation,""",
+        new="""            if true {
+                tx.execute(
+                    "DELETE FROM raw_events
+                      WHERE source_type = ?1 AND source_location = ?2 AND source_path = ?3
+                        AND source_revision = ?4 AND projection_revision = ?5",
+                    generation,""",
+        must_fail=["reclaim_removes_only_fully_covered_old_generations"],
+        why="预览也删 ⇒ 人只想看一眼清单，历史就没了",
+    ),
 ]
 
 

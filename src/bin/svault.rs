@@ -191,6 +191,22 @@ enum Command {
         #[arg(long)]
         store: Option<PathBuf>,
     },
+    /// 回收被当前代按内容完整覆盖的回退旧代（`docs/storage-growth.md` 第 5 项）。
+    ///
+    /// 回退（源文件变短、被原地改写）留下的旧源版本按设计不自动回收、`gc` 也不碰：它可能是已消失
+    /// 内容的唯一副本。这里只回收**每一条**都能在当前代找到内容相同事件的那些，部分覆盖的整代留着。
+    /// 每份一行（`reclaim_generation`），最后一行汇总；有份因统计之后库变了没删时退出码为 2。
+    ///
+    /// 默认只预览（只读打开，不迁移）；`--apply` 才删，删之前先备份、确认没有别的进程开着库
+    /// （先退出 QuotaBar / TumeFlow）。删完库文件不会变小，要 `VACUUM` 才还给磁盘。
+    #[cfg(feature = "store")]
+    ReclaimRollbacks {
+        /// 真的删；不加只预览。
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        store: Option<PathBuf>,
+    },
     /// 列出本机能读的总库：本机库与副本目录里的每一个（多机同步，见 `docs/linux-replica.md`
     /// 第四部分）。打不开的也列出来（`store_unavailable`），不当作不存在。
     #[cfg(feature = "store")]
@@ -841,6 +857,27 @@ enum Out<'a> {
         skipped: usize,
         dry_run: bool,
     },
+    /// `reclaim-rollbacks` 回收（预览时：将会回收）的每份旧代一行。
+    #[cfg(feature = "store")]
+    ReclaimGeneration {
+        source_type: String,
+        source_location: String,
+        source_path: String,
+        source_revision: i64,
+        projection_revision: i64,
+        events: u64,
+        bytes: u64,
+    },
+    /// `reclaim-rollbacks` 的最后一行。`dry_run` 时前三个数是「将会」；`kept` 是没被完整覆盖、留着的份数。
+    #[cfg(feature = "store")]
+    ReclaimSummary {
+        generations: usize,
+        events: u64,
+        bytes: u64,
+        kept: u64,
+        changed_meanwhile: u64,
+        dry_run: bool,
+    },
     /// `session-origin` 每个会话一行。
     SessionOrigin {
         /// 原样回显入参 `--session`。
@@ -1124,6 +1161,8 @@ fn main() {
         Command::AdoptErasures { store, replicas } => run_adopt_erasures(store, replicas),
         #[cfg(feature = "store")]
         Command::Reattribute { apply, store } => run_reattribute(apply, store),
+        #[cfg(feature = "store")]
+        Command::ReclaimRollbacks { apply, store } => run_reclaim_rollbacks(apply, store),
         Command::SessionOrigin { sessions } => run_session_origin(sessions),
         #[cfg(feature = "store")]
         Command::Snapshots { store } => run_snapshots(store),
@@ -2496,11 +2535,38 @@ fn run_erasures(store_arg: Option<PathBuf>, stores: AllStoresArgs) -> i32 {
     0
 }
 
+/// 写之前确认没有别的进程开着库（同 `key-import --rekey`）；开着就给出退出码。
+#[cfg(feature = "store")]
+fn bail_if_held_open_elsewhere(store_path: &std::path::Path) -> Option<i32> {
+    use session_vault::probe::Probed;
+    match session_vault::probe::held_open_elsewhere(store_path) {
+        Probed::Found(false) => None,
+        Probed::Found(true) => {
+            log::error!(
+                target: tag::CLI,
+                "the store is open in another process (QuotaBar / TumeFlow?); quit it first"
+            );
+            Some(1)
+        }
+        Probed::Absent => {
+            log::error!(target: tag::CLI, "{} not found", store_path.display());
+            Some(1)
+        }
+        Probed::Unknown(e) => {
+            log::warn!(
+                target: tag::CLI,
+                "cannot tell whether another process has the store open ({e}); \
+                 make sure QuotaBar / TumeFlow are not running"
+            );
+            None
+        }
+    }
+}
+
 /// `reattribute`：见 [`session_vault::TotalStore::reattribute`]。注册表与 `scan-all` 用同一份
 /// （本机挂载表下的 `project_root_registry`），改出来的写法与重扫给的一致。
 #[cfg(feature = "store")]
 fn run_reattribute(apply: bool, store_arg: Option<PathBuf>) -> i32 {
-    use session_vault::probe::Probed;
     let Some(store_path) = resolve_store_path(store_arg) else {
         log::error!(target: tag::CLI, "no data_local_dir; pass --store");
         return 1;
@@ -2508,26 +2574,10 @@ fn run_reattribute(apply: bool, store_arg: Option<PathBuf>) -> i32 {
     if let Some(code) = bail_unless_store_present(&store_path, 1) {
         return code;
     }
-    // 写之前确认没有别的写入方：读与写之间它追加的事件不在新的一代里（同 `key-import --rekey`）。
+    // 写之前确认没有别的写入方：读与写之间它追加的事件不在新的一代里。
     if apply {
-        match session_vault::probe::held_open_elsewhere(&store_path) {
-            Probed::Found(false) => {}
-            Probed::Found(true) => {
-                log::error!(
-                    target: tag::CLI,
-                    "the store is open in another process (QuotaBar / TumeFlow?); quit it first"
-                );
-                return 1;
-            }
-            Probed::Absent => {
-                log::error!(target: tag::CLI, "{} not found", store_path.display());
-                return 1;
-            }
-            Probed::Unknown(e) => log::warn!(
-                target: tag::CLI,
-                "cannot tell whether another process has the store open ({e}); \
-                 make sure QuotaBar / TumeFlow are not running"
-            ),
+        if let Some(code) = bail_if_held_open_elsewhere(&store_path) {
+            return code;
         }
     }
     let opened = if apply {
@@ -2584,6 +2634,67 @@ fn run_reattribute(apply: bool, store_arg: Option<PathBuf>) -> i32 {
         dry_run: stats.dry_run,
     });
     if stats.skipped.is_empty() && stats.ambiguous.is_empty() {
+        0
+    } else {
+        2
+    }
+}
+
+/// `reclaim-rollbacks`：见 [`session_vault::TotalStore::reclaim_covered_rollbacks`]。
+#[cfg(feature = "store")]
+fn run_reclaim_rollbacks(apply: bool, store_arg: Option<PathBuf>) -> i32 {
+    let Some(store_path) = resolve_store_path(store_arg) else {
+        log::error!(target: tag::CLI, "no data_local_dir; pass --store");
+        return 1;
+    };
+    if let Some(code) = bail_unless_store_present(&store_path, 1) {
+        return code;
+    }
+    // 删的是历史、不可逆：不和别的写入方同时开着库。
+    if apply {
+        if let Some(code) = bail_if_held_open_elsewhere(&store_path) {
+            return code;
+        }
+    }
+    let opened = if apply {
+        open_total_store(&store_path)
+    } else {
+        open_total_store_read_only(&store_path)
+    };
+    let store = match opened {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!(target: tag::CLI, "open total store failed: {e}");
+            return 1;
+        }
+    };
+    let stats = match store.reclaim_covered_rollbacks(!apply) {
+        Ok(stats) => stats,
+        Err(e) => {
+            log::error!(target: tag::CLI, "reclaim-rollbacks failed: {e}");
+            return 1;
+        }
+    };
+    for g in &stats.reclaimed {
+        emit(&Out::ReclaimGeneration {
+            source_type: g.source_type.clone(),
+            source_location: g.source_location.clone(),
+            source_path: g.source_path.clone(),
+            source_revision: g.source_revision,
+            projection_revision: g.projection_revision,
+            events: g.events,
+            bytes: g.bytes,
+        });
+    }
+    emit(&Out::ReclaimSummary {
+        generations: stats.reclaimed.len(),
+        events: stats.reclaimed.iter().map(|g| g.events).sum(),
+        bytes: stats.reclaimed.iter().map(|g| g.bytes).sum(),
+        kept: stats.kept,
+        changed_meanwhile: stats.changed_meanwhile,
+        dry_run: stats.dry_run,
+    });
+    if stats.changed_meanwhile == 0 {
         0
     } else {
         2
