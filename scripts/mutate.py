@@ -454,6 +454,39 @@ MUTATIONS: list[Mutation] = [
         must_fail=["a_cached_length_still_reads_the_bytes_when_they_are_needed"],
         why="长度取自缓存时不补读字节 ⇒ 要读新内容的那一轮读失败",
     ),
+    # ── 回退旧代的覆盖统计（storage-growth 第 5 项）──────────────────────────
+    Mutation(
+        name="coverage-content-key-keeps-the-root",
+        rel_path="src/store.rs",
+        old='                    "project_root",\n',
+        new="",
+        must_fail=["rollback_coverage_counts_old_events_found_in_the_current_generation"],
+        why="归属变了就算内容不同 ⇒ 注册表长出新根后，被覆盖的旧代判成没覆盖",
+    ),
+    Mutation(
+        name="coverage-content-is-not-a-multiset",
+        rel_path="src/store.rs",
+        old=".map(|(k, n)| (*n).min(contents.get(k).copied().unwrap_or(0)))",
+        new=".map(|(k, n)| if contents.contains_key(k) { *n } else { 0 })",
+        must_fail=["rollback_coverage_counts_old_events_found_in_the_current_generation"],
+        why="旧代两条相同、当前代只剩一条也算全覆盖 ⇒ 回收时删掉那条的唯一副本",
+    ),
+    Mutation(
+        name="coverage-reports-the-current-generation",
+        rel_path="src/store.rs",
+        old="                  WHERE r.source_revision < COALESCE(h.source_revision, 0)",
+        new="                  WHERE r.source_revision <= COALESCE(h.source_revision, 0)",
+        must_fail=["rollback_coverage_counts_old_events_found_in_the_current_generation"],
+        why="当前代也进报告 ⇒ 当前代自己「被自己覆盖」，回收时会把当前答案删掉",
+    ),
+    Mutation(
+        name="gc-reclaims-generations-left-by-a-rollback",
+        rel_path="src/store.rs",
+        old="               AND p.source_revision = COALESCE(h.source_revision, 0)\n",
+        new="",
+        must_fail=["gc_spares_rollback_history_and_rows_of_unknown_origin"],
+        why="退回 10-29 之前的候选条件 ⇒ gc --apply 删掉回退留下的旧代（作者本机 279 份、237,541 条唯一副本）",
+    ),
 ]
 
 

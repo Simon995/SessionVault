@@ -396,6 +396,30 @@ pub struct RecomputeStats {
     pub dry_run: bool,
 }
 
+/// [`TotalStore::rollback_coverage`] 的一行：一个来源的一代旧代，被当前代覆盖了多少。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GenerationCoverage {
+    pub source_type: String,
+    pub source_location: String,
+    pub source_path: String,
+    pub source_revision: i64,
+    pub projection_revision: i64,
+    /// 台账里这一代的来由（`append` / `rollback` / `reparse` / `unknown`）；台账里没有这一代时为 `None`。
+    pub origin: Option<String>,
+    pub events: u64,
+    /// 带 `EventKey` 的事件数。`covered_by_key` 为 0 时靠它分开「比不了」（v1 遗留，没有键）
+    /// 与「比了、一条都对不上」（源记录全被改写过）。
+    pub keyed: u64,
+    /// 在当前代里找得到同一条源记录（`(event_type, EventKey)` 相同）的事件数。
+    pub covered_by_key: u64,
+    /// 在当前代里找得到内容相同的事件数（按多重集）。
+    pub covered_by_content: u64,
+    /// 解不开的事件数（两种判据下都算没覆盖）。
+    pub undecodable: u64,
+    /// 这一代 `event_json` 的字节数。
+    pub bytes: u64,
+}
+
 /// [`TotalStore::recent_sessions`] 的一行。
 ///
 /// `last_occurred_at_unix_ms` 为 `None` = 这个会话的事件全都没有可解析的时间。它排在
@@ -3584,14 +3608,18 @@ impl TotalStore {
 
     /// 回收**已被取代且来源明确**的投影（ADR-044 决定 7）。
     ///
-    /// 🔴 只碰满足两个条件的行：
+    /// 🔴 只碰满足三个条件的行：
     ///
     /// 1. 它不是该源文件的当前投影（`current_head` 说了算）；
-    /// 2. 它在台账里的 `origin` 是 **`reparse`** —— 也就是「同一批字节的一份更差的
-    ///    解析」，可再生。
+    /// 2. 它在台账里的 `origin` 是 **`reparse`**；
+    /// 3. 它与当前头在**同一个源版本**里 —— 于是它是「同一批字节的一份更差的解析」，
+    ///    那批字节还在、当前头就是它们更新的解析，可再生。
     ///
-    /// **禁止**碰的两类，各有各的理由：
+    /// **禁止**碰的三类，各有各的理由：
     ///
+    /// - 比当前头**更早的源版本**里的任何投影，`origin` 是 `reparse` 也一样：回退之后那批
+    ///   字节已经不在磁盘上，那一代是它们在库里的唯一副本。2026-10-29 之前缺第 3 个条件，
+    ///   候选全是这一类 —— 作者本机 279 份、237,541 条，`gc --apply` 会把它们删掉；
     /// - `origin = 'rollback'`：那是磁盘上**已消失内容的唯一副本**，删了真没了；
     /// - `origin = 'unknown'`：本 ADR 落地**之前**产生的行。当时只有一个 `generation`
     ///   整数，无从判断某一代当初是回退还是重解析。实测作者本机 930,056 行里有
@@ -3602,7 +3630,7 @@ impl TotalStore {
     pub fn gc_superseded_projections(&self, dry_run: bool) -> StoreResult<GcStats> {
         let mut conn = self.conn.lock().unwrap();
         let tx = Self::write_tx(&mut conn)?;
-        // 候选：台账里 origin='reparse'、且不是当前头指向的那一份。
+        // 候选：台账里 origin='reparse'、与当前头同一个源版本、且不是当前头指向的那一份。
         const CANDIDATES: &str = r#"
             SELECT p.source_type, p.source_location, p.source_path,
                    p.source_revision, p.projection_revision
@@ -3612,6 +3640,7 @@ impl TotalStore {
                     AND h.source_location = p.source_location
                     AND h.source_path = p.source_path
              WHERE p.origin = 'reparse'
+               AND p.source_revision = COALESCE(h.source_revision, 0)
                AND (p.source_revision, p.projection_revision)
                    IS NOT (COALESCE(h.source_revision, 0), COALESCE(h.projection_revision, 0))
         "#;
@@ -4031,20 +4060,7 @@ impl TotalStore {
             )
             .optional()?
             .flatten();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {ENCRYPTED_ROW_COLUMNS} {CURRENT_ROWS} \
-               AND r.source_type = ?1 AND r.source_location = ?2 AND r.source_path = ?3 \
-             ORDER BY r.seq ASC, r.offset ASC"
-        ))?;
-        let rows = stmt.query_map(params![st, loc, path], EncryptedRow::from_sql)?;
-        let mut key_cache = HashMap::new();
-        let (mut events, mut undecodable) = (Vec::new(), 0usize);
-        for row in rows {
-            match self.decode_event_on(&conn, &mut key_cache, &row?) {
-                Ok(ev) => events.push(ev),
-                Err(_) => undecodable += 1,
-            }
-        }
+        let (events, undecodable) = self.decode_generation_on(&conn, st, loc, path, head)?;
         if undecodable > 0 {
             return Ok(Err(format!(
                 "{undecodable} event(s) in the current projection cannot be decrypted; rewriting would drop them"
@@ -4058,6 +4074,169 @@ impl TotalStore {
             parser_revision,
             events,
         }))
+    }
+
+    /// 解密一个来源的某一代 `(source_revision, projection_revision)`，按 seq 排；另报解不开的条数。
+    fn decode_generation_on(
+        &self,
+        conn: &Connection,
+        st: &str,
+        loc: &str,
+        path: &str,
+        generation: HeadRevisions,
+    ) -> StoreResult<(Vec<RawEvent>, usize)> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ENCRYPTED_ROW_COLUMNS} FROM raw_events r \
+              WHERE r.source_type = ?1 AND r.source_location = ?2 AND r.source_path = ?3 \
+                AND r.source_revision = ?4 AND r.projection_revision = ?5 \
+              ORDER BY r.seq ASC, r.offset ASC"
+        ))?;
+        let rows = stmt.query_map(
+            params![st, loc, path, generation.0, generation.1],
+            EncryptedRow::from_sql,
+        )?;
+        let mut key_cache = HashMap::new();
+        let (mut events, mut undecodable) = (Vec::new(), 0usize);
+        for row in rows {
+            match self.decode_event_on(conn, &mut key_cache, &row?) {
+                Ok(ev) => events.push(ev),
+                Err(_) => undecodable += 1,
+            }
+        }
+        Ok((events, undecodable))
+    }
+
+    /// 回退留下的旧代被当前代覆盖了多少 —— 只读，给「哪些旧代能回收」定判据用
+    /// （`docs/storage-growth.md` 第 5 项）。
+    ///
+    /// 旧代 = 源版本比当前小的那些代：回退（文件变短、原地重写）时开新源版本，旧的那代按设计
+    /// 永不自动回收，因为它可能是已消失内容的唯一副本。但源文件只是被改写而内容没丢时（Codex
+    /// 改写已压缩的会话），旧代多半能在当前代里逐条找到。这里按两种判据各数一遍：
+    ///
+    /// - **同一条源记录**：`(event_type, EventKey)` 相同（同一行、同一槽位）。没有 `EventKey`
+    ///   的旧事件（v1 遗留）按这条永远对不上。
+    /// - **内容相同**：去掉 `seq`、`EventKey`、归属三项与 `schema_version` 后其余字段都相同
+    ///   （按多重集：旧代两条相同的，当前代也要有两条）。
+    ///
+    /// 解不开的事件两条都算没覆盖，另报条数。每个来源的当前代只解一次。
+    pub fn rollback_coverage(&self) -> StoreResult<Vec<GenerationCoverage>> {
+        use sha2::{Digest, Sha256};
+        type Gen = (String, String, String, i64, i64);
+        let conn = self.conn.lock().unwrap();
+        let old: Vec<(Gen, Option<String>, u64, u64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT r.source_type, r.source_location, r.source_path,
+                        r.source_revision, r.projection_revision, p.origin,
+                        COUNT(*), SUM(LENGTH(r.event_json))
+                   FROM raw_events r
+                   LEFT JOIN current_head h
+                          ON h.source_type = r.source_type
+                         AND h.source_location = r.source_location
+                         AND h.source_path = r.source_path
+                   LEFT JOIN projections p
+                          ON p.source_type = r.source_type
+                         AND p.source_location = r.source_location
+                         AND p.source_path = r.source_path
+                         AND p.source_revision = r.source_revision
+                         AND p.projection_revision = r.projection_revision
+                  WHERE r.source_revision < COALESCE(h.source_revision, 0)
+                  GROUP BY 1, 2, 3, 4, 5
+                  ORDER BY 1, 2, 3, 4, 5",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+                    r.get(5)?,
+                    r.get::<_, i64>(6)? as u64,
+                    r.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let record_key = |ev: &RawEvent| {
+            ev.event_key.as_ref().map(|k| {
+                format!(
+                    "{}|{}|{}|{}",
+                    event_type_key(ev.event_type),
+                    k.version,
+                    k.record_fingerprint,
+                    k.slot_ordinal
+                )
+            })
+        };
+        let content_key = |ev: &RawEvent| -> [u8; 32] {
+            let mut v = serde_json::to_value(ev).unwrap_or_default();
+            if let Some(o) = v.as_object_mut() {
+                for k in [
+                    "seq",
+                    "event_key",
+                    "project_root",
+                    "project_root_source",
+                    "workspace_location",
+                    "schema_version",
+                ] {
+                    o.remove(k);
+                }
+            }
+            Sha256::digest(v.to_string().as_bytes()).into()
+        };
+        /// 一个来源当前代的两种索引：源记录键，内容键 → 条数。
+        struct Current {
+            source: (String, String, String),
+            records: HashSet<String>,
+            contents: HashMap<[u8; 32], u64>,
+        }
+        let mut out = Vec::new();
+        let mut current: Option<Current> = None;
+        for ((st, loc, path, sr, pr), origin, rows, bytes) in old {
+            let source = (st.clone(), loc.clone(), path.clone());
+            if current.as_ref().map(|c| &c.source) != Some(&source) {
+                let head = head_of(&conn, &st, &loc, &path)?;
+                let (events, _) = self.decode_generation_on(&conn, &st, &loc, &path, head)?;
+                let mut contents: HashMap<[u8; 32], u64> = HashMap::new();
+                for ev in &events {
+                    *contents.entry(content_key(ev)).or_default() += 1;
+                }
+                current = Some(Current {
+                    source,
+                    records: events.iter().filter_map(record_key).collect(),
+                    contents,
+                });
+            }
+            let Current {
+                records, contents, ..
+            } = current.as_ref().expect("set just above");
+            let (events, undecodable) =
+                self.decode_generation_on(&conn, &st, &loc, &path, (sr, pr))?;
+            let keyed = events.iter().filter(|ev| ev.event_key.is_some()).count() as u64;
+            let covered_by_key = events
+                .iter()
+                .filter(|ev| record_key(ev).is_some_and(|k| records.contains(&k)))
+                .count() as u64;
+            let mut wanted: HashMap<[u8; 32], u64> = HashMap::new();
+            for ev in &events {
+                *wanted.entry(content_key(ev)).or_default() += 1;
+            }
+            let covered_by_content = wanted
+                .iter()
+                .map(|(k, n)| (*n).min(contents.get(k).copied().unwrap_or(0)))
+                .sum();
+            out.push(GenerationCoverage {
+                source_type: st,
+                source_location: loc,
+                source_path: path,
+                source_revision: sr,
+                projection_revision: pr,
+                origin,
+                events: rows,
+                keyed,
+                covered_by_key,
+                covered_by_content,
+                undecodable: undecodable as u64,
+                bytes,
+            });
+        }
+        Ok(out)
     }
 
     /// 把改写好的当前投影作为同一份字节的新投影版本写回（[`Projection::Reparse`]），`op` 进 token。
@@ -6013,6 +6192,100 @@ mod tests {
             .unwrap();
         assert!(applied.is_some_and(|a| a.head_moved));
         assert_eq!(head(), (0, 1));
+    }
+
+    /// `rollback_coverage`：回退留下的旧代按两种判据各数一遍 —— 同一条源记录（`EventKey`）、
+    /// 内容相同（多重集，不看 seq 与归属）；解不开的另报。当前代与没回退过的来源不报。
+    #[test]
+    fn rollback_coverage_counts_old_events_found_in_the_current_generation() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let ev = |seq: u64, text: &str, fingerprint: &str| {
+            let mut e = mk_event(seq, "s", Some(text));
+            e.event_key = Some(crate::rawevent::EventKey {
+                version: 1,
+                record_fingerprint: fingerprint.to_string(),
+                slot_ordinal: 0,
+            });
+            e
+        };
+        // 旧代：a 原样留下；b 内容没变、源记录改了；c 两条内容相同、新代只剩一条；
+        // d 新代里没有，且是没有 EventKey 的遗留事件。
+        let mut old = vec![
+            ev(0, "a", "fa"),
+            ev(1, "b", "fb"),
+            ev(2, "c", "fc1"),
+            ev(3, "c", "fc2"),
+            ev(4, "d", "fd"),
+        ];
+        old[4].event_key = None;
+        store.append_events(&old, Projection::Append).unwrap();
+        // 新代：seq 从 0 重来、归属也可以不同 —— 都不影响「内容相同」。
+        let mut new = vec![
+            ev(0, "a", "fa"),
+            ev(1, "b", "fb-rewritten"),
+            ev(2, "c", "fc1"),
+            ev(3, "e", "fe"),
+        ];
+        new[0].project_root = Some("/elsewhere".into());
+        store
+            .apply_projection(FileProjectionBatch {
+                source: SourceKey::from_event(&new[0]),
+                parser_revision: None,
+                mode: Projection::Rollback,
+                events: new,
+                token: None,
+            })
+            .unwrap();
+        store
+            .append_events(&[mk_event_at(0, "s", "/p/other.jsonl")], Projection::Append)
+            .unwrap();
+
+        let report = store.rollback_coverage().unwrap();
+        assert_eq!(report.len(), 1, "{report:?}");
+        let g = &report[0];
+        assert_eq!(
+            (
+                g.source_path.as_str(),
+                g.source_revision,
+                g.projection_revision
+            ),
+            ("/p/file.jsonl", 0, 0)
+        );
+        assert_eq!(g.origin.as_deref(), Some("append"));
+        assert_eq!(
+            (
+                g.events,
+                g.keyed,
+                g.covered_by_key,
+                g.covered_by_content,
+                g.undecodable
+            ),
+            (5, 4, 2, 3, 0)
+        );
+        assert!(g.bytes > 0);
+
+        // 旧代里 a 解不开：两种判据都少算它，另报一条。
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE raw_events SET event_json = 'sv2:broken' \
+                  WHERE source_path = '/p/file.jsonl' AND source_revision = 0 AND seq = 0",
+                [],
+            )
+            .unwrap();
+        let g = &store.rollback_coverage().unwrap()[0];
+        assert_eq!(
+            (
+                g.events,
+                g.keyed,
+                g.covered_by_key,
+                g.covered_by_content,
+                g.undecodable
+            ),
+            (5, 3, 1, 2, 1)
+        );
     }
 
     /// 带上挂载表时，`<盘>:\…` 与 `/mnt/<盘>/…`（含经发行版看的）也是同一目录；不带时不互认。
@@ -8812,13 +9085,15 @@ mod tests {
 
     /// 🔴 **护栏 G8（ADR-044 决定 7）：GC 只碰「已被取代且来源明确」的投影。**
     ///
-    /// 三类并存，只有一类该被回收 —— 这条测试的价值全在**另外两类必须活下来**：
+    /// 四类并存，只有一类该被回收 —— 这条测试的价值全在**另外三类必须活下来**：
     ///
-    /// - `reparse` 且非当前 → 回收（同一批字节的更差解析，可再生）；
+    /// - `reparse`、非当前、与当前头同一个源版本 → 回收（同一批字节的更差解析，可再生）；
+    /// - `reparse`、但在回退之前的源版本里 → **保留**（那批字节已不在，它是唯一副本；
+    ///   2026-10-29 之前这一类被当成候选，测试也照错的那样钉着）；
     /// - `rollback`         → **保留**（磁盘上已消失内容的唯一副本）；
     /// - `unknown`          → **保留**（ADR-044 之前产生，无从判断当初是哪一种）。
     ///
-    /// 首稿计划里的「删除每个文件的非当前代」正是会把后两类一并删掉的形状。
+    /// 首稿计划里的「删除每个文件的非当前代」正是会把后三类一并删掉的形状。
     #[test]
     fn gc_spares_rollback_history_and_rows_of_unknown_origin() {
         let store = TotalStore::open_in_memory().unwrap();
@@ -8855,7 +9130,9 @@ mod tests {
 
         // ② 「来源不明」的旧代 —— 直接造出 ADR-044 之前的形态：有行、台账标 unknown、
         //    且不是当前头。迁移正是这么标的。
-        // ③ 一份历史遗留的、被取代的 reparse 投影 —— 决定 2 之后不再产生新的，
+        // ③ 回退之前那个源版本里的一份 reparse 投影（rolled.jsonl 的 (0,7)，当前头在 (1,0)）
+        //    —— 它是回退前那批字节的唯一副本，必须留下。
+        // ④ 另一个文件当前源版本里一份被取代的 reparse 投影 —— 决定 2 之后不再产生新的，
         //    GC 存在的意义正是清扫此前攒下的。
         {
             let conn = store.conn.lock().unwrap();
@@ -8879,6 +9156,19 @@ mod tests {
                     projection_revision, aad_version, event_type, occurred_at,
                     occurred_at_unix_ms, project_root, event_json)
                 VALUES (0,1,'claude_code','local','/p/rolled.jsonl','s',0,0,7,1,
+                        'message',NULL,NULL,NULL,'sv2:only-copy-before-rollback');
+
+                INSERT INTO current_head (source_type, source_location, source_path,
+                    source_revision, projection_revision, updated_at)
+                VALUES ('claude_code','local','/p/reparsed.jsonl',0,9,0);
+                INSERT INTO projections (source_type, source_location, source_path,
+                    source_revision, projection_revision, parser_revision, origin, created_at)
+                VALUES ('claude_code','local','/p/reparsed.jsonl',0,7,1,'reparse',0);
+                INSERT INTO raw_events (ingested_at, schema_version, source_type,
+                    source_location, source_path, source_session_id, seq, source_revision,
+                    projection_revision, aad_version, event_type, occurred_at,
+                    occurred_at_unix_ms, project_root, event_json)
+                VALUES (0,1,'claude_code','local','/p/reparsed.jsonl','s',0,0,7,1,
                         'message',NULL,NULL,NULL,'sv2:superseded');
                 "#,
             )
@@ -8897,20 +9187,26 @@ mod tests {
         let done = store.gc_superseded_projections(false).unwrap();
         assert_eq!((done.projections, done.events), (1, 1));
 
-        let survivors: Vec<(String, i64, i64)> = {
+        let survivors: Vec<(String, i64, i64, String)> = {
             let conn = store.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT origin, source_revision, projection_revision FROM projections
+                    "SELECT origin, source_revision, projection_revision, source_path FROM projections
                       ORDER BY source_revision, projection_revision",
                 )
                 .unwrap();
             let rows = stmt
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .unwrap();
             rows.map(Result::unwrap).collect()
         };
-        let origins: Vec<&str> = survivors.iter().map(|(o, _, _)| o.as_str()).collect();
+        let origins: Vec<&str> = survivors.iter().map(|(o, ..)| o.as_str()).collect();
+        assert!(
+            survivors
+                .iter()
+                .any(|(o, sr, pr, p)| o == "reparse" && (*sr, *pr) == (0, 7) && p == "/p/rolled.jsonl"),
+            "回退之前那个源版本里的 reparse 投影被删了 —— 那批字节已不在，它是唯一副本。实得 {survivors:?}"
+        );
         assert!(
             origins.contains(&"rollback"),
             "rollback 历史被删了 —— 那是磁盘上已消失内容的唯一副本。实得 {survivors:?}"
@@ -8920,10 +9216,10 @@ mod tests {
             "来源不明的旧代被删了 —— 无从判断它当初是回退还是重解析，只能保守保留。实得 {survivors:?}"
         );
         assert!(
-            !survivors
-                .iter()
-                .any(|(o, sr, pr)| o == "reparse" && (*sr, *pr) == (0, 7)),
-            "被取代的 reparse 投影应已回收"
+            !survivors.iter().any(|(o, sr, pr, p)| o == "reparse"
+                && (*sr, *pr) == (0, 7)
+                && p == "/p/reparsed.jsonl"),
+            "当前源版本里被取代的 reparse 投影应已回收"
         );
     }
 
