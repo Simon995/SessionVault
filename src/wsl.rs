@@ -679,6 +679,86 @@ fn parse_stat_many(
         .collect()
 }
 
+/// 一个文件的身份：内容改写、原子替换（写临时文件再换名进来）都会更新 `ctime`，所以三项都没变
+/// 就当内容没变。按它缓存从内容算出来的东西（压缩件解压后的长度）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    pub size: u64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+/// [`identify_many`] 对一条路径的答案，语义同 [`StatAnswer`]。
+pub type IdentityAnswer = Result<Option<FileIdentity>, String>;
+
+/// 同 [`stat_many`]，另带 `ctime`：一次 `wsl.exe` 问完一批文件的 [`FileIdentity`]。
+#[cfg(windows)]
+pub fn identify_many(
+    distro: &str,
+    paths: &[String],
+    deadline: crate::deadline::Deadline,
+) -> Result<std::collections::HashMap<String, IdentityAnswer>, String> {
+    if paths.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut script = String::from("A=()\n");
+    for path in paths {
+        let esc = shell_escape(path);
+        script.push_str(&format!(
+            "if [ -f \"{esc}\" ]; then A+=(\"{esc}\"); else printf 'M\\t%s\\0' \"{esc}\"; fi\n"
+        ));
+    }
+    script.push_str(
+        "[ ${#A[@]} -eq 0 ] || stat --printf 'S\\t%Y\\t%Z\\t%s\\t%n\\0' -- \"${A[@]}\" || true\n",
+    );
+    let out = run_bash_stdin(distro, &script, deadline)?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl identify_many {distro} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_identify_many(&out.stdout, paths))
+}
+
+/// 解析 [`identify_many`] 的输出：`M\t<路径>\0` = 不是普通文件，`S\t<mtime>\t<ctime>\t<size>\t<路径>\0` = 有。
+/// 请求了却没出现在输出里的路径是「没问成」。
+#[cfg(any(windows, test))]
+fn parse_identify_many(
+    bytes: &[u8],
+    requested: &[String],
+) -> std::collections::HashMap<String, IdentityAnswer> {
+    let mut answers = std::collections::HashMap::new();
+    for record in bytes.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let text = String::from_utf8_lossy(record);
+        if let Some(path) = text.strip_prefix("M\t") {
+            answers.insert(path.to_string(), Ok(None));
+        } else if let Some(rest) = text.strip_prefix("S\t") {
+            let mut parts = rest.splitn(4, '\t');
+            let (Some(m), Some(c), Some(sz), Some(path)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let answer = match (m.parse::<i64>(), c.parse::<i64>(), sz.parse::<u64>()) {
+                (Ok(mtime), Ok(ctime), Ok(size)) => Ok(Some(FileIdentity { size, mtime, ctime })),
+                _ => Err(format!("wsl identify_many bad record: {text:?}")),
+            };
+            answers.insert(path.to_string(), answer);
+        }
+    }
+    requested
+        .iter()
+        .map(|p| {
+            let answer = answers
+                .remove(p)
+                .unwrap_or_else(|| Err(format!("wsl identify_many: no answer for {p}")));
+            (p.clone(), answer)
+        })
+        .collect()
+}
+
 /// [`read_many`] 读到的一个文件：全文与读它那一刻的 mtime。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRead {
@@ -905,6 +985,12 @@ stub_on_non_windows! {
         paths: &[String],
         deadline: crate::deadline::Deadline,
     ) -> Result<std::collections::HashMap<String, StatAnswer>, String>;
+
+    pub fn identify_many(
+        distro: &str,
+        paths: &[String],
+        deadline: crate::deadline::Deadline,
+    ) -> Result<std::collections::HashMap<String, IdentityAnswer>, String>;
 
     pub fn read_many(
         distro: &str,
@@ -1483,6 +1569,35 @@ mod tests {
         assert_eq!(answers["/c/t\tab.jsonl"], Ok(Some((7, 1_700_000_001))));
         assert!(answers["/d/bad.jsonl"].is_err(), "坏记录不是答案");
         assert!(answers["/e/silent.jsonl"].is_err(), "输出里没有 ≠ 不在");
+    }
+
+    #[test]
+    fn parse_identify_many_answers_every_requested_path() {
+        let requested: Vec<String> = ["/a/s1.zst", "/b/gone.zst", "/c/t\tab.zst", "/d/silent.zst"]
+            .map(String::from)
+            .to_vec();
+        let out =
+            b"S\t1700000000\t1700000500\t42\t/a/s1.zst\0M\t/b/gone.zst\0S\t1\t2\t7\t/c/t\tab.zst\0";
+        let answers = parse_identify_many(out, &requested);
+        assert_eq!(answers.len(), requested.len());
+        assert_eq!(
+            answers["/a/s1.zst"],
+            Ok(Some(FileIdentity {
+                size: 42,
+                mtime: 1_700_000_000,
+                ctime: 1_700_000_500
+            }))
+        );
+        assert_eq!(answers["/b/gone.zst"], Ok(None));
+        assert_eq!(
+            answers["/c/t\tab.zst"],
+            Ok(Some(FileIdentity {
+                size: 7,
+                mtime: 1,
+                ctime: 2
+            }))
+        );
+        assert!(answers["/d/silent.zst"].is_err(), "输出里没有 ≠ 不在");
     }
 
     #[test]

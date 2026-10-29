@@ -77,7 +77,10 @@ pub fn scan_append_log_observed(
 #[derive(Debug, Default)]
 pub struct StatPrefetch {
     answers: std::collections::HashMap<(String, String), crate::wsl::StatAnswer>,
-    /// [`Self::reading_whole`] 规划的整份读。批在第一次用到时才读（`&self` 上读，所以要锁）。
+    /// 原文件确认不在的来源：它的压缩形态（`<路径>.zst`）的身份。键里是逻辑路径。
+    compressed: std::collections::HashMap<(String, String), crate::wsl::IdentityAnswer>,
+    /// 整份读的批：[`Self::reading_whole`] 规划的原文件，与解压后长度不在缓存里的压缩件。
+    /// 批在第一次用到时才读（`&self` 上读，所以要锁）。
     whole: std::sync::Mutex<WholeReads>,
 }
 
@@ -90,44 +93,44 @@ struct WholeReads {
     /// 已读的批（读过就不再读，没读成也一样 —— 那批的来源退回逐个读）。
     fetched_batches: std::collections::HashSet<usize>,
     /// 读到、还没交出去的内容。交出去就删，同时占着的内存约一批。
-    contents: std::collections::HashMap<(String, String), Vec<u8>>,
+    contents: std::collections::HashMap<(String, String), crate::wsl::FileRead>,
     deadline: Option<crate::deadline::Deadline>,
 }
 
-/// [`StatPrefetch::reading_whole`] 的分批：按 `sources` 的顺序，同一发行版的接着往当前批里装，
-/// 装不下（合计会超过 `READ_MANY_MAX_TOTAL`）就另起一批。只收 WSL 上的 append-log、`stat` 到了、
-/// 大小在 `(0, READ_MANY_MAX_EACH]` 里的；其余照旧逐个读。
+impl WholeReads {
+    fn add(&mut self, batches: Vec<(String, Vec<String>)>) {
+        for (distro, paths) in batches {
+            let i = self.batches.len();
+            for p in &paths {
+                self.batch_of.insert((distro.clone(), p.clone()), i);
+            }
+            self.batches.push((distro, paths));
+        }
+    }
+}
+
+/// 分批：按给的顺序，同一发行版的接着往当前批里装，装不下（合计会超过 `READ_MANY_MAX_TOTAL`）
+/// 就另起一批。大小不在 `(0, READ_MANY_MAX_EACH]` 里的不收，照旧逐个读。
 ///
 /// 按调用方的顺序装而不是按大小排：调用方按这个顺序逐个扫，一批读回来很快就交完，
 /// 不会把几百 MB 同时留在内存里（QuotaBar 是托盘程序）。
-fn plan_whole_batches(
-    sources: &[SourceRef],
-    answers: &std::collections::HashMap<(String, String), crate::wsl::StatAnswer>,
+fn plan_batches(
+    items: impl IntoIterator<Item = (String, String, u64)>,
 ) -> Vec<(String, Vec<String>)> {
     let mut batches: Vec<(String, Vec<String>, u64)> = Vec::new();
     let mut open: std::collections::HashMap<String, usize> = Default::default();
-    for s in sources {
-        let (SourceMode::AppendLog, SourceLocation::Wsl(distro)) =
-            (s.source_mode, &s.source_location)
-        else {
-            continue;
-        };
-        let path = s.path.to_string_lossy().into_owned();
-        let Some(Ok(Some((size, _)))) = answers.get(&(distro.clone(), path.clone())) else {
-            continue;
-        };
-        let size = *size;
+    for (distro, path, size) in items {
         if size == 0 || size > crate::wsl::READ_MANY_MAX_EACH {
             continue;
         }
         let fits = open
-            .get(distro)
+            .get(&distro)
             .is_some_and(|&i| batches[i].2 + size <= crate::wsl::READ_MANY_MAX_TOTAL);
         if !fits {
             open.insert(distro.clone(), batches.len());
             batches.push((distro.clone(), Vec::new(), 0));
         }
-        let i = open[distro];
+        let i = open[&distro];
         batches[i].1.push(path);
         batches[i].2 += size;
     }
@@ -137,40 +140,130 @@ fn plan_whole_batches(
         .collect()
 }
 
+/// WSL 上的 append-log 来源，按 `sources` 的顺序：`(发行版, 路径)`。
+fn wsl_append_logs(sources: &[SourceRef]) -> impl Iterator<Item = (&str, String)> {
+    sources
+        .iter()
+        .filter_map(|s| match (s.source_mode, &s.source_location) {
+            (SourceMode::AppendLog, SourceLocation::Wsl(distro)) => {
+                Some((distro.as_str(), s.path.to_string_lossy().into_owned()))
+            }
+            _ => None,
+        })
+}
+
+/// [`StatPrefetch::reading_whole`] 的分批：只收 `stat` 到了的原文件。
+fn plan_whole_batches(
+    sources: &[SourceRef],
+    answers: &std::collections::HashMap<(String, String), crate::wsl::StatAnswer>,
+) -> Vec<(String, Vec<String>)> {
+    plan_batches(wsl_append_logs(sources).filter_map(|(distro, path)| {
+        match answers.get(&(distro.to_string(), path.clone())) {
+            Some(Ok(Some((size, _)))) => Some((distro.to_string(), path, *size)),
+            _ => None,
+        }
+    }))
+}
+
+/// 这一轮要整份读的压缩件：身份问到了，而解压后的长度不在缓存里（没算过，或身份变了）。分批。
+fn plan_compressed_reads(
+    sources: &[SourceRef],
+    compressed: &std::collections::HashMap<(String, String), crate::wsl::IdentityAnswer>,
+) -> Vec<(String, Vec<String>)> {
+    plan_batches(wsl_append_logs(sources).filter_map(|(distro, path)| {
+        let Some(Ok(Some(id))) = compressed.get(&(distro.to_string(), path.clone())) else {
+            return None;
+        };
+        let zst = format!("{path}{}", crate::compressed::SUFFIX);
+        cached_compressed_len(&(distro.to_string(), zst.clone()), *id)
+            .is_none()
+            .then(|| (distro.to_string(), zst, id.size))
+    }))
+}
+
+/// 压缩件解压后的长度，键是 `(发行版, .zst 路径)`，以文件身份为准（[`crate::wsl::FileIdentity`]）。
+///
+/// WSL 里的压缩件多数帧头不写解压后的长度（2026-10-29 实测 248 个里 202 个），要知道长度只能整份读回来
+/// 解一遍；不缓存时每轮每个压缩件一次 `wsl.exe`、搬全部字节（实测一轮 282 次、788 MiB、约 1 分钟）。
+/// 压缩件写成后不再变，变了身份必变 —— 身份没变就用上次算的。进程内有效：常驻的宿主只在启动后
+/// 第一轮、以及 Codex 改写过的文件上读。
+type CompressedLengths =
+    std::collections::HashMap<(String, String), (crate::wsl::FileIdentity, u64)>;
+
+fn compressed_lengths() -> &'static std::sync::Mutex<CompressedLengths> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<CompressedLengths>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn cached_compressed_len(key: &(String, String), id: crate::wsl::FileIdentity) -> Option<u64> {
+    let cache = compressed_lengths().lock().ok()?;
+    cache
+        .get(key)
+        .and_then(|(known, len)| (*known == id).then_some(*len))
+}
+
 impl StatPrefetch {
     /// 给这批来源里 WSL 上的 append-log 来源预取，每个发行版问一次。本机来源不预取（本来就便宜）。
     ///
     /// 某个发行版整批没问成，就不给它留答案：那些来源照旧逐个问，与没有预取时一样。
+    ///
+    /// 原文件确认不在的（可能被就地压缩了），再一次问完它们压缩形态的身份（有就每个发行版多一次
+    /// `wsl.exe`）：身份与上次算长度时相同的，不再读它（[`compressed_lengths`]）；不同或没算过的，
+    /// 按发行版分批整份读，用到时才读。
     pub fn for_sources(sources: &[SourceRef], deadline: crate::deadline::Deadline) -> Self {
         let mut by_distro: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
-        for s in sources {
-            if let (SourceMode::AppendLog, SourceLocation::Wsl(distro)) =
-                (s.source_mode, &s.source_location)
-            {
-                by_distro
-                    .entry(distro)
-                    .or_default()
-                    .push(s.path.to_string_lossy().into_owned());
-            }
+        for (distro, path) in wsl_append_logs(sources) {
+            by_distro.entry(distro).or_default().push(path);
         }
         let mut answers = std::collections::HashMap::new();
+        let mut compressed = std::collections::HashMap::new();
         for (distro, paths) in by_distro {
-            match crate::wsl::stat_many(distro, &paths, deadline) {
-                Ok(batch) => answers.extend(
-                    batch
-                        .into_iter()
-                        .map(|(path, answer)| ((distro.to_string(), path), answer)),
-                ),
+            let batch = match crate::wsl::stat_many(distro, &paths, deadline) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    log::warn!(
+                        target: tag::WSL,
+                        "batch stat failed for {distro} ({} sources fall back to one wsl.exe each): {e}",
+                        paths.len()
+                    );
+                    continue;
+                }
+            };
+            let zst: Vec<String> = paths
+                .iter()
+                .filter(|p| matches!(batch.get(*p), Some(Ok(None))))
+                .map(|p| format!("{p}{}", crate::compressed::SUFFIX))
+                .collect();
+            answers.extend(
+                batch
+                    .into_iter()
+                    .map(|(path, answer)| ((distro.to_string(), path), answer)),
+            );
+            match crate::wsl::identify_many(distro, &zst, deadline) {
+                Ok(ids) => compressed.extend(ids.into_iter().map(|(zst, answer)| {
+                    let logical = zst
+                        .strip_suffix(crate::compressed::SUFFIX)
+                        .unwrap_or(&zst)
+                        .to_string();
+                    ((distro.to_string(), logical), answer)
+                })),
                 Err(e) => log::warn!(
                     target: tag::WSL,
-                    "batch stat failed for {distro} ({} sources fall back to one wsl.exe each): {e}",
-                    paths.len()
+                    "batch identify failed for {distro} ({} compressed candidates are read whole one by one): {e}",
+                    zst.len()
                 ),
             }
         }
+        let mut whole = WholeReads {
+            deadline: Some(deadline),
+            ..Default::default()
+        };
+        whole.add(plan_compressed_reads(sources, &compressed));
         Self {
             answers,
-            whole: Default::default(),
+            compressed,
+            whole: std::sync::Mutex::new(whole),
         }
     }
 
@@ -181,31 +274,28 @@ impl StatPrefetch {
     /// 306 次、120 s。批在第一次用到时才读，读完一份交出去一份。只用于从 0 开始的读；大小取本预取
     /// `stat` 到的，没问成的不规划。整批没读成、或读到的比 `stat` 时短（中途被截断），那个来源照旧
     /// 逐个读 —— 截断由逐个读的短读报错处理，与没有预取时一样。
-    pub fn reading_whole(self, sources: &[SourceRef], deadline: crate::deadline::Deadline) -> Self {
+    pub fn reading_whole(
+        mut self,
+        sources: &[SourceRef],
+        deadline: crate::deadline::Deadline,
+    ) -> Self {
         let batches = plan_whole_batches(sources, &self.answers);
-        let mut batch_of = std::collections::HashMap::new();
-        for (i, (distro, paths)) in batches.iter().enumerate() {
-            for p in paths {
-                batch_of.insert((distro.clone(), p.clone()), i);
-            }
-        }
-        Self {
-            whole: std::sync::Mutex::new(WholeReads {
-                batches,
-                batch_of,
-                deadline: Some(deadline),
-                ..Default::default()
-            }),
-            ..self
-        }
+        let whole = self.whole.get_mut().unwrap_or_else(|e| e.into_inner());
+        whole.add(batches);
+        whole.deadline = Some(deadline);
+        self
     }
 
     fn get(&self, distro: &str, abs: &str) -> Option<&crate::wsl::StatAnswer> {
         self.answers.get(&(distro.to_string(), abs.to_string()))
     }
 
-    /// 这个来源整份读到的字节（交出去就不再留）。没规划、批没读成、这一条没读到 ⇒ `None`。
-    fn take_whole(&self, distro: &str, abs: &str) -> Option<Vec<u8>> {
+    fn get_compressed(&self, distro: &str, abs: &str) -> Option<&crate::wsl::IdentityAnswer> {
+        self.compressed.get(&(distro.to_string(), abs.to_string()))
+    }
+
+    /// 这个文件整份读到的内容（交出去就不再留）。没规划、批没读成、这一条没读到 ⇒ `None`。
+    fn take_whole(&self, distro: &str, abs: &str) -> Option<crate::wsl::FileRead> {
         let mut w = self.whole.lock().ok()?;
         let key = (distro.to_string(), abs.to_string());
         let i = *w.batch_of.get(&key)?;
@@ -216,7 +306,7 @@ impl StatPrefetch {
                 Ok(answers) => {
                     for (path, answer) in answers {
                         if let Ok(Some(read)) = answer {
-                            w.contents.insert((batch_distro.clone(), path), read.bytes);
+                            w.contents.insert((batch_distro.clone(), path), read);
                         }
                     }
                 }
@@ -268,9 +358,11 @@ pub fn scan_append_log_prefetched(
                     abs: &abs,
                     deadline,
                     prefetched: prefetch.get(distro, &abs),
+                    prefetched_compressed: prefetch.get_compressed(distro, &abs),
                     whole: prefetch,
                     stored: Default::default(),
                     compressed: Default::default(),
+                    identity: Default::default(),
                 },
                 source,
                 cursor_in,
@@ -665,31 +757,63 @@ struct WslSource<'a> {
     deadline: crate::deadline::Deadline,
     /// 本轮预取到的答案（[`StatPrefetch`]）。批量里这一条没问成（`Err`）就单独再问。
     prefetched: Option<&'a crate::wsl::StatAnswer>,
-    /// 整份读的批（[`StatPrefetch::reading_whole`]）；从 0 开始读时先查它。
+    /// 本轮预取到的压缩形态（`<路径>.zst`）身份：原文件确认不在时才有。
+    prefetched_compressed: Option<&'a crate::wsl::IdentityAnswer>,
+    /// 整份读的批（[`StatPrefetch`]）；从 0 开始读原文件、或读压缩件时先查它。
     whole: &'a StatPrefetch,
     stored: std::cell::Cell<Stored>,
-    /// 压缩形态的全部字节：`stat` 要解压后的长度就得整份读回来，`read_range` 接着用它，
-    /// 不再起第二次 `wsl.exe`。
+    /// 压缩形态的全部字节：`stat` 读回来算了长度的，`read_range` 接着用它，不再起第二次 `wsl.exe`。
     compressed: std::cell::RefCell<Option<Vec<u8>>>,
+    /// 长度取自缓存时那个压缩件的身份：`read_range` 补读字节时核它没变。
+    identity: std::cell::Cell<Option<crate::wsl::FileIdentity>>,
 }
 
 impl WslSource<'_> {
-    /// 原文件不在时问压缩形态：整份读回来（一到两次 `wsl.exe`），在本机算解压后的长度。
+    fn zst(&self) -> String {
+        format!("{}{}", self.abs, crate::compressed::SUFFIX)
+    }
+
+    /// 原文件不在时问压缩形态，答解压后的长度。
     ///
-    /// ⚠️ 每轮每个压缩件都要读一次 —— 预取（`stat_many`）只问原路径，答不出解压后的长度。
-    /// 2026-10-20 本机 WSL 里一个压缩件都没有；它们多起来时按发行版分批读（见 `docs/backlog.md`）。
+    /// 预取问到了它的身份、且与上次算长度时相同 ⇒ 用缓存的长度，不读（字节等 `read_range` 真要用时
+    /// 再读）。否则整份读回来（预取规划的批，或单独一到两次 `wsl.exe`），在本机算；读到的与预取到的
+    /// 身份对得上才记进缓存。预取确认两种形态都不在 ⇒ 直接报不在，不再起进程。
     fn stat_compressed(&self) -> Result<(u64, Option<i64>), String> {
-        let zst = format!("{}{}", self.abs, crate::compressed::SUFFIX);
-        let read = crate::wsl::read_whole(self.distro, &zst, self.deadline)
-            .map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
-        let Some(read) = read else {
-            return Err(format!(
+        let zst = self.zst();
+        let missing = || {
+            format!(
                 "wsl file missing: {}:{} (nor its compressed form)",
                 self.distro, self.abs
-            ));
+            )
+        };
+        let id = match self.prefetched_compressed {
+            Some(Ok(None)) => return Err(missing()),
+            Some(Ok(Some(id))) => Some(*id),
+            Some(Err(_)) | None => None,
+        };
+        let key = (self.distro.to_string(), zst.clone());
+        if let Some(id) = id {
+            if let Some(len) = cached_compressed_len(&key, id) {
+                self.stored.set(Stored::Compressed);
+                self.identity.set(Some(id));
+                return Ok((len, Some(id.mtime)));
+            }
+        }
+        let read = match self.whole.take_whole(self.distro, &zst) {
+            Some(read) => read,
+            None => crate::wsl::read_whole(self.distro, &zst, self.deadline)
+                .map_err(|e| format!("{}:{zst}: {e}", self.distro))?
+                .ok_or_else(missing)?,
         };
         let len = crate::compressed::decoded_len(&mut std::io::Cursor::new(&read.bytes))
             .map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
+        if let Some(id) =
+            id.filter(|id| id.size == read.bytes.len() as u64 && id.mtime == read.mtime)
+        {
+            if let Ok(mut cache) = compressed_lengths().lock() {
+                cache.insert(key, (id, len));
+            }
+        }
         self.stored.set(Stored::Compressed);
         *self.compressed.borrow_mut() = Some(read.bytes);
         Ok((len, Some(read.mtime)))
@@ -713,6 +837,22 @@ impl ByteSource for WslSource<'_> {
 
     fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
         if self.stored.get() == Stored::Compressed {
+            if self.compressed.borrow().is_none() {
+                // 长度取自缓存、字节还没读：现在读，且须仍是 stat 时那一份。
+                let zst = self.zst();
+                let read = crate::wsl::read_whole(self.distro, &zst, self.deadline)
+                    .map_err(|e| format!("{}:{zst}: {e}", self.distro))?
+                    .ok_or_else(|| format!("{}:{zst} is gone", self.distro))?;
+                if let Some(id) = self.identity.get() {
+                    if id.size != read.bytes.len() as u64 || id.mtime != read.mtime {
+                        return Err(format!(
+                            "{}:{zst} changed after it was stat'ed",
+                            self.distro
+                        ));
+                    }
+                }
+                *self.compressed.borrow_mut() = Some(read.bytes);
+            }
             let compressed = self.compressed.borrow();
             let bytes = compressed
                 .as_deref()
@@ -730,7 +870,7 @@ impl ByteSource for WslSource<'_> {
             if let Some(bytes) = self
                 .whole
                 .take_whole(self.distro, self.abs)
-                .and_then(|bytes| whole_prefix(bytes, end))
+                .and_then(|read| whole_prefix(read.bytes, end))
             {
                 return Ok(bytes);
             }
@@ -1955,6 +2095,173 @@ mod tests {
         );
     }
 
+    /// 预取问到：原文件不在，压缩形态的身份是 `id`。
+    fn prefetch_compressed(path: &str, id: crate::wsl::IdentityAnswer) -> super::StatPrefetch {
+        let mut prefetch = super::StatPrefetch::default();
+        prefetch
+            .answers
+            .insert((NO_SUCH_DISTRO.into(), path.into()), Ok(None));
+        prefetch
+            .compressed
+            .insert((NO_SUCH_DISTRO.into(), path.into()), id);
+        prefetch
+    }
+
+    fn scan_path(
+        path: &str,
+        cursor: crate::cursor::Cursor,
+        prefetch: &super::StatPrefetch,
+    ) -> crate::observation::AppendLogObservation {
+        let mut source = wsl_source();
+        source.path = PathBuf::from(path);
+        super::scan_append_log_prefetched(
+            &source,
+            Some(cursor),
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+            prefetch,
+        )
+        .0
+    }
+
+    fn remember_len(path: &str, id: crate::wsl::FileIdentity, len: u64) {
+        super::compressed_lengths()
+            .lock()
+            .unwrap()
+            .insert((NO_SUCH_DISTRO.into(), format!("{path}.zst")), (id, len));
+    }
+
+    const ZST_ID: crate::wsl::FileIdentity = crate::wsl::FileIdentity {
+        size: 40,
+        mtime: 1_700_000_000,
+        ctime: 1_700_000_100,
+    };
+
+    /// WSL 压缩件解压后的长度按身份缓存：身份没变 ⇒ 不读文件（退回去读必然读不成，所以 `Clean`
+    /// 本身就证明没读）；任一项变了 ⇒ 去读。只变 ctime 的也算（Codex 原地改写过，10-29 真机见过）。
+    #[test]
+    fn a_compressed_wsl_file_whose_identity_is_unchanged_is_not_read() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        let path = "/home/u/.codex/sessions/cached.jsonl";
+        remember_len(path, ZST_ID, 100);
+        let obs = scan_path(
+            path,
+            caught_up_cursor(),
+            &prefetch_compressed(path, Ok(Some(ZST_ID))),
+        );
+        assert!(
+            matches!(obs.quality, ParseQuality::Clean { .. }),
+            "{:?}",
+            obs.quality
+        );
+        assert_eq!(
+            (obs.cursor.size, obs.cursor.mtime),
+            (100, Some(ZST_ID.mtime))
+        );
+
+        for changed in [
+            crate::wsl::FileIdentity {
+                ctime: ZST_ID.ctime + 1,
+                ..ZST_ID
+            },
+            crate::wsl::FileIdentity {
+                size: ZST_ID.size + 1,
+                ..ZST_ID
+            },
+            crate::wsl::FileIdentity {
+                mtime: ZST_ID.mtime + 1,
+                ..ZST_ID
+            },
+        ] {
+            let obs = scan_path(
+                path,
+                caught_up_cursor(),
+                &prefetch_compressed(path, Ok(Some(changed))),
+            );
+            let ParseQuality::Unavailable(ScanFailure::Stat(why)) = &obs.quality else {
+                panic!("身份变了却没去读：{changed:?} {:?}", obs.quality);
+            };
+            assert!(why.contains(".jsonl.zst:"), "{why}");
+        }
+    }
+
+    /// 预取确认两种形态都不在 ⇒ 直接报不在，不再去读压缩件。
+    #[test]
+    fn both_forms_confirmed_missing_is_reported_without_reading() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        let path = "/home/u/.codex/sessions/gone.jsonl";
+        let obs = scan_path(
+            path,
+            caught_up_cursor(),
+            &prefetch_compressed(path, Ok(None)),
+        );
+        let ParseQuality::Unavailable(ScanFailure::Stat(why)) = &obs.quality else {
+            panic!("{:?}", obs.quality);
+        };
+        assert!(why.contains("nor its compressed form"), "{why}");
+        assert!(!why.contains(".jsonl.zst:"), "已确认不在还去读了：{why}");
+    }
+
+    /// 长度取自缓存、而这一轮要读字节（游标落后）：补读压缩件 —— 这里读不成，报读失败，
+    /// 不当成「没有新内容」。
+    #[test]
+    fn a_cached_length_still_reads_the_bytes_when_they_are_needed() {
+        use crate::observation::{ParseQuality, ScanFailure};
+        let path = "/home/u/.codex/sessions/behind.jsonl";
+        remember_len(path, ZST_ID, 100);
+        let mut cursor = caught_up_cursor();
+        cursor.safe_offset = 50;
+        let obs = scan_path(path, cursor, &prefetch_compressed(path, Ok(Some(ZST_ID))));
+        let ParseQuality::Unavailable(ScanFailure::Read(why)) = &obs.quality else {
+            panic!("{:?}", obs.quality);
+        };
+        assert!(why.contains(".jsonl.zst:"), "{why}");
+    }
+
+    /// 要整份读的压缩件只有「身份问到了、长度不在缓存里」的那些；按调用方的顺序分批。
+    #[test]
+    fn only_compressed_files_without_a_cached_length_are_planned_for_reading() {
+        let mk = |name: &str| {
+            let mut s = wsl_source();
+            s.path = PathBuf::from(format!("/home/u/.codex/sessions/plan-{name}.jsonl"));
+            s
+        };
+        let sources = [
+            mk("cached"),
+            mk("new"),
+            mk("gone"),
+            mk("unasked"),
+            mk("changed"),
+        ];
+        let path = |s: &SourceRef| s.path.to_string_lossy().into_owned();
+        remember_len(&path(&sources[0]), ZST_ID, 100);
+        remember_len(&path(&sources[4]), ZST_ID, 100);
+        let mut compressed = std::collections::HashMap::new();
+        let key = |s: &SourceRef| (NO_SUCH_DISTRO.to_string(), path(s));
+        compressed.insert(key(&sources[0]), Ok(Some(ZST_ID)));
+        compressed.insert(key(&sources[1]), Ok(Some(ZST_ID)));
+        compressed.insert(key(&sources[2]), Ok(None));
+        compressed.insert(
+            key(&sources[4]),
+            Ok(Some(crate::wsl::FileIdentity {
+                ctime: ZST_ID.ctime + 1,
+                ..ZST_ID
+            })),
+        );
+        assert_eq!(
+            super::plan_compressed_reads(&sources, &compressed),
+            vec![(
+                NO_SUCH_DISTRO.to_string(),
+                vec![
+                    format!("{}.zst", path(&sources[1])),
+                    format!("{}.zst", path(&sources[4])),
+                ]
+            )]
+        );
+    }
+
     /// 实机：QuotaBar 按规则 2 提的三条判据（2026-10-10）。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`。
     ///
     /// 夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读 —— 不往发行版里写，也不从这边删它的文件。
@@ -2322,10 +2629,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 实机：发行版里只剩压缩件时按逻辑路径读，结果与读原文件逐字节相同。预取只问原路径、
-    /// 答不出解压后的长度，所以压缩件多一次 `wsl.exe`（整份读回来，不超过 8 MiB 时一次）。
-    /// 两种形态都不在 ⇒ stat 失败。需 Windows + WSL，且置 `SVAULT_WSL_IT=1`，单独跑
-    /// （`--test-threads=1`）。夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读。
+    /// 实机：发行版里只剩压缩件时按逻辑路径读，结果与读原文件逐字节相同。每轮 `wsl.exe` 次数：
+    /// 第一次见到它 3（批量 stat、批量问压缩件身份、一批整份读）；身份没变的稳态 2（不读）；
+    /// 被改写后 3（重读）；两种形态都不在 2（stat 失败，不去读）。需 Windows + WSL，且置
+    /// `SVAULT_WSL_IT=1`，单独跑（`--test-threads=1`）。夹具建在 Windows 临时目录，发行版经 `/mnt/<盘>` 读。
     #[test]
     #[cfg(windows)]
     fn a_compressed_rollout_reads_the_same_over_wsl_it() {
@@ -2375,9 +2682,23 @@ mod tests {
         );
         std::fs::write(dir.join("z.jsonl.zst"), packed).unwrap();
         std::fs::remove_file(dir.join("z.jsonl")).unwrap();
-        let before = crate::wsl::spawn_count();
-        let compressed = scan(&super::StatPrefetch::for_sources(sources, unbounded()));
-        let spawned = crate::wsl::spawn_count() - before;
+        // 一轮：新的预取 + 从给的游标扫，数这一轮起了几次 wsl.exe。
+        let round = |cursor: Option<crate::cursor::Cursor>| {
+            let before = crate::wsl::spawn_count();
+            let prefetch = super::StatPrefetch::for_sources(sources, unbounded());
+            let obs = super::scan_append_log_prefetched(
+                &src,
+                cursor,
+                None,
+                Profile::Full,
+                no_roots(),
+                unbounded(),
+                &prefetch,
+            )
+            .0;
+            (obs, crate::wsl::spawn_count() - before)
+        };
+        let (compressed, spawned) = round(None);
         assert!(
             matches!(compressed.quality, ParseQuality::Clean { .. }),
             "{:?}",
@@ -2389,10 +2710,38 @@ mod tests {
         );
         assert_eq!(compressed.cursor.safe_offset, plain.cursor.safe_offset);
         assert_eq!(compressed.source_fingerprint, plain.source_fingerprint);
-        assert_eq!(spawned, 2, "1 次批量 stat + 1 次整份读压缩件");
+        assert_eq!(spawned, 3, "批量 stat + 批量问压缩件身份 + 一批整份读");
+
+        // 稳态：身份没变，长度取自缓存，不读压缩件。
+        let (steady, spawned) = round(Some(compressed.cursor.clone()));
+        assert!(
+            matches!(steady.quality, ParseQuality::Clean { .. }),
+            "{:?}",
+            steady.quality
+        );
+        assert!(steady.events.is_empty());
+        assert_eq!(steady.cursor.safe_offset, compressed.cursor.safe_offset);
+        assert_eq!(spawned, 2, "稳态只有两次批量问");
+
+        // Codex 改写了它（这里多一行）：身份变了，重读，只出新的那一行。
+        let longer = format!("{body}{}\n", claude_line("z", "line 300"));
+        let repacked = ruzstd::encoding::compress_to_vec(
+            longer.as_bytes(),
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
+        std::fs::write(dir.join("z.jsonl.zst"), repacked).unwrap();
+        let (rewritten, spawned) = round(Some(steady.cursor.clone()));
+        assert!(
+            matches!(rewritten.quality, ParseQuality::Clean { .. }),
+            "{:?}",
+            rewritten.quality
+        );
+        assert_eq!(rewritten.events.len(), 1);
+        assert_eq!(rewritten.cursor.safe_offset, longer.len() as u64);
+        assert_eq!(spawned, 3, "身份变了：两次批量问 + 一批整份读");
 
         std::fs::remove_file(dir.join("z.jsonl.zst")).unwrap();
-        let gone = scan(&super::StatPrefetch::for_sources(sources, unbounded()));
+        let (gone, spawned) = round(Some(rewritten.cursor.clone()));
         assert!(
             matches!(
                 gone.quality,
@@ -2401,6 +2750,7 @@ mod tests {
             "{:?}",
             gone.quality
         );
+        assert_eq!(spawned, 2, "两种形态都确认不在：不再去读");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
