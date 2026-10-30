@@ -41,8 +41,23 @@
 | WSL `wsl.exe` 桥接（只回传 `safe_offset` 后新字节）           | `usage_facts` / 成本 / ROI 投影（QuotaBar）                         |
 | 项目根解析（`.git` / marker / `cwd` + confidence）            | 游标持久化（消费者各存各的库；`svault` CLI 自带默认实现 `--state`） |
 | 归一化为 `RawEvent`、产出结构化扫描报告                       | LLM 调用、联网                                                      |
+| —                                                             | 反向写回或原地改写各 Agent 原生会话目录（续接 / `resume` 物化归上层） |
 
-内核是**无状态纯函数式**的：不持有数据库、不落盘游标、不发网络、不弹界面。详细来源发现与探测规则见 `SYSTEM_DESIGN.md` §11.2–§11.5（那是本内核的来源契约参考）。
+内核是**无状态纯函数式**的：不持有数据库、不落盘游标、不发网络、不弹界面、不改动上游源文件。详细来源发现与探测规则见 `SYSTEM_DESIGN.md` §11.2–§11.5（那是本内核的来源契约参考）。
+
+### 2.1 外部参考：AgentGit（向后存证据 vs 向前续会话）
+
+> 📌 **外部输入，会过期**：核查 [Einsia/agent-git](https://github.com/Einsia/agent-git) `main` 分支源码（`v0.2.29`，MIT，2026-10-30 查证 `Cargo.toml`、`docs/02_session_store.md`、`src/adapter/`、`src/domain/install/`、`src/commands/resume.rs`），非二手文章转述。
+
+本仓与 AgentGit 都处理 Claude Code / Codex 会话历史，但目标正交：本仓管**「过去发生过什么」**（全自动后台入库、本地端到端加密、多机只读副本、物理擦除传播、Windows ⇄ WSL 路径与项目身份收敛）；AgentGit 管**「怎么从某一步继续跑」**（手动快照、会话分叉、跨运行时恢复）。对照结论：
+
+| 维度 | AgentGit 的做法（源码核实） | 本仓取舍与边界 |
+| --- | --- | --- |
+| **运行时与 Hub 依赖** | 本地每事件拆成单文件存 Git 对象库；`~/.agit/store/` 只存软链不自动兜底上游 30 天清理；本地 `commit` 强制先登录闭源 Hub，服务端持钥（非端到端加密）且只追加不可擦除；源码零 WSL 路径支持；读 Codex `.jsonl.zst` 时 `codex_rollout::restore` 会在原目录解压并**删掉原 `.zst`** | **不安装、不接入其 CLI 或 Hub**。不在真实会话目录运行它，以免原地删 `.zst` 干扰扫描现场或破坏本仓的端到端加密与 `erase` 物理删除契约 |
+| **跨工具恢复与 `RawEvent` 体积** | 核心 IR 极简（不含工具入参、`call_id` 与 `Thinking`），同格式恢复走原始行闭集改写，跨格式恢复（`resume --as`）靠 `enrich.rs` 按行号**回读源 JSONL** 配对入参与输出，并用 `close_open_calls` 补齐末尾悬空工具调用；跨格式损失判定只是 `a.format() != b.format()` 布尔值加固定三行提示 | **不为此扩大 `RawEvent` 存原始 JSONL 行**。单靠总库现有的瘦 `RawEvent`（工具入参只留 `[Tool: <名>]`）不能反向生成原生 `--resume` 文件；实时接力场景源文件仍在盘上，上层编排方若选原生转写路线，按本仓给出的 `(source_location, source_path)` 与路径换算回读源文件、参考其 MIT `src/adapter/` 转换即可；软交接单路线则直接读总库有效视图 |
+| **压缩边界与有效视图（借鉴 ①）** | `LOG`（审计全史）与 `VIEW`（有效上下文，默认自最近一次压缩边界起算）分离；`EventKind` 区分无损过滤（Codex `compacted`）与有损合成摘要（Claude `isCompactSummary: true`，禁止喂给 `merge`、提首条意图时跳过） | **值得借鉴**（见 [backlog.md](backlog.md) G.1）：在解析层标出压缩边界与合成摘要，帮下游切出当前有效窗口，并防止记忆层把模型二手摘要当用户原话重复蒸馏 |
+| **重放血缘防重（借鉴 ②）** | 恢复/分叉在 `link` 与 `meta.json` 记血缘基线 | **上层做原生转写时的硬前提**（见 [backlog.md](backlog.md) G.4）：往原生目录写重放文件必须带血缘标记，让本仓扫描跳过重放段，防重复计 token 与重复入记忆 |
+| **Codex 上游格式线索（借鉴 ③）** | `codex_rollout.rs` 处理 `<thread>_<segment>` 分页续写段（沿 `session_meta.payload.history_base` 拼接）与 `.jsonl.zst` 流式首行早停；`codex_index.rs` 只读查 `state_<N>.sqlite` | **反哺扫描器核查**（见 [backlog.md](backlog.md) G.2、G.3）：核查分段 rollout 是否已在本机 / WSL 出现，以及优化 `session-origin` 压缩件流式早停 |
 
 ## 3. 来源目录（Source Catalog）
 

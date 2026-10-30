@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | 只读打开不迁移 | ✅ 只读子命令走 `open_read_only`；`open_existing` 也改为只读（10-10） | `fe89ce9`、`f268ef5` |
 | 无桌面 Linux 的主密钥 | ✅ `SVAULT_KEY_FILE` | `7b474d4` |
-| 本仓发布 svault | ✅ `scripts/release.py`；已发 `v2026.10.09`、`v2026.10.10`（`6cd6bd1`）。之后的改动**未进发布物** | `83ec9df` |
+| 本仓发布 svault | ✅ `scripts/release.py`；10-10 时已发 `v2026.10.09`、`v2026.10.10`（`6cd6bd1`），后续发布记录统一见 [backlog.md](backlog.md) B 节 | `83ec9df` |
 | ① 每个库带标识 | ✅ `store_id`、`store-info` | `63e75d9` |
 | ② 主密钥导出 / 导入 / 换钥 | ✅ `key-export` / `key-import [--rekey]` | `ac4d85a`、`6cd6bd1` |
 | ③ 合并读取 | ✅ `stores`；`sessions-read` / `sessions-recent --all-stores`；`pull` / `changes` 摘要带 `store_id` | `65dd59f` |
