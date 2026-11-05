@@ -12,6 +12,12 @@
 node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 ```
 
-zstd 检查只涉及 Node 同步原语和已知边界的合成帧，并报告当前 Node 版本、串接读取及截断 checksum 的行为。解压有输出或 codec finish 未抛错都不能单独证明输入完整；`backend_recovery_validated` 明确为 false。
+该离线脚本的 zstd 检查只涉及 Node 同步原语和已知边界的合成帧，并报告当前 Node 版本、串接读取及截断 checksum 的行为。解压有输出或 codec finish 未抛错都不能单独证明输入完整；其 `backend_recovery_validated` 明确为 false。
 
-当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、跨代迁移、真实 backend 的稳定读 / 帧扫描 / 修尾或真实 provider。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§11。
+另运行 [verify-dsh-backend.mjs](../../../scripts/verify-dsh-backend.mjs) 执行 19 组真实 backend 检查。它用最小 Cordis Context 挂载安装版 persistence plugin，复用这里的样本，在本仓 `target` 的全新目录内生成明文 / zstd 日志，验证只读不改文件、原生坏尾恢复、v3 内存迁移、受控 v4 发布、未来代拒绝、追加与缩短，以及明文 / zstd 写路径修尾。脚本保留合成日志目录，报告本次相对路径；不加载 Host / LLM，不写真实日志或总库。
+
+```sh
+node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
+```
+
+当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、0→4 全链迁移、并发竞争窗口、崩溃持久性或真实 provider。顺序交错追加 / 代切换不等于并发压力验收。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§12。
