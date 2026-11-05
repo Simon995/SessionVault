@@ -1,32 +1,26 @@
 # SessionVault
 
-> 共享摄取内核（shared ingestion kernel）+ 不可变 RawEvent 总库。
-> 把"发现各 Agent 本地数据 → 增量扫描 → 归一化为 `RawEvent` → 落入永不删的总库"
-> 这件最容易踩坑的事，**只实现一次**。
+> 共享摄取内核（shared ingestion kernel）+ 加密 RawEvent 总库。
+> 把"发现各 Agent 本地数据 → 增量扫描 → 归一化为 `RawEvent` → 追加保存到总库"
+> 这件最容易踩坑的事，**只实现一次**；用户主动擦除受墓碑与防复活规则保护。
 
-状态：摄取核心已落地（P0 ✅ / P1 ✅ —— 本地 + WSL 双位置摄取、游标持久化端到端实测）；
-P2 绞杀者迁移 **step 1-4 ✅，切换完成、soak 中**（QuotaBar 已改用共享扫描器，闸门 = 原生 vs
-svault 构建 diff `cache.db` 一致后删旧路径；首测 9134 条 usage must-match=0）；**P3 🟡**：
-总库写入侧 `TotalStore` 已落地（QuotaBar 作默认写者，随 QuotaBar 0.8.0-beta.8 发布 soak），
-TumeFlow `svault pull --since` 消费拉取环已通。待办 = P2 soak 删旧路径 + at-rest 加密 / erase
-（P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，非 SessionVault 待办）。
-Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/指纹/入库，TumeFlow 只做语义解析。
-最后更新：**上面这段跨仓状态停在 2026-07-13，可能已过期**；CLI 能力表已于 2026-09-02 核过。
+**现状（2026-11-05 核对）**：Claude Code / Codex 本地与 WSL 摄取、状态快照、总库正文加密、用户擦除、项目归属及多机副本读取已实现。正式发布版本见 [待做清单 B 节](docs/backlog.md#b-发版)；源码中的 `reclaim-rollbacks` 尚未进入最新正式版。
 
-> ⚠️ 跨仓进度（P2 soak 有没有删旧路径、消费方发布到哪一版）**要问那两个仓，不在本仓能确证的范围内** ——
-> 与其猜一个新日期，不如说清这段的时效边界。
+**接下来**：先核 DSH 宿主来源样本，同时与消费方明确临时属性、真实发送方和血缘的可信输入契约，再按兼容方案实现和发布。DSH 正式来源及端到端临时排除尚未交付，不能拿通用 JSONL 实验入口代替；顺序和阻塞只维护在 [待做清单](docs/backlog.md)，职责见 [内核设计](docs/INGEST_KERNEL.md) §2.2。
+
+历史抽取 / 迁移记录保留在下文，均按当时日期理解。消费方的迁移收尾、发布与实际接入由各仓维护，本仓不据历史记录推断它们的当前进度。
 
 ---
 
 ## 是什么
 
 **SessionVault** 是一个独立仓库的 **Rust crate**（`session-vault`）+ CLI（`svault`），
-中立、无头，不属于任何单一消费者。两个产品平等依赖它：
+中立、无头，不属于任何单一消费者。主要消费者包括：
 
 - **[QuotaBar](https://github.com/Simon995/QuotaBar)** —— 配额/用量监控桌面应用，是总库的默认常驻写者。
 - **[TumeFlow](https://github.com/Simon995/TumeFlow)**（记忆流，Memory Flow）—— 本地优先的 Agent 记忆系统：当前认知持续向前演化，历史变化始终可追溯（`supersede ≠ delete`）。从总库物化自己的固化分库。
 
-这样避免两处各写一遍扫描器、各踩一遍 Codex 累计 token / `safe_offset` / WSL 桥 / 路径发现等坑。
+此外，只读 CLI 消费者可使用已发布的原文读取、路径归属和擦除记录出口。消费方自行维护领域索引、记忆和界面；本仓统一扫描与来源语义，避免重复实现 Codex 累计 token / `safe_offset` / WSL 桥 / 路径发现。
 
 ## 现状（已实现）
 
@@ -40,9 +34,9 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                    | ✅ append_log + snapshot_file                 |
 | `compressed`                 | Codex 就地压缩的 `*.jsonl.zst`：按逻辑路径 `*.jsonl` 发现，偏移按解压后的字节算（纯 Rust 解压） | ✅ 2026-10-20 本机 88 个实测                  |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                               | ✅                                            |
-| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute` / `reclaim-rollbacks`；跨运行游标持久化 | ✅ 2026-09-29 核（`reattribute` 2026-10-10 加，`reclaim-rollbacks` 2026-10-29 加） |
+| `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute` / `reclaim-rollbacks`；跨运行游标持久化 | ✅ 源码已实现；`reclaim-rollbacks` 尚未正式发布，其余发布记录见待做清单 B 节 |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`） | ✅ 首测 must-match=0                          |
-| 总库（持久化输出库）         | append-only RawEvent 库                                                                      | 🟡 P3-② 写入侧 `TotalStore` 已落地（soak）    |
+| 总库（持久化输出库）         | 逻辑追加、正文加密、投影读取、墓碑擦除与防复活                                               | ✅ `store` feature                           |
 | snapshot_file                | Claude/Codex memory、rules、项目 instruction 状态快照                                        | ✅ experimental（Windows/WSL + 最新快照查询） |
 | sqlite_store / 其它 provider | 契约预留                                                                                     | ⬜ `planned`                                  |
 
@@ -54,31 +48,28 @@ Class-B `snapshot_file` 主路径已落地：SessionVault 统一发现/读取/�
 | 维度                | 约定                                                                                                                                                                                                        |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **来源目录**        | 声明式单一事实源：要扫哪些 provider、每平台扫哪些路径，集中维护一份（现 Codex / Claude Code，后续 Cursor / Gemini）。                                                                                       |
-| **provider 可扩展** | 加 provider = 加一个描述符 + 一个解析器，消费者代码与 `RawEvent` 契约不动。                                                                                                                                 |
-| **路径可配置**      | 优先级：环境变量 > 用户配置 > 内置候选；前端填一个路径就能扫。                                                                                                                                              |
+| **provider 可扩展** | 扩展描述符与解析器；涉及公开来源类型、字段或值域时，必须核消费方构造、穷举及逐字段读取的兼容性。                                                                                                                                 |
+| **路径可配置**      | 现有配置根环境变量与内置候选；任意宿主 `user_config` / 新增 provider 根仍是设计目标，不能视为现成接口。                                                                                                                                              |
 | **宿主感知路径**    | `pathnorm` 把「裸 Unix 绝对路径如何归属」按宿主平台分叉：Windows 宿主默认 WSL、Unix 原生判 local——修掉了 QuotaBar 内建的「裸 `/abs` 一律当 WSL」假设。Unix 路径语义在 Linux 原生与 WSL 内部共用同一套函数。 |
-| **无状态内核**      | lib 是纯函数 `(目录 + 配置 + 游标) → (事件 + 新游标 + 报告)`：不写库、不落盘、不联网、不弹界面。游标**持久化由宿主负责**——`svault` CLI 提供一个默认实现（`--state` 状态文件）。                             |
-| **RawEvent 契约**   | 归一化事件 schema；去重唯一键 `(source_type, source_location, source_path, source_session_id, seq)`。                                                                                                       |
+| **无状态内核**      | 扫描 / 解析层读来源与游标，返回事件、新游标和报告；不写总库、不持久化游标、不联网。游标由宿主持久化，CLI 提供 `--state`；同仓可选 `store` 组件另管总库。                             |
+| **RawEvent 契约**   | 归一化事件 schema；`seq` 为解析序，跨解析器升级的稳定事件引用使用 `event_key`。当前 DTO 与总库存储身份分别见内核设计 §7 和扫描状态模型。                                                                                                       |
 | **时间语义**        | 每条带 `occurred_at`（对话内时间，冲突裁决权威）+ `time_confidence`；latest-wins 只认 `occurred_at`，不认入库顺序 / offset。                                                                                |
 | **扫描报告**        | 内核无头，但每轮产出结构化 `SourceReport`，由宿主（QuotaBar / TumeFlow）渲染 GUI。                                                                                                                          |
 | **黄金 fixture**    | tricky case 做成样例输入 + 期望输出，消费者升级内核前必须全绿——"坑只有一处"的物理保证。                                                                                                                     |
 
-## 总库 / 分库（P3 🟡）
+## 总库 / 分库
 
-内核之上提供一个可选持久化组件——共享 **RawEvent 总库**（"Vault" 即指这个永不删、不可变的库）。
-**写入侧（P3-②）已落地**：QuotaBar 作默认写者把扫描出的 `RawEvent` append 进 `TotalStore`
-（随 QuotaBar 0.8.0-beta.8 发布 soak）；TumeFlow 经 `svault pull --since` 增量消费的拉取环（P3-③）
-已通。`svault scan-all` 仍把 `RawEvent` 以 NDJSON 吐到 stdout，供无总库的消费者直接接走。
-待办：at-rest 加密 / erase（P3-③ 下游物化 RawEvent→Episode 已在 TumeFlow 落地）。
+扫描内核之上提供可选持久化组件 **RawEvent 总库**（`store` feature）：保存加密的归一化事件、投影与墓碑，不承担下游领域模型。正文加密、旧库迁移、用户擦除及删除防复活已实现，消费方通过 `pull` / `changes` / `sessions-read` 等出口维护自己的索引或记忆。
 
-- **总库（活、最新、中立）**：只存 `RawEvent`，append-only 不可变，**默认永不删 / 不压缩 / 不过期**
-  （用户主动删除是一等操作，见 TumeFlow ADR-027）；以 `full` 物化（含正文）；QuotaBar 常驻当默认写者。
+`svault scan-all` 默认输出 NDJSON 事件与报告；带 `--write-store` 才写总库，此时以写入报告替代逐条事件输出。原始总库留在来源主机的使用方式，与复制整库作为只读副本的方式分别按契约接入，后者不是本地读取的前置。
+
+- **总库（活、最新、中立）**：保存 `RawEvent` 与投影、墓碑等存储元数据，默认追加保留，不自动过期；用户主动擦除与受判据保护的旧代回收是显式操作。以 `full` 物化正文，当前未做入库前压缩；QuotaBar 常驻当默认写者。
 - **TumeFlow 分库（物化、固化、可复现）**：按自己节奏从总库增量拉取并物化，两次同步之间冻结，
-  盖复现戳（`总库 offset + RawEvent schema 版本`）；总库不可变 → 给定 offset 永远确定性重建。
+  盖复现戳（`总库 offset + RawEvent schema 版本`）；重建仍须遵守当前投影与墓碑，不能仅凭 offset 假定已擦除的正文永远可恢复。
 
 ## 标准化接口
 
-CLI（NDJSON）与 lib 等价（PyO3 wheel 后置）：
+Rust lib 与 CLI 复用摄取实现，接口粒度不同；PyO3 wheel 尚未交付：
 
 | lib 接口                                          | 用途                                                                                                                                                                 |
 | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -104,10 +95,11 @@ CLI：
   （没读成，**不是**删了）。**判「已删」要凭 `source_gone`，不能凭「不在列表里」** ——
   本仓从没采到的来源也不在列表里。
 
-## 落地路线（绞杀者迁移）
+## 历史落地路线（绞杀者迁移）
 
-SessionVault **不从零写**，而是**抽取 QuotaBar 已实机验证的扫描器**，用绞杀者（strangler-fig）
-迁移改用它，不破坏 QuotaBar 现有功能：
+以下保留 2026-06 至 2026-07 的抽取与迁移记录；P0–P3 是当时的阶段划分，soak 与消费方接入状态不代表今天的进度。当前本仓任务以 [待做清单](docs/backlog.md) 为准，消费方收尾回各仓维护。
+
+SessionVault 起步于抽取 QuotaBar 已实机验证的扫描器，通过绞杀者（strangler-fig）迁移接入：
 
 - **P0 ✅** 冻结黄金语料 + `RawEvent` 定稿
 - **P1 ✅** crate 抽取过语料：本地 + WSL × Claude + Codex 发现/解析/归一化、宿主感知路径规范化、
@@ -124,11 +116,13 @@ project_root)` 随机生成的数据密钥。旧明文/`sv1` 库事务迁移并�
   后续 `append_events` 按墓碑拒绝重扫复活。合成隔离跨进程 E2E 10/10 PASS；正式构建不包含
   fixture 密钥入口。TumeFlow 删除传播与 QuotaBar 双重确认已同步落地。
 
+## 归属修正与旧代回收
+
 `svault reattribute`：把当前投影里「同一个目录的旧写法」的 `project_root`（如旧注册表留下的 UNC 写法）改成注册表现在的写法，受影响的来源各写一代新投影（不读源文件），消费方经 `changes` 收到替换。只改写法、不改归属；注册表里同一个目录有不止一种写法时不改、单列报出。默认只预览，`--apply` 才写（先退出 QuotaBar / TumeFlow）。
 
 `TotalStore::recompute_attribution`（库接口，没有 CLI）：调用方点名一批来源，按每条事件记下的 `cwd` 与当前注册表重算归属三项（`project_root` / `project_root_source` / `workspace_location`）。用的是解析器同一个函数，结果就是拿这份注册表重扫会写下的；有改动的来源各写一代新投影，经 `changes` 可见。给源文件已不在、重扫不了的来源用，还在的来源照旧重扫。
 
-`svault reclaim-rollbacks`：回收回退（源文件变短、被原地改写）留下的旧代里，**每一条**都能在当前代找到内容相同事件的那些；部分覆盖的整代留着（它可能是已消失内容的唯一副本，`gc` 也不碰）。每份旧代一行、最后一行汇总。默认只预览，`--apply` 才删（先备份、先退出 QuotaBar / TumeFlow）；删完要 `VACUUM` 才缩文件。判据与实测见 `docs/storage-growth.md` 第 5 项。
+`svault reclaim-rollbacks`（源码已合并，尚未进入 `v2026.10.29.1` 正式版）：回收回退（源文件变短、被原地改写）留下的旧代里，**每一条**都能在当前代找到内容相同事件的那些；部分覆盖的整代留着（它可能是已消失内容的唯一副本，`gc` 也不碰）。每份旧代一行、最后一行汇总。默认只预览，`--apply` 才删（先备份、先退出 QuotaBar / TumeFlow）；删完要 `VACUUM` 才缩文件。判据与实测见 `docs/storage-growth.md` 第 5 项。
 
 ## 构建
 
@@ -160,6 +154,7 @@ cargo test          # 单测（WSL 实机 IT 需 SVAULT_WSL_IT=1，默认跳过�
 
 ## 文档
 
+- [docs/backlog.md](docs/backlog.md) —— 当前任务顺序、消费影响及源码 / 发布状态；下一步从这里看。
 - [docs/INGEST_KERNEL.md](docs/INGEST_KERNEL.md) —— 完整设计契约（来源目录、provider 扩展、`RawEvent`、游标、扫描报告、总库/分库、黄金语料、落地计划与进度）。
 - [docs/rawevent-reconciliation.md](docs/rawevent-reconciliation.md) —— `RawEvent` 契约 ⇄ QuotaBar 实际扫描器逐字段对账（P0）。
 - [docs/parity-contract.md](docs/parity-contract.md) —— 影子并跑对账契约（P2 step 1）：QuotaBar `usage_facts` ⇄ SessionVault RawEvent(usage) 的序数对齐、must-match/advisory 等价定义、字节边界、首测结果。`parity` 工具：`cargo run --features parity --bin parity -- …`。
@@ -171,7 +166,7 @@ cargo test          # 单测（WSL 实机 IT 需 SVAULT_WSL_IT=1，默认跳过�
 
 ## 分发与版本
 
-Rust **lib**（QuotaBar 原生 cargo 依赖）+ **CLI**（NDJSON 出 stdout，TumeFlow 子进程消费）+ 可选 **PyO3** wheel。
+已交付 Rust **lib**（原生 cargo 依赖）与 **CLI**（NDJSON 出 stdout，跨语言子进程消费）；**PyO3** wheel 后置，尚未交付。
 
 **CLI 二进制由本仓发布**（2026-10-09 起）：`uv run python scripts/release.py <tag>` 在本机编
 Windows 版、在 WSL 里编 Linux 版，逐项验证后试运行结束；加 `--publish` 才打标签、发 GitHub

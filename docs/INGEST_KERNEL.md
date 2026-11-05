@@ -1,30 +1,28 @@
 # SessionVault — 共享摄取内核与 RawEvent 总库
 
-> 🔴 **跨三仓「现状 + 优先级」权威文档在宿主仓：`QuotaBar/docs/MASTER_PLAN.md`。** 本文 §15 的
-> SessionVault 内部 P0-P3 状态仍是 SV 细节准绳；跨仓全局（与 TumeFlow/QuotaBar 衔接、下一步）以 MASTER_PLAN 为准。
+> **本仓当前任务、顺序与发布记录统一见 [backlog.md](backlog.md)**；消费方自己的接入与产品进度回各仓维护。本文保存职责与数据契约，§15 保留历史抽取记录，不再作为当前排期。
 
-状态：摄取核心已落地（P0 ✅ / P1 ✅）；P2 绞杀者迁移 step 1-3 ✅、**step 4 切换完成、soak 中**
-（QuotaBar 已翻默认 `svault_index`，`parse_native` 留作回退；CI 三配置全绿；见 §15 与
-[parity-contract.md](parity-contract.md)）；soak 闸门 = 原生 vs svault 构建 diff `cache.db` → 过后删旧路径；**P3 🟡**：总库写入侧 `TotalStore` 已落地（QuotaBar 默认写者，随 QuotaBar 0.8.0-beta.8 soak）+ TumeFlow `svault pull --since` 消费拉取环已通；ADR-027 C5 技术安全门已完成：`sv2` 按来源/项目分组数据密钥、`sv1→sv2` 迁移、crypto-shred、跨库 erase 传播、防复活与合成隔离跨进程 E2E 10/10 PASS（P3-③ 下游物化 RawEvent→Episode 在 **TumeFlow 侧、已落地**，见 TumeFlow ROADMAP Phase 2）
-最后更新：2026-07-11
+现状（2026-11-05 对照源码整理）：Claude Code / Codex 会话摄取、状态快照、总库正文加密、墓碑擦除、防复活、项目归属及多机只读副本能力已实现。宿主与子 CLI 的新来源、临时排除、真实发送方及血缘契约尚未交付，见 §2.2；源码完成与正式发布的差别见待做清单 B / E。
+
+本文包含现行接口、设计候选与历史记录；标为候选 / 预留的内容不能视为已实现能力。最后整理：2026-11-05。
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
 >
 > - `DECISIONS.md` / `SYSTEM_DESIGN.md` / `INTEGRATION.md` → [TumeFlow `docs/`](https://github.com/Simon995/TumeFlow/tree/main/docs)（ADR-024/025/026 与本内核直接相关；其摘要见本仓 [README](../README.md) 与 [LOGGING.md](LOGGING.md)）。
 > - `SESSION_MEMORY_ARCHITECTURE.md` / `AGENT_MEMORY_POSITION.md` / `LOGGING.md`（QuotaBar 侧）→ [QuotaBar `docs/`](https://github.com/Simon995/QuotaBar/tree/main/docs)。
 >
-> 本仓内的文档为：本文 + [rawevent-reconciliation.md](rawevent-reconciliation.md) + [LOGGING.md](LOGGING.md)。内核独立建仓后，关键 ADR 摘要将固化进本仓，外部仅留链接。
+> 本仓文档导航见 [README](../README.md#文档)；字段对账见 [rawevent-reconciliation.md](rawevent-reconciliation.md)，日志见 [LOGGING.md](LOGGING.md)，当前扫描 / 投影状态见 [scan-state-model.md](scan-state-model.md)。外仓文档是决策背景，不替代本仓现行源码与契约。
 
 ## 1. 定位
 
-**SessionVault** 是一个**独立仓库的 Rust crate**（共享摄取内核 + 不可变 RawEvent 总库），把"发现各 Agent 的本地数据 → 增量扫描 → 归一化为 `RawEvent` → 落入永不删的总库"这件最容易踩坑的事**只实现一次**。QuotaBar 与 TumeFlow 都消费它，避免两处实现悄悄分叉、各踩一遍 Codex 累计 token / `safe_offset` / WSL / 路径发现等坑。
+**SessionVault** 是一个**独立仓库的 Rust crate**（共享摄取内核 + 加密 RawEvent 总库），把"发现各 Agent 的本地数据 → 增量扫描 → 归一化为 `RawEvent` → 追加保存到总库"这件最容易踩坑的事**只实现一次**。总库默认保留，用户擦除与旧代回收受显式判据约束；各消费方复用同一份来源语义，避免 Codex 累计 token / `safe_offset` / WSL / 路径发现逻辑分叉。
 
-- **中立命名 SessionVault**（crate `session-vault`、CLI `svault`），不属于任何一个消费者，两个产品平等依赖。
+- **中立命名 SessionVault**（crate `session-vault`、CLI `svault`），不属于任何一个消费者；消费形状包括 Rust 库、内嵌 CLI 与读取独立发布的 CLI。
 - **声明式来源目录**（§3）是单一事实源：要扫哪些 provider、每个平台扫哪些文件夹/文件，全部集中在内核里维护一份。
-- **provider 可扩展**（§4）：现在是 Codex / Claude Code，后续 Cursor / Gemini 等只增描述符 + 解析器，不改消费者。
-- **路径可配置**（§5）：内置默认路径之外，允许前端/用户填入自定义路径覆盖或补充。
+- **provider 可扩展**（§4）：优先复用描述符与解析器框架；增加公开来源类型、字段或值域必须验证消费者兼容，不能承诺消费者零改动。
+- **路径可配置**（§5）：已有配置根环境变量覆盖；任意宿主 `user_config`、派生配置根与前端设置接线仍是设计目标。
 - **无头（headless）**：内核不带 GUI，但产出标准化**扫描报告**（§10），由宿主（QuotaBar / TumeFlow）渲染界面。
-- 提供 **Rust lib** + 一个吐 **NDJSON 的 CLI**；可选 **PyO3** wheel。
+- 已提供 **Rust lib** + 一个吐 **NDJSON 的 CLI**；**PyO3** wheel 后置，尚未交付。
 - 公开 API = 来源目录 + `RawEvent` 契约 + 无状态游标 + 扫描报告。破坏它 = major 版本。
 - **黄金 fixture 语料**（§11）是它的一致性测试，也是"坑只有一处"的物理保证。
 
@@ -35,15 +33,15 @@
 | 内核负责（唯一一份）                                          | 内核不做（消费者各自负责）                                          |
 | ------------------------------------------------------------- | ------------------------------------------------------------------- |
 | 维护来源目录（provider × 平台 × 路径）                        | 自带 GUI（仅产出扫描报告，宿主渲染）                                |
-| 发现来源（Win / macOS / Linux / WSL；环境变量与用户配置覆盖） | 脱敏 / 敏感信息处理                                                 |
-| 增量字节读、`safe_offset`、坏行 / 半截行处理                  | 写任何数据库                                                        |
+| 发现来源（本地 / WSL；配置根环境变量覆盖）                   | 脱敏 / 敏感信息处理                                                 |
+| 增量字节读、`safe_offset`、坏行 / 半截行处理                  | 下游产品领域数据库（总库另属同仓 `store` 组件）                     |
 | Codex 累计 token parser state                                 | 候选 / 记忆 / Dream（TumeFlow）                                     |
 | WSL `wsl.exe` 桥接（只回传 `safe_offset` 后新字节）           | `usage_facts` / 成本 / ROI 投影（QuotaBar）                         |
-| 项目根解析（`.git` / marker / `cwd` + confidence）            | 游标持久化（消费者各存各的库；`svault` CLI 自带默认实现 `--state`） |
+| 按已知项目根注册表归属；无法判定时保留未知                    | 游标持久化（消费者各存各的库；`svault` CLI 自带默认实现 `--state`） |
 | 归一化为 `RawEvent`、产出结构化扫描报告                       | LLM 调用、联网                                                      |
 | —                                                             | 反向写回或原地改写各 Agent 原生会话目录（续接 / `resume` 物化归上层） |
 
-内核是**无状态纯函数式**的：不持有数据库、不落盘游标、不发网络、不弹界面、不改动上游源文件。详细来源发现与探测规则见 `SYSTEM_DESIGN.md` §11.2–§11.5（那是本内核的来源契约参考）。
+上述边界指**扫描 / 解析层**：读取来源与调用方给出的游标、注册表，返回事件、新游标及报告；不持有总库、不持久化游标、不发网络、不弹界面、不改动上游源文件。同仓 `TotalStore`（`store` feature）另管持久化，CLI 负责编排。来源探测与项目归属以本仓源码及 [project-attribution.md](project-attribution.md) 为准；外仓 `SYSTEM_DESIGN.md` 的旧章节仅作设计背景。
 
 ### 2.1 外部参考：AgentGit（向后存证据 vs 向前续会话）
 
@@ -81,7 +79,20 @@
 
 ## 3. 来源目录（Source Catalog）
 
-这是内核的核心资产之一：**要扫什么、在哪扫，集中声明一份**，消费者不各自硬编码路径。下表是内置默认；实际路径以"环境变量 > 用户配置 > 内置候选"的顺序探测（§5），存在才扫。所有路径中 `~` / `%USERPROFILE%` 按当前平台展开。
+这是内核的核心资产之一：**要扫什么、在哪扫，集中声明一份**，消费者不各自硬编码路径。已实现的内置描述符以 [`src/catalog.rs`](../src/catalog.rs) 为准，本地配置根按 §5 的环境变量覆盖；来源探测区分存在、不在与无法判定。所有路径中 `~` / `%USERPROFILE%` 按当前平台展开。
+
+**2026-11-05 实现对照**：以下旧来源表还保留了设计候选，并非每一行均已摄取；未列入当前描述符的候选不能据此启用。
+
+| 已实现来源 | 形态与状态 |
+| --- | --- |
+| Claude `projects/**/*.jsonl`、`sessions/**/*.jsonl` | `append_log`，`stable` |
+| Claude 全局 `CLAUDE.md`、`projects/**/memory/*.md`、`skills/**/*.md`、`tasks/**/*.json`、`plans/*.md`、`history.jsonl` | `snapshot_file`，`experimental`；history 目前仍是整份指纹快照，增量化见 [backlog.md](backlog.md) E 节 |
+| Codex `sessions/**/*.jsonl`、`archived_sessions/**/*.jsonl` | `append_log`，前者 `stable`、后者 `experimental`；都支持逻辑路径对应 `.zst` |
+| Codex 全局 `AGENTS.md`、`memories/*.md`、`memories/rollout_summaries/*.md`、`memories/extensions/ad_hoc/notes/*.md`、`rules/*.rules`、`skills/**/*.md` | `snapshot_file`，`experimental` |
+| 宿主已确认项目根内的指令文件 | `discover_project_snapshots` 单独发现，不能把全部项目层候选都算作已实现 |
+| 通用 JSONL `sessions/**/*.jsonl` | `append_log`，`experimental`；仅显式设置 `SVAULT_JSONL_DIR` 时发现 |
+
+`sqlite_store` / `opaque_family`、任意派生配置根与其他 provider 仍是预留设计；当前描述符没有 Cursor / Gemini 的可扫描实现。
 
 #### 来源的两个正交属性（架构保险，见 ADR-025）
 
@@ -126,8 +137,8 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 | 类别(kind)  | 相对路径 / glob                                                                                                                            | 含正文 | 说明                                                                                                           |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------ | -------------------------------------------------------------------------------------------------------------- |
 | session     | 来源族=`projects/` **与 `sessions/`** 两根下**递归任意 `*.jsonl`**（已验证实现，非 `projects/<enc>/<uuid>.jsonl` 单一模式）                | 是     | 会话事件流，主数据源。QuotaBar 实证：`.claude/projects` + `.claude/sessions` 两根、`find -name '*.jsonl'` 递归 |
-| memory      | `projects/<项目>/memory/*.md`                                                                                                              | 是     | Auto Memory（v2.1.59+），可被 `autoMemoryDirectory` 改写。注：QuotaBar 现未扫，greenfield                      |
-| history     | `history.jsonl`                                                                                                                            | 是     | 命令历史                                                                                                       |
+| memory      | `projects/<项目>/memory/*.md` | 是 | 已按 `snapshot_file` / `experimental` 摄取；`autoMemoryDirectory` 改写属于待核派生配置根，不能视为已接线 |
+| history     | `history.jsonl` | 是 | 当前按 `snapshot_file` / `experimental` 保存整份；尚未按行增量解析 |
 | instruction | 用户 `<config>/CLAUDE.md`；项目 `./CLAUDE.md`、`./.claude/CLAUDE.md`、`./CLAUDE.local.md`、`./.claude/rules/*.md`；托管 policy（平台相关） | 是     | 只读不改写；须解析 `@import`（≤4 跳）与 rules 的 `paths` 作用域                                                |
 | config      | `<config>/settings.json` 等                                                                                                                | 否     | 仅用于解析 `autoMemoryDirectory` / `cleanupPeriodDays`，不作事件                                               |
 
@@ -141,13 +152,13 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 | agent        | `<config>/agents/*.md`；项目 `./.claude/agents/*.md`                         | snapshot_file | 否             | subagent 定义改系统提示/工具/模型，行为塑形。较可信                                         |
 | skill        | `<config>/skills/**/SKILL.md`（含插件分发载体）                              | snapshot_file | 部分           | `CLAUDE_CODE_SYNC_SKILLS=1` 会下载 skills；程序性记忆。较可信                               |
 | plugin       | `<config>/plugins/**`（marketplaces / cache）                                | opaque_family | 否             | 装了哪些插件/来源；至少读来解析能力面。env `CLAUDE_CODE_PLUGIN_CACHE_DIR` / `_SEED_DIR`。中 |
-| task         | `<config>/tasks/<task-list-id>/**`                                           | opaque_family | 不定           | 跨 compaction/会话的计划状态；格式未公开。env `CLAUDE_CODE_TASK_LIST_ID`。保留来源族        |
+| task         | `<config>/tasks/**/*.json` | snapshot_file | 是 | 已按 `experimental` 摄取，只收 JSON，排除锁 / 游标文件；`CLAUDE_CODE_TASK_LIST_ID` 派生根未接线 |
 | mcp/config   | 项目 `./.mcp.json`；`<config>/settings.json`、项目 `./.claude/settings.json` | snapshot_file | 否             | 解析 MCP / hooks / `autoMemoryDirectory` / worktree 行为，定位真实数据根。中                |
 | worktree     | 项目 `./.claude/worktrees/**`                                                | opaque_family | 间接           | background session 隔离编辑快照；作 provenance，不默认全文摄取。中                          |
 | forensic log | `OTEL_LOG_RAW_API_BODIES=file:<dir>` 指定目录                                | append_log    | 可能含完整正文 | 完整请求/响应落盘；路径全由 env 决定，作"条件来源族"，不写死。高确信存在                    |
 | bg state     | `<config>/` 下未公开 supervisor/background-session state                     | opaque_family | 可能           | 官方确认持久化在 config dir，文件名未公开；保留来源族，不硬编码                             |
 
-> 这些**多数不进 `RawEvent` 正文型事件**，但要作为被扫描、被版本化、可参与路径解析与行为归因的正式来源，否则下游只记住"说了什么"、解释不了"为什么这么做"。
+> 本表是控制面候选与已实现来源的混合记录，当前覆盖以上方实现对照为准。已接入的快照在 `full` 档可产 `RawEvent.content`；未实现来源的发现、配置解析与版本化不能据此宣称完成。
 
 ### 3.3 Codex（status: stable）
 
@@ -224,10 +235,7 @@ agent 会话逐字相同**的摄取路径 —— 同一套物化、去重、游�
  "cwd": "…"}                                   // 可选，参与项目归属
 ```
 
-⚠️ **`timestamp` 不收数字**（unix 毫秒）。内核存原始串、不做时间换算
-（§7：「v0 存原始串，归一到 UTC unix 秒是后续细化」），为一个 provider 引入日期库
-是把成本推给两个互不知情的消费者 —— **换算归写入方**。认不出 ⇒ `occurred_at: None`
-⇒ `time_confidence: low`，**不拿「现在」冒充**。
+⚠️ **输入 `timestamp` 只收字符串，不收数字**（unix 毫秒）。`RawEvent.occurred_at` 保留该串；缺失或类型不符时为 `None`、`time_confidence=low`，不拿「现在」冒充。字符串的时间解析是另一层：本仓已有 `occurred_at_unix_ms` 归一到 UTC 毫秒，无法解析则返回 `None`；不能把输入是字符串等同于已核时间有效。
 
 🔴 **不要把外部对话伪装成 Claude / Codex 的形状塞进它们的根。** 那样零改动就能跑，
 但事件会带着错误的 `source_type` —— **对来源撒谎**，而 provenance 是下游一切判决的
@@ -235,57 +243,44 @@ agent 会话逐字相同**的摄取路径 —— 同一套物化、去重、游�
 
 ## 4. Provider 可扩展性（声明式描述符）
 
-加一个 provider = **加一个描述符 + 一个解析器**，消费者代码与 `RawEvent` 契约不动。描述符形如：
+新增来源优先复用描述符与读取框架；若要增加公开 `SourceType`、字段或值域，仍须按 §2.2 与 [backlog.md](backlog.md) H.7 验证多类消费者。当前数据结构摘要如下，完整字段类型见 [`src/catalog.rs`](../src/catalog.rs)：
 
 ```text
 ProviderDescriptor {
-  provider_id          # claude_code | codex | cursor | gemini | jsonl | ...
-  display_name
-  status               # stable | experimental | planned
-  config_root {        # 每平台候选根 + 环境变量覆盖
-    env_override        # 如 ["CLAUDE_CONFIG_DIR"]
-    windows / macos / linux / wsl   # 候选根路径列表，逐个探测
-  }
-  artifacts [          # 该 provider 下要扫的各类产物
-    { kind, glob, parser, content: bool,
-      source_mode,      # append_log | snapshot_file | sqlite_store | opaque_family（见 §3）
-      cursor_kind,      # byte_offset | fingerprint | sqlite_rowid | none（见 §8）
-      family,           # 稳定来源族 id（两层契约的稳定层）
-      override_setting? }
-    # 例：{ session, "projects/*/*.jsonl",   claude_jsonl, true,  append_log,    byte_offset,  session_log }
-    #     { agent,   ".claude/agents/*.md",   markdown,     false, snapshot_file, fingerprint,  snapshot_instruction }
-    #     { sqlite,  "**/*.sqlite",           codex_sqlite, false, sqlite_store,  sqlite_rowid, sqlite_state }
-  ]
+  source_type
+  name
+  config_dir           # 已解析的本地配置根；通用 JSONL 未设环境变量时为 None
+  artifacts: [Artifact {
+    subdir, glob
+    source_mode
+    status             # stable | experimental | planned，属于 artifact
+    recursive
+    kind               # 快照类别；append_log 为 None
+    may_be_compressed  # 是否允许逻辑路径对应 <path>.zst
+  }]
 }
 ```
 
-- **描述符是数据，不是分支逻辑**：发现器对所有 provider 跑同一套"探测根 → 匹配 glob → 绑定解析器"流程；`source_mode` 决定走哪类读取器与游标，发现/报告框架复用。
-- **解析器是 trait**：`parse(input, cursor, profile) -> (events, cursor)`，`input` 随 `source_mode` 而异（字节窗口 / 快照全文 / SQLite 句柄）。Claude/Codex/通用 JSONL 各实现 `append_log` 一份；快照指令实现 `snapshot_file` 一份；Cursor / Codex SQLite 实现 `sqlite_store` 一份。新增来源**首选只加描述符 + 复用已有 mode 的解析器**，不动公开契约。
-- 新 provider 先入库为 `planned` 描述符（仅占位、不默认扫），补完解析器 + 黄金 fixture（§11）后升级状态。
-- provider 状态与 `RawEvent` 的 `parser_version` 绑定，格式漂移时显式失败而非静默错解。
+- **描述符集中声明读取范围**：发现器复用根探测、文件匹配与来源报告；配置根和 WSL 发现行为以当前实现为准，不因表中列了候选环境变量就视为已支持。
+- **解析按来源类型与形态分派**：当前已有 Claude / Codex / 通用 JSONL 的 append-log 解析及 snapshot-file 读取；并非已交付任意 parser trait / SQLite 插件接口。
+- 新 provider 的流程是先登记候选、补解析与黄金 fixture、再核状态和兼容；`planned` 是占位而非已有可扫描实现。
+- `RawEvent` 当前没有 `parser_version` 字段。解析器升级的稳定引用、投影替换与游标处理按 [`scan-state-model.md`](scan-state-model.md) 核验，不能假定 schema 版本就等于解析器版本。
 
 ## 5. 路径可配置（内置默认 + 用户覆盖）
 
-内核自带默认目录，但**允许前端/用户填路径**，便于非标准安装、便携目录、额外 WSL 发行版或新 provider 抢先接入。优先级（高→低）：
+**现行能力**：本地 Claude 根由 `CLAUDE_CONFIG_DIR` 覆盖默认 `~/.claude`，Codex 根由 `CODEX_HOME` 覆盖默认 `~/.codex`；通用 JSONL 只认 `SVAULT_JSONL_DIR`，没有默认根。当前 `catalog()` / `discover()` 不接收宿主 `user_config` 入参。Windows 的 WSL 来源另行发现，本地根覆盖不能当作 WSL 隔离，见 §13.1.1。
 
-1. **环境变量覆盖**：`CLAUDE_CONFIG_DIR` / `CODEX_HOME` / `CODEX_SQLITE_HOME` / `CLAUDE_CODE_PLUGIN_CACHE_DIR` / `CLAUDE_CODE_PLUGIN_SEED_DIR` / `CLAUDE_CODE_TASK_LIST_ID` 等（来自描述符 `env_override`）。
-2. **用户配置覆盖**：宿主把一份用户配置传给内核，可启用/禁用 provider、增删根路径、登记新 provider 根。
-3. **内置候选**：§3 默认路径，逐个探测，存在才扫。
+**仍待实现的设计目标**：任意宿主配置可启停 provider、增删根路径；需要解析 config/env 的来源走「读配置 → 算真实根 → 派生子来源」。例如 SQLite、插件、任务列表或 profile 的派生根，不因 §3 列了环境变量就视为已接入。路径解析仍应归本仓，消费者不另写同一套推导。
 
-**来源目录不是静态路径表，而是派生路径解析器（derived-path resolver，见 ADR-025）**：有些根要先读一层 config/env 才知道去哪扫（`CODEX_SQLITE_HOME` 决定 SQLite 根、`CLAUDE_CODE_TASK_LIST_ID` 决定任务目录、profile 选择决定 config 层、project trust 决定项目层是否生效）。内核按"读 env/config → 算真实根 → 派生子来源"两段式发现，**把这层逻辑收在内核里**；否则消费者各自塞路径推导，正好违背"坑只有一处"的设计目标。这层是 `discover()`（§9）的职责，仍无状态——config/env 由宿主作入参传入。
-
-用户配置示意（由宿主持有与持久化，内核只读取入参）：
+以下只表达配置需求，**不是现成配置文件格式**；宿主持有和持久化配置，新增公开入参前另定兼容契约：
 
 ```text
-[providers.codex]      enabled=true                                  # 开关
-[providers.cursor]     enabled=true  roots=["D:/Cursor/User"]        # 补一个根
-[providers.claude_code] roots_add=["\\\\wsl$\\Ubuntu-22.04\\home\\me\\.claude"]  # 额外 WSL 根
-[extra_jsonl]          paths=["E:/exports/*.jsonl"]                  # 通用 JSONL 自定义路径
+[providers.codex]       enabled=true
+[providers.cursor]      enabled=true  roots=["D:/Cursor/User"]
+[providers.claude_code]  roots_add=["<extra-config-root>"]
 ```
 
-- 内核**不**自己存配置（无状态原则）：配置由宿主（QuotaBar 设置页 / TumeFlow 配置）保存，每次调用作为入参传入。
-- 这样"前端填一个路径就能扫"对两个产品都成立，且填的逻辑不在内核——内核只认入参，UI 各做各的。
-- 安全：用户新增根仍受授权与排除规则约束（`auth.json`、`.env`、私钥、未授权目录默认排除，见 `SYSTEM_DESIGN.md` §11.2 / §12）。
+授权 UI、启停设置和按来源正文策略由上层控制面接合；当前来源白名单不能替代尚未交付的任意目录授权清单或临时会话排除。
 
 ## 6. 两种抽取档位（profile）
 
@@ -302,44 +297,43 @@ ProviderDescriptor {
 
 ## 7. `RawEvent` 契约
 
+以下为 2026-11-05 对照 [`src/rawevent.rs`](../src/rawevent.rs) 的字段摘要，完整类型与值域以该文件为准：
+
 ```text
-schema_version            # 内核归一化 schema 版本
-source_type               # claude_code | codex | cursor | gemini | jsonl
-source_location           # transcript 文件存储位置：local | wsl:<distro>
-workspace_location        # 项目物理所在：local | wsl:<distro> | wsl（WSL 项目可记在 local transcript 下，与 source_location 不同；QuotaBar 实证有此二分）
-source_mode               # append_log | snapshot_file | sqlite_store（事件来自哪类形态，见 §3）。注：opaque_family 只登记、不产 RawEvent，故此处不含它
-source_path               # 源文件
+schema_version            # RawEvent schema 版本；不等于解析器版本
+source_type               # provider，含已实现与预留枚举值
+source_location           # SourceLocation；as_key() 为 local / wsl:<distro>
+source_path               # 来源逻辑路径；压缩件磁盘上可能只有 <path>.zst
 source_session_id
-seq                       # 文件内单调序号，用于排序 + 去重
-occurred_at               # 事件在对话内发生的时间，UTC unix 秒；冲突裁决(latest-wins)的权威时间
-time_confidence           # occurred_at 可信度：high | low（缺失/不可靠时 low，交下游处理）；【QuotaBar 无此概念，本契约新增——QuotaBar 对无时间戳事件直接丢弃】
-actor                     # user | assistant | tool | system（thinking 不单列 actor，归 assistant，见下 event_type 说明）
-event_type                # message | tool_use | tool_result | usage | meta | config_snapshot（snapshot_file 变更时产出）| thinking（思考/推理块）
-cwd
-project_root              # 解析结果
-project_root_source       # git | marker:<file> | cwd | wsl_cwd | missing_cwd（QuotaBar 实证取值；marker 文件∈{Cargo.toml,package.json,pyproject.toml,go.mod,AGENTS.md,CLAUDE.md}）
-project_root_confidence   # 0.0–1.0
-git_branch
-model                     # 适用时
-effort                    # Codex
-input_tokens
-output_tokens
-cache_creation_tokens
-cache_read_tokens
-tool_name
-result_status
-message_id
-request_id
-parent_ref                # 父事件引用的预留槽位；现有解析器未填（None），不是已交付的父子会话关系，后续契约见 §2.2。
-content                   # 仅 full 档：原始可见正文（未脱敏）；metadata 档为空。【QuotaBar 不持久化正文，仅按需即时解析 + 存折叠 search_text；full 档总库存正文是新建能力，见 §6/§13、rawevent-reconciliation.md】
-content_hash
-raw_reference             # 字节偏移 / 行指针，用于回溯源
-parser_version            # 解析器版本，绑定字段语义
+seq                       # 本次解析的产出序号，增量批次延续；不作跨解析器升级身份
+event_key                 # Option<EventKey>：version / record_fingerprint / slot_ordinal
+source_mode               # 来源形态；sqlite_store 仍预留，opaque_family 不产事件
+cwd                       # 原始会话 cwd
+project_root              # 归属结果；未归属时也可能保留原始路径
+project_root_source       # 归属判定依据；须据此区分已归属与未归属
+workspace_location        # 项目物理位置，与 transcript 的 source_location 分开
+event_type                # message / tool_use / tool_result / usage / meta / config_snapshot / thinking
+actor                     # Option<Actor>，user / assistant / tool / system；不是授权证明
+occurred_at               # Option<String>，保留来源原始时间戳
+time_confidence           # high / low；现行主要按有无 occurred_at 标记，不替代时间解析
+model
+effort
+usage                     # Option<TokenUsage>：input / output / cache_creation / cache_read
+content                   # full 档提取的可见正文；metadata 档为 None
+parent_ref                # 父事件引用预留槽位，现有解析器为 None；会话血缘另见 §2.2
+content_hash              # 快照 SHA-256，用于变更与版本证据
+artifact_kind             # 快照类别，对应 catalog::ArtifactKind；append_log 为 None
+observed_at               # 快照观测时刻，Unix 秒字符串，不冒充 occurred_at
+modified_at               # 快照 mtime，Unix 秒字符串；问不出为 None
+message_id                # Claude 来源适用时
+request_id                # Claude 来源适用时
 ```
 
-去重唯一键 = `(source_type, source_location, source_path, source_session_id, seq)`。`content_hash` 仅用于相似重复检测，不作全局唯一约束（见 `SYSTEM_DESIGN.md` §9.4）。`ingested_at`（入总库时间）与总库 `offset` 由**总库层在 append 时附加**，不由解析内核产出（解析内核无状态，见 §13.1）。
+`RawEvent::dedup_key()` 仍返回 `(source_type, source_location, source_path, source_session_id, seq)` 的字符串，但 `seq` 会随解析器产出组成改变；**跨解析器升级的稳定事件引用使用来源定位、事件类型与 `event_key`**。键缺失表示 v1 遗留或非 append-log 快照，不能补猜成稳定身份。源记录被改写时指纹也会变化，不承诺跨任意上游改写仍是同一条记录。
 
-> **粒度对账（见 `rawevent-reconciliation.md`）**：QuotaBar 只在 **usage 事件**（Claude `type=assistant` 带 usage；Codex `token_count`）产 fact，**用户提问 / 工具结果 / 纯文本助手消息不成事件**，且正文只在即时 transcript 路径上、不落库。本契约的"逐事件 RawEvent（每条消息一事件、含正文、带 `actor`/`event_type`）"是在 QuotaBar 正文抽取函数（`message_from_*_value` / `extract_text`）之上的**升级**：把即时、含正文的 transcript 解析改成持久事件源。`seq` 语义 = 文件内行位序（增量时接已存最大 `seq`+1）。
+`content_hash` 是快照内容证据，不是所有事件的全局唯一键；总库还区分来源版本与投影版本，不能拿 DTO 的旧去重串代替存储身份。投影替换与回退见 [scan-state-model.md](scan-state-model.md)。`ingested_at` 与总库 `offset` 由总库层附加，不由解析内核产出。
+
+> **粒度对账（见 `rawevent-reconciliation.md`）**：QuotaBar 只在 **usage 事件**（Claude `type=assistant` 带 usage；Codex `token_count`）产 fact，**用户提问 / 工具结果 / 纯文本助手消息不成事件**，且正文只在即时 transcript 路径上、不落库。本契约把即时正文解析升级为按事件类型持久化的 `RawEvent`；一条源 JSONL 记录可产多个事件。`seq` 是产出序而非物理行号，增量从游标 `next_seq` 延续；稳定引用另用 `event_key`。
 
 > **thinking / reasoning 建模（闭合 `rawevent-reconciliation.md` §3.3 的取舍）**：思考块（Claude `thinking`、Codex `reasoning.summary[].text`）统一记为 `actor=assistant` + `event_type=thinking`——**不另设 thinking actor**（QuotaBar 的 role=thinking 气泡归一到 actor/event_type 二维）。**opaque（明文不可得）**：Codex `encrypted_content` 等无明文场景，仍产 `thinking` 事件但 `content=None`，表示"推理发生过、无正文"，下游据此区分明文思考与加密思考。黄金语料 §11 已含该用例。
 
@@ -358,48 +352,43 @@ parser_version            # 解析器版本，绑定字段语义
 | --------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | `append_log`    | 每行 `occurred_at`（Claude 顶层 `timestamp` / Codex `value.timestamp`）           | 高（精确点）                                                   |
 | `sqlite_store`  | 行级时间戳（有则用）+ `rowid`/`wal_lsn` 顺序                                      | 中                                                             |
-| `snapshot_file` | 仅"内容变了"（`content_hash` 变）；真实 `valid_from` 被扫描节奏 + 文件 mtime 框住 | 低（近似区间，须带 `valid_from_confidence`，不得伪造成精确点） |
+| `snapshot_file` | `content_hash` 判变，`observed_at` 记观测、`modified_at` 另记 mtime | 低；真实有效期由下游推导，RawEvent 没有 `valid_from_confidence` 字段 |
 | `opaque_family` | 仅 `observed_at`（何时见到）                                                      | 仅 provenance，不进语义时间                                    |
 
 **两条铁律**：
 
 - **文件 mtime 永不作语义时间**：它只用于增量 / 回退检测（§8）；copy / sync / `touch` / WSL 9P 都会搅乱甚至令其倒退，拿来当事件时间必错。
-- **缺失 / 不可信即降级**：点事件 `occurred_at` 缺失 → `time_confidence=low`；snapshot `valid_from` 不确定 → 带 `valid_from_confidence`；一律不默认当"现在"（ADR-020）。`occurred_at` v0 存原始时间串，归一到 UTC unix 秒是后续细化。
+- **缺失 / 不可信不补猜**：点事件缺时间为 `None` / `low`，快照不伪造 `occurred_at`；下游推导有效期时另标不确定性。DTO 保留原始时间串，本仓已有 `occurred_at_unix_ms` 归一为 **UTC 毫秒**供总库排序 / 查询使用，不能按原始字符串字典序比较；无法解析返回 `None`，不能改用入库时刻冒充。
 
 ## 8. 无状态游标 API
 
+当前 `ScanResult` / `Cursor` 字段摘要如下，完整类型见 [`src/cursor.rs`](../src/cursor.rs)；写入总库时还须使用扫描观察与提交规划，不能只凭压缩后的三态状态决定，见 [scan-state-model.md](scan-state-model.md)。
+
 ```text
-scan(source_ref, cursor_in, profile, roots) -> ScanResult {
-  events:     [RawEvent],
-  cursor_out: Cursor,
-  status:     ok | partial | error,
-  error?:     ...
+ScanResult {
+  events: [RawEvent]
+  cursor_out: Cursor
+  status: ok | partial | error
+  report: SourceReport
 }
 
 Cursor {
-  source_path
-  cursor_kind               # byte_offset | fingerprint | sqlite_rowid | none（随 source_mode，见 §3）
-  # —— append_log（cursor_kind=byte_offset）——
-  safe_offset?              # 已安全消费的字节
-  size?                     # 上轮文件大小
-  mtime?
-  # —— snapshot_file（cursor_kind=fingerprint）——
-  content_hash?             # 上轮快照内容哈希；变了才产 config_snapshot 事件
-  # —— sqlite_store（cursor_kind=sqlite_rowid）——
-  last_rowid?               # 或 wal_lsn / 表级 max(ts)
-  schema_fingerprint?       # 表结构指纹，漂移即显式失败
-  # —— provider 专有 ——
-  codex_state? {            # 仅 Codex append_log：累计 token 解析所需（QuotaBar CodexParserState 实证）
-    current_model
-    current_effort
-    current_cwd
-    current_session_id
-    previous_total { input, cached, output }   # 累计 token 三元组（非标量）；delta = last_token_usage 优先，否则 total − previous_total
+  kind                     # byte_offset | fingerprint | sqlite_rowid | no_cursor
+  safe_offset              # u64，已安全消费的字节
+  size                     # u64，上轮逻辑文件大小
+  mtime                    # Option<i64>
+  content_hash             # Option<String>，快照指纹
+  last_rowid               # Option<i64>，SQLite 预留
+  schema_fingerprint       # Option<String>，SQLite 预留
+  codex_state? {
+    current_model, current_effort, current_cwd, current_session_id
+    previous_total { input, cached, output }
   }
+  next_seq                 # 下批事件产出序号；回退重读归零
 }
 ```
 
-游标是**带类型的联合**：`source_mode` 选定 `cursor_kind`，三类形态各用各的推进量，公开契约一次定全，新增来源不再撑破"只有 byte_offset"的假设。
+游标当前是带 `kind` 的结构体，各形态读取相应字段；SQLite 的字段预留不表示对应读取器已实现。来源路径由调用方在游标外关联。
 
 推进规则（与 QuotaBar 实机验证一致）：
 
@@ -409,50 +398,54 @@ Cursor {
    - **一次性全扫**（`cursor_in=None`，影子对账 / 总库首扫）→ **保留好行事件**：没有"下一轮"可重读，丢弃只会平白少数据（一行坏 = 整文件 N 条全丢，比 native `parse_lines` 还差），故跳过坏行、保留前后所有好行，`status=partial`（与"半行 pending"同档：带事件、非 Ok），供上层按需降级而非整文件作废；`safe_offset` 推进到完整行边界（游标推进对一次性调用无意义，调用方丢弃 `cursor_out`）。
      **已知代价**（仅增量路径）：永久损坏的完整行会让该来源停在原地，将来可在游标加 retry 计数做"毒行"跳过（后续阶段；QuotaBar `ROADMAP §E.5.5` 已记此 backlog）。（半截尾行属规则 1 的 pending，不在此列。）
 3. `(mtime, size)` 未变且游标已到尾（byte_offset 满足 `safe_offset >= size`；fingerprint 满足 `content_hash` 未变）时跳过该文件。
-4. **append_log 截断 / 重写 / 压缩检测**（关键）：判据以 **`(mtime, size)` 回退**为准（QuotaBar 实证：缓存 `mtime > 当前` 或 `size <` 缓存即触发 `safe_offset` 归零、全量重建；WSL 侧 `size < known` → Full 重读）。压缩场景如 Codex `history.jsonl` 超 `max_bytes` 丢最旧。重建后用 `(occurred_at, message_id, request_id)` 去重，**不把旧尾当新事件**。（`content_hash` 不用于 append_log 截断判定，仅用于 snapshot_file，见规则 5。）
+4. **append_log 截断 / 重写 / 压缩检测**（关键）：判据以 **`(mtime, size)` 回退**为准（QuotaBar 实证：缓存 `mtime > 当前` 或 `size <` 缓存即触发 `safe_offset` 归零、全量重建；WSL 侧 `size < known` → Full 重读）。压缩场景如 Codex `history.jsonl` 超 `max_bytes` 丢最旧。总库按 `Rollback` / `Reparse` 等提交计划维护来源版本与当前投影，不能只按时间 / 消息 id 合并。写入观察路径还可携带源指纹识别原地改写，见 [scan-state-model.md](scan-state-model.md)；通用 `scan()` 与带指纹观察路径的能力不可混为一谈。
 5. **snapshot_file** — 比 `content_hash`；变了产一条 `config_snapshot` 事件（带新旧哈希），未变跳过。整体重写是常态，不用字节游标。
-6. **sqlite_store** — 先校 `schema_fingerprint`（漂移即显式失败、不静默错解），再按 `last_rowid` / `wal_lsn` 增量取；**不可按字节读**。
+6. **sqlite_store（预留设计）** — 将来先校 schema、再按表级游标增量取，不按字节读；当前不能视为已有可调用读取路径。
 7. **游标由调用方持久化**：QuotaBar 存自己的 `cache.db`，TumeFlow 存自己的库。内核本身不落盘——不同消费者的读取进度互不干扰，无锁竞争。
 
 ## 9. 标准化接口汇总
 
-内核对外是一组稳定调用，CLI（NDJSON）与 lib/PyO3 等价：
+当前 Rust 库与 CLI 复用摄取实现，接口粒度不同；PyO3 尚未交付。以下对应 [`src/lib.rs`](../src/lib.rs)：
 
-| 接口                                          | 入参                                | 出参                                                           | 用途                                                          |
-| --------------------------------------------- | ----------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------- |
-| `catalog()`                                   | （可选 user_config）                | 生效后的 provider 描述符列表                                   | 宿主据此渲染"将扫哪些 provider/路径"与设置页                  |
-| `discover(user_config)`                       | 用户配置 + 平台                     | 发现到的来源清单（path、location、kind、provider、是否已授权） | 首次只发现不读，供用户授权                                    |
-| `scan(source_ref, cursor_in, profile, roots)` | 单来源 + 游标 + 档位 + 项目根注册表 | `ScanResult`（事件 + 新游标 + 状态）                           | 增量摄取主接口。`roots` 空 ⇒ 一致地 `Unattributed`（ADR-050） |
-| `scan_all(user_config, cursors, profile)`     | 全量来源 + 游标表                   | 事件流 + 游标表 + **扫描报告**（§10）                          | 一轮全量增量扫描                                              |
+| 库接口 | 入参 / 结果 | 用途 |
+| --- | --- | --- |
+| `catalog()` | 无入参，返回 `Vec<ProviderDescriptor>` | 当前内置描述符；配置根读取环境变量，尚未接 `user_config` |
+| `discover()` / `discover_local()` | 无入参，返回 `Result<Vec<SourceRef>>` | 全来源发现 / 仅本地发现，不读正文 |
+| `discover_transcripts()` / `discover_snapshots()` | 无入参，返回相应来源清单 | 分开会话与状态制品 |
+| `discover_transcripts_reported(deadline)` | 返回 `DiscoveryOutcome` | 显式报告哪些位置没问成；依发现结果清存量的调用方须用它 |
+| `discover_project_snapshots(roots, deadline)` | 已确认的项目根与预算，返回 `ProjectSnapshotOutcome` | 项目指令快照发现，保留无法探测的状态 |
+| `scan(source, cursor_in, profile, roots)` | `&SourceRef`、`Option<Cursor>`、`Profile`、`Arc<RootRegistry>` → `ScanResult` | 单来源扫描；空注册表表示无法归属，不退回 cwd 猜根 |
 
-- CLI 形态（`svault`）：`svault discover`、`svault scan --source ... --cursor ...`、`svault scan-all --profile metadata|full`，事件走 stdout NDJSON，报告走单独 JSON。
-- 两个消费者用**同一组接口**，差异只在 `profile` 与各自持久化的游标——这是"代码一份、维护一处"的接口面。
+- 一轮编排由 CLI `svault scan-all --profile metadata|full` 提供；没有同名公开 `scan_all(user_config, ...)` 库函数，也没有 `svault scan --source ...` 子命令。
+- `svault discover` 输出来源 NDJSON。`scan-all` 默认将事件、每来源报告与汇总都写到 stdout NDJSON，诊断写 stderr；带 `--write-store` 时不再逐条输出事件，见 §13.1.1。
+- 总库读取、快照、项目归属与擦除等 CLI 另见 [README](../README.md) 及对应主题文档；是否已进正式发布以 [backlog.md](backlog.md) B 节为准。
 
 ## 10. 扫描报告（Scan Report）与 GUI
 
 内核**无头**，但每轮扫描产出结构化报告，宿主据此渲染"扫了哪些文件、各是什么情况"。报告即 GUI 的数据契约：
 
+当前库结构摘要（[`src/report.rs`](../src/report.rs)）；CLI 外层另包装状态、来源标识与 `kind`，不能把下列结构直接当作每条命令的完整线格式：
+
 ```text
+SourceReport {
+  source_path
+  source_mode?, cursor_kind?
+  items_examined, events_emitted, items_skipped
+  fingerprint_changed, schema_changed, rollback_detected
+  bytes_read, pending_tail_bytes
+  warnings: [String]
+}
+ProviderReport {
+  provider, sources_scanned, events_emitted, errors
+  sources: [SourceReport]
+}
 ScanReport {
-  started_at, finished_at, platform
-  providers [
-    { provider_id, status: enabled | skipped | error,
-      roots_probed [ { path, location, exists, source: builtin|user|env } ],
-      sources [
-        { source_path, location, kind, provider_id,
-          # —— 模式无关（任何 source_mode 都有意义）——
-          source_mode, cursor_kind,
-          items_examined, events_emitted, items_skipped,
-          fingerprint_changed,    # snapshot_file：指纹是否变
-          schema_changed,         # sqlite_store：schema 指纹是否漂移
-          rollback_detected,
-          status: ok|partial|skipped|error, error?, last_event_at,
-          # —— append_log 专属（字节口径）——
-          bytes_new, pending_tail_bytes } ],
-      totals { sources, events, bytes_new } } ]
-  warnings [ ... ]   # 路径不存在 / 权限拒绝 / 未授权 / 格式漂移
+  providers: [ProviderReport]
+  total_events, total_errors
 }
 ```
+
+`schema_changed` 等字段保留扩展空间，不表示 SQLite 读取已交付；当前报告没有旧草案中的 `roots_probed`、授权状态或 `started_at` / `finished_at` 字段。
 
 **GUI 放在宿主，不放内核**：
 
@@ -460,13 +453,13 @@ ScanReport {
 - TumeFlow 侧用 CLI 表格或简单 web 视图渲染同一份 `ScanReport` 即可，无需重做采集逻辑。
 - 这样"一个简单 GUI 显示扫描了什么、情况如何"的需求由**共享的报告 schema + 各自的渲染**满足，仍是"代码一份"（采集一份、报告结构一份），渲染按产品风格各做各的。
 
-建议宿主界面至少展示：本轮扫描的 provider 与生效根、每个文件读取的新字节/事件数、跳过/出错原因、未授权与格式漂移告警，以及"前端填路径/启停 provider"的设置入口（写回 §5 的用户配置）。
+建议宿主界面展示已可取得的来源、读取字节 / 事件数及告警，无法探测与确认不在须分开。授权清单、任意根设置及 provider 启停仍需 §5 的控制面设计，不能承诺当前报告已经提供这些字段。
 
 > **`ScanReport`（机器结果）≠ 日志（诊断流水账）**：前者确定性、`return`/序列化给宿主渲染、可进黄金语料断言；后者走 stderr、含 `run_id`/时间等易变量、给人排错。日志规范见 `LOGGING.md`（对齐 QuotaBar `docs/LOGGING.md`：lib 用 `log` 复用宿主 sink、stdout=NDJSON/stderr=日志、正文不进日志；决策见 TumeFlow ADR-026）。
 
 ## 11. 黄金 fixture 语料（一致性套件，必须覆盖）
 
-这是整套架构最值钱的资产：所有 tricky case 做成样例输入 + 期望 `RawEvent` / `ScanReport` 输出，消费者升级内核前必须全绿。
+以下保留一致性用例目标，并非每一条均已有测试。当前已实现路径升级时须跑相关测试；父子树 / 压缩边界、任意配置根、SQLite 等未交付能力的用例是将来开工门槛，不算本轮已验证结果。过时字段名以 §7–§10 的现行结构为准。
 
 - Codex 累计 token 跨多次 append 的 delta 正确性：`last_token_usage` 存在时直接取、缺失时 `total_token_usage − previous_total{input,cached,output}`。
 - Codex `cached = min(delta.cached, delta.input)`、`input_tokens = delta.input − cached` 的拆分正确。
@@ -483,7 +476,7 @@ ScanReport {
 - `workspace_location` ≠ `source_location`：WSL 项目记在 local transcript 下时，前者 `wsl:<distro>`、后者 `local`，不混淆。
 - 迟到入库：旧 `occurred_at` 事件以大 `offset` 追加 → 时间线按 `occurred_at` 重建，`offset` 不当时间用（latest-wins 不被冒充）。
 - `occurred_at` 缺失 / 不可信 → `time_confidence=low`，不默认当"现在"。
-- 项目根 `.git` vs marker vs `cwd` 三种来源 + 对应 confidence。
+- 项目归属按当前注册表判据验证已归属、未归属与无法判定；不再使用旧 `cwd` 兜底或数值 confidence 草案。
 - 文件轮转 / 新会话文件出现 → 增量发现。
 - 超大文件：只读 `safe_offset` 后新字节（尤其 WSL 9P，避免整文件重读）。
 - 来源发现：内置默认 / 用户配置 / 环境变量三种路径来源的优先级与去重。
@@ -509,19 +502,21 @@ ScanReport {
 - **CLI 是跨语言主交付，不是 pip**：内核中立，交付也中立。一个 `svault` 二进制服务所有语言；pip 只解决 Python 一种消费者，却要背 `manylinux × macOS × Windows × 多 Python 版本` 的 wheel 构建矩阵。
 - **CLI 优先的四个理由**：(1) 一个产物服务所有消费者；(2) 给定二进制 = 给定确定内核版本，和"总库 offset + schema 版本"复现戳天然对齐，钉版最干净；(3) 扫描器 panic 只挂子进程，不波及宿主（PyO3 同进程一崩全崩）；(4) 扫描是 I/O 密集批量摄取、非高频小调用热循环，子进程开销被大块读摊薄，且 NDJSON 流贴合 `scan_all`。
 - **pip（PyO3）何时才上**：仅当**实测**出现高频细粒度（逐事件）调用、大正文序列化成热点、或需给第三方干净 `import` API 时，用 `maturin` 把同一份 crate 包成预编译 wheel 传 PyPI——是锦上添花，不替代 CLI。
-- **预编译**：各平台 CLI 走 GitHub Release（Windows / macOS / Linux）；TumeFlow 打包对应二进制随 sidecar 一起发。
+- **预编译**：当前发布脚本构建 Windows / Linux CLI，见 [README 分发与版本](../README.md#分发与版本)；macOS 不在现行发布脚本覆盖范围。内嵌与独立发布的运行时分别核实际提交及所需子命令。
 - **semver**：来源目录、`RawEvent`、`ScanReport`、游标都是公开 API；黄金语料是一致性套件，消费者升级前必须跑。
-- **两个消费者的钉版方式不同**（"submodule" 是源码钉版手段，不是调用方式）：
-  - **QuotaBar（Rust，进程内 lib）**——钉**源码**。抽取期（P1–P2，co-development）用 **git submodule + cargo `path` 依赖**，submodule 的 commit SHA 即版本，方便在 QuotaBar 构建里直接迭代 crate；契约稳定后转 **cargo git `rev` 锁** 或 **crates.io**。QuotaBar 已用 submodule，顺手。
-  - **TumeFlow（Python，子进程 CLI）**——**不** submodule Rust 源码，而是钉 **GitHub Release 的预编译 `svault` 二进制版本**，随 sidecar 打包、运行时子进程调用。仅当将来上 PyO3/pip（ADR-024 后置项）才可能 submodule 源码本地构建 wheel。
+- **消费方钉版形状不同**（2026-11-05 按本仓 `AGENTS.md` 的消费者契约整理；具体已接入提交由各仓核验）：
+  - **Rust 进程内库**：由消费方子模块指针决定编入的源码版本；当前库消费者启用 `store`。
+  - **内嵌 CLI**：从消费方钉住的子模块构建，并冻结进分发包；只重打包、不更新指针，仍是旧版。TumeFlow 属此形状，旧文「不使用子模块、只钉发布物」不再成立。
+  - **独立发布 CLI**：TumeChat 按本仓发布的 `svault` 消费只读出口，2026-10-09 起约定。
+  - 本仓不替消费方更新指针；源码合并后主动通知，正式发布与消费方实际验收另记。
 
 ## 13. 集成形态：上游 RawEvent 总库 + 下游物化分库
 
-解析内核本身无状态（§8 纯函数）。在它之上，SessionVault 仓库再提供一个**可选的持久化组件**——共享 **RawEvent 总库**（SessionVault 名字里的 "Vault" 即指这个永不删、不可变的库），把两个产品的集成收敛成"上游一个活库、下游各自物化"的形态。决策见 ADR-020 / ADR-021。
+解析内核本身不持久化状态（§8）。在它之上，本仓提供**可选持久化组件** `TotalStore`（`store` feature）：保存加密 RawEvent、来源投影与墓碑等元数据，下游各自物化领域视图。默认追加保留，用户擦除与旧代回收按显式判据执行；多机副本与来源主机就地证据两种使用方式的边界见 §2.2。历史决策背景见 ADR-020 / ADR-021。
 
 ### 13.1 总库（活、最新、中立）
 
-- **内容**：只存 `RawEvent` 契约，**append-only 不可变**；不含任何产品的领域表（`usage_facts` / 记忆都不入总库）。
+- **内容**：存 RawEvent 与来源版本 / 投影 / 墓碑等存储元数据；不含产品领域表（`usage_facts` / 记忆都不入总库）。事件默认追加保存，当前投影替换、用户擦除及旧代回收须遵守各自契约。
 - **归属**：SessionVault 仓库（中立），不归 QuotaBar，也不归 TumeFlow。
 - **写者**：谁跑扫描谁写，同一时刻单写者；QuotaBar 常驻，天然当默认写者。开 WAL，读者不挡写。
 
@@ -534,7 +529,7 @@ ScanReport {
   | `BEGIN IMMEDIATE`（rusqlite 默认 DEFERRED） | 事务里**先读后写**时读快照会过期 ⇒ `SQLITE_BUSY`，**而 `busy_timeout` 对这一种无能为力**（等下去快照也不会变新） |
 
   第二条不是理论：`gc_superseded_projections` 正是这个形状（先 `SELECT` 出候选、
-  再在 `if !dry_run` 里写）。规则收在 `store.rs::write_tx()`，**7 个写事务全走它**。
+  再在 `if !dry_run` 里写）。写事务规则收在 `store.rs::write_tx()`，具体调用点随源码核查，不固化历史数量。
 
   ⚠️ **不要在这上面再套一把文件锁。** 那会与 SQLite 自己的锁各管一半，而两套锁的
   边界不重合时**没有任何东西会报错**。**这条对 `scan-all --write-store` 同样成立。**
@@ -549,8 +544,7 @@ ScanReport {
   `two_independent_writers…`；退回 `DEFERRED` 只红 `a_read_then_write…`。
   那正是「两者缺一不可」该有的证据形状。
 
-  写者现在有四个：`scan-all --write-store`（Class-A，见 §13.1.1）/
-  `sync-snapshots`（Class-B）/ `erase` / 直连库的宿主。
+  写入入口包括 `scan-all --write-store`（Class-A，见 §13.1.1）、`sync-snapshots`（Class-B）、`erase`、归属重算与直连库的宿主等；不能把历史列举当成完整写者白名单。
 
 #### 13.1.1 Class-A 的写入口：`svault scan-all --write-store`
 
@@ -592,24 +586,24 @@ svault scan-all --write-store [--store <path>] [--state <path>] [--only <type>].
 
 - **版本**：一直跟随最新内核往前走，方便 QuotaBar 直接读用。
 - **正文**：以 `full` 物化（含正文）。QuotaBar 已放开"不读正文"限制（ADR-021），故总库可承载正文供两边使用。
-- **保留**：**永不删、不压缩、不过期**——总库是证据最终归宿（与 ADR-016 一致）；正因永不删，下游落后可随时全量重建。**注意此默认与本地隐私控制存在张力，必须配套 §13.6 的隐私/删除机制**，否则"证据归宿"会与"用户对本机数据的掌控权"冲突。
+- **保留**：默认追加、不过期，当前未做入库前压缩；用户主动擦除与受保护的旧代回收是例外。下游重建须遵守当前投影和墓碑，不承诺已擦除正文可按旧 offset 恢复；体积事项见 [storage-growth.md](storage-growth.md)。
 - **时间**：每条记录 `occurred_at`（对话内时间，冲突裁决权威）与 `ingested_at`（入库时间，溯源）；`offset` 仅作同步游标，**不代表**时间先后（迟到入库的旧事件 offset 大但 `occurred_at` 旧）。
 
 ### 13.2 TumeFlow 分库（物化、固化、可复现）
 
 - TumeFlow **不直接读活总库**，而是按自己的节奏、钉自己的 `RawEvent` 版本，从总库**增量拉取**并物化成自己的领域分库（Episode / 证据 / 记忆），两次同步之间冻结。
 - 同步用一个**指向总库的游标**（拉到哪条 RawEvent），幂等、可断点续。
-- 分库盖**复现戳**：`总库 offset + RawEvent schema 版本`，评测据此精确重建。
-- 因总库不可变，给定 offset 永远确定性地物化出同一份分库。
-- **两条同步路径**：**增量**（日常拉 offset 之后的新事件，轻）/ **全量重建**（落后过多 / 版本升级 / 分库损坏 / 换钉版本时，从 offset 0 重物化）。总库不可变 → 重建恒为确定性结果，是增量的可靠底座。
+- 历史设计的**复现戳**为 `总库 offset + RawEvent schema 版本`；多库还须区分 `store_id`，事件引用须考虑稳定身份与投影版本。
+- **offset 不冻结内容视图**：重解析会换当前投影，擦除会删除正文；给定旧 offset 不能保证永远重建同一份内容，也不能绕过墓碑恢复已删数据。
+- **两条同步路径**：日常增量与全量重建。按 offset 拉取事件外，下游还要消费投影变更及擦除记录；重建按当时可读的投影与删除状态执行，不能只重放旧事件流。
 - **时间敏感**：记忆冲突裁决（latest-wins，如用户后来更新规则以最新为准）按事件 `occurred_at`，**不按入库顺序 / offset**；详见 `DECISIONS.md` ADR-020 时间语义。
 
 #### 13.2.1 具体命令：`svault pull --since`（P3-③，已落地生产侧）
 
-增量拉取的**跨语言入口**就是 `svault` CLI 的 `pull` 子命令（§12 子进程 + NDJSON 形态，`store` feature 门控）。它把 `TotalStore::read_since` 暴露成带 `offset` 的流，**只读**总库（QuotaBar 是默认写者），游标由调用方（TumeFlow）持久化——符合 §8「内核不落盘游标」与 §14「消费者负责游标」。
+增量拉取的**跨语言入口**是 `svault pull`（`store` feature 门控）。它通过分页读接口输出带 `offset` 的事件流，**只读打开**总库，不建库、不迁移；游标由调用方持久化。每个库单独维护进度，不能把它当成 `--all-stores` 合读或跨主机 RPC。
 
 ```bash
-svault pull [--since <offset>] [--limit <N>] [--store <path>]
+svault pull [--since <offset>] [--limit <N>] [--store <path>] [--projection all|current]
 ```
 
 | 参数      | 默认                                     | 含义                                                                               |
@@ -618,7 +612,9 @@ svault pull [--since <offset>] [--limit <N>] [--store <path>]
 | `--limit` | `0`（不限）                              | 本轮最多吐多少条，把大回填切成有界批次；`0` = 一次拉到追平总库尾。                 |
 | `--store` | `<data_local_dir>/svault/total_store.db` | 总库路径，**与 QuotaBar 写者同址**（宿主集成时通常显式传）。                       |
 
-**stdout NDJSON**（每行一对象，按 `kind` 分流）：
+`--projection` 默认 `all`，保留既有事件流语义；`current` 只读当前投影。只拉当前事件仍不能替代 `changes` 的来源替换通知与 `erasures` 的删除消费。
+
+**stdout NDJSON 示意**（每行一对象，按 `kind` 分流；摘要另带 `store_id` 等当前字段，以命令输出契约为准）：
 
 ```jsonc
 // 每条事件——offset 是消费者持久化的游标 token
@@ -628,7 +624,7 @@ svault pull [--since <offset>] [--limit <N>] [--store <path>]
  "store_max_offset":42,"caught_up":true}
 ```
 
-- **`offset` 单调递增**、墓碑事件（`erase`）在 `read_since` 内被跳过、不出流。
+- **`offset` 单调递增**；被墓碑覆盖的事件不出流，擦除记录另由 `erasures` 消费。分页进度包含已扫描但解码失败的行，不能把一个全坏行窗口的空事件误判成追平。
 - **`caught_up`**：`true` = 已读尽 `since` 之后的可读事件；`false` = 仅因 `--limit` 截断（还有），消费者应带新 `last_offset` 再拉一轮。
 - **退出码**：`0` 正常（含「无新事件」）；`1` 定位/打开/读取失败（库不存在 = 宿主还没扫过一轮）。
 - **坏行容忍**：单条 `event_json` 反序列化失败（schema drift）在 `read_since` 内 skip+warn，不中断整条增量同步（与 `read_session` 的「显式暴露 skipped」策略相反——pull 是流式同步、不能因一行断流）。
@@ -637,8 +633,8 @@ svault pull [--since <offset>] [--limit <N>] [--store <path>]
 
 ### 13.3 为什么同时满足"新"和"稳"
 
-- QuotaBar 要新 → 总库一直最新，直接用。
-- TumeFlow 要稳 → 分库两次 sync 之间冻结；TumeFlow 是**主动拉**，总库升到它尚不支持的大版本时只要不同步过该点，就停在上一个固化版本，**暂停同步而非崩**。
+- 常驻写者推进来源投影，读者使用自己支持的读取契约；持有旧副本、来源暂不可达或本轮写入失败时不能宣称数据必然最新。
+- 下游可暂停主动同步以冻结自己的领域视图，但这不保证旧读者能打开任意新版库。schema / 值域变化仍须验证旧读者与并存写者兼容，缺表列的只读路径显式报 `SchemaBehind`，不能静默当空库。
 
 ### 13.4 独立性退路（铁律）
 
@@ -651,7 +647,7 @@ TumeFlow 运行时不依赖 QuotaBar 是否存在：
 
 ### 13.5 固化管理（GUI 四件套）
 
-分库固化的边界条件已定（见 ADR-020）：总库永不删 → 落后则全量重建；不做多版本并存，只维护单一分库。界面上用四件套管理（"记忆"页，宿主渲染，详见 `INTEGRATION.md` §12）：
+本节保留 ADR-020 的下游界面设计建议，当前产品进度由消费方维护。全量重建须遵守当前投影与擦除状态，不能以「总库永不删」为前提；同步、重建、状态与冻结入口由宿主渲染（历史设计见 `INTEGRATION.md` §12）：
 
 - **自动后台增量同步**（默认开，跟 Dream 节奏）——保持"新"，无需按钮。
 - **"重建记忆库"按钮**（带确认 + 进度）——落后过多 / 版本升级 / 修复时的底座操作。
@@ -660,18 +656,15 @@ TumeFlow 运行时不依赖 QuotaBar 是否存在：
 
 ### 13.6 隐私 / 删除 / 加密（ADR-027 C5 技术安全门已落地）
 
-总库默认 `full`、含正文、永不删——架构上强，但隐私风险也最大。"证据最终归宿"与"用户对本机数据的掌控"必须靠下列机制调和，**否则二者打架**。这些是总库组件的硬要求（解析内核仍无状态、不涉隐私存储）：
+总库默认以 `full` 保存正文，默认保留与主动擦除须同时成立。当前实现与后续产品目标分开：
 
-- **显式授权**：`discover()` 首次只发现不读；每个来源（尤其 `full` 含正文、forensic log、含凭据目录）须经用户显式授权才纳入摄取。
-- **敏感源默认排除**：`auth.json` / `.env` / 私钥 / 凭据面**永不进 RawEvent**（§3.3 已列、§11 有用例）；未授权目录默认不扫。
-- **at-rest 加密**：总库正文落盘应支持加密（密钥归用户/OS keychain，内核不持密钥）。
-- **导出 / 销毁**：提供"导出整库"与"销毁整库 / 按来源删除"两类操作。**永不删是默认保留策略、不是不可删**——用户主动销毁是一等公民操作（与"逻辑 append-only"不矛盾：销毁是用户对物理存储的控制权）。
-- **正文存储档位可配**：除全局 `metadata` / `full`（§6）外，允许**按来源**关正文（只留元数据），满足"想留用量、不想留正文"的折中。
+- **已实现的正文加密**：`sv2` 分组数据密钥、旧库迁移及缺钥匙硬失败，详见 §15 的历史实现记录和 [README](../README.md#主密钥从哪来)。明文索引列仍包含路径、会话 id 等元数据；不把正文加密说成全部元数据均加密。
+- **已实现的用户擦除**：`svault erase` 支持 session / source-path / project-root 作用域，同事务写无正文墓碑、物理删除事件并回收孤立数据密钥；后续写入检查墓碑防复活。`erasures` / `adopt-erasures` 提供跨库删除消费，不自动删除上游日志或下游缓存。
+- **来源范围**：当前按已声明的 artifact 发现，不能把配置根中的任意文件当正文摄取；来源范围白名单不是任意目录授权系统，也不保证正文中的秘密已被识别或脱敏。
+- **尚待产品化的控制面**：任意来源授权清单、整库导出 / 销毁流程及按来源正文开关仍是设计目标，不能据旧草案视为 CLI 已有能力。`scan-all --write-store` 当前明确拒绝 `metadata`，不能拿它模拟临时排除。
+- **新增宿主 / 临时模式**：先补 §2.2 的可信属性、排除与多写者兼容契约；执行授权和记忆筛选归上层。
 
-> 落点：权威决策见 TumeFlow `DECISIONS.md` 的 **ADR-027 隐私与删除**。C5 已实现 `full`
-> 正文 `sv2` 分组密钥加密、敏感源排除、项目/来源销毁、crypto-shred、隔离 E2E 和 QuotaBar
-> 双重确认界面。授权清单、导出与五级删除中尚未产品化的粒度属于后续隐私控制面扩展，不阻塞
-> 当前 C5 技术门，但公开发布仍由产品所有者的独立禁令阻断。
+> 历史决策背景见外仓 ADR-027；旧文中的产品发布限制是当时状态，不能据此阻断本仓当前交付。本仓已正式发布 `svault`，具体发布记录见 [backlog.md](backlog.md) B 节；消费方的独立发布约束由各仓维护。
 
 ## 14. 非目标
 
@@ -683,9 +676,11 @@ TumeFlow 运行时不依赖 QuotaBar 是否存在：
 - ❌ 不把 `planned` provider 的候选路径当稳定接口（须探测 + 验证）。
 - ❌ **解析内核**不持久任何状态——纯函数 `(目录 + 配置 + 游标) → (事件 + 新游标 + 报告)`；持久化是总库组件的事，与解析分层。
 
-## 15. 落地计划（从 QuotaBar 抽取）
+## 15. 历史落地计划（从 QuotaBar 抽取）
 
-SessionVault 不从零写，而是**抽取 QuotaBar 已实机验证的扫描器**；QuotaBar 用绞杀者迁移改用它，不改现有功能。这是当前最高优先级，决策见 ADR-022。
+以下保留抽取阶段及后续按日期补记的记录；P0–P3 状态、消费方分支、soak / CI / 接入结论均按当时理解，本轮未复测，不作为今天的交付清单。本仓当前任务以 [backlog.md](backlog.md) 为准，跨仓进度回各仓维护。
+
+SessionVault 起步于**抽取 QuotaBar 已实机验证的扫描器**，以绞杀者迁移保持原有功能；这是当时的最高优先级，历史决策见 ADR-022。
 
 **核心原则：一个扫描器，总库是它的输出。** 不要先用新代码建总库、却让 QuotaBar 继续跑旧扫描器——那会变成同机两个扫描器（正是本项目要消灭的重复）。先让 QuotaBar 改用共享扫描器，总库只是其额外输出。
 
