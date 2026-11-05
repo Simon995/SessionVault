@@ -136,6 +136,24 @@ FIELDS = frozenset(
         "stream",
         "seq0",
         "time0",
+        "turn",
+        "step",
+        "toolCallId",
+        "isError",
+        "error",
+        "meta",
+        "chunk",
+        "blockType",
+        "block",
+        "dt",
+        "texts",
+        "args",
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+        "totalTokens",
+        "reasoningTokens",
     ]
 )
 ENUM_FIELDS = frozenset({"type", "kind", "role", "op", "operation", "surfaceOp"})
@@ -177,7 +195,9 @@ ENUM_VALUES = frozenset(
         "developer",
         "user/message",
         "assistant/message",
-        "tool/message",
+        "assistant/attempt",
+        "tool/call",
+        "tool/result",
         "system/message",
         "developer/message",
         "session/end-seed",
@@ -195,7 +215,7 @@ ENUM_VALUES = frozenset(
     ]
 )
 SAMPLE_TYPES = frozenset(
-    {"session", "user/message", "assistant/message", "tool/message"}
+    {"session", "user/message", "assistant/message", "tool/result"}
 )
 MAX_SAMPLE_ARRAY_ITEMS = 3
 
@@ -550,6 +570,24 @@ def self_test() -> None:
     )
     assert "user/message" in projected["samples"]
     assert sentinel not in json.dumps(projected)
+    tool_result = {
+        "type": "tool/result",
+        "data": {"message": {"role": "tool", "id": sentinel, "toolCallId": sentinel}},
+    }
+    tool_shape = inspect_records(
+        io.BytesIO(json.dumps(tool_result).encode() + b"\n"), DEFAULT_FILE_BYTES
+    )
+    assert "tool/result" in tool_shape["samples"]
+    assert sentinel not in json.dumps(tool_shape)
+    usage_record = {
+        "type": "assistant/message",
+        "data": {"usage": {"inputTokens": 10, "cacheReadTokens": 0}},
+    }
+    usage_shape = inspect_records(
+        io.BytesIO(json.dumps(usage_record).encode() + b"\n"), DEFAULT_FILE_BYTES
+    )
+    assert usage_shape["fields"]["$.data.usage.inputTokens:number"] == 1
+    assert usage_shape["discriminators"]["$.type=assistant/message"] == 1
     frames = packed + zstandard.ZstdCompressor().compress(line)
     with (
         zstandard.ZstdDecompressor().stream_reader(

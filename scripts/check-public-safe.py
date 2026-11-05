@@ -36,7 +36,19 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKIP_DIRS = {".git", "target", "node_modules", ".idea", ".vscode"}
-TEXT_EXT = {".rs", ".md", ".toml", ".yml", ".yaml", ".json", ".txt", ".sh", ".ps1", ".py"}
+TEXT_EXT = {
+    ".rs",
+    ".md",
+    ".toml",
+    ".yml",
+    ".yaml",
+    ".json",
+    ".txt",
+    ".sh",
+    ".ps1",
+    ".py",
+    ".mjs",
+}
 EXTRA_FILES = {"LICENSE", "README.md"}
 
 # 允许出现在 `/home/X` / `Users/X` 位置上的名字。

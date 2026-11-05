@@ -1,12 +1,12 @@
 # DSH 来源核查与适配判据
 
-> 2026-11-05 第一轮只读核查。安装包源码与本机日志结构已交叉核对；**不是正式 provider、临时排除或可信来源接口的交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
+> 2026-11-05 来源核查。第一轮安装源码与本机日志结构已交叉核对，后续静态 profile 与原生样本 / 字段核对见 §8–§9；**不是正式 provider、临时排除或可信来源接口的交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
 ## 1. 证据范围
 
 - **安装源码**：本机 `@deepseek-ai/dsh` 及下列相关包，已核版本均为 `0.2.1-rc.5`。这是安装包快照，不声称 npm 最新版或上游 `main` 当前仍相同。包元数据指向 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)，查证日期为 2026-11-05。
 - **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。未启动 Host / LLM，未读取凭据配置、回放或调用上游恢复 API，未写上游日志或总库。
-- **未覆盖**：其他 profile 覆写的 root、WSL / 其他机器来源、当前活动 Host 最终采用的配置、原生恢复与迁移的运行时验收。目录存在只能证明这里有日志，不证明它覆盖全部活动来源。
+- **未覆盖**：WSL / 其他机器来源、当前活动 Host 的启动环境及额外 `--patch`、原生恢复与迁移的运行时验收。本机两个 profile 的静态配置已在后续核查中组合，见 §8；这仍不证明覆盖全部活动来源。
 - **工具限制**：探针只统计物理 JSONL、白名单字段形状并输出脱敏结构投影，不解码完整 DSH 事件语义、attempt stream 或有效 surface。`complete` 仅表示本轮流读取未中断；`valid_jsonl` 不代表通过 DSH schema 校验。压缩帧完整性没有独立验证，不能用本轮退出码证明 torn-frame 恢复正确。
 
 ## 2. 本机观察
@@ -59,9 +59,9 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 | --- | --- | --- |
 | root、所选代、header version | 来源实例、逻辑来源与格式代 | 未知代不回退，物理压缩形态不是另一份事实 |
 | `id,createdAt,cwd` | 会话生命周期与项目归属 | 单个 id 不证明生命周期；cwd 不从目录反解 |
-| `type,seq,time,data` | 事件类型、原生顺序、原生时间与内容 | `seq` 不等于行号，跨代迁移可能改变；时间单位仍须逐事件类型核验后映射 |
-| `user/message.data`；其余 message 事件的 `data.message` | 消息、角色、来源与内容 | 保留未知 producer / form，不能把 user 角色当人类证明 |
-| assistant attempt stream / usage | 文本、思考、工具及用量 | 须展开对应 codec，并防止 stream 与最终 message 重复计量；本轮未完成字段级映射 |
+| `type,seq,time,data` | 事件类型、原生顺序、原生时间与内容 | `seq` 不等于行号，跨代迁移可能改变；已核 event / stream 为 epoch 毫秒，不保证墙钟单调，见 §9 |
+| `user/message.data`；system / developer / assistant 消息与 `tool/result` 的 `data.message` | 消息、角色、来源与内容 | 保留未知 producer / form，不能把 user 角色当人类证明；`tool/result` 不是 `tool/message` |
+| assistant attempt stream / usage | 文本、思考、工具及用量 | 已用原生 codec 与合成 fixture 核对主要字段，见 §9；cache 未知与精确 total 的表示仍须在正式适配前解决 |
 | `parentSession,origin,delegationDepth,isSeeded`、`session/end-seed` | 父子关系、继承边界与 own suffix | 有 parent 不等于继承历史；不能直接占用父事件槽位 `parent_ref` |
 | `subagent/descriptor`、父 `subagent/catalog`、`runId` | 子会话与一次执行的不同身份 | external catalog 不保证本地有子日志；展示投影不能替代恢复判据 |
 | `sourceEventSeqs,surfaceOp` | 重放引用与有效视图 | 范围编码须解开；日志全史与当前有效消息分开 |
@@ -99,7 +99,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 - user-role 的人工、注入、agent relay、settlement 与未知来源；可信属性缺失 / 冲突、多写者及记忆缓存不绕过临时范围。
 - CLI / Rust 构造与穷举 / 逐字段读取 / `SourceMode` 过滤兼容；旧版读者与并存写者协调。
 
-建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。开工前补真实配置根确认、合法完整的合成 fixture、文本 / 思考 / 工具 / usage 字段对账，以及 H.1 的可信载体。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因结构探针退出 0 就启用自动入库。
+建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。后续已补静态 profile 根、合法完整的合成 fixture 与主要消息 / 工具 / usage 对账，见 §8–§9。正式实现仍缺活动启动配置证据、损坏 / 迁移 / seed 反例、用量未知状态的保真方案，以及 H.1 的可信载体。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
 
 ## 7. 安装源码索引
 
@@ -114,3 +114,71 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 | S5 | `dsh-session/lib/types/types.d.ts:251,447`；`dsh-session/lib/index.js:1654`；`dsh-session-projection/lib/index.js:263`；`dsh-session-projection-cache/lib/index.js:34,272` | 事实源、surface、可丢弃 cache 与生命周期 |
 | S6 | `dsh-session/lib/types/types.d.ts:408,490`；`dsh-session/lib/types/fork.d.ts:6`；`dsh-subagent/lib/index.js:332,697,1659,2158,2720`；`dsh-subagent/lib/types/descriptor.d.ts:44`；`dsh-subagent/lib/types/catalog.d.ts:19` | seq、父子 / seed、descriptor、catalog 与恢复差别 |
 | S7 | `dsh-session-persistence-jsonl/lib/index.js:782,844`；`dsh-llm/lib/types/message.d.ts:30,95,123,134,166`；`dsh-session/lib/types/types.d.ts:289`；`dsh-subagent/lib/types/continuation-messages.d.ts:11`；`dsh-typert-protocol/lib/types/types.d.ts:352`；`dsh-api-remote-access/lib/types/types.d.ts:12,43`；`dsh-api-session-controller/lib/types/types.d.ts:386` | header、来源与角色、peer / principal、临时属性边界 |
+| S8 | `dsh-app-boot/lib/index.js:61,311,421,529,995,1015,1065,1084,1127,3942,3961`；`dsh/lib/profile-boot-C14i-8IN.js:236`；`dsh-base/cordis.patch.yml:138` | 静态 patch 组合、兼容检查、读取与可能改写 profile 的入口区别 |
+| S9 | `dsh-session/lib/types/types.d.ts:289`；`dsh-session/lib/index.js:1194,1378,1528`；`dsh-llm/lib/types/types.d.ts:45,413`；`dsh-agent-loop/lib/index.js:395,681,1093` | 消息 payload、工具标识、时间与 settlement 分支 |
+| S10 | `dsh-llm/lib/types/assistant-stream.js:31,135,378`；`dsh-llm/lib/types/assembler.js:33,121,155`；`dsh-session-format-v3-to-v4/lib/index.js:314,459,982,1057`；`dsh-session-persistence-jsonl/lib/index.js:1838` | stream 编解码、装配规则、原生恢复与校验边界 |
+| S11 | `dsh-token-meter/lib/types/usage-projection.js:60,91`；`dsh-token-meter/lib/types/turn-usage.js:21,115`；`dsh-llm-deepseek/lib/index.js:1832,2017` | 用量样本选择、重试折叠、完整性与 cache 拆分 |
+
+## 8. 后续核查：静态 profile 的日志根
+
+2026-11-05，用 [inspect-dsh-roots.mjs](../scripts/inspect-dsh-roots.mjs) 显式指定安装包与 home，只读检查本机两个已存在的 profile。工具使用安装版 `composeEntries`、bundle 路径解析与 patch 读取函数，按 bundle → profile → home → 显式 overlay 的顺序组合；不调用可能初始化、清理或改写 profile 的 `loadProfile` / `loadProfileDirectory`，不读取凭据或 settings 文件，也不启动 Host。[S8]
+
+本轮两个 profile 分别声明 3 / 2 个 bundle，均未跳过 bundle、未产生 patch 告警，每份组合均只有一个 JSONL backend，最终 root 都仍是 `dshHomePath('sessions')` 表达式。观测的 17 份文件或缺失状态在检查前后相同；没有输出实际路径、profile 名或其他配置内容。
+
+这证明**当前静态组合仍指向显式 home 下的 sessions**，没有执行 `!!js`，也没有观测活动 Host 的环境或额外启动参数。不能据此推出所有 Host 都使用这份 home；动态 root 表达式、相对根、disabled / 替换 backend、组合告警均单列为未完成状态。
+
+已运行原生 patch 组合反例：默认表达式、后层根覆写、整份 config 替换后缺 root、显式禁用、未知表达式、父 group 动态禁用 / 明确禁用及 backend 替换；检查配置未被原生组合函数原地改变。Node 语法、自检与本机静态检查均退出 0。
+
+## 9. 后续核查：消息、stream 与用量
+
+2026-11-05，新增 [complete-turn.json](../tests/fixtures/dsh-v4/complete-turn.json) 与 [verify-dsh-v4.mjs](../scripts/verify-dsh-v4.mjs)。样本完全合成，包含 10 个事件、五种消息角色和一次完整工具调用关系；已通过安装版 v4 restore、detached `Session.create`、物理 codec 往返及内嵌 stream 往返。它不是上游 Host 实际运行生成的会话，也没有验证真实 provider 的输出。Node 核验共 12 组检查，退出 0。
+
+### 消息与工具
+
+| 事件 | 消息位置 / 关键字段 | 摄取约束 |
+| --- | --- | --- |
+| `user/message` | `data` 就是消息对象 | `role=user` 仍不能证明人类来源 |
+| `system/message` | `data.{turn,step,message}` | 消息 source 为 `system-prompt` |
+| `developer/message` | `data.{turn,step,message,headerSeq?}` | producer 自有 source；tool-addition 引用历史 request/header，不内联工具定义 |
+| `assistant/message` | `data.{turn,step,message,stream,usage?,interrupted?}` | 已提交正文取 message.content；stream 是同一次生成的过程，不能再拼成第二份正文 |
+| `assistant/attempt` | `data.{turn,step,stream}` | 保留失败 / 取消 attempt 的过程，不伪造一条已提交消息 |
+| `tool/call` | `data.{turn,step,callId,name,arguments}` | arguments 是原始 JSON 字符串；call 记录不证明执行成功 |
+| `tool/result` | `data.{turn,step,message,error?,meta?}` | `message.toolCallId = message.source.callId`，对应 assistant 的 tool-call.id；结果有自己的 message id |
+
+合成样本核对了 text、reasoning、tool-call 三类块；工具 id、参数与结果的原生关系错误会被拒绝。image / file / attachment、tool-addition / tool-removal、错误修复结果及 external 子会话仍须另补样本，不能把本轮内容子集当作全部合法 content。[S9][S10]
+
+结构探针同步修正了工具事件白名单：采样实际 `tool/result`，加入 `tool/call`、`assistant/attempt` 与 camelCase 用量字段。第一轮结构探针不解码 DSH 语义的限制仍成立；字段白名单与脱敏输出不承担原生 admission。
+
+### stream 的事实与去重
+
+`text-chunks` / `reasoning-chunks` / `tool-call-chunks` 按 `time0` 与相邻 `dt` 展开，另有单个 `{type:"chunk",time,chunk}`。本轮实跑确认负 `dt` 合法，不能强加单调时间。event.time 为宿主写事件的 epoch 毫秒，stream 时间是宿主收到 chunk 的时间，不是 provider 生成时间。[S9][S10]
+
+原生 assembler 按 index 首次出现顺序装配；首次 block-end 的完整块覆盖累积 delta，此后的 delta / re-close 不再改变该块。取消前缀只保留非空 text / reasoning，max-tokens 也去掉工具调用。本轮已运行这些分支。stream 中多条 usage 由最后一条覆盖，不能逐条相加；message 与 stream 也不能各记一次用量。
+
+**原生 restore 不是完整内容校验器。** 本轮构造的嵌套 `text:123`、负 inputTokens 可通过 native restore + Session.create；raw chunk 的未知 type 可通过 stream 展开，但不能用于装配。本仓验证脚本把 native restore、stream / 字段子集及用量 reducer 分开检查，分别断言这些缺口；它仍不是可供生产摄取的完整 validator。[S10]
+
+### 用量映射与不能压掉的未知
+
+| DSH 字段 | 现有 TokenUsage 的候选字段 | 必须保留的限制 |
+| --- | --- | --- |
+| `inputTokens` | `input` | 与 cache 分桶，不再次扣 cache；已核 DeepSeek adapter 的实际赋值 |
+| `outputTokens` | `output` | 不再把 reasoning 加一次 |
+| `cacheWriteTokens?` | `cache_creation` | 缺失不等于 0 |
+| `cacheReadTokens?` | `cache_read` | 缺失不等于 0 |
+| `reasoningTokens?` | 无独立字段 | 四项映射会丢失拆分 |
+| `totalTokens?` | 无独立字段 | 四项相加不能保证重建原始精确 total |
+
+已跑反例：`inputTokens=10, outputTokens=5, totalTokens=20`，cache 均未报告，严格 reducer 仍能保留精确总量 20 与未知 cache；若缺失 cache 填 0，四项之和只有 15。**正式适配前必须确定如何保留原始 usage / 未知状态及精确 total；不先修改公开类型或 schema。** 缺 usage、缺 turn/end、负值或矛盾 total 应报告不可得，不能生成 0 用量。[S11]
+
+两个原生 reducer 的承诺也要分开：会话投影取外层 message.usage，缺失时取 stream 最后 usage，同一 turn/step 替换槽位，遇匹配 retry-started 后才另加；严格 `deriveTurnTokenUsage` 还要求完整 turn / step / attempt 边界，失败 attempt 也可计入。重试单元样本实测总量 37，但该样本只给 reducer 所读字段，**未声明通过完整 v4 admission**。完整合法 fixture 的总量则为 20，不能混报。[S11]
+
+### 复跑与剩余范围
+
+两个 Node 工具共用 [dsh-installed.mjs](../scripts/dsh-installed.mjs) 的安装版本约束。明确传入自己要核的安装包与 home；不通过全局 CLI 启动 profile，不生成上游配置，不输出配置或会话原文。公开仓扫描闸补入 `.mjs`，使新增脚本也进入身份检查；该闸脚本的 Ruff 检查在本轮修改前后均有相同的 14 条存量诊断，未扩展清理，不能报成全量 Ruff 通过。
+
+```sh
+node scripts/inspect-dsh-roots.mjs --dsh-package '<dsh-package.json>' --home '<DSH_HOME>'
+node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
+```
+
+字段与合成样本准备已取得进展；真实失败 / 重试、附件、seed / 有效视图、坏尾帧与代切换、旧版读者 / 多写者协调仍未验收。活动启动配置、H.1 可信载体、用量保真表示和这些读取反例是后续实现门，运行时适配尚未启用。
