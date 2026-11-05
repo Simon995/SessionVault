@@ -1,12 +1,12 @@
 # DSH 来源核查与适配判据
 
-> 2026-11-05 来源核查。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生合成样本、恢复边界、用量保真草案及原生 backend 验证见 §8–§12。**正式 provider、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
+> 2026-11-05 来源核查。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生合成样本、恢复边界、用量保真草案、原生 backend 与受控并发验证见 §8–§13。**正式 provider、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
 ## 1. 证据范围
 
 - **安装源码**：本机 `@deepseek-ai/dsh` 及下列相关包，已核版本均为 `0.2.1-rc.5`。这是安装包快照，不声称 npm 最新版或上游 `main` 当前仍相同。包元数据指向 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)，查证日期为 2026-11-05。
-- **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。原生 restore、codec 与 reducer 用于完全合成的内存夹具（§9–§10）；原生 backend 只对本仓 `target` 新建目录内的合成文件做读写 / 修尾（§12）。未对真实日志调用恢复 API，未启动 Host / LLM、读取凭据、写真实会话日志或总库。
-- **未覆盖**：WSL / 其他机器来源、当前活动 Host 的启动环境及额外 `--patch`、真实会话恢复、复杂迁移和并发竞争窗口。本机两个 profile 的静态配置已在后续核查中组合，见 §8；这仍不证明覆盖全部活动来源。
+- **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。原生 restore、codec 与 reducer 用于完全合成的内存夹具（§9–§10）；原生 backend 只对本仓 `target` 新建目录内的合成文件做读写 / 修尾（§12–§13）。未对真实日志调用恢复 API，未启动 Host / LLM、读取凭据、写真实会话日志或总库。
+- **未覆盖**：WSL / 其他机器来源、当前活动 Host 的启动环境及额外 `--patch`、真实会话恢复、复杂迁移、无约束并发压力和崩溃持久性。受控双进程窗口见 §13；本机两个 profile 的静态配置见 §8，这仍不证明覆盖全部活动来源。
 - **工具限制**：探针只统计物理 JSONL、白名单字段形状并输出脱敏结构投影，不解码完整 DSH 事件语义、attempt stream 或有效 surface。`complete` 仅表示本轮流读取未中断；`valid_jsonl` 不代表通过 DSH schema 校验。压缩帧完整性没有独立验证，不能用本轮退出码证明 torn-frame 恢复正确。
 
 ## 2. 本机观察
@@ -68,7 +68,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 事件位置不能只靠 `(session_id, seq)` 跨格式升级复用；正式方案至少考虑来源实例、会话生命周期与格式代。是否还能提供跨代稳定映射，须用迁移样例验证，不能由一次并存观察推断。[S4][S6]
 
-读取状态至少区分：完整、可恢复前缀、损坏、未知格式、迁移条件不足、I/O 未知。源码显示明文缺换行的尾行不提交；坏记录后若出现 `turn/end` 会报损坏；压缩尾帧修复还可能缩短物理文件并重写恢复前缀。不能照搬「坏行跳过继续」或「物理压缩 offset 永远只增」的假设。[S3]
+读取状态至少区分：完整、可恢复前缀、读取期间变化、损坏、未知格式、迁移条件不足、I/O 未知与取消。源码显示明文缺换行的尾行不提交；坏记录后若出现 `turn/end` 会报损坏；压缩尾帧修复还可能缩短物理文件并重写恢复前缀。不能照搬「坏行跳过继续」或「物理压缩 offset 永远只增」的假设。[S3] §13 的受控反例进一步说明：本次取得合法前缀与物理来源完整是两条判断，原生 `eventState` 不承担后者。
 
 ## 5. H.1 可信输入契约草案
 
@@ -90,7 +90,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 **首轮结构扫描已执行**：探针自检覆盖未知字段 / 值与正文不泄露、脱敏结构投影、坏 JSON / UTF-8 / 非对象 / 未换行尾部可观察、预算截断、Zstd 多帧、checksum 错、规范代选择、前导零 / 临时名排除、未来代不回退、编码冲突；随后跑本机显式根的结构扫描。另经 CLI 验证缺失根与非目录根分别报告 `absent` / `not_directory`，均退出 2；Ruff 格式与检查、ty 类型检查、公开仓闸、指令预算闸及补丁格式检查通过。ty 显式使用含脚本依赖的解释器及依赖搜索目录。自检走与扫描相同的函数，首轮未启动原生恢复；后续合成原生核验见 §9–§10。未知字段被脱敏并不等于已理解其含义。
 
-**正式适配仍须执行的反例集**：
+**正式适配仍须落到生产路径的反例集**（部分已有下文的合成核查证据，不能代替生产接入验收）：
 
 - 文件名与 header 版本不符、同 id 跨目录、同 id 新生命周期、projectKey 碰撞、实际 profile root 覆写。
 - v0 packed row 展开与跨代引用重映射；v4 内嵌 stream 与最终消息 / usage 不重复；未知 required / ignorable 事件分开。
@@ -99,7 +99,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 - user-role 的人工、注入、agent relay、settlement 与未知来源；可信属性缺失 / 冲突、多写者及记忆缓存不绕过临时范围。
 - CLI / Rust 构造与穷举 / 逐字段读取 / `SourceMode` 过滤兼容；旧版读者与并存写者协调。
 
-建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§12 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾，以及原生 backend 对合成文件的读取、修尾和顺序交错代切换。正式实现仍缺活动启动配置、并发竞争窗口、复杂迁移 / 有效视图样本、§11 用量保真草案的实现与兼容验证，以及 H.1 的可信载体。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
+建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§13 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾，以及双进程受控追加 / 修尾 / 代发布窗口。正式实现仍缺生产读取状态与安全推进位置、活动启动配置、复杂迁移 / 有效视图样本、§11 用量保真草案的实现与兼容验证，以及 H.1 的可信载体；一般并发压力、崩溃及租约争夺仍未验。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
 
 ## 7. 安装源码索引
 
@@ -121,6 +121,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 | S12 | `dsh-agent-loop/lib/index.js:1217,1226`；`dsh-session/lib/types/types.d.ts:218`；`dsh-llm-retry/lib/types/types.d.ts:13`；`dsh-session-format-v3-to-v4/lib/index.js:676` | 请求头 writer、完整 retry payload 与原生配对 |
 | S13 | `dsh-session-format-v1-to-v2/lib/index.js:219,263`；`dsh-session-format-v3-to-v4/lib/index.js:982,1065,1107`；`dsh-session/lib/index.js:1399` | framing 恢复、v4 admission、继承 cut 与 marker |
 | S14 | `dsh-session-persistence-jsonl/lib/index.js:63,103,2488,2644,2839,2980,3626`；`dsh-session-persistence/lib/types/handle.d.ts:52`；`dsh-session-format-v2-to-v3/lib/index.js:533` | 原生 backend 挂载、只读句柄、历史代准备、帧扫描与修尾读取 |
+| S15 | `dsh-session-persistence/lib/types/handle.d.ts:19,38`；`dsh-session-persistence-jsonl/lib/index.js:63,228,1632,1652,2826,2938` | 公开读取结果与并发前缀承诺、长度防倒退、稳定读单次重试、缓存身份及修尾顺序 |
 
 ## 8. 后续核查：静态 profile 的日志根
 
@@ -184,7 +185,7 @@ node scripts/inspect-dsh-roots.mjs --dsh-package '<dsh-package.json>' --home '<D
 node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 ```
 
-字段与合成样本准备已取得进展；后续完整重试、seed 前缀及 codec 恢复反例见 §10，用量保真方案草案见 §11。原生 backend 的合成文件读取 / 修尾与顺序交错代切换见 §12；真实失败 / 重试、附件、compaction / 有效视图、并发竞争窗口及旧版读者 / 多写者协调仍未验收。活动启动配置、H.1 可信载体与这些实现门仍须完成，运行时适配尚未启用。
+字段与合成样本准备已取得进展；后续完整重试、seed 前缀及 codec 恢复反例见 §10，用量保真方案草案见 §11。原生 backend 的合成文件读取 / 修尾见 §12，受控双进程窗口与读取状态反例见 §13；真实失败 / 重试、附件、compaction / 有效视图、一般并发压力及旧版读者 / 多写者协调仍未验收。活动启动配置、H.1 可信载体与这些实现门仍须完成，运行时适配尚未启用。
 
 ## 10. 后续核查：完整重试、继承与恢复边界
 
@@ -284,8 +285,59 @@ node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 
 `SessionHandle.read()` 的公开结果只有事件与事件所有权状态，修尾位置等诊断没有随它返回。**能读出完整 turn 甚至全部逻辑事件，也不证明物理来源无坏尾。** 正式摄取仍需独立保留读取状态和可安全推进的位置，不能仅拿原生 read 的事件数或没有异常当完整性证明。原生 writer 会截断 / 重编码尾帧，物理 offset 不能作为永久只增的事实。[S14]
 
-本轮已验证原生 backend 在合成文件上的读取、受控代切换和写路径修尾；没有验证多进程并发窗口、崩溃持久性、租约争夺、0→4 全链迁移、复杂 fork / compaction、活动配置根、WSL 或真实会话修复。报告明确 `concurrent_races_validated=false`；原有 `verify-dsh-v4.mjs` 的 `backend_recovery_validated=false` 仍只描述该离线 codec 工具，不代表本节没有调用 backend。
+本节脚本验证原生 backend 在合成文件上的读取、受控代切换和写路径修尾，报告的 `concurrent_races_validated=false` 只描述该脚本；新增双进程受控窗口另见 §13。崩溃持久性、租约争夺、0→4 全链迁移、复杂 fork / compaction、活动配置根、WSL 或真实会话修复仍未验证；原有 `verify-dsh-v4.mjs` 的 `backend_recovery_validated=false` 仍只描述该离线 codec 工具，不代表本节没有调用 backend。
 
 ```sh
 node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
+```
+
+## 13. 后续核查：并发窗口与读取状态反例
+
+2026-11-05，新增 [verify-dsh-concurrency.mjs](../scripts/verify-dsh-concurrency.mjs) 和独立进程夹具 [persistence-peer.mjs](../tests/fixtures/dsh-v4/persistence-peer.mjs)。安装版仍为 `0.2.1-rc.5`，Windows、Node `v25.2.1`；21 组检查退出 0。它们验证指定的跨进程窗口与读取结果边界，尚未实现生产读取状态或安全游标。[S15]
+
+### 方法与隔离范围
+
+两个独立 Node 进程分别挂载原生 Cordis backend，正向断言 PID 不同，通过 IPC 请求与回执安排合成日志操作。父进程临时包装公开 `node:fs/promises.readFile` / `truncate`，并用 `syncBuiltinESMExports()` 同步 ESM binding：在真实 I/O 已完成、backend 尚未取得结果时，让另一进程完成指定追加、替换、发布或读取，再继续原生调用。每个窗口断言预定 I/O 已命中及实际次数，避免未触发也算通过；`finally` 恢复方法，超时集中定义为 15 秒，不靠 sleep 猜时序。为使已打开句柄重新进入真实读取，必要时先以同字节替换刷新文件身份并核身份变化。
+
+没有改安装源码、访问私有 backend 状态或复制私有 scanner。父子进程均把操作限制在本仓 `target` 下本次新建运行目录，拒绝链接 / 越界路径，不接受真实 session root。每组释放句柄与 Context，结束时等待自己启动的子进程退出；保留 `target/dsh-concurrency-*` 合成运行物，不递归清理。没有启动 Host / LLM，也没有读取真实日志、凭据或写总库。替换 / 发布由夹具控制，其中未来代用排他硬链接发布；它们不证明任意外部改写都满足原生 append 契约。
+
+### 已实跑的 21 组
+
+前十行分别跑明文 / zstd，共 20 组；历史代发布另 1 组。每次比较完整事件内容与顺序，续读比较精确后缀，不只比较数量。
+
+| 受控场景 | 实跑结果与限制 |
+| --- | --- |
+| 首次 readFile 完成后只追加下一记录 / 帧的 2 字节 | 原生重读一次，仅返回原 10 事件；文件仍有残尾，reader 未修复。补齐后同句柄得到 16 事件，旧逻辑 offset 只返回新增 6 条 |
+| 两次 readFile 后分别追加一个完整 turn | 两次读取均与追加重叠，本次返回 16 事件时磁盘已存在 22 事件；随后续读精确补齐 6 条，全读与 22 事件样本一致 |
+| 另一进程持原生 write 句柄 append + flush | 父进程既有 read 句柄随后读到完整 16 事件及精确新增后缀；该场景未争夺第二份 write 租约 |
+| 首次 readFile 后发布损坏内容 | 明文为坏 JSON 后仍有 turn/end，zstd 为完整帧 checksum 错；第二次读后均报 SessionPersistenceCorruptionError。恢复文件后同句柄可读，失败未变成空成功 |
+| 公开 readFile 屏障注入 EIO | 保留原 `code=EIO`；恢复方法后读取正常、文件未变。这是受控故障注入，不是实测磁盘或权限故障 |
+| 已观察前缀后替换成同事件数的不同正文 | 两种编码均读回改写后的 10 事件；明文物理字节数也相同，zstd 物理字节数不同。事件数防倒退不证明旧内容未变 |
+| 原生 writer 完成 truncate、尚未写回恢复记录 | 明文读者仍取得原前缀；zstd 既有读者因低于已观察前缀而拒绝。writer 完成恢复及追加后，同读者取得完整 16 事件 |
+| v4 的 readFile 已返回，另一进程才发布 v5 | 执行中的读取返回已选 v4 合法前缀；下一次 read 和新 open 均拒绝未知代，没有回退到 v4 |
+| readFile 后追加并取消当前读取 | 保留 AbortError，不返回空成功；下一次未取消的 read 读到完整 16 事件 |
+| 完整文件与带坏尾文件分别读取 | 明文 / zstd 的公开结果均完全相等，键只有 `eventState` / `events`；对照确认物理字节不同且 reader 未修尾 |
+| open 已读到 v3 字节后，另一进程发布含新增 turn 的 v4 | 随后的 handle.read 使用 v4，得到 12 事件，v3 字节未变，stat 为 current。v3 用原生 codec 编码的合法纯文本 turn，不以改 v4 header 冒充 |
+
+### 读取结果不能替代的证据
+
+原生 `read()` 在并发写入时只承诺合法连续前缀；`eventState=shared-frozen` 描述事件所有权，不表示物理完整。稳定读比较文件身份，变化时重试一次；若再次变化，则按第二次读之前的大小返回字节前缀。该分支依赖 append 保持旧前缀的前提。两次追加得到 16 / 22 的实测符合这个边界，不能把“本次没有异常”解释成已追到物理 EOF。[S15]
+
+既有句柄的长度检查能阻止事件数倒退，没有逐事件证明旧前缀内容相同。同事件数改写反例说明：只持久化事件数或 `seq`，下一轮可能漏掉已消费内容的变化。zstd 修尾反例又说明：在已知 writer 修复的窗口内，暂时读不到旧前缀不等于永久损坏；生产路径不能只凭错误字符串把所有缩短归因为修尾，也不能用空结果覆盖已归档前缀。这些是适配约束，不据此定性上游 append 契约有缺陷。
+
+正式读取方案需要分别表达本次是否取得可用前缀、来源是否变化 / 完整以及失败原因，至少守住：
+
+| 判据 | 读取状态 / 推进要求 |
+| --- | --- |
+| 已验证的物理快照完整，或仅恢复出前缀 | 分别报告；当前原生公开结果无法区分，若没有独立证据则完整性保留未知，不能借事件齐全补成完整 |
+| 读取期间追加 / 修尾 / 代发布 | 保留本次选代与来源版本证据；合法旧前缀可与“仍有变化”同时成立，不能冒充已追平 |
+| 旧前缀缩短或内容改写 | 使旧推进凭据失效，重新核对 / 建立投影；不能只凭相同事件数沿用，也不能把未读成当成空会话 |
+| 损坏、未知格式、迁移条件不足、I/O 未知、取消 | 保留各自状态与已有已验证前缀；是否重试另定，失败不自动推进，也不产生空成功 |
+
+安全推进凭据至少绑定来源实例、会话生命周期、格式代、实际已验证前缀及其版本证据；内容改写、代变化和尾部重编码时须验证旧凭据是否仍成立。物理 EOF、旧压缩 offset 或逻辑事件数都不能单独充当该凭据。如何取得独立完整性证据、验证旧前缀及把状态接入 `scan` / 投影替换，仍是下一步实现设计；本轮不新增公开枚举、DTO 或 schema。
+
+报告明确 `controlled_concurrent_windows_validated=true`、`public_physical_completeness_available=false`、`general_stress_validated=false` 与 `crash_durability_validated=false`。无约束压力、崩溃持久性、租约争夺、WSL、0→4 全链迁移、复杂 fork / descriptor / compaction 仍未验；正式 provider、可信临时属性和统一排除仍未交付。
+
+```sh
+node scripts/verify-dsh-concurrency.mjs --dsh-package '<dsh-package.json>'
 ```
