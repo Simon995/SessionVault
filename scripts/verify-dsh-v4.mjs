@@ -9,6 +9,11 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { pathToFileURL } from "node:url";
+import { constants, zstdCompressSync, zstdDecompressSync } from "node:zlib";
+import {
+  seedWithTurn,
+  withRetry,
+} from "../tests/fixtures/dsh-v4/scenarios.mjs";
 import {
   loadDshInstallation,
   SUPPORTED_DSH_VERSION as VERSION,
@@ -170,29 +175,44 @@ async function main() {
     }
   };
   const clone = () => structuredClone(artifact);
-
-  check("native_complete_turn", () => validateFixture(clone()));
-  check("physical_codec_roundtrip", () => {
-    const codec = format.releasedV4SessionFormatCodec;
-    const physicalHeader = codec.encodeHeader(
-      artifact.header,
-      artifact.inheritedEventCount,
+  const codec = format.releasedV4SessionFormatCodec;
+  const encodeRows = (value) =>
+    value.events.map((event) =>
+      JSON.parse(JSON.stringify(codec.encodeEvent(event))),
     );
-    const decoder = codec.createDecoder(physicalHeader, "strict");
+  const decodeRows = (value, rows = encodeRows(value), recovery = "strict") => {
+    const decoder = codec.createDecoder(
+      codec.encodeHeader(value.header, value.inheritedEventCount),
+      recovery,
+    );
     const events = [];
     const context = {
       emitEvent: (event) => events.push(event),
       emitRun: () => assert.fail("v4 packed top-level run"),
     };
-    for (const event of artifact.events)
-      decoder.decodeRow(
-        JSON.parse(JSON.stringify(codec.encodeEvent(event))),
-        context,
-      );
-    decoder.finish(context);
-    assert.deepEqual(decoder.header, artifact.header);
-    assert.deepEqual(events, artifact.events);
-    validateFixture({ ...artifact, events });
+    for (const row of rows) decoder.decodeRow(row, context);
+    return {
+      header: decoder.header,
+      events,
+      inheritedEventCount: decoder.finish(context),
+    };
+  };
+  const retryArtifact = withRetry(artifact);
+  const child = seedWithTurn(artifact, "s1");
+  let concatenatedZstdRead;
+  let tornZstdRead;
+  const usageCases = JSON.parse(
+    readFileSync(
+      new URL("../tests/fixtures/dsh-v4/usage-cases.json", import.meta.url),
+      "utf8",
+    ),
+  );
+
+  check("native_complete_turn", () => validateFixture(clone()));
+  check("physical_codec_roundtrip", () => {
+    const decoded = decodeRows(artifact);
+    assert.deepEqual(decoded, artifact);
+    validateFixture(decoded);
   });
   check("stream_codec_roundtrip", () => {
     const expanded = llm.expandAssistantStream(assistant.data.stream);
@@ -270,32 +290,17 @@ async function main() {
     );
     assert.equal(exact.uncachedInputTokens + exact.outputTokens, 15);
   });
-  check("retry_usage_fold_only", () => {
-    // reducer 单元样本，只给 fold 读的字段；不称为合法 v4 日志。
-    const failedUsage = {
-      inputTokens: 7,
-      outputTokens: 5,
-      cacheReadTokens: 2,
-      cacheWriteTokens: 3,
-      totalTokens: 17,
-      reasoningTokens: 0,
-    };
-    const failed = {
-      type: "assistant/attempt",
-      data: {
-        turn: 1,
-        step: 1,
-        stream: [
-          {
-            type: "chunk",
-            time: 1,
-            chunk: { type: "usage", usage: failedUsage },
-          },
-        ],
-      },
-    };
-    const retry = { type: "llm/retry", data: { turn: 1, step: 1 } };
-    const started = { type: "llm/retry-started", data: { turn: 1, step: 1 } };
+  check("native_complete_retry", () => {
+    validateFixture(retryArtifact);
+    const decoded = decodeRows(retryArtifact);
+    assert.deepEqual(decoded, retryArtifact);
+    validateFixture(decoded);
+    const failed = decoded.events.find(
+      (event) => event.type === "assistant/attempt",
+    );
+    const started = decoded.events.find(
+      (event) => event.type === "llm/retry-started",
+    );
     const failedState = projection.apply(projection.init(), failed);
     assert.equal(
       projection.apply(failedState, assistant).totals.uncachedInputTokens,
@@ -306,22 +311,265 @@ async function main() {
         .uncachedInputTokens,
       17,
     );
-    const events = [
-      artifact.events[0],
-      artifact.events[1],
-      failed,
-      retry,
-      started,
-      assistant,
-      ...artifact.events.slice(-2),
+    const total = meter.deriveTurnTokenUsage(decoded.events);
+    assert.deepEqual(total, {
+      uncachedInputTokens: 17,
+      outputTokens: 10,
+      cacheReadTokens: 4,
+      cacheWriteTokens: 6,
+      reasoningTokens: 2,
+      totalTokens: 37,
+    });
+    // 失败 attempt 没有模型路由；不能替它补成成功消息的 route。
+    assert(!Object.hasOwn(total, "routes"));
+    assert.equal(
+      meter.deriveTurnTokenUsage(
+        decoded.events.filter((event) => event.type !== "llm/retry-started"),
+      ),
+      undefined,
+    );
+  });
+  check("native_retry_relationship_rejections", () => {
+    for (const [type, field, value, reason] of [
+      ["llm/retry", "provider", "other", /provider does not match/],
+      ["llm/retry", "retry", 2, /policy attempt sequence/],
+      ["llm/retry-started", "retryId", "other", /no prior scheduled attempt/],
+      ["llm/retry-started", "step", 2, /changes scheduled coordinates/],
+    ]) {
+      const changed = structuredClone(retryArtifact);
+      changed.events.find((event) => event.type === type).data[field] = value;
+      assert.throws(() => nativeRestore(changed), reason);
+    }
+  });
+  check("seed_prefix_and_own_usage", () => {
+    validateFixture(child);
+    assert.deepEqual(decodeRows(child), child);
+    assert.deepEqual(nativeRestore(child).snapshotEvents(), child.events);
+    const cut = child.inheritedEventCount;
+    assert.equal(cut, artifact.events.length);
+    assert.deepEqual(child.events.slice(0, cut), artifact.events);
+    assert.equal(child.events[cut].type, "session/end-seed");
+    assert.equal(child.events[cut].data.inherited, true);
+    assert.equal(
+      meter.deriveTurnTokenUsage(child.events.slice(0, cut)).totalTokens,
+      20,
+    );
+    assert.equal(
+      meter.deriveTurnTokenUsage(child.events.slice(cut + 1)).totalTokens,
+      5,
+    );
+    assert.equal(meter.deriveTurnTokenUsage(child.events), undefined);
+  });
+  check("seed_last_marker_and_parent_only", () => {
+    const grandchild = seedWithTurn(child, "s2");
+    validateFixture(grandchild);
+    assert.deepEqual(decodeRows(grandchild), grandchild);
+    assert.deepEqual(
+      grandchild.events.slice(0, grandchild.inheritedEventCount),
+      child.events,
+    );
+    assert.equal(
+      grandchild.events.filter(
+        (event) =>
+          event.type === "session/end-seed" && event.data.inherited === true,
+      ).length,
+      2,
+    );
+    const wrongCut = structuredClone(grandchild);
+    wrongCut.inheritedEventCount = child.inheritedEventCount;
+    assert.throws(
+      () => nativeRestore(wrongCut),
+      /last inherited end-seed marker/,
+    );
+    const unseeded = structuredClone(child);
+    unseeded.header.isSeeded = false;
+    unseeded.inheritedEventCount = 0;
+    assert.throws(() => nativeRestore(unseeded), /unseeded Session contains/);
+    const noMarker = structuredClone(child);
+    noMarker.events[child.inheritedEventCount].data = {};
+    assert.throws(
+      () => nativeRestore(noMarker),
+      /last inherited end-seed marker/,
+    );
+    const parentOnly = clone();
+    parentOnly.header.parentSession = "parent";
+    validateFixture(parentOnly);
+    assert.deepEqual(decodeRows(parentOnly), parentOnly);
+    assert.equal(parentOnly.inheritedEventCount, 0);
+  });
+  check("codec_recoverable_suffix_is_incomplete", () => {
+    const rows = encodeRows(artifact);
+    rows.at(-1).time = "invalid";
+    assert.throws(() => decodeRows(artifact, rows));
+    const prefix = decodeRows(artifact, rows, "recoverable");
+    assert.equal(prefix.events.length, rows.length - 1);
+    assert.deepEqual(prefix.events, artifact.events.slice(0, -1));
+    validateFixture(prefix);
+    assert.equal(meter.deriveTurnTokenUsage(prefix.events), undefined);
+    const afterClosedTurn = [
+      ...encodeRows(artifact),
+      {
+        type: "fixture/unknown",
+        seq: artifact.events.length,
+        time: "invalid",
+        data: {},
+      },
+      {
+        type: "fixture/unknown",
+        seq: artifact.events.length + 1,
+        time: 26,
+        data: {},
+        ignorable: true,
+      },
     ];
-    const total = meter.deriveTurnTokenUsage(events);
-    assert.equal(total.uncachedInputTokens, 17);
-    assert.equal(total.outputTokens, 10);
-    assert.equal(total.cacheReadTokens, 4);
-    assert.equal(total.cacheWriteTokens, 6);
-    assert.equal(total.reasoningTokens, 2);
-    assert.equal(total.totalTokens, 37);
+    const recovered = decodeRows(artifact, afterClosedTurn, "recoverable");
+    assert.deepEqual(recovered, artifact);
+    assert(recovered.events.length < afterClosedTurn.length);
+    assert.equal(meter.deriveTurnTokenUsage(recovered.events).totalTokens, 20);
+  });
+  check("codec_corruption_before_turn_end_is_rejected", () => {
+    const malformed = encodeRows(artifact);
+    malformed.at(-2).time = "invalid";
+    assert.throws(() => decodeRows(artifact, malformed, "recoverable"));
+    const gap = encodeRows(artifact);
+    gap[1].seq += 1;
+    assert.throws(() => decodeRows(artifact, gap, "recoverable"));
+    const retired = [
+      ...encodeRows(artifact),
+      {
+        type: "request/header",
+        seq: artifact.events.length,
+        time: 25,
+        data: {
+          header: {
+            config: { provider: "p0", model: "m0" },
+            system: "retired",
+          },
+        },
+      },
+    ];
+    assert.throws(
+      () => decodeRows(artifact, retired, "recoverable"),
+      /header.system/,
+    );
+  });
+  check("codec_needs_semantic_admission", () => {
+    const rows = [
+      ...encodeRows(artifact),
+      {
+        type: "fixture/unknown",
+        seq: artifact.events.length,
+        time: 25,
+        data: {},
+      },
+    ];
+    const required = decodeRows(artifact, rows);
+    assert.equal(required.events.length, rows.length);
+    assert.throws(() => nativeRestore(required), /unknown event type/);
+    rows.at(-1).ignorable = true;
+    validateFixture(decodeRows(artifact, rows));
+    const brokenRelation = clone();
+    brokenRelation.events.find(
+      (event) => event.type === "tool/call",
+    ).data.arguments = "{}";
+    const decoded = decodeRows(brokenRelation);
+    assert.deepEqual(decoded, brokenRelation);
+    assert.throws(
+      () => nativeRestore(decoded),
+      /does not match one advertised tool call/,
+    );
+  });
+  check("zstd_primitives_multiframe_checksum_and_torn_tail", () => {
+    // 仅验证 Node zstd 原语；没有调用 DSH backend 的恢复或修尾入口。
+    const chunks = [
+      codec.encodeHeader(artifact.header, 0),
+      ...encodeRows(artifact),
+    ].map((value) => Buffer.from(`${JSON.stringify(value)}\n`));
+    const frames = chunks.map((chunk) =>
+      zstdCompressSync(chunk, {
+        params: { [constants.ZSTD_c_checksumFlag]: 1 },
+      }),
+    );
+    const compressed = Buffer.concat(frames);
+    const expected = Buffer.concat(chunks);
+    // 已知帧边界来自本夹具的压缩调用，不是对任意文件实现帧扫描器。
+    assert.deepEqual(
+      Buffer.concat(frames.map((frame) => zstdDecompressSync(frame))),
+      expected,
+    );
+    const decompressed = zstdDecompressSync(compressed);
+    concatenatedZstdRead = decompressed.equals(expected)
+      ? "all_frames"
+      : "first_frame_only";
+    assert.deepEqual(
+      decompressed,
+      concatenatedZstdRead === "all_frames" ? expected : chunks[0],
+    );
+    const corrupt = Buffer.from(frames.at(-1));
+    corrupt[corrupt.length - 1] ^= 1;
+    stage = "zstd_primitives:corrupt_checksum";
+    assert.throws(() => zstdDecompressSync(corrupt));
+    const lastFrame = frames.at(-1);
+    assert((lastFrame[4] & 4) !== 0); // 本夹具确实开启 frame checksum。
+    const torn = lastFrame.subarray(0, -1);
+    stage = "zstd_primitives:torn_tail";
+    let tornPayload;
+    try {
+      tornPayload = zstdDecompressSync(torn);
+    } catch (error) {
+      assert.equal(typeof error.code, "string");
+    }
+    if (tornPayload === undefined) tornZstdRead = "rejected";
+    else {
+      assert.deepEqual(tornPayload, chunks.at(-1));
+      tornZstdRead = "full_payload_without_complete_checksum";
+    }
+    stage = "zstd_primitives:prefix";
+    const prefix = zstdDecompressSync(torn, {
+      finishFlush: constants.ZSTD_e_flush,
+    });
+    assert.deepEqual(prefix, chunks.at(-1));
+    stage = "zstd_primitives:corrupt_prefix";
+    assert.throws(() =>
+      zstdDecompressSync(corrupt, { finishFlush: constants.ZSTD_e_flush }),
+    );
+  });
+  check("usage_vectors_preserve_unknown_and_reject_invalid", () => {
+    assert.equal(
+      new Set(usageCases.map((item) => item.name)).size,
+      usageCases.length,
+    );
+    for (const item of usageCases) {
+      stage = `usage_vectors:${item.name}`;
+      const value = clone();
+      const data = value.events.find(
+        (event) => event.type === "assistant/message",
+      ).data;
+      data.stream = data.stream.filter(
+        (record) => record.chunk?.type !== "usage",
+      );
+      delete data.usage;
+      if (item.usage !== undefined) {
+        data.usage = structuredClone(item.usage);
+        data.stream.splice(-1, 0, {
+          type: "chunk",
+          time: 16,
+          chunk: { type: "usage", usage: structuredClone(item.usage) },
+        });
+      }
+      const exact = meter.deriveTurnTokenUsage(value.events);
+      if (item.expected === null) assert.equal(exact, undefined, item.name);
+      else
+        assert.deepEqual(
+          exact,
+          { ...item.expected, routes: [{ provider: "p0", model: "m0" }] },
+          item.name,
+        );
+      assert.deepEqual(
+        item.usage === undefined ? undefined : data.usage,
+        item.usage,
+      );
+    }
   });
   check("negative_dt_and_first_close", () => {
     const timed = llm.expandAssistantStream([
@@ -400,6 +648,13 @@ async function main() {
         scope: "synthetic_fixture_and_offline_folds",
         fixture: "complete-turn",
         events: artifact.events.length,
+        retry_events: retryArtifact.events.length,
+        seeded_events: child.events.length,
+        usage_case_count: usageCases.length,
+        backend_recovery_validated: false,
+        node_version: process.version,
+        synchronous_zstd_concat_read: concatenatedZstdRead,
+        synchronous_zstd_torn_read: tornZstdRead,
         message_roles: artifact.events
           .filter((event) => event.surfaceOp === "append")
           .map((event) =>

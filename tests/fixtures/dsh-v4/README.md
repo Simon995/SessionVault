@@ -1,13 +1,17 @@
 # DSH v4 合成夹具
 
-`complete-turn.json` 是完全合成的逻辑 artifact，不含真实日志片段、身份或配置。目标安装版为 `@deepseek-ai/dsh` `0.2.1-rc.5`；查证与运行日期：2026-11-05。
+目标安装版为 `@deepseek-ai/dsh` `0.2.1-rc.5`；查证与运行日期：2026-11-05。所有样本完全合成，不含真实日志片段、身份或配置。
 
-样本包含五种消息角色、文本 / reasoning / tool-call、一次 call/result 关系与完整 turn/step 边界。assistant 的 stream 有两次 usage 报告，最终 message 也保留最后一份 usage；正确的一次计量为 20，不能累加过程样本或重复计算外层消息。
+- `complete-turn.json`：10 事件的逻辑 artifact，含五种消息角色、text / reasoning / tool-call、call/result 与完整 turn/step 边界。stream 有两次 usage 报告，外层 message 保留最后一份；正确单次用量为 20。
+- `scenarios.mjs`：从共享 artifact 在内存中派生完整失败重试（14 事件、用量 37）、继承前缀与新增 turn（child 共 17 事件，父用量 20、新增用量 5）及再继承。该模块只是夹具生成器，按共享样本的事件关系构造，不是通用 DSH 日志改写器。
+- `usage-cases.json`：13 个用量向量，含精确 / 推导 total、未知 cache 与已知零、缺失 / 非法 / 溢出；`expected:null` 表示原生严格 reducer 返回 `undefined`，没有承诺已实现本仓诊断分类器。
 
-运行 [verify-dsh-v4.mjs](../../../scripts/verify-dsh-v4.mjs) 可执行原生 v4 restore、detached Session、物理 codec 与 stream 往返，以及缺用量、未知 cache、重试折叠和原生校验缺口的反例。物理 JSONL header 由 codec 生成，逻辑 header 不含 `type:"session"`。
+运行 [verify-dsh-v4.mjs](../../../scripts/verify-dsh-v4.mjs) 执行 20 组检查。物理 JSONL header 由原生 codec 生成，逻辑 header 不含 `type:"session"`；strict / recoverable codec、原生 restore、detached Session、stream 装配与严格用量 reducer 分层校验。完整重试已替换之前只给 reducer 部分字段的单元样本。
 
 ```sh
 node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 ```
 
-脚本内的重试样本只用于 reducer 单元检查，不能当作可回放的完整原生日志。当前夹具不覆盖附件、seed、compaction、迁移、损坏恢复或真实 provider 行为。详细字段映射、源码出处与尚未完成的实现门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9。
+zstd 检查只涉及 Node 同步原语和已知边界的合成帧，并报告当前 Node 版本、串接读取及截断 checksum 的行为。解压有输出或 codec finish 未抛错都不能单独证明输入完整；`backend_recovery_validated` 明确为 false。
+
+当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、跨代迁移、真实 backend 的稳定读 / 帧扫描 / 修尾或真实 provider。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§11。

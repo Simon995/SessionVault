@@ -1,12 +1,12 @@
 # DSH 来源核查与适配判据
 
-> 2026-11-05 来源核查。第一轮安装源码与本机日志结构已交叉核对，后续静态 profile 与原生样本 / 字段核对见 §8–§9；**不是正式 provider、临时排除或可信来源接口的交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
+> 2026-11-05 来源核查。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生合成样本、恢复边界与用量保真草案见 §8–§11。**正式 provider、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
 ## 1. 证据范围
 
 - **安装源码**：本机 `@deepseek-ai/dsh` 及下列相关包，已核版本均为 `0.2.1-rc.5`。这是安装包快照，不声称 npm 最新版或上游 `main` 当前仍相同。包元数据指向 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)，查证日期为 2026-11-05。
-- **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。未启动 Host / LLM，未读取凭据配置、回放或调用上游恢复 API，未写上游日志或总库。
-- **未覆盖**：WSL / 其他机器来源、当前活动 Host 的启动环境及额外 `--patch`、原生恢复与迁移的运行时验收。本机两个 profile 的静态配置已在后续核查中组合，见 §8；这仍不证明覆盖全部活动来源。
+- **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。原生 restore、codec 与 reducer 仅用于完全合成的内存夹具（§9–§10）；未对真实日志调用恢复 API，未启动 Host / LLM、读取凭据、写上游日志或总库。
+- **未覆盖**：WSL / 其他机器来源、当前活动 Host 的启动环境及额外 `--patch`、真实 backend 恢复及格式迁移的运行时验收。本机两个 profile 的静态配置已在后续核查中组合，见 §8；这仍不证明覆盖全部活动来源。
 - **工具限制**：探针只统计物理 JSONL、白名单字段形状并输出脱敏结构投影，不解码完整 DSH 事件语义、attempt stream 或有效 surface。`complete` 仅表示本轮流读取未中断；`valid_jsonl` 不代表通过 DSH schema 校验。压缩帧完整性没有独立验证，不能用本轮退出码证明 torn-frame 恢复正确。
 
 ## 2. 本机观察
@@ -88,7 +88,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 ## 6. 执行过的检查与后续实施门
 
-**本轮已执行**：探针自检覆盖未知字段 / 值与正文不泄露、脱敏结构投影、坏 JSON / UTF-8 / 非对象 / 未换行尾部可观察、预算截断、Zstd 多帧、checksum 错、规范代选择、前导零 / 临时名排除、未来代不回退、编码冲突；随后跑本机显式根的结构扫描。另经 CLI 验证缺失根与非目录根分别报告 `absent` / `not_directory`，均退出 2；Ruff 格式与检查、ty 类型检查、公开仓闸、指令预算闸及补丁格式检查通过。ty 显式使用含脚本依赖的解释器及依赖搜索目录。自检走与扫描相同的函数，未启动原生恢复。未知字段被脱敏并不等于已理解其含义。
+**首轮结构扫描已执行**：探针自检覆盖未知字段 / 值与正文不泄露、脱敏结构投影、坏 JSON / UTF-8 / 非对象 / 未换行尾部可观察、预算截断、Zstd 多帧、checksum 错、规范代选择、前导零 / 临时名排除、未来代不回退、编码冲突；随后跑本机显式根的结构扫描。另经 CLI 验证缺失根与非目录根分别报告 `absent` / `not_directory`，均退出 2；Ruff 格式与检查、ty 类型检查、公开仓闸、指令预算闸及补丁格式检查通过。ty 显式使用含脚本依赖的解释器及依赖搜索目录。自检走与扫描相同的函数，首轮未启动原生恢复；后续合成原生核验见 §9–§10。未知字段被脱敏并不等于已理解其含义。
 
 **正式适配仍须执行的反例集**：
 
@@ -99,7 +99,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 - user-role 的人工、注入、agent relay、settlement 与未知来源；可信属性缺失 / 冲突、多写者及记忆缓存不绕过临时范围。
 - CLI / Rust 构造与穷举 / 逐字段读取 / `SourceMode` 过滤兼容；旧版读者与并存写者协调。
 
-建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。后续已补静态 profile 根、合法完整的合成 fixture 与主要消息 / 工具 / usage 对账，见 §8–§9。正式实现仍缺活动启动配置证据、损坏 / 迁移 / seed 反例、用量未知状态的保真方案，以及 H.1 的可信载体。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
+建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§10 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage 对账、完整重试、继承边界与 codec 坏尾反例。正式实现仍缺活动启动配置、真实 backend 恢复与并发代切换、迁移及复杂有效视图样本、§11 用量保真草案的实现与兼容验证，以及 H.1 的可信载体。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
 
 ## 7. 安装源码索引
 
@@ -118,6 +118,8 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 | S9 | `dsh-session/lib/types/types.d.ts:289`；`dsh-session/lib/index.js:1194,1378,1528`；`dsh-llm/lib/types/types.d.ts:45,413`；`dsh-agent-loop/lib/index.js:395,681,1093` | 消息 payload、工具标识、时间与 settlement 分支 |
 | S10 | `dsh-llm/lib/types/assistant-stream.js:31,135,378`；`dsh-llm/lib/types/assembler.js:33,121,155`；`dsh-session-format-v3-to-v4/lib/index.js:314,459,982,1057`；`dsh-session-persistence-jsonl/lib/index.js:1838` | stream 编解码、装配规则、原生恢复与校验边界 |
 | S11 | `dsh-token-meter/lib/types/usage-projection.js:60,91`；`dsh-token-meter/lib/types/turn-usage.js:21,115`；`dsh-llm-deepseek/lib/index.js:1832,2017` | 用量样本选择、重试折叠、完整性与 cache 拆分 |
+| S12 | `dsh-agent-loop/lib/index.js:1217,1226`；`dsh-session/lib/types/types.d.ts:218`；`dsh-llm-retry/lib/types/types.d.ts:13`；`dsh-session-format-v3-to-v4/lib/index.js:676` | 请求头 writer、完整 retry payload 与原生配对 |
+| S13 | `dsh-session-format-v1-to-v2/lib/index.js:219,263`；`dsh-session-format-v3-to-v4/lib/index.js:982,1065,1107`；`dsh-session/lib/index.js:1399` | framing 恢复、v4 admission、继承 cut 与 marker |
 
 ## 8. 后续核查：静态 profile 的日志根
 
@@ -131,7 +133,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 ## 9. 后续核查：消息、stream 与用量
 
-2026-11-05，新增 [complete-turn.json](../tests/fixtures/dsh-v4/complete-turn.json) 与 [verify-dsh-v4.mjs](../scripts/verify-dsh-v4.mjs)。样本完全合成，包含 10 个事件、五种消息角色和一次完整工具调用关系；已通过安装版 v4 restore、detached `Session.create`、物理 codec 往返及内嵌 stream 往返。它不是上游 Host 实际运行生成的会话，也没有验证真实 provider 的输出。Node 核验共 12 组检查，退出 0。
+2026-11-05，新增 [complete-turn.json](../tests/fixtures/dsh-v4/complete-turn.json) 与 [verify-dsh-v4.mjs](../scripts/verify-dsh-v4.mjs)。样本完全合成，包含 10 个事件、五种消息角色和一次完整工具调用关系；已通过安装版 v4 restore、detached `Session.create`、物理 codec 往返及内嵌 stream 往返。它不是上游 Host 实际运行生成的会话，也没有验证真实 provider 的输出。该批（`7625bce`）Node 核验为 12 组，退出 0；后续扩展到 20 组，见 §10。
 
 ### 消息与工具
 
@@ -170,7 +172,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 已跑反例：`inputTokens=10, outputTokens=5, totalTokens=20`，cache 均未报告，严格 reducer 仍能保留精确总量 20 与未知 cache；若缺失 cache 填 0，四项之和只有 15。**正式适配前必须确定如何保留原始 usage / 未知状态及精确 total；不先修改公开类型或 schema。** 缺 usage、缺 turn/end、负值或矛盾 total 应报告不可得，不能生成 0 用量。[S11]
 
-两个原生 reducer 的承诺也要分开：会话投影取外层 message.usage，缺失时取 stream 最后 usage，同一 turn/step 替换槽位，遇匹配 retry-started 后才另加；严格 `deriveTurnTokenUsage` 还要求完整 turn / step / attempt 边界，失败 attempt 也可计入。重试单元样本实测总量 37，但该样本只给 reducer 所读字段，**未声明通过完整 v4 admission**。完整合法 fixture 的总量则为 20，不能混报。[S11]
+两个原生 reducer 的承诺也要分开：会话投影取外层 message.usage，缺失时取 stream 最后 usage，同一 turn/step 替换槽位，遇匹配 retry-started 后才另加；严格 `deriveTurnTokenUsage` 还要求完整 turn / step / attempt 边界，失败 attempt 也可计入。`7625bce` 的重试检查仅是 reducer 单元样本，后续已替换为通过完整 v4 admission 的 14 事件派生夹具，总量同为 37，见 §10。共享 `complete-turn.json` 的单次总量仍为 20。[S11]
 
 ### 复跑与剩余范围
 
@@ -181,4 +183,71 @@ node scripts/inspect-dsh-roots.mjs --dsh-package '<dsh-package.json>' --home '<D
 node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 ```
 
-字段与合成样本准备已取得进展；真实失败 / 重试、附件、seed / 有效视图、坏尾帧与代切换、旧版读者 / 多写者协调仍未验收。活动启动配置、H.1 可信载体、用量保真表示和这些读取反例是后续实现门，运行时适配尚未启用。
+字段与合成样本准备已取得进展；后续完整重试、seed 前缀及 codec 恢复反例见 §10，用量保真方案草案见 §11。真实失败 / 重试、附件、compaction / 有效视图、backend 坏尾帧恢复与代切换、旧版读者 / 多写者协调仍未验收。活动启动配置、H.1 可信载体与这些实现门仍须完成，运行时适配尚未启用。
+
+## 10. 后续核查：完整重试、继承与恢复边界
+
+2026-11-05，扩展 [verify-dsh-v4.mjs](../scripts/verify-dsh-v4.mjs)，新增 [scenarios.mjs](../tests/fixtures/dsh-v4/scenarios.mjs) 和 [usage-cases.json](../tests/fixtures/dsh-v4/usage-cases.json)。场景从共享逻辑 fixture 派生，全部在内存中经过安装版原生函数验证；仍未运行 Host / LLM 或操作真实日志 / 总库。实跑 20 组检查，其中一组遍历 13 个用量向量，退出 0。
+
+### 完整失败重试
+
+派生样本有 14 个事件，包含 `request/header`、带失败 finish / usage 的 `assistant/attempt`、完整 `llm/retry` 与对应 `llm/retry-started`，随后成功消息及工具 call/result。请求头来自实际 writer 的形状，retry 补齐 provider、retryId、policyKey、mode、retry / maxRetries、delayMs 与 failure。样本通过 native v4 restore、detached Session、物理 codec 往返和 stream / 字段子集检查。[S12]
+
+- 严格单 turn 总量为 37：uncached input 17、output 10、cache read 4、cache write 6；reasoning 2 已包含在 output 内。
+- 失败 attempt 未提供模型路由，聚合结果也不返回完整 routes；不能拿成功消息的路由补给失败 attempt。
+- 原生关系校验拒绝 provider 不匹配、retry 跳号、retry-started 无对应 retryId 或改变坐标。单独从 reducer 输入移除 retry-started 时，用量不可得；该删减序列不作为合法原生日志。
+- 会话投影仍保留同槽覆盖的对照：没有 retry-started 时替换，匹配后另计一次。完整原生恢复和 reducer 语义分别断言。
+
+### 继承前缀与本会话新增部分
+
+派生 child 有 17 个事件：原 10 个事件逐个保留，cut=10 处为当前 child 拥有的 `session/end-seed {inherited:true}`，其后为新增 turn。marker 自己不属于 inherited prefix。原前缀用量 20 与本会话新增 turn 的用量 5 分别核算，不能把整份 child 当作一个 turn，也不能把父历史重新计作 child 工作。消息 id 保留在未改写的前缀中。[S6][S13]
+
+再派生一层时，祖先 marker 留在继承前缀，**最后一个 inherited marker** 决定当前 cut。错误 cut、缺 marker、unseeded 却带 inherited marker 均被原生恢复拒绝。只有 `parentSession` 而 `isSeeded=false` 的样本通过，cut 仍为 0；父子关系本身不证明继承历史。上述边界通过 restore / Session 与 codec 往返，但未验证原生 `buildForkSeed` 的复杂 fork 修复、descriptor 或 compaction 有效视图。
+
+### codec 恢复与完整性
+
+| 合成反例 | 实跑结果 | 正式读取必须保留的判断 |
+| --- | --- | --- |
+| 最后一行 envelope 损坏，后面没有有效 turn/end | strict 拒绝；recoverable 只返回有效前缀，finish 正常 | 对照输入行与产出；不能仅凭 finish 未抛错报完整 |
+| 完整 turn 后再接坏行与无 end 的后缀 | recoverable 返回原完整 turn，用量仍可得 20 | 有完整 turn / 用量不证明整个输入已读完，不推进到损坏后缀末尾 |
+| 坏行或 seq 缺口之后还有有效 turn/end | recoverable 拒绝 | 不能跳过中间损坏继续入库 |
+| 尾部 request/header 含已退役 header.system | v4 admission 在 recoverable framing 前直接拒绝 | 不是所有错误都进入可恢复尾部逻辑 |
+| 未知 required 事件、tool/call 与 assistant 声明的参数不符 | codec 可解码；restore 才拒绝，unknown ignorable 则可保留 | strict codec 也不替代事件词汇与关系校验 |
+
+这里调用的是公开 codec 和 restore；JSONL 字节分行、缺换行尾行、DSH backend 的帧扫描 / 稳定读 / 修尾入口没有经过本轮运行。codec 的 recoverable 行为是恢复证据的一层，不能当作整个 backend 验收。[S13]
+
+### Node zstd 原语的实测边界
+
+本机 Node `v25.2.1`，合成数据使用带 checksum 的独立帧再串接。逐帧解压后字节等于原始 JSONL；改坏完整末帧的 checksum 会被拒绝。另实测：
+
+- `zstdDecompressSync` 对整串帧只返回首帧；脚本显式报告 `first_frame_only`，不能把同步解压成功当成读完整个串接日志。
+- 末帧少一个 checksum 字节时，默认同步解压仍返回完整 payload；`ZSTD_e_flush` 也能返回 payload。完整行已经出现，不证明帧已完整提交。
+- 对完整但 checksum 错误的单帧，默认及 flush 两种同步调用均拒绝。
+
+这些是当前 Node 同步 API 的实测，不泛化为所有版本或异步入口的行为。脚本允许其他 Node 返回完整串接内容或拒绝残帧，但每次都报告观测值。已知帧边界由夹具的压缩调用提供，未复制私有 scanner；DSH backend 自有结构扫描和逐帧流程，须另验，本轮 `backend_recovery_validated=false`。[S3]
+
+## 11. 用量保真方案草案与存储边界
+
+2026-11-05，核过本仓 [RawEvent / TokenUsage](../src/rawevent.rs)、[parser 的 profile 判据](../src/parser.rs) 与 [总库写入 / 读取](../src/store.rs)。`TokenUsage` 只有四个必填 `u64`，`RawEvent` 无通用原始记录扩展字段；`append_events` / `FileProjectionBatch` 接收 `RawEvent`，写入时把它序列化成加密 `event_json`，读取时反序列化回 `RawEvent`。**这一写读路径不会自动保留没有进入 DTO 的源字段**。`metadata` profile 不物化正文，因此把源 usage 放进 `content` 不能满足统一保真要求。
+
+### 建议保留的独立事实
+
+建议正式实现优先评估事件上的独立计量证据字段，旧四桶作为证据完整时的兼容投影；本轮只形成契约草案，不新增公开字段或 schema。证据至少同时包含：
+
+| 事实 | 草案要求 |
+| --- | --- |
+| 原生计量样本 | 保存原生 usage 对象、来自外层 message 还是 stream、所在事件与 stream 样本位置；保留被覆盖样本供核对，合计只用 settlement 的选定样本 |
+| 逐字段值 | input / output / cache read / cache write / reasoning 各自保留已知与未知；报告的 0 仍是已知 0，缺字段不变成 0，也不自行求未知 cache 的拆分 |
+| 精确 total | 保留显式报告的 total，或在所有分桶已知时标记为推导值；reasoning 不重复加，原始矛盾值保留但不进入可用合计 |
+| 可用状态 | 区分完全缺报告、已有合法但不足以求精确总量的报告、值非法 / 矛盾、生命周期不完整、已有精确总量；精确 total 可以与未知 cache 同时成立 |
+| 计量归属 | 绑定来源实例 / 格式代 / 事件与 attempt；继承前缀不计作本会话新增。缺 route、父子元数据与执行绑定的未知分别保留 |
+
+原生严格 reducer 对缺失、非法和生命周期不完整均返回 `undefined`，不能单靠它的返回值推断失败原因。正式适配需要在规范化前保留字段观察和生命周期诊断；不能最终只输出 `usage=None`，使原始精确 total 或不可得原因消失。13 个公开向量已覆盖完整四桶、推导 total、精确 total + 全部 / 单个未知 cache、明确零、缺报告、缺 total、矛盾 total、reasoning 超界、负数、不安全整数与加法溢出；它们验证原生 reducer 的边界，不是已实现的本仓状态类型。
+
+### 实现与兼容验收门
+
+1. metadata / full 均可保留计量证据，JSON 序列化、加密入库、只读解码往返不丢逐字段未知、精确 total、原始报告及诊断。
+2. 旧四桶仅在四项均可证明时提供；精确 total 与未知分桶不能靠填 0 进入旧统计。全量 / 增量 / 重扫 / 重试 / seed 均无重复合计。
+3. 若给公开 `RawEvent` 加字段，Rust 字面量构造会受影响，必须核消费方构造 / 穷举与逐字段读取。Serde 对缺字段的默认兼容不等于旧读者理解新证据，更不解决新增 SourceType 值域的兼容。
+4. 先实测旧版 reader 和并存 writer，再确定事件版本、schema / DTO 的实际形状与发布协调；本轮未测，因此不宣称可以零迁移上线，也不默认需要重建数据库表。
+5. 和 H.1 可信属性及临时排除共同验收后才启用正式摄取；本轮合成证据不补足上层执行绑定。

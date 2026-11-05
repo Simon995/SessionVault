@@ -1,0 +1,138 @@
+[
+  {
+    "name": "exact_all_buckets",
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "cacheWriteTokens": 3,
+      "reasoningTokens": 2,
+      "totalTokens": 20
+    },
+    "expected": {
+      "uncachedInputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "cacheWriteTokens": 3,
+      "reasoningTokens": 2,
+      "totalTokens": 20
+    }
+  },
+  {
+    "name": "derive_total_from_known_buckets",
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "cacheWriteTokens": 3
+    },
+    "expected": {
+      "uncachedInputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "cacheWriteTokens": 3,
+      "totalTokens": 20
+    }
+  },
+  {
+    "name": "exact_total_unknown_cache",
+    "usage": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 20 },
+    "expected": {
+      "uncachedInputTokens": 10,
+      "outputTokens": 5,
+      "totalTokens": 20
+    }
+  },
+  {
+    "name": "exact_total_one_unknown_bucket",
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "totalTokens": 20
+    },
+    "expected": {
+      "uncachedInputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "totalTokens": 20
+    }
+  },
+  {
+    "name": "explicit_zero_cache",
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "totalTokens": 15
+    },
+    "expected": {
+      "uncachedInputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0,
+      "totalTokens": 15
+    }
+  },
+  {
+    "name": "missing_usage",
+    "expected": null
+  },
+  {
+    "name": "unknown_cache_without_total",
+    "usage": { "inputTokens": 10, "outputTokens": 5 },
+    "expected": null
+  },
+  {
+    "name": "total_below_known_buckets",
+    "usage": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 14 },
+    "expected": null
+  },
+  {
+    "name": "total_above_complete_buckets",
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "cacheReadTokens": 2,
+      "cacheWriteTokens": 3,
+      "totalTokens": 21
+    },
+    "expected": null
+  },
+  {
+    "name": "reasoning_above_output",
+    "usage": {
+      "inputTokens": 10,
+      "outputTokens": 5,
+      "reasoningTokens": 6,
+      "totalTokens": 20
+    },
+    "expected": null
+  },
+  {
+    "name": "negative_count",
+    "usage": { "inputTokens": -1, "outputTokens": 5, "totalTokens": 20 },
+    "expected": null
+  },
+  {
+    "name": "unsafe_integer",
+    "usage": {
+      "inputTokens": 9007199254740992,
+      "outputTokens": 0,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0
+    },
+    "expected": null
+  },
+  {
+    "name": "safe_inputs_overflow_derived_sum",
+    "usage": {
+      "inputTokens": 9007199254740991,
+      "outputTokens": 1,
+      "cacheReadTokens": 0,
+      "cacheWriteTokens": 0
+    },
+    "expected": null
+  }
+]
