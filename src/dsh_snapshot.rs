@@ -15,10 +15,16 @@ use crate::compressed::{checked_frames, FrameCheckFailure};
 use crate::probe::{self, Probed};
 use crate::rawevent::EventKey;
 
+mod native;
+pub use native::{AdmittedSnapshot, NativeRuntime};
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct Limits {
     input_bytes: u64,
     decoded_bytes: u64,
+    audit_timeout_ms: u64,
+    audit_cleanup_timeout_ms: u64,
+    audit_output_bytes: u64,
 }
 
 fn limits() -> Limits {
@@ -80,6 +86,16 @@ pub struct PhysicalSnapshot {
     decoded_bytes: usize,
     frames: Vec<FrameSpan>,
     positions: Vec<RecordPosition>,
+    jsonl: VerifiedJsonl,
+}
+
+struct VerifiedJsonl(Vec<u8>);
+impl std::fmt::Debug for VerifiedJsonl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedJsonl")
+            .field("len", &self.0.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PhysicalSnapshot {
@@ -237,6 +253,7 @@ fn verify(bytes: &[u8], compression: Compression) -> Result<PhysicalSnapshot, Bl
         decoded_bytes: plain.len(),
         frames,
         positions,
+        jsonl: VerifiedJsonl(plain),
     })
 }
 

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { constants, zstdCompressSync } from "node:zlib";
 import { createDshSnapshotReader } from "./dsh-snapshot-reader.mjs";
+import { decodeDshV4Jsonl } from "./dsh-native-admission.mjs";
 import {
   loadDshInstallation,
   SUPPORTED_DSH_VERSION,
@@ -42,9 +43,11 @@ async function main() {
   const { load } = loadDshInstallation(packagePath);
   const { Context } = await load("@deepseek-ai/cordis");
   const backend = await load("@deepseek-ai/dsh-session-persistence-jsonl");
-  const { releasedV4SessionFormatCodec: codec } = await load(
-    "@deepseek-ai/dsh-session-format-v3-to-v4",
-  );
+  const [format, session] = await Promise.all([
+    load("@deepseek-ai/dsh-session-format-v3-to-v4"),
+    load("@deepseek-ai/dsh-session"),
+  ]);
+  const codec = format.releasedV4SessionFormatCodec;
   const artifact = JSON.parse(
     await fs.readFile(
       new URL("../tests/fixtures/dsh-v4/complete-turn.json", import.meta.url),
@@ -82,7 +85,7 @@ async function main() {
     detail = value;
     assert.equal(value.kind, "verified_snapshot");
   };
-  const check = async (name, compression, action) => {
+  const check = async (name, compression, action, initial = artifact) => {
     stage = `${compression}_${name}`;
     detail = undefined;
     const root = join(run, stage);
@@ -97,8 +100,8 @@ async function main() {
         compression,
         sourceInstance: "fixture-source",
       });
-      const content = encode(artifact, compression);
-      const path = service.locate(artifact.header).path;
+      const content = encode(initial, compression);
+      const path = service.locate(initial.header).path;
       inside(root, path);
       await fs.mkdir(dirname(path), { recursive: true });
       await fs.writeFile(path, content, { flag: "wx" });
@@ -301,6 +304,82 @@ async function main() {
         assert.deepEqual(reader.events(old), reader.events(next));
         assert.equal(reader.compare(old, next), "lifecycle_changed");
       });
+      await check(
+        "seeded_inherited_cut_lifecycle_change",
+        compression,
+        async ({ reader, path, content }) => {
+          const changed = seedWithTurn(child, "reseeded");
+          // 再次继承完整旧前缀，仅保留同一 header；原生 cut 由最后一个 marker 决定。
+          changed.header = structuredClone(child.header);
+          assert.deepEqual(child.header, changed.header);
+          const oldRows = rows(child);
+          const nextRows = rows(changed);
+          assert.deepEqual(oldRows[0], nextRows[0]);
+          const admitted = [oldRows, nextRows].map((encoded) =>
+            decodeDshV4Jsonl(Buffer.concat(encoded), {
+              codec,
+              format,
+              session,
+            }),
+          );
+          // 共享 admission 实际运行 strict codec、restore 与 Session.create。
+          assert.deepEqual(admitted, [child, changed]);
+          assert.notEqual(
+            admitted[0].inheritedEventCount,
+            admitted[1].inheritedEventCount,
+          );
+          assert.deepEqual(
+            changed.events.slice(0, child.events.length),
+            child.events,
+          );
+          const replacement = encode(changed, compression);
+          const physicalHeader =
+            compression === "zstd" ? pack(oldRows[0]) : oldRows[0];
+          assert.deepEqual(
+            content.subarray(0, physicalHeader.length),
+            physicalHeader,
+          );
+          assert.deepEqual(
+            replacement.subarray(0, physicalHeader.length),
+            physicalHeader,
+          );
+          const old = await reader.capture(child.header.id);
+          verified(old);
+          assert.deepEqual(reader.events(old), child.events);
+          await mutate("replace", path, replacement);
+          const next = await reader.capture(child.header.id);
+          verified(next);
+          assert.deepEqual(reader.events(next), changed.events);
+          const before = reader.describe(old);
+          const after = reader.describe(next);
+          assert.equal(before.source_binding, after.source_binding);
+          assert.equal(
+            before.inherited_event_count,
+            admitted[0].inheritedEventCount,
+          );
+          assert.equal(
+            after.inherited_event_count,
+            admitted[1].inheritedEventCount,
+          );
+          assert.notEqual(before.lifecycle, after.lifecycle);
+          const relation = reader.compare(old, next);
+          assert.equal(relation, "lifecycle_changed");
+          observations[stage] = {
+            logical_header_equal: true,
+            encoded_header_equal: true,
+            physical_header_equal: true,
+            native_admitted: admitted.length,
+            inherited_event_counts: [
+              before.inherited_event_count,
+              after.inherited_event_count,
+            ],
+            event_counts: [before.event_count, after.event_count],
+            old_event_prefix_preserved: true,
+            relation,
+          };
+        },
+        child,
+      );
       await check(
         "incomplete_holds_old_snapshot",
         compression,

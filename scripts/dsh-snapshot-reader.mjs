@@ -9,6 +9,10 @@ import { isDeepStrictEqual } from "node:util";
 import { zstdDecompressSync } from "node:zlib";
 import limits from "./dsh-snapshot-limits.json" with { type: "json" };
 import { loadDshInstallation } from "./dsh-installed.mjs";
+import {
+  decodeDshV4Jsonl,
+  nativeLifecycleHash,
+} from "./dsh-native-admission.mjs";
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 class Blocked extends Error {
@@ -299,36 +303,10 @@ export async function createDshSnapshotReader({
         refuse("unavailable", "decoded_binding_mismatch");
       let artifact;
       try {
-        const rows = new TextDecoder("utf-8", { fatal: true })
-          .decode(plain)
-          .split("\n");
-        assert.equal(rows.pop(), "");
-        const physicalHeader = JSON.parse(rows.shift());
-        if (physicalHeader.version !== selected.generation)
-          refuse("rejected", "header_generation_mismatch");
-        const decoder = codec.createDecoder(physicalHeader, "strict");
-        const events = [];
-        const context = {
-          emitEvent: (event) => events.push(event),
-          emitRun: () => {
-            throw new Error("unexpected packed v4 run");
-          },
-        };
-        for (const row of rows) decoder.decodeRow(JSON.parse(row), context);
-        artifact = {
-          header: decoder.header,
-          events,
-          inheritedEventCount: decoder.finish(context),
-        };
-        format.restoreReleasedV4Artifact(
-          artifact,
-          session.KNOWN_SESSION_EVENT_TYPES,
-        );
-        session.Session.create(
-          artifact.header.id,
-          artifact.events,
-          artifact.header,
-          artifact.inheritedEventCount,
+        artifact = decodeDshV4Jsonl(
+          plain,
+          { codec, format, session },
+          selected.generation,
         );
         if (
           artifact.header.id !== id ||
@@ -339,6 +317,8 @@ export async function createDshSnapshotReader({
           refuse("rejected", "record_coverage_mismatch");
       } catch (error) {
         if (error instanceof Blocked) throw error;
+        if (error.code === "DSH_HEADER_GENERATION")
+          refuse("rejected", "header_generation_mismatch");
         refuse("rejected", "semantic_admission");
       }
       await observeAgain(saved, signal);
@@ -358,11 +338,7 @@ export async function createDshSnapshotReader({
             selected.generation,
           ]),
         ),
-        lifecycle: hash(
-          JSON.stringify(
-            codec.encodeHeader(artifact.header, artifact.inheritedEventCount),
-          ),
-        ),
+        lifecycle: nativeLifecycleHash(artifact, codec),
       });
       return receipt;
     } catch (error) {

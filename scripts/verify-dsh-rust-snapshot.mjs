@@ -21,7 +21,12 @@ import {
   loadDshInstallation,
   SUPPORTED_DSH_VERSION,
 } from "./dsh-installed.mjs";
+import {
+  decodeDshV4Jsonl,
+  nativeLifecycleHash,
+} from "./dsh-native-admission.mjs";
 import limits from "./dsh-snapshot-limits.json" with { type: "json" };
+import { seedWithTurn } from "../tests/fixtures/dsh-v4/scenarios.mjs";
 
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 const line = (value) => Buffer.from(`${JSON.stringify(value)}\n`);
@@ -45,6 +50,8 @@ async function main() {
       "dsh-package": { type: "string" },
       "rust-reader": { type: "string" },
       "wsl-reader": { type: "string" },
+      "native-node": { type: "string" },
+      "native-dsh-package": { type: "string" },
     },
   });
   assert(values["dsh-package"]);
@@ -54,6 +61,16 @@ async function main() {
     1,
   );
   const inWsl = Boolean(values["wsl-reader"]);
+  const native = Boolean(values["native-node"]);
+  assert(!values["native-dsh-package"] || native);
+  const nativePackage =
+    values["native-dsh-package"] ??
+    (!inWsl ? resolve(values["dsh-package"]) : undefined);
+  if (native) {
+    const absolute = inWsl ? posix.isAbsolute : isAbsolute;
+    assert(absolute(values["native-node"]));
+    assert(nativePackage && absolute(nativePackage));
+  }
   const reader = inWsl ? values["wsl-reader"] : resolve(values["rust-reader"]);
   const wsl = (args) => {
     const child = spawnSync("wsl.exe", ["--exec", ...args], {
@@ -111,6 +128,16 @@ async function main() {
     Buffer.concat(
       rows.map((row) => (compression === "zstd" ? pack(row) : row)),
     );
+  const child = seedWithTurn(artifact, "child");
+  const reseeded = seedWithTurn(child, "reseeded");
+  reseeded.header = structuredClone(child.header);
+  const rowsOf = (value) =>
+    [
+      codec.encodeHeader(value.header, value.inheritedEventCount),
+      ...value.events.map((event) => codec.encodeEvent(event)),
+    ].map(line);
+  assert.deepEqual(rowsOf(child)[0], rowsOf(reseeded)[0]);
+  assert.deepEqual(reseeded.events.slice(0, child.events.length), child.events);
   const cases = [];
   const add = async (name, compression, bytes, expected, options = {}) => {
     const path = join(run, `${name}.bin`);
@@ -139,6 +166,14 @@ async function main() {
     await addRows("header_only", parts.slice(0, 1), "physically_validated", {
       native: true,
     });
+    for (const [name, value] of [
+      ["seeded", child],
+      ["reseeded_same_header", reseeded],
+    ]) {
+      await addRows(name, rowsOf(value), "physically_validated", {
+        native: true,
+      });
+    }
     await addRows(
       "whitespace_utf8",
       parts.map((row) =>
@@ -371,6 +406,9 @@ async function main() {
         "--compression",
         compression,
         ...(positions ? ["--positions"] : []),
+        ...(native
+          ? ["--node", values["native-node"], "--dsh-package", nativePackage]
+          : []),
       ],
       {
         cwd: repo,
@@ -384,34 +422,7 @@ async function main() {
   };
   const nativeAdmission = (plain) => {
     try {
-      const rows = plain
-        .toString("utf8")
-        .trimEnd()
-        .split("\n")
-        .map((row) => JSON.parse(row));
-      const decoder = codec.createDecoder(rows.shift(), "strict");
-      const events = [];
-      const context = {
-        emitEvent: (event) => events.push(event),
-        emitRun: () => assert.fail("unexpected packed run"),
-      };
-      for (const row of rows) decoder.decodeRow(row, context);
-      const restored = {
-        header: decoder.header,
-        events,
-        inheritedEventCount: decoder.finish(context),
-      };
-      format.restoreReleasedV4Artifact(
-        restored,
-        session.KNOWN_SESSION_EVENT_TYPES,
-      );
-      session.Session.create(
-        restored.header.id,
-        events,
-        restored.header,
-        restored.inheritedEventCount,
-      );
-      return true;
+      return decodeDshV4Jsonl(plain, { codec, format, session });
     } catch {
       return false;
     }
@@ -419,12 +430,26 @@ async function main() {
   for (const [index, item] of cases.entries()) {
     stage = item.name;
     const { report, code } = invoke(item.path, item.compression);
+    const expected = native
+      ? item.expected.map((kind) =>
+          kind === "physically_validated"
+            ? item.native === false
+              ? "rejected"
+              : "native_admitted_snapshot"
+            : kind,
+        )
+      : item.expected;
     assert(
-      item.expected.includes(report.kind),
+      expected.includes(report.kind),
       `${stage}: ${JSON.stringify(report)}`,
     );
+    if (native && item.native === false) {
+      assert.equal(report.reason, "native_semantic_admission");
+    }
     const evidence = audited.results[index];
-    if (report.kind === "physically_validated") {
+    if (
+      ["physically_validated", "native_admitted_snapshot"].includes(report.kind)
+    ) {
       assert.equal(code, 0);
       assert.equal(evidence.status, "complete");
       assert.equal(report.snapshot_sha256, digest(item.bytes));
@@ -447,7 +472,7 @@ async function main() {
       assert.equal(report.jsonl_sha256, digest(plain));
       assert.equal(report.jsonl_sha256, evidence.verified_jsonl_sha256);
       assert.equal(report.production_advance_permit, false);
-      assert.equal(report.semantic_admission_validated, false);
+      assert.equal(report.semantic_admission_validated, native);
       assert.equal(report.source_observation_validated, false);
       assert.equal(report.normalized_positions_available, false);
       assert.equal(report.atomic_source_snapshot_proven, false);
@@ -488,8 +513,18 @@ async function main() {
         );
         logicalOffset += chunk.length;
       });
+      const admitted = nativeAdmission(plain);
       if (item.native !== undefined)
-        assert.equal(nativeAdmission(plain), item.native);
+        assert.equal(Boolean(admitted), item.native);
+      if (native) {
+        assert(admitted);
+        assert.deepEqual(report.native_admission, {
+          inherited_event_count: admitted.inheritedEventCount,
+          lifecycle_sha256: nativeLifecycleHash(admitted, codec),
+          native_events_sha256: digest(JSON.stringify(admitted.events)),
+          dsh_version: SUPPORTED_DSH_VERSION,
+        });
+      }
     } else {
       assert.equal(code, 2);
       assert.equal(typeof report.reason, "string");
@@ -500,6 +535,29 @@ async function main() {
     reports[item.name] = report;
     checks[item.name] = "passed";
   }
+  stage = native
+    ? "inherited_cut_changes_lifecycle_with_same_header"
+    : "seeded_snapshots_share_header";
+  for (const compression of ["none", "zstd"]) {
+    const before = reports[`${compression}_seeded`];
+    const after = reports[`${compression}_reseeded_same_header`];
+    assert.equal(before.header_sha256, after.header_sha256);
+    if (native) {
+      assert.equal(
+        before.native_admission.inherited_event_count,
+        child.inheritedEventCount,
+      );
+      assert.equal(
+        after.native_admission.inherited_event_count,
+        reseeded.inheritedEventCount,
+      );
+      assert.notEqual(
+        before.native_admission.lifecycle_sha256,
+        after.native_admission.lifecycle_sha256,
+      );
+    }
+  }
+  checks[stage] = "passed";
   stage = "repacking_preserves_record_positions";
   const baseline = reports.zstd_native_complete;
   const repacked = reports.zstd_repacked_events;
@@ -545,7 +603,7 @@ async function main() {
         checksum_mutations: 4,
         same_buffer_physical_validation: true,
         native_record_positions_compared: true,
-        rust_semantic_admission_integrated: false,
+        rust_semantic_admission_integrated: native,
         rust_source_observation_integrated: false,
         normalized_positions_available: false,
         production_advance_gate_integrated: false,

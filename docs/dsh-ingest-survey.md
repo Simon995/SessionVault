@@ -13,17 +13,17 @@
 
 以下数字来自 2026-11-05 本轮探针，包含两代日志，**不是去重后的会话事件数或 RawEvent 数**：
 
-| 项 | 实测 |
-| --- | --- |
-| 会话目录 | 6 |
-| 物理日志 | 10 |
-| `session.jsonl.zstd`，header version 0 | 4 |
-| `session.v4.jsonl.zstd`，header version 4 | 6 |
-| 同目录两代并存 | 4 |
-| 按最高规范代选择 | 6 个目录均选 v4 / zstd |
-| 解压后读到的字节 | 8,975,978 |
-| 物理 JSON 对象 / 行 | 6,572 / 6,572 |
-| 预算触顶、遍历错误、读取期间文件变化 | 本轮均未观察到 |
+| 项                                        | 实测                   |
+| ----------------------------------------- | ---------------------- |
+| 会话目录                                  | 6                      |
+| 物理日志                                  | 10                     |
+| `session.jsonl.zstd`，header version 0    | 4                      |
+| `session.v4.jsonl.zstd`，header version 4 | 6                      |
+| 同目录两代并存                            | 4                      |
+| 按最高规范代选择                          | 6 个目录均选 v4 / zstd |
+| 解压后读到的字节                          | 8,975,978              |
+| 物理 JSON 对象 / 行                       | 6,572 / 6,572          |
+| 预算触顶、遍历错误、读取期间文件变化      | 本轮均未观察到         |
 
 v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两个数字字段。v0 中存在 `seq0/time0` 的 packed rows，不能把两代混在一起数，再推断 v4 也支持顶层 packed rows。
 
@@ -55,16 +55,16 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 下表是实施依据，**不预定新增公开枚举、字段或 schema**：
 
-| 来源证据 | 本仓需要保留或判定的语义 | 约束 |
-| --- | --- | --- |
-| root、所选代、header version | 来源实例、逻辑来源与格式代 | 未知代不回退，物理压缩形态不是另一份事实 |
-| `id,createdAt,cwd` | 会话生命周期与项目归属 | 单个 id 不证明生命周期；cwd 不从目录反解 |
-| `type,seq,time,data` | 事件类型、原生顺序、原生时间与内容 | `seq` 不等于行号，跨代迁移可能改变；已核 event / stream 为 epoch 毫秒，不保证墙钟单调，见 §9 |
-| `user/message.data`；system / developer / assistant 消息与 `tool/result` 的 `data.message` | 消息、角色、来源与内容 | 保留未知 producer / form，不能把 user 角色当人类证明；`tool/result` 不是 `tool/message` |
-| assistant attempt stream / usage | 文本、思考、工具及用量 | 已用原生 codec 与合成 fixture 核对主要字段，见 §9；cache 未知与精确 total 的表示仍须在正式适配前解决 |
-| `parentSession,origin,delegationDepth,isSeeded`、`session/end-seed` | 父子关系、继承边界与 own suffix | 有 parent 不等于继承历史；不能直接占用父事件槽位 `parent_ref` |
-| `subagent/descriptor`、父 `subagent/catalog`、`runId` | 子会话与一次执行的不同身份 | external catalog 不保证本地有子日志；展示投影不能替代恢复判据 |
-| `sourceEventSeqs,surfaceOp` | 重放引用与有效视图 | 范围编码须解开；日志全史与当前有效消息分开 |
+| 来源证据                                                                                   | 本仓需要保留或判定的语义           | 约束                                                                                                 |
+| ------------------------------------------------------------------------------------------ | ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| root、所选代、header version                                                               | 来源实例、逻辑来源与格式代         | 未知代不回退，物理压缩形态不是另一份事实                                                             |
+| `id,createdAt,cwd`                                                                         | 会话生命周期与项目归属             | 单个 id 不证明生命周期；cwd 不从目录反解                                                             |
+| `type,seq,time,data`                                                                       | 事件类型、原生顺序、原生时间与内容 | `seq` 不等于行号，跨代迁移可能改变；已核 event / stream 为 epoch 毫秒，不保证墙钟单调，见 §9         |
+| `user/message.data`；system / developer / assistant 消息与 `tool/result` 的 `data.message` | 消息、角色、来源与内容             | 保留未知 producer / form，不能把 user 角色当人类证明；`tool/result` 不是 `tool/message`              |
+| assistant attempt stream / usage                                                           | 文本、思考、工具及用量             | 已用原生 codec 与合成 fixture 核对主要字段，见 §9；cache 未知与精确 total 的表示仍须在正式适配前解决 |
+| `parentSession,origin,delegationDepth,isSeeded`、`session/end-seed`                        | 父子关系、继承边界与 own suffix    | 有 parent 不等于继承历史；不能直接占用父事件槽位 `parent_ref`                                        |
+| `subagent/descriptor`、父 `subagent/catalog`、`runId`                                      | 子会话与一次执行的不同身份         | external catalog 不保证本地有子日志；展示投影不能替代恢复判据                                        |
+| `sourceEventSeqs,surfaceOp`                                                                | 重放引用与有效视图                 | 范围编码须解开；日志全史与当前有效消息分开                                                           |
 
 事件位置不能只靠 `(session_id, seq)` 跨格式升级复用；正式方案至少考虑来源实例、会话生命周期与格式代。是否还能提供跨代稳定映射，须用迁移样例验证，不能由一次并存观察推断。[S4][S6]
 
@@ -78,11 +78,11 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 建议把下面三层分别验收，实际载体待双方验证：
 
-| 层 | 最小完成判据 | 缺失 / 冲突时 |
-| --- | --- | --- |
-| 原生日志事实 | 保留原生来源、父子关系与继承边界，并指出来源字段由谁写 | 报未知，不把它提升为可信人类或执行授权 |
-| 控制面绑定 | 可把一次启动 / 执行绑定到具体来源实例与会话生命周期，区分临时 / 持久，并传给子 CLI；正式入口有可复现样例 | 隔离模式拒入；既有普通来源兼容策略另定，不全局猜成非临时 |
-| 摄取与记忆消费 | CLI / Rust 写者统一在入库前排除，报告计数；缓存与记忆引擎遵守同一临时范围；旧写者不能绕过 | 显式阻断或协调版本，不只改单个 parser |
+| 层             | 最小完成判据                                                                                             | 缺失 / 冲突时                                            |
+| -------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| 原生日志事实   | 保留原生来源、父子关系与继承边界，并指出来源字段由谁写                                                   | 报未知，不把它提升为可信人类或执行授权                   |
+| 控制面绑定     | 可把一次启动 / 执行绑定到具体来源实例与会话生命周期，区分临时 / 持久，并传给子 CLI；正式入口有可复现样例 | 隔离模式拒入；既有普通来源兼容策略另定，不全局猜成非临时 |
+| 摄取与记忆消费 | CLI / Rust 写者统一在入库前排除，报告计数；缓存与记忆引擎遵守同一临时范围；旧写者不能绕过                | 显式阻断或协调版本，不只改单个 parser                    |
 
 载体可评估原生正式扩展或单独的控制面绑定记录，但本轮不选定文件名、签名方式或公开 DTO。无论哪种载体，都必须说明信任边界、绑定真实性、生命周期复用、并发写入、属性继承与冲突处理；正文标签和自填 `principal` 不能自证。授权裁定仍归上层控制层。
 
@@ -105,23 +105,23 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 以下路径均相对已安装的 `@deepseek-ai/` 包目录，版本均为 `0.2.1-rc.5`；查证日期 **2026-11-05**。这些是源码读到的行为，未经本轮运行时复现的恢复 / 迁移分支已在上文标明。
 
-| 索引 | 包相对文件与行 | 支撑内容 |
-| --- | --- | --- |
-| S1 | 导出 `resolveDshHome` 的 home 路径包，入口 `lib/index.js:70,83,99`；`dsh-base/cordis.patch.yml:138`；`dsh-session-persistence-jsonl/lib/index.js:2434`；`dsh/lib/profile-boot-C14i-8IN.js:223` | home / backend root、composition 与覆盖顺序 |
-| S2 | `dsh-session-persistence-jsonl/lib/index.js:758,848,871,907,919,2673,3159,3410,3443,3467,3526` | 规范名、路径编码、最高代、版本 / 编码 / id 检查 |
-| S3 | `dsh-session-persistence-jsonl/lib/index.js:102,187,223,1024,1070,1086,1286,1298,1377,1641,2290,2298,2980,3268,3294` | append、串接帧、尾部恢复、稳定读取与修尾 |
-| S4 | `dsh-session-format-catalog/lib/index.js:39`；`dsh-session-format-v0-to-v1/lib/index.js:1595,1610,1661,1700,1741`；`dsh-session-format-v1-to-v2/lib/index.js:163,243,263,296,303`；`dsh-session-format-v3-to-v4/lib/index.js:1044,1065,1092,1452,1513`；`dsh-session-persistence-jsonl/lib/index.js:945` | 格式链、packed 位置、事件 envelope、迁移重排 |
-| S5 | `dsh-session/lib/types/types.d.ts:251,447`；`dsh-session/lib/index.js:1654`；`dsh-session-projection/lib/index.js:263`；`dsh-session-projection-cache/lib/index.js:34,272` | 事实源、surface、可丢弃 cache 与生命周期 |
-| S6 | `dsh-session/lib/types/types.d.ts:408,490`；`dsh-session/lib/types/fork.d.ts:6`；`dsh-subagent/lib/index.js:332,697,1659,2158,2720`；`dsh-subagent/lib/types/descriptor.d.ts:44`；`dsh-subagent/lib/types/catalog.d.ts:19` | seq、父子 / seed、descriptor、catalog 与恢复差别 |
-| S7 | `dsh-session-persistence-jsonl/lib/index.js:782,844`；`dsh-llm/lib/types/message.d.ts:30,95,123,134,166`；`dsh-session/lib/types/types.d.ts:289`；`dsh-subagent/lib/types/continuation-messages.d.ts:11`；`dsh-typert-protocol/lib/types/types.d.ts:352`；`dsh-api-remote-access/lib/types/types.d.ts:12,43`；`dsh-api-session-controller/lib/types/types.d.ts:386` | header、来源与角色、peer / principal、临时属性边界 |
-| S8 | `dsh-app-boot/lib/index.js:61,311,421,529,995,1015,1065,1084,1127,3942,3961`；`dsh/lib/profile-boot-C14i-8IN.js:236`；`dsh-base/cordis.patch.yml:138` | 静态 patch 组合、兼容检查、读取与可能改写 profile 的入口区别 |
-| S9 | `dsh-session/lib/types/types.d.ts:289`；`dsh-session/lib/index.js:1194,1378,1528`；`dsh-llm/lib/types/types.d.ts:45,413`；`dsh-agent-loop/lib/index.js:395,681,1093` | 消息 payload、工具标识、时间与 settlement 分支 |
-| S10 | `dsh-llm/lib/types/assistant-stream.js:31,135,378`；`dsh-llm/lib/types/assembler.js:33,121,155`；`dsh-session-format-v3-to-v4/lib/index.js:314,459,982,1057`；`dsh-session-persistence-jsonl/lib/index.js:1838` | stream 编解码、装配规则、原生恢复与校验边界 |
-| S11 | `dsh-token-meter/lib/types/usage-projection.js:60,91`；`dsh-token-meter/lib/types/turn-usage.js:21,115`；`dsh-llm-deepseek/lib/index.js:1832,2017` | 用量样本选择、重试折叠、完整性与 cache 拆分 |
-| S12 | `dsh-agent-loop/lib/index.js:1217,1226`；`dsh-session/lib/types/types.d.ts:218`；`dsh-llm-retry/lib/types/types.d.ts:13`；`dsh-session-format-v3-to-v4/lib/index.js:676` | 请求头 writer、完整 retry payload 与原生配对 |
-| S13 | `dsh-session-format-v1-to-v2/lib/index.js:219,263`；`dsh-session-format-v3-to-v4/lib/index.js:982,1065,1107`；`dsh-session/lib/index.js:1399` | framing 恢复、v4 admission、继承 cut 与 marker |
-| S14 | `dsh-session-persistence-jsonl/lib/index.js:63,103,2488,2644,2839,2980,3626`；`dsh-session-persistence/lib/types/handle.d.ts:52`；`dsh-session-format-v2-to-v3/lib/index.js:533` | 原生 backend 挂载、只读句柄、历史代准备、帧扫描与修尾读取 |
-| S15 | `dsh-session-persistence/lib/types/handle.d.ts:19,38`；`dsh-session-persistence-jsonl/lib/index.js:63,228,1632,1652,2826,2938` | 公开读取结果与并发前缀承诺、长度防倒退、稳定读单次重试、缓存身份及修尾顺序 |
+| 索引 | 包相对文件与行                                                                                                                                                                                                                                                                                                                                                      | 支撑内容                                                                   |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| S1   | 导出 `resolveDshHome` 的 home 路径包，入口 `lib/index.js:70,83,99`；`dsh-base/cordis.patch.yml:138`；`dsh-session-persistence-jsonl/lib/index.js:2434`；`dsh/lib/profile-boot-C14i-8IN.js:223`                                                                                                                                                                      | home / backend root、composition 与覆盖顺序                                |
+| S2   | `dsh-session-persistence-jsonl/lib/index.js:758,848,871,907,919,2673,3159,3410,3443,3467,3526`                                                                                                                                                                                                                                                                      | 规范名、路径编码、最高代、版本 / 编码 / id 检查                            |
+| S3   | `dsh-session-persistence-jsonl/lib/index.js:102,187,223,1024,1070,1086,1286,1298,1377,1641,2290,2298,2980,3268,3294`                                                                                                                                                                                                                                                | append、串接帧、尾部恢复、稳定读取与修尾                                   |
+| S4   | `dsh-session-format-catalog/lib/index.js:39`；`dsh-session-format-v0-to-v1/lib/index.js:1595,1610,1661,1700,1741`；`dsh-session-format-v1-to-v2/lib/index.js:163,243,263,296,303`；`dsh-session-format-v3-to-v4/lib/index.js:1044,1065,1092,1452,1513`；`dsh-session-persistence-jsonl/lib/index.js:945`                                                            | 格式链、packed 位置、事件 envelope、迁移重排                               |
+| S5   | `dsh-session/lib/types/types.d.ts:251,447`；`dsh-session/lib/index.js:1654`；`dsh-session-projection/lib/index.js:263`；`dsh-session-projection-cache/lib/index.js:34,272`                                                                                                                                                                                          | 事实源、surface、可丢弃 cache 与生命周期                                   |
+| S6   | `dsh-session/lib/types/types.d.ts:408,490`；`dsh-session/lib/types/fork.d.ts:6`；`dsh-subagent/lib/index.js:332,697,1659,2158,2720`；`dsh-subagent/lib/types/descriptor.d.ts:44`；`dsh-subagent/lib/types/catalog.d.ts:19`                                                                                                                                          | seq、父子 / seed、descriptor、catalog 与恢复差别                           |
+| S7   | `dsh-session-persistence-jsonl/lib/index.js:782,844`；`dsh-llm/lib/types/message.d.ts:30,95,123,134,166`；`dsh-session/lib/types/types.d.ts:289`；`dsh-subagent/lib/types/continuation-messages.d.ts:11`；`dsh-typert-protocol/lib/types/types.d.ts:352`；`dsh-api-remote-access/lib/types/types.d.ts:12,43`；`dsh-api-session-controller/lib/types/types.d.ts:386` | header、来源与角色、peer / principal、临时属性边界                         |
+| S8   | `dsh-app-boot/lib/index.js:61,311,421,529,995,1015,1065,1084,1127,3942,3961`；`dsh/lib/profile-boot-C14i-8IN.js:236`；`dsh-base/cordis.patch.yml:138`                                                                                                                                                                                                               | 静态 patch 组合、兼容检查、读取与可能改写 profile 的入口区别               |
+| S9   | `dsh-session/lib/types/types.d.ts:289`；`dsh-session/lib/index.js:1194,1378,1528`；`dsh-llm/lib/types/types.d.ts:45,413`；`dsh-agent-loop/lib/index.js:395,681,1093`                                                                                                                                                                                                | 消息 payload、工具标识、时间与 settlement 分支                             |
+| S10  | `dsh-llm/lib/types/assistant-stream.js:31,135,378`；`dsh-llm/lib/types/assembler.js:33,121,155`；`dsh-session-format-v3-to-v4/lib/index.js:314,459,982,1057`；`dsh-session-persistence-jsonl/lib/index.js:1838`                                                                                                                                                     | stream 编解码、装配规则、原生恢复与校验边界                                |
+| S11  | `dsh-token-meter/lib/types/usage-projection.js:60,91`；`dsh-token-meter/lib/types/turn-usage.js:21,115`；`dsh-llm-deepseek/lib/index.js:1832,2017`                                                                                                                                                                                                                  | 用量样本选择、重试折叠、完整性与 cache 拆分                                |
+| S12  | `dsh-agent-loop/lib/index.js:1217,1226`；`dsh-session/lib/types/types.d.ts:218`；`dsh-llm-retry/lib/types/types.d.ts:13`；`dsh-session-format-v3-to-v4/lib/index.js:676`                                                                                                                                                                                            | 请求头 writer、完整 retry payload 与原生配对                               |
+| S13  | `dsh-session-format-v1-to-v2/lib/index.js:219,263`；`dsh-session-format-v3-to-v4/lib/index.js:982,1065,1107`；`dsh-session/lib/index.js:1399`                                                                                                                                                                                                                       | framing 恢复、v4 admission、继承 cut 与 marker                             |
+| S14  | `dsh-session-persistence-jsonl/lib/index.js:63,103,2488,2644,2839,2980,3626`；`dsh-session-persistence/lib/types/handle.d.ts:52`；`dsh-session-format-v2-to-v3/lib/index.js:533`                                                                                                                                                                                    | 原生 backend 挂载、只读句柄、历史代准备、帧扫描与修尾读取                  |
+| S15  | `dsh-session-persistence/lib/types/handle.d.ts:19,38`；`dsh-session-persistence-jsonl/lib/index.js:63,228,1632,1652,2826,2938`                                                                                                                                                                                                                                      | 公开读取结果与并发前缀承诺、长度防倒退、稳定读单次重试、缓存身份及修尾顺序 |
 
 ## 8. 后续核查：静态 profile 的日志根
 
@@ -139,15 +139,15 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 ### 消息与工具
 
-| 事件 | 消息位置 / 关键字段 | 摄取约束 |
-| --- | --- | --- |
-| `user/message` | `data` 就是消息对象 | `role=user` 仍不能证明人类来源 |
-| `system/message` | `data.{turn,step,message}` | 消息 source 为 `system-prompt` |
-| `developer/message` | `data.{turn,step,message,headerSeq?}` | producer 自有 source；tool-addition 引用历史 request/header，不内联工具定义 |
-| `assistant/message` | `data.{turn,step,message,stream,usage?,interrupted?}` | 已提交正文取 message.content；stream 是同一次生成的过程，不能再拼成第二份正文 |
-| `assistant/attempt` | `data.{turn,step,stream}` | 保留失败 / 取消 attempt 的过程，不伪造一条已提交消息 |
-| `tool/call` | `data.{turn,step,callId,name,arguments}` | arguments 是原始 JSON 字符串；call 记录不证明执行成功 |
-| `tool/result` | `data.{turn,step,message,error?,meta?}` | `message.toolCallId = message.source.callId`，对应 assistant 的 tool-call.id；结果有自己的 message id |
+| 事件                | 消息位置 / 关键字段                                   | 摄取约束                                                                                              |
+| ------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `user/message`      | `data` 就是消息对象                                   | `role=user` 仍不能证明人类来源                                                                        |
+| `system/message`    | `data.{turn,step,message}`                            | 消息 source 为 `system-prompt`                                                                        |
+| `developer/message` | `data.{turn,step,message,headerSeq?}`                 | producer 自有 source；tool-addition 引用历史 request/header，不内联工具定义                           |
+| `assistant/message` | `data.{turn,step,message,stream,usage?,interrupted?}` | 已提交正文取 message.content；stream 是同一次生成的过程，不能再拼成第二份正文                         |
+| `assistant/attempt` | `data.{turn,step,stream}`                             | 保留失败 / 取消 attempt 的过程，不伪造一条已提交消息                                                  |
+| `tool/call`         | `data.{turn,step,callId,name,arguments}`              | arguments 是原始 JSON 字符串；call 记录不证明执行成功                                                 |
+| `tool/result`       | `data.{turn,step,message,error?,meta?}`               | `message.toolCallId = message.source.callId`，对应 assistant 的 tool-call.id；结果有自己的 message id |
 
 合成样本核对了 text、reasoning、tool-call 三类块；工具 id、参数与结果的原生关系错误会被拒绝。image / file / attachment、tool-addition / tool-removal、错误修复结果及 external 子会话仍须另补样本，不能把本轮内容子集当作全部合法 content。[S9][S10]
 
@@ -163,14 +163,14 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 
 ### 用量映射与不能压掉的未知
 
-| DSH 字段 | 现有 TokenUsage 的候选字段 | 必须保留的限制 |
-| --- | --- | --- |
-| `inputTokens` | `input` | 与 cache 分桶，不再次扣 cache；已核 DeepSeek adapter 的实际赋值 |
-| `outputTokens` | `output` | 不再把 reasoning 加一次 |
-| `cacheWriteTokens?` | `cache_creation` | 缺失不等于 0 |
-| `cacheReadTokens?` | `cache_read` | 缺失不等于 0 |
-| `reasoningTokens?` | 无独立字段 | 四项映射会丢失拆分 |
-| `totalTokens?` | 无独立字段 | 四项相加不能保证重建原始精确 total |
+| DSH 字段            | 现有 TokenUsage 的候选字段 | 必须保留的限制                                                  |
+| ------------------- | -------------------------- | --------------------------------------------------------------- |
+| `inputTokens`       | `input`                    | 与 cache 分桶，不再次扣 cache；已核 DeepSeek adapter 的实际赋值 |
+| `outputTokens`      | `output`                   | 不再把 reasoning 加一次                                         |
+| `cacheWriteTokens?` | `cache_creation`           | 缺失不等于 0                                                    |
+| `cacheReadTokens?`  | `cache_read`               | 缺失不等于 0                                                    |
+| `reasoningTokens?`  | 无独立字段                 | 四项映射会丢失拆分                                              |
+| `totalTokens?`      | 无独立字段                 | 四项相加不能保证重建原始精确 total                              |
 
 已跑反例：`inputTokens=10, outputTokens=5, totalTokens=20`，cache 均未报告，严格 reducer 仍能保留精确总量 20 与未知 cache；若缺失 cache 填 0，四项之和只有 15。**正式适配前必须确定如何保留原始 usage / 未知状态及精确 total；不先修改公开类型或 schema。** 缺 usage、缺 turn/end、负值或矛盾 total 应报告不可得，不能生成 0 用量。[S11]
 
@@ -208,13 +208,13 @@ node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 
 ### codec 恢复与完整性
 
-| 合成反例 | 实跑结果 | 正式读取必须保留的判断 |
-| --- | --- | --- |
-| 最后一行 envelope 损坏，后面没有有效 turn/end | strict 拒绝；recoverable 只返回有效前缀，finish 正常 | 对照输入行与产出；不能仅凭 finish 未抛错报完整 |
-| 完整 turn 后再接坏行与无 end 的后缀 | recoverable 返回原完整 turn，用量仍可得 20 | 有完整 turn / 用量不证明整个输入已读完，不推进到损坏后缀末尾 |
-| 坏行或 seq 缺口之后还有有效 turn/end | recoverable 拒绝 | 不能跳过中间损坏继续入库 |
-| 尾部 request/header 含已退役 header.system | v4 admission 在 recoverable framing 前直接拒绝 | 不是所有错误都进入可恢复尾部逻辑 |
-| 未知 required 事件、tool/call 与 assistant 声明的参数不符 | codec 可解码；restore 才拒绝，unknown ignorable 则可保留 | strict codec 也不替代事件词汇与关系校验 |
+| 合成反例                                                  | 实跑结果                                                 | 正式读取必须保留的判断                                       |
+| --------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------ |
+| 最后一行 envelope 损坏，后面没有有效 turn/end             | strict 拒绝；recoverable 只返回有效前缀，finish 正常     | 对照输入行与产出；不能仅凭 finish 未抛错报完整               |
+| 完整 turn 后再接坏行与无 end 的后缀                       | recoverable 返回原完整 turn，用量仍可得 20               | 有完整 turn / 用量不证明整个输入已读完，不推进到损坏后缀末尾 |
+| 坏行或 seq 缺口之后还有有效 turn/end                      | recoverable 拒绝                                         | 不能跳过中间损坏继续入库                                     |
+| 尾部 request/header 含已退役 header.system                | v4 admission 在 recoverable framing 前直接拒绝           | 不是所有错误都进入可恢复尾部逻辑                             |
+| 未知 required 事件、tool/call 与 assistant 声明的参数不符 | codec 可解码；restore 才拒绝，unknown ignorable 则可保留 | strict codec 也不替代事件词汇与关系校验                      |
 
 本节的离线脚本调用公开 codec 和 restore，没有经过 JSONL 字节分行或 DSH backend 的帧扫描 / 稳定读 / 修尾入口；后续原生 backend 合成文件验证见 §12。codec 的 recoverable 行为是恢复证据的一层，不能当作整个 backend 验收。[S13]
 
@@ -236,13 +236,13 @@ node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 
 建议正式实现优先评估事件上的独立计量证据字段，旧四桶作为证据完整时的兼容投影；本轮只形成契约草案，不新增公开字段或 schema。证据至少同时包含：
 
-| 事实 | 草案要求 |
-| --- | --- |
-| 原生计量样本 | 保存原生 usage 对象、来自外层 message 还是 stream、所在事件与 stream 样本位置；保留被覆盖样本供核对，合计只用 settlement 的选定样本 |
-| 逐字段值 | input / output / cache read / cache write / reasoning 各自保留已知与未知；报告的 0 仍是已知 0，缺字段不变成 0，也不自行求未知 cache 的拆分 |
-| 精确 total | 保留显式报告的 total，或在所有分桶已知时标记为推导值；reasoning 不重复加，原始矛盾值保留但不进入可用合计 |
-| 可用状态 | 区分完全缺报告、已有合法但不足以求精确总量的报告、值非法 / 矛盾、生命周期不完整、已有精确总量；精确 total 可以与未知 cache 同时成立 |
-| 计量归属 | 绑定来源实例 / 格式代 / 事件与 attempt；继承前缀不计作本会话新增。缺 route、父子元数据与执行绑定的未知分别保留 |
+| 事实         | 草案要求                                                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| 原生计量样本 | 保存原生 usage 对象、来自外层 message 还是 stream、所在事件与 stream 样本位置；保留被覆盖样本供核对，合计只用 settlement 的选定样本        |
+| 逐字段值     | input / output / cache read / cache write / reasoning 各自保留已知与未知；报告的 0 仍是已知 0，缺字段不变成 0，也不自行求未知 cache 的拆分 |
+| 精确 total   | 保留显式报告的 total，或在所有分桶已知时标记为推导值；reasoning 不重复加，原始矛盾值保留但不进入可用合计                                   |
+| 可用状态     | 区分完全缺报告、已有合法但不足以求精确总量的报告、值非法 / 矛盾、生命周期不完整、已有精确总量；精确 total 可以与未知 cache 同时成立        |
+| 计量归属     | 绑定来源实例 / 格式代 / 事件与 attempt；继承前缀不计作本会话新增。缺 route、父子元数据与执行绑定的未知分别保留                             |
 
 原生严格 reducer 对缺失、非法和生命周期不完整均返回 `undefined`，不能单靠它的返回值推断失败原因。正式适配需要在规范化前保留字段观察和生命周期诊断；不能最终只输出 `usage=None`，使原始精确 total 或不可得原因消失。13 个公开向量已覆盖完整四桶、推导 total、精确 total + 全部 / 单个未知 cache、明确零、缺报告、缺 total、矛盾 total、reasoning 超界、负数、不安全整数与加法溢出；它们验证原生 reducer 的边界，不是已实现的本仓状态类型。
 
@@ -262,22 +262,22 @@ node scripts/verify-dsh-v4.mjs --dsh-package '<dsh-package.json>'
 
 ### 已实跑的服务路径
 
-| 合成场景 | 实跑结果 |
-| --- | --- |
-| 完整明文、zstd 多帧 | 原生 open/read 返回完整事件；切片、末尾空读与元数据出口符合预期 |
-| read 句柄 append / flush | 均抛 SessionReadOnlyError，只读检查前后文件未变 |
-| 明文完整 JSON 但没有末尾换行 | 最后一条不返回；尾部只有不完整 JSON 时也保留此前有效事件 |
-| 坏 JSON 行之后仍有有效 turn/end | SessionPersistenceCorruptionError，不跳过后继续 |
-| zstd 最后一帧缺一个 checksum 字节 | 读回已恢复的完整记录，文件字节不变；该样本能读回全部事件，仍存在物理坏尾 |
-| 完整帧 checksum 错误、完整帧内缺换行、header 与事件挤在首帧 | 均抛 SessionPersistenceCorruptionError |
-| 完整重试、seed child | 原生 backend 返回共享派生事件，child 的 inherited cut 与父前缀长度相等 |
-| v4 与不可读 v3 并存，v3 的 mtime 更晚 | 选 v4；不按 mtime 选代，也不要求读完较低代 |
-| 只有合法 v3 纯文本 turn | stat 报 migration-required；只读 open/read 在内存中转成当前逻辑事件，文件列表与哈希不变，没有发布 v4 |
-| v3 读句柄已打开，再原子发布等价 v4 | 原句柄能切换到新代，stat 变为 current；这是可控顺序交错，不是并发窗口压力验证 |
-| 已有 v4 读句柄，随后出现 v5 | 原句柄后续 read 和新 open 均抛 SessionFormatUnsupportedError，不回退 v4 |
-| 明文 / zstd 读句柄已读完，夹具写入者再追加完整 turn | 原句柄读到新增部分；按旧逻辑事件 offset 读取只返回新增事件 |
-| 已观察完整前缀后，文件被较短合法前缀原子替换 | 原句柄拒绝倒退，不静默缩短已观察历史 |
-| 明文 / zstd 坏尾，随后经原生 write 句柄追加 | open/read 尚不修尾；首次 append 修复并持久化，再读事件无丢失、无重复 |
+| 合成场景                                                    | 实跑结果                                                                                             |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| 完整明文、zstd 多帧                                         | 原生 open/read 返回完整事件；切片、末尾空读与元数据出口符合预期                                      |
+| read 句柄 append / flush                                    | 均抛 SessionReadOnlyError，只读检查前后文件未变                                                      |
+| 明文完整 JSON 但没有末尾换行                                | 最后一条不返回；尾部只有不完整 JSON 时也保留此前有效事件                                             |
+| 坏 JSON 行之后仍有有效 turn/end                             | SessionPersistenceCorruptionError，不跳过后继续                                                      |
+| zstd 最后一帧缺一个 checksum 字节                           | 读回已恢复的完整记录，文件字节不变；该样本能读回全部事件，仍存在物理坏尾                             |
+| 完整帧 checksum 错误、完整帧内缺换行、header 与事件挤在首帧 | 均抛 SessionPersistenceCorruptionError                                                               |
+| 完整重试、seed child                                        | 原生 backend 返回共享派生事件，child 的 inherited cut 与父前缀长度相等                               |
+| v4 与不可读 v3 并存，v3 的 mtime 更晚                       | 选 v4；不按 mtime 选代，也不要求读完较低代                                                           |
+| 只有合法 v3 纯文本 turn                                     | stat 报 migration-required；只读 open/read 在内存中转成当前逻辑事件，文件列表与哈希不变，没有发布 v4 |
+| v3 读句柄已打开，再原子发布等价 v4                          | 原句柄能切换到新代，stat 变为 current；这是可控顺序交错，不是并发窗口压力验证                        |
+| 已有 v4 读句柄，随后出现 v5                                 | 原句柄后续 read 和新 open 均抛 SessionFormatUnsupportedError，不回退 v4                              |
+| 明文 / zstd 读句柄已读完，夹具写入者再追加完整 turn         | 原句柄读到新增部分；按旧逻辑事件 offset 读取只返回新增事件                                           |
+| 已观察完整前缀后，文件被较短合法前缀原子替换                | 原句柄拒绝倒退，不静默缩短已观察历史                                                                 |
+| 明文 / zstd 坏尾，随后经原生 write 句柄追加                 | open/read 尚不修尾；首次 append 修复并持久化，再读事件无丢失、无重复                                 |
 
 历史样本单独构造两代都支持的纯文本 turn，由原生 v3 codec 编码；没有把包含 v4 developer / tool-role 的共享样本仅改 header 后冒充合法 v3。v4 发布和“另一写者追加”由夹具写入者控制；原生读者始终使用 read 句柄。两个修尾样本则显式打开 write 句柄，只修改项目内合成日志，核明文最终字节、zstd 已完成帧的保留前缀及重新读取的完整事件。
 
@@ -305,19 +305,19 @@ node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
 
 前十行分别跑明文 / zstd，共 20 组；历史代发布另 1 组。每次比较完整事件内容与顺序，续读比较精确后缀，不只比较数量。
 
-| 受控场景 | 实跑结果与限制 |
-| --- | --- |
-| 首次 readFile 完成后只追加下一记录 / 帧的 2 字节 | 原生重读一次，仅返回原 10 事件；文件仍有残尾，reader 未修复。补齐后同句柄得到 16 事件，旧逻辑 offset 只返回新增 6 条 |
-| 两次 readFile 后分别追加一个完整 turn | 两次读取均与追加重叠，本次返回 16 事件时磁盘已存在 22 事件；随后续读精确补齐 6 条，全读与 22 事件样本一致 |
-| 另一进程持原生 write 句柄 append + flush | 父进程既有 read 句柄随后读到完整 16 事件及精确新增后缀；该场景未争夺第二份 write 租约 |
-| 首次 readFile 后发布损坏内容 | 明文为坏 JSON 后仍有 turn/end，zstd 为完整帧 checksum 错；第二次读后均报 SessionPersistenceCorruptionError。恢复文件后同句柄可读，失败未变成空成功 |
-| 公开 readFile 屏障注入 EIO | 保留原 `code=EIO`；恢复方法后读取正常、文件未变。这是受控故障注入，不是实测磁盘或权限故障 |
-| 已观察前缀后替换成同事件数的不同正文 | 两种编码均读回改写后的 10 事件；明文物理字节数也相同，zstd 物理字节数不同。事件数防倒退不证明旧内容未变 |
-| 原生 writer 完成 truncate、尚未写回恢复记录 | 明文读者仍取得原前缀；zstd 既有读者因低于已观察前缀而拒绝。writer 完成恢复及追加后，同读者取得完整 16 事件 |
-| v4 的 readFile 已返回，另一进程才发布 v5 | 执行中的读取返回已选 v4 合法前缀；下一次 read 和新 open 均拒绝未知代，没有回退到 v4 |
-| readFile 后追加并取消当前读取 | 保留 AbortError，不返回空成功；下一次未取消的 read 读到完整 16 事件 |
-| 完整文件与带坏尾文件分别读取 | 明文 / zstd 的公开结果均完全相等，键只有 `eventState` / `events`；对照确认物理字节不同且 reader 未修尾 |
-| open 已读到 v3 字节后，另一进程发布含新增 turn 的 v4 | 随后的 handle.read 使用 v4，得到 12 事件，v3 字节未变，stat 为 current。v3 用原生 codec 编码的合法纯文本 turn，不以改 v4 header 冒充 |
+| 受控场景                                             | 实跑结果与限制                                                                                                                                     |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 首次 readFile 完成后只追加下一记录 / 帧的 2 字节     | 原生重读一次，仅返回原 10 事件；文件仍有残尾，reader 未修复。补齐后同句柄得到 16 事件，旧逻辑 offset 只返回新增 6 条                               |
+| 两次 readFile 后分别追加一个完整 turn                | 两次读取均与追加重叠，本次返回 16 事件时磁盘已存在 22 事件；随后续读精确补齐 6 条，全读与 22 事件样本一致                                          |
+| 另一进程持原生 write 句柄 append + flush             | 父进程既有 read 句柄随后读到完整 16 事件及精确新增后缀；该场景未争夺第二份 write 租约                                                              |
+| 首次 readFile 后发布损坏内容                         | 明文为坏 JSON 后仍有 turn/end，zstd 为完整帧 checksum 错；第二次读后均报 SessionPersistenceCorruptionError。恢复文件后同句柄可读，失败未变成空成功 |
+| 公开 readFile 屏障注入 EIO                           | 保留原 `code=EIO`；恢复方法后读取正常、文件未变。这是受控故障注入，不是实测磁盘或权限故障                                                          |
+| 已观察前缀后替换成同事件数的不同正文                 | 两种编码均读回改写后的 10 事件；明文物理字节数也相同，zstd 物理字节数不同。事件数防倒退不证明旧内容未变                                            |
+| 原生 writer 完成 truncate、尚未写回恢复记录          | 明文读者仍取得原前缀；zstd 既有读者因低于已观察前缀而拒绝。writer 完成恢复及追加后，同读者取得完整 16 事件                                         |
+| v4 的 readFile 已返回，另一进程才发布 v5             | 执行中的读取返回已选 v4 合法前缀；下一次 read 和新 open 均拒绝未知代，没有回退到 v4                                                                |
+| readFile 后追加并取消当前读取                        | 保留 AbortError，不返回空成功；下一次未取消的 read 读到完整 16 事件                                                                                |
+| 完整文件与带坏尾文件分别读取                         | 明文 / zstd 的公开结果均完全相等，键只有 `eventState` / `events`；对照确认物理字节不同且 reader 未修尾                                             |
+| open 已读到 v3 字节后，另一进程发布含新增 turn 的 v4 | 随后的 handle.read 使用 v4，得到 12 事件，v3 字节未变，stat 为 current。v3 用原生 codec 编码的合法纯文本 turn，不以改 v4 header 冒充               |
 
 ### 读取结果不能替代的证据
 
@@ -327,12 +327,12 @@ node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
 
 正式读取方案需要分别表达本次是否取得可用前缀、来源是否变化 / 完整以及失败原因，至少守住：
 
-| 判据 | 读取状态 / 推进要求 |
-| --- | --- |
-| 已验证的物理快照完整，或仅恢复出前缀 | 分别报告；当前原生公开结果无法区分，若没有独立证据则完整性保留未知，不能借事件齐全补成完整 |
-| 读取期间追加 / 修尾 / 代发布 | 保留本次选代与来源版本证据；合法旧前缀可与“仍有变化”同时成立，不能冒充已追平 |
-| 旧前缀缩短或内容改写 | 使旧推进凭据失效，重新核对 / 建立投影；不能只凭相同事件数沿用，也不能把未读成当成空会话 |
-| 损坏、未知格式、迁移条件不足、I/O 未知、取消 | 保留各自状态与已有已验证前缀；是否重试另定，失败不自动推进，也不产生空成功 |
+| 判据                                         | 读取状态 / 推进要求                                                                        |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 已验证的物理快照完整，或仅恢复出前缀         | 分别报告；当前原生公开结果无法区分，若没有独立证据则完整性保留未知，不能借事件齐全补成完整 |
+| 读取期间追加 / 修尾 / 代发布                 | 保留本次选代与来源版本证据；合法旧前缀可与“仍有变化”同时成立，不能冒充已追平               |
+| 旧前缀缩短或内容改写                         | 使旧推进凭据失效，重新核对 / 建立投影；不能只凭相同事件数沿用，也不能把未读成当成空会话    |
+| 损坏、未知格式、迁移条件不足、I/O 未知、取消 | 保留各自状态与已有已验证前缀；是否重试另定，失败不自动推进，也不产生空成功                 |
 
 安全推进凭据至少绑定来源实例、会话生命周期、格式代、实际已验证前缀及其版本证据；内容改写、代变化和尾部重编码时须验证旧凭据是否仍成立。物理 EOF、旧压缩 offset 或逻辑事件数都不能单独充当该凭据。如何取得独立完整性证据、验证旧前缀及把状态接入 `scan` / 投影替换，仍是下一步实现设计；本轮不新增公开枚举、DTO 或 schema。
 
@@ -372,6 +372,16 @@ receipt 仅可由该 reader 的实际验证路径登记，外部对象 / JSON / 
 
 Windows 与 WSL Linux 二进制分别通过 136 份合成快照及四组附加对照；独立 Python 帧审计、Node 解压与原生 codec / restore / Session admission 用于交叉检查。覆盖最后一帧的 89 个非空截断点、四个 checksum 字节破坏、输入 / 解码 / 窗口预算、字典与无 checksum、坏 JSON / UTF-8、混合 header 帧、重复 / 缺失 seq、重分帧与空帧位置。重分帧后原生记录的 JSONL 字节范围不变，物理帧位置改变。原生 seq、记录索引、UTF-8 字节位置和物理帧位置分别输出；它们没有被当成 RawEvent.seq 或 Cursor 的位置。
 
-Windows 432 个库测试与所需功能组合 / 零警告 clippy 通过；Linux experimental 组合 256 个库测试与 store 编译通过。Linux 全库 store 测试另有一项既有钥匙链准备失败，仍未通过全库，详见 [读取状态设计 §8](dsh-read-state-design.md#8-rust-同缓冲区物理核验与原生记录位置) 与 backlog F。现有 Rust 消费方临时指向本仓源码的编译也通过，未改其 manifest、lock 或子模块指针。
+`9caf18b` 提交时，Windows 432 个库测试与所需功能组合 / 零警告 clippy 通过；Linux experimental 组合 256 个库测试与 store 编译通过，Linux 全库 store 测试当时另有一项既有钥匙链准备失败（后续本批已在 `store.rs` 修复并全绿，详见 §17 与 [读取状态设计 §8–§9](dsh-read-state-design.md#8-rust-同缓冲区物理核验与原生记录位置)）。现有 Rust 消费方临时指向本仓源码的编译也通过，未改其 manifest、lock 或子模块指针。
 
-本轮是 Rust 物理与原生记录位置的隔离验收；语义 admission、来源 / 生命周期 / 选代与旧前缀核对尚未移植，归一化位置和生产写库门也未接入。未知必需事件或断裂 call/result 能通过 Rust 物理检查、同时被原生 admission 拒绝，对拍明确保留这一差别。所有成功摘要的 `production_advance_permit`、`semantic_admission_validated`、`source_observation_validated` 与 `normalized_positions_available` 均为 false；没有完成 H.4 或完整 WSL DSH 捕获。
+本节记录 `9caf18b` 的 Rust 物理与原生记录位置隔离验收，尚未合并发布；该版语义 admission、来源 / 生命周期 / 选代与旧前缀核对尚未移植，归一化位置和生产写库门也未接入。未知必需事件或断裂 call/result 能通过 Rust 物理检查、同时被原生 admission 拒绝，对拍明确保留这一差别。所有成功摘要的 `production_advance_permit`、`semantic_admission_validated`、`source_observation_validated` 与 `normalized_positions_available` 均为 false；没有完成 H.4 或完整 WSL DSH 捕获。
+
+## 17. 后续实现：Rust 原生 admission 与继承边界绑定
+
+2026-11-06，Rust `PhysicalSnapshot` 保留实际核验后的私有 JSONL，经 stdin 交给显式本机 Node / 安装版 DSH，复用严格 codec、restore 与 detached Session。共享脚本内嵌于实验模块，不重开来源、不导出正文；响应摘要、原 header、事件覆盖和退出状态匹配后才构造私有 `AdmittedSnapshot`。支持版本仍由安装约束核为 `0.2.1-rc.5`，Node 两平台实际 `v25.2.1`；详见 [读取状态设计 §9](dsh-read-state-design.md#9-rust-原生-admission-接缝)。这是显式可信本地运行时的接缝，不认证恶意 SDK。
+
+同时修正 §15 生命周期描述未落实的部分：原来只 hash 编码后的 header，但 v4 `encodeHeader` 不写入 inherited cut。现在共享摘要函数显式纳入 cut；两份原生合法、header 完全相同、旧事件前缀保留的 artifact，cut 为 10 / 17、事件数为 17 / 24，实际捕获判为 `lifecycle_changed`。捕获矩阵由此前 36 组增加到 38 组并通过。
+
+Windows / WSL Linux 各通过 140 份原生模式快照和五组附加对照，包括上述 seeded 样本、原生语义拒绝、同缓冲区摘要、全部字节 / 帧位置与物理失败；Windows 纯物理模式同一矩阵回归通过。每个平台另过 17 组异常响应、错绑、资源预算与进程收尾检查，超时后本次父子 PID 均已消失；ready 用随机标记，不跨系统比较时间。Windows 库测试 435 passed，Linux experimental 库测试 259 passed；修复 `open_existing_returns_the_store_when_it_is_there` 改用显式测试文件钥匙后，Linux 全库 `store`（415 passed）与 `store,dsh-experimental`（421 passed）均 0 失败通过，相关 feature 编译与零警告 clippy 通过。
+
+原生模式成功将 `semantic_admission_validated` 置为 true，其他来源观察、归一化、原子来源证明和生产推进标志仍为 false；无参数的物理模式保留原语义。没有接生产来源 / 生命周期对照、选代、完整旧前缀门、RawEvent、CommitPlan、写库及持久化重放，也没有完成 H.4 或 provider。当前批源码尚未提交，`9caf18b` 只代表 §16，不代表本节接缝已发布。

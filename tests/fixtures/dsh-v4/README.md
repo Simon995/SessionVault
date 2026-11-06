@@ -57,4 +57,13 @@ node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --r
 
 WSL Linux 二进制可在 Windows Node 脚本中改用 `--wsl-reader '<absolute-linux-example-binary>'`（与 `--rust-reader` 二选一）；Git Bash 必须在 node 命令前设置 `MSYS_NO_PATHCONV=1`，避免 Linux 参数被改写。夹具与独立审计在 Windows，Rust 在 Linux 读取本次夹具；不表示 Linux DSH backend 或完整 Node 捕获已验。Rust 仅完成物理核验、最小 envelope 与原生记录位置；未知事件 / 断裂关系仍可通过该层但被原生 admission 拒绝。正式归一化位置、来源绑定与生产推进标志全部保留未接入，详见 [读取状态设计 §8](../../../docs/dsh-read-state-design.md#8-rust-同缓冲区物理核验与原生记录位置)。
 
+2026-11-06 后续原生接缝新增 [dsh-native-admission.mjs](../../../scripts/dsh-native-admission.mjs)：Rust 保留私有已验证 JSONL，经 stdin 交给内嵌 helper，复用安装版 strict codec / restore / Session，并核响应摘要和事件覆盖。加 `--native-node` 才启用原生模式，成功为 `native_admitted_snapshot`；纯物理模式仍保留上述区别。加入两编码各两份 seeded 样本后，Windows / WSL Linux 原生模式各通过 140 份快照及五组附加对照，Windows 纯物理模式回归通过。Node 捕获的 cut 绑定反例使捕获矩阵增至 38 组并通过；header 相同、cut 为 10 / 17 的合法快照，实际生命周期摘要不同。
+
+```sh
+node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>' --native-node '<absolute-node>'
+node scripts/verify-dsh-native-admission.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>' --native-node '<absolute-node>'
+```
+
+WSL 原生模式的 Node 路径须为 Linux 写法，快照矩阵另给 `--native-dsh-package '<absolute-linux-package.json>'`。异常脚本在新建 `target/dsh-native-admission-*` 内生成合成 SDK，模拟坏响应、错绑、退出状态、超限、安装缺失与超时，两平台各 17 组通过。超时父子进程写入本次随机 ready 标记，返回后逐个查 PID，均为 absent；不是仅凭返回 timeout 或输出管道结束判定。真实成功由真实安装版快照矩阵负责，不把合成 SDK 当语义验收。Rust 来源身份 / 选代与旧前缀核对、归一化及生产推进仍未接入，详见 [读取状态设计 §9](../../../docs/dsh-read-state-design.md#9-rust-原生-admission-接缝)。
+
 当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、0→4 全链迁移、无约束并发压力、任意 ABA、租约争夺、崩溃持久性、完整 WSL DSH 捕获或真实 provider。19 组 backend 脚本仍报告 `concurrent_races_validated=false`；21 组并发脚本另报 `controlled_concurrent_windows_validated=true`，各自限定范围。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§15 与 [读取状态设计](../../../docs/dsh-read-state-design.md) §7。

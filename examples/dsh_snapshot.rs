@@ -3,9 +3,11 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
-use session_vault::dsh_snapshot::{capture, Compression};
+use session_vault::deadline::Deadline;
+use session_vault::dsh_snapshot::{capture, Compression, NativeRuntime};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Encoding {
@@ -22,6 +24,13 @@ struct Args {
     /// 输出字节范围和原生 seq，不输出正文。
     #[arg(long)]
     positions: bool,
+    /// 显式启用本机原生 admission；Node 与安装包路径必须成对给出。
+    #[arg(long, requires = "dsh_package")]
+    node: Option<PathBuf>,
+    #[arg(long, requires = "node")]
+    dsh_package: Option<PathBuf>,
+    #[arg(long, requires = "node")]
+    native_timeout_ms: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -34,8 +43,21 @@ fn main() -> ExitCode {
         Encoding::None => Compression::None,
         Encoding::Zstd => Compression::Zstd,
     };
-    let (report, code) = match capture(&args.path, encoding) {
-        Ok(snapshot) => (snapshot.report(args.positions), ExitCode::SUCCESS),
+    let deadline = args
+        .native_timeout_ms
+        .map(|ms| Deadline::after(Duration::from_millis(ms)))
+        .unwrap_or_else(Deadline::unbounded);
+    let result = capture(&args.path, encoding).and_then(|snapshot| {
+        if let (Some(node), Some(package)) = (args.node, args.dsh_package) {
+            NativeRuntime::new(node, package)?
+                .admit(snapshot, deadline)
+                .map(|admitted| admitted.report(args.positions))
+        } else {
+            Ok(snapshot.report(args.positions))
+        }
+    });
+    let (report, code) = match result {
+        Ok(report) => (report, ExitCode::SUCCESS),
         Err(reason) => (
             serde_json::to_value(reason).expect("serializable blocked result"),
             ExitCode::from(2),

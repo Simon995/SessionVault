@@ -1,16 +1,16 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§15；独立快照审计、Node 捕获与 Rust 字节 / 原生位置原型见本文 §6–§8。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§17；独立快照审计、Node 捕获、Rust 字节 / 原生位置及原生 admission 接缝见本文 §6–§9。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
 一次读取应分别回答：取得了什么前缀、来源的哪个版本得到验证、本次是否完整或为什么未完成。三者不能压成一个成功标志或事件数。
 
-| 事实 | 可用证据 | 不能替代它的值 |
-| --- | --- | --- |
-| 来源与生命周期 | 明确配置的来源实例、逻辑来源、实际选中的物理格式代、header 生命周期与继承边界 | 目录叶子名、同一个 session id、恢复后的逻辑版本号 |
-| 已验证前缀 | 同一份读取快照上的事件顺序、完整内容和旧前缀对照，覆盖范围明确 | 事件数、末尾 seq、物理文件大小 |
-| 完整性与本次结果 | 该快照的分行 / 帧 / 校验与 admission 结果；变化、损坏、未知代、迁移条件不足、I/O 未知和取消分别保留 | `eventState`、原生 read 没抛错、能构造完整 turn |
+| 事实             | 可用证据                                                                                            | 不能替代它的值                                    |
+| ---------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| 来源与生命周期   | 明确配置的来源实例、逻辑来源、实际选中的物理格式代、header 生命周期与继承边界                       | 目录叶子名、同一个 session id、恢复后的逻辑版本号 |
+| 已验证前缀       | 同一份读取快照上的事件顺序、完整内容和旧前缀对照，覆盖范围明确                                      | 事件数、末尾 seq、物理文件大小                    |
+| 完整性与本次结果 | 该快照的分行 / 帧 / 校验与 admission 结果；变化、损坏、未知代、迁移条件不足、I/O 未知和取消分别保留 | `eventState`、原生 read 没抛错、能构造完整 turn   |
 
 DSH 原生 `SessionPersistence.stat()` 已有 `revision`，不是没有版本观察口。公开契约只允许在**同一个 service 实例、同一个 session id** 内比较；相等可用于未变化的派生缓存，不承诺跨实例、跨进程或重启后比较。`SessionPersistence.identity` 是进程内的 symbol，不能原样变成持久化来源身份。JSONL 实现的 revision 来自 dev / ino / size / mtime / ctime，是 best-effort 变化观察，不是内容摘要、完整性诊断或可长期复用的事件游标。
 
@@ -62,13 +62,13 @@ CARGO_TARGET_DIR=target/dsh-read-state cargo test --features store --test cli_sc
 
 建议内部 reader 到观察 / 规划之间先保留独立的读取结果，构造权归实际读取与校验路径；不提供可由调用方随手传入 `complete=true` 的证明。首版只在证据足够覆盖目标投影时放行。
 
-| 本次结果 | 首版提交行为 | 后续仍需的证据 |
-| --- | --- | --- |
-| 不支持的代、迁移条件不足、损坏、I/O 未知、取消 | 不写新投影，不推进旧凭据；分别报告原因 | 支持策略或重试后取得的新结果 |
-| 合法前缀，物理完整性未知；读取期间来源变化 | 保留既有投影与凭据，不标已追平 | 与同一快照绑定的完整性及来源版本验证 |
-| 修尾期间短于旧已验证前缀 | 保留既有投影与凭据，重新观察 | 不能仅凭缩短或错误文案认定永久回退 / 永久损坏 |
-| 同一来源 / 生命周期 / 格式代，旧前缀内容保持，新增部分已验证 | 证据齐备后才允许增量提交 | 原生位置与归一化事件位置的明确映射 |
-| 已确认内容改写、生命周期或格式代变化 | 使旧推进凭据失效；证据足够时重建目标投影 | 来源版本和解析版本的区分、跨代支持策略及旧读者兼容 |
+| 本次结果                                                     | 首版提交行为                             | 后续仍需的证据                                     |
+| ------------------------------------------------------------ | ---------------------------------------- | -------------------------------------------------- |
+| 不支持的代、迁移条件不足、损坏、I/O 未知、取消               | 不写新投影，不推进旧凭据；分别报告原因   | 支持策略或重试后取得的新结果                       |
+| 合法前缀，物理完整性未知；读取期间来源变化                   | 保留既有投影与凭据，不标已追平           | 与同一快照绑定的完整性及来源版本验证               |
+| 修尾期间短于旧已验证前缀                                     | 保留既有投影与凭据，重新观察             | 不能仅凭缩短或错误文案认定永久回退 / 永久损坏      |
+| 同一来源 / 生命周期 / 格式代，旧前缀内容保持，新增部分已验证 | 证据齐备后才允许增量提交                 | 原生位置与归一化事件位置的明确映射                 |
+| 已确认内容改写、生命周期或格式代变化                         | 使旧推进凭据失效；证据足够时重建目标投影 | 来源版本和解析版本的区分、跨代支持策略及旧读者兼容 |
 
 未来若要先持久化可验证前缀，必须另外表达“前缀已提交”和“来源已完整追平”，再核游标 / 同步目标的推进语义；当前 `CommitPlan` 对可用降级批次的 Advance 不能直接承担这两种水位。
 
@@ -76,7 +76,7 @@ CARGO_TARGET_DIR=target/dsh-read-state cargo test --features store --test cli_sc
 
 ## 5. 下一步完成判据
 
-- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7，Rust 字节与原生位置核验见 §8。Rust 尚需接入来源 / 生命周期 / 选代绑定及旧前缀核对；Node 原型通过不能代替 Rust 对应路径验收，也不证明任意 ABA 已排除。
+- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7，Rust 字节与原生位置核验见 §8，Rust 原生语义 admission 接缝见 §9。Rust 尚需接入来源 / 生命周期 / 选代对照及旧前缀核对；Node 原型通过不能代替 Rust 对应路径验收，也不证明任意 ABA 已排除。
 - 将实际 reader 的阻断 / 已验证结果接入观察前的提交门；未知完整性不得落成既有 Clean / Degraded 后继续推进。明确快照验证与生产推进之间所需的稳定性条件。
 - 同事件数改写、双追加旧前缀、修尾中间态、读取后发布未来代和写库后未保存状态的重放，须经过生产读取 / 写库 / 状态保存路径核验。§7 的旧快照保留仅在 reader 内存中成立，尚未验证 DSH 总库投影事务。
 - 再决定是否需要公开类型、持久化字段或 schema 变化；改动时按四类消费者及旧读者 / 并存写者逐项验证。当前没有理由先给公开 Cursor 加字段，也不把一次内存模型通过称作生产验收。
@@ -92,16 +92,16 @@ Node 工具在 `target/dsh-snapshot-*` 的全新目录排他写入合成快照�
 
 2026-11-06，29 组快照 / 原生读取与证据绑定检查全部通过（Windows，DSH `0.2.1-rc.5`、Node `v25.2.1`、`zstandard` `0.25.0`）。核心对照：
 
-| 合成来源 | 原生观察 | 独立证据与约束 |
-| --- | --- | --- |
-| 完整 v4 明文 / 逐帧 zstd | 均返回 10 事件 | 字节、JSONL、原生 admission 与记录覆盖同时满足，才在本原型中认该副本已验证 |
-| zstd 最后一个 checksum 字节缺失 | 仍返回全部 10 事件，restore 可接受 | 标 `incomplete/torn_frame`；最后一个完整帧结束于 1572，当前文件 1661 字节，不能推进到物理 EOF |
-| 正文字符串内损坏一个 UTF-8 字节 | 两种编码仍返回 10 事件，restore 可接受 | 严格 UTF-8 审计拒绝；不能把替换字符解码当作来源原文保真 |
-| JSONL 完整但包含未知必需事件，或 tool/result 指向未出现的 call | 原生 read 分别报不支持 / 损坏 | 物理完整不能替代格式与语义 admission |
-| 在完整 zstd 日志后追加一个新事件，但缺最后一个 checksum 字节 | 原生 read 与 restore 可接受全部 11 事件 | 仍标 `incomplete`，已验证物理范围只覆盖追加前的完整帧 |
-| 同事件数正文改写 | 新内容也能通过当前副本验证 | 事件内容与物理摘要均改变，旧证据不能借相同事件数复用 |
-| 保留单独 header 帧，把事件重打包为一帧 | 仍为相同 10 事件 | 物理摘要改变，解压后的原始 JSONL 摘要不变；物理 offset 不是长期逻辑位置 |
-| 把旧副本审计结果用于改写后的副本 | 在原生 read 前阻断 | 报 `snapshot_mismatch`，不能拼接两次读取的证据 |
+| 合成来源                                                       | 原生观察                                | 独立证据与约束                                                                                |
+| -------------------------------------------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------- |
+| 完整 v4 明文 / 逐帧 zstd                                       | 均返回 10 事件                          | 字节、JSONL、原生 admission 与记录覆盖同时满足，才在本原型中认该副本已验证                    |
+| zstd 最后一个 checksum 字节缺失                                | 仍返回全部 10 事件，restore 可接受      | 标 `incomplete/torn_frame`；最后一个完整帧结束于 1572，当前文件 1661 字节，不能推进到物理 EOF |
+| 正文字符串内损坏一个 UTF-8 字节                                | 两种编码仍返回 10 事件，restore 可接受  | 严格 UTF-8 审计拒绝；不能把替换字符解码当作来源原文保真                                       |
+| JSONL 完整但包含未知必需事件，或 tool/result 指向未出现的 call | 原生 read 分别报不支持 / 损坏           | 物理完整不能替代格式与语义 admission                                                          |
+| 在完整 zstd 日志后追加一个新事件，但缺最后一个 checksum 字节   | 原生 read 与 restore 可接受全部 11 事件 | 仍标 `incomplete`，已验证物理范围只覆盖追加前的完整帧                                         |
+| 同事件数正文改写                                               | 新内容也能通过当前副本验证              | 事件内容与物理摘要均改变，旧证据不能借相同事件数复用                                          |
+| 保留单独 header 帧，把事件重打包为一帧                         | 仍为相同 10 事件                        | 物理摘要改变，解压后的原始 JSONL 摘要不变；物理 offset 不是长期逻辑位置                       |
+| 把旧副本审计结果用于改写后的副本                               | 在原生 read 前阻断                      | 报 `snapshot_mismatch`，不能拼接两次读取的证据                                                |
 
 自测逐一截断第二帧的 45 个非空切点，均不能得到 `complete`，另逐个破坏四个 checksum 字节。完整帧边界上的独立前缀作为单独快照可以完整，这仍不等于来源已追平。附加对照还覆盖坏 JSON、完整帧内未换行记录、header 混帧、下一帧 magic 截断、无 checksum 及未来物理代；具体断言维护在可复跑脚本中。
 
@@ -131,16 +131,16 @@ node scripts/verify-dsh-snapshot.mjs --dsh-package '<dsh-package.json>'
 
 Windows、Node `v25.2.1`、DSH `0.2.1-rc.5`、`zstandard` `0.25.0` 实跑 36 组全部通过；每种编码 17 组，另有重分帧和输入预算两组：
 
-| 实际路径上的对照 | 结果与边界 |
-| --- | --- |
-| 稳定读取、只读 CLI、不可伪造引用与导出副本隔离 | 取得完整 10 事件、来源字节未变；伪造引用均拒绝 |
-| 原生追加、同事件数改写、header 生命周期变化 | 分别为前缀保持、`prefix_rewritten`、`lifecycle_changed`；旧 receipt 不因失败或新读取而被改写 |
-| 真实句柄读完、返回调用方之前发生追加 / 同长度原地覆盖 | 两种编码均阻断为 `changed`；追加后下一轮可取得完整新快照 |
-| 关闭读取句柄后，另一进程两次替换、最终字节恢复 | 最终摘要相同仍因文件身份变化阻断；只覆盖此受控替换，不能排除 metadata 不可见的任意 ABA |
-| 读取中发布 v5，或有效 receipt 取得后才发布 v5 | 本轮捕获或后续 recheck 均报不支持，未静默回退到 v4 |
-| 断尾、未知必需事件、缺 metadata、注入 EIO、取消、超预算 | 分别保留阻断结果，不构造空成功；EIO 通过公开 open 注入，非实机磁盘故障 |
-| 原生修尾已 truncate、恢复记录未写入 | JSONL 中间快照 10 事件、前缀保持；zstd 为 9 事件、`prefix_shrank`。完成恢复与追加后均为 16 事件，旧前缀保持；中间快照也没有生产推进许可 |
-| zstd 事件重新分帧 | 物理摘要改变，JSONL 摘要及事件前缀保持 |
+| 实际路径上的对照                                        | 结果与边界                                                                                                                              |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| 稳定读取、只读 CLI、不可伪造引用与导出副本隔离          | 取得完整 10 事件、来源字节未变；伪造引用均拒绝                                                                                          |
+| 原生追加、同事件数改写、header 生命周期变化             | 分别为前缀保持、`prefix_rewritten`、`lifecycle_changed`；旧 receipt 不因失败或新读取而被改写                                            |
+| 真实句柄读完、返回调用方之前发生追加 / 同长度原地覆盖   | 两种编码均阻断为 `changed`；追加后下一轮可取得完整新快照                                                                                |
+| 关闭读取句柄后，另一进程两次替换、最终字节恢复          | 最终摘要相同仍因文件身份变化阻断；只覆盖此受控替换，不能排除 metadata 不可见的任意 ABA                                                  |
+| 读取中发布 v5，或有效 receipt 取得后才发布 v5           | 本轮捕获或后续 recheck 均报不支持，未静默回退到 v4                                                                                      |
+| 断尾、未知必需事件、缺 metadata、注入 EIO、取消、超预算 | 分别保留阻断结果，不构造空成功；EIO 通过公开 open 注入，非实机磁盘故障                                                                  |
+| 原生修尾已 truncate、恢复记录未写入                     | JSONL 中间快照 10 事件、前缀保持；zstd 为 9 事件、`prefix_shrank`。完成恢复与追加后均为 16 事件，旧前缀保持；中间快照也没有生产推进许可 |
+| zstd 事件重新分帧                                       | 物理摘要改变，JSONL 摘要及事件前缀保持                                                                                                  |
 
 验证复用 [io-harness.mjs](../tests/fixtures/dsh-v4/io-harness.mjs) 的公共 I/O 屏障与独立进程回执，每个窗口断言实际命中；操作只落本轮 `target/dsh-capture-*` 全新合成目录。保留运行物，不读真日志或写总库，不启动 Host / LLM。相同 helper 提取后，原生并发 21 组与冻结快照 29 组回归均通过。
 
@@ -161,15 +161,15 @@ node scripts/read-dsh-snapshot.mjs --dsh-package '<dsh-package.json>' --root '<a
 
 实际路径为 `probe::with_reader → 有界 Vec → compressed::checked_frames → 严格 UTF-8 / JSONL → 最小 v4 envelope 与位置表`。只打开一次，输入预算加一字节区分完整读取和超限；摘要与验证来自同一份字节。zstd 复用 `compressed.rs` 原有唯一帧头解析与解码器，在分配解码窗口前核窗口 / 声明长度预算，逐帧核内容长度和 checksum。第一帧只含 header，每帧结束于记录边界，允许空事件帧。输入 / 解码预算仍只取共享 `dsh-snapshot-limits.json`，没有新增依赖。
 
-结果 `PhysicalSnapshot` 的字段私有，只有实际核验路径能构造；`Blocked` 用穷举 enum 保留 unavailable、incomplete、unverified、unsupported、budget_exceeded、invalid 与 rejected。坏尾与 checksum 解码失败尚未全部精确分类，统一保留未核结论时返回 `unverified`，不会猜成永久损坏或空会话。读取未完成、来源打不开与超预算均不输出全文摘要或成功位置表。核验完成只保留摘要与位置，不导出原始 header / 正文，也未提供摄取重放内容。
+结果 `PhysicalSnapshot` 的字段私有，只有实际核验路径能构造；`Blocked` 用穷举 enum 保留 unavailable、incomplete、unverified、unsupported、budget_exceeded、invalid 与 rejected。坏尾与 checksum 解码失败尚未全部精确分类，统一保留未核结论时返回 `unverified`，不会猜成永久损坏或空会话。读取未完成、来源打不开与超预算均不输出全文摘要或成功位置表。本节初版（`9caf18b`）核验完成只保留摘要与位置；后续 §9 为原生 admission 保留私有已验证 JSONL。两阶段均不导出原始 header / 正文，也未提供摄取重放内容。
 
-| 输出位置 / 摘要 | 含义与限制 |
-| --- | --- |
-| `record_index`、`native_seq` | header 占第 0 条记录，事件原生 seq 从 0 连续；不是 `RawEvent.seq` 或 `Cursor.next_seq` |
-| `jsonl_start/end` | 解压后 UTF-8 字节范围，包含该行末尾 LF；CRLF 的 CR 也计入，不按字符数算 |
-| `frame_index`、`frame_spans` | 对应物理帧与该帧解压后的字节范围；明文的事件 frame_index 为 null，空帧不占事件序号 |
-| `record_fingerprint` | 复用现有 `EventKey::fingerprint_of`，对 trim 后原记录截断摘要；没有构造 EventKey、RawEvent 或生产身份 |
-| `snapshot_sha256`、`jsonl_sha256`、`header_sha256` | 物理文件、原始 JSONL 与含 LF 的原 header 行摘要；header 摘要没有规范化，不是已验证生命周期凭据 |
+| 输出位置 / 摘要                                    | 含义与限制                                                                                            |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `record_index`、`native_seq`                       | header 占第 0 条记录，事件原生 seq 从 0 连续；不是 `RawEvent.seq` 或 `Cursor.next_seq`                |
+| `jsonl_start/end`                                  | 解压后 UTF-8 字节范围，包含该行末尾 LF；CRLF 的 CR 也计入，不按字符数算                               |
+| `frame_index`、`frame_spans`                       | 对应物理帧与该帧解压后的字节范围；明文的事件 frame_index 为 null，空帧不占事件序号                    |
+| `record_fingerprint`                               | 复用现有 `EventKey::fingerprint_of`，对 trim 后原记录截断摘要；没有构造 EventKey、RawEvent 或生产身份 |
+| `snapshot_sha256`、`jsonl_sha256`、`header_sha256` | 物理文件、原始 JSONL 与含 LF 的原 header 行摘要；header 摘要没有规范化，不是已验证生命周期凭据        |
 
 [verify-dsh-rust-snapshot.mjs](../scripts/verify-dsh-rust-snapshot.mjs) 用原生 v4 codec 从共享 artifact 生成全新合成文件，加入中文正文与 JSON 空白；Python `zstandard==0.25.0` 独立审计同副本，Rust example 实际打开核验，再与 Node 按审计帧范围解码所得的每条位置、摘要和原生 admission 对拍。上游 v4 物理编码出处为安装版 `dsh-session-format-v3-to-v4/lib/index.js:1057–1099`，查证日期 2026-11-06。未知必需事件与断裂 call/result 可以通过本轮 Rust 物理核验、同时被原生 admission 拒绝；脚本明确断言成功摘要的 `semantic_admission_validated=false`，不把最小 envelope 检查称作语义接入。
 
@@ -187,8 +187,36 @@ WSL 另用 Linux 工具链编译 example，并由 Windows Node / Python 生成�
 MSYS_NO_PATHCONV=1 node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --wsl-reader '<absolute-linux-example-binary>'
 ```
 
-这是 Linux Rust 读 Windows 盘上合成文件的验收，不是完整 Linux DSH backend / Node 捕获验收。Windows `cargo test --lib --features store,dsh-experimental` 为 432 passed，默认 / store bin、experimental all-target 编译与 all-feature clippy 均通过。Linux `cargo test --lib --features dsh-experimental` 为 256 passed，store + experimental 的 bin 编译通过。Linux 全库 store 测试实际为 416 passed / 1 failed：现有 `open_existing_returns_the_store_when_it_is_there` 在建库准备阶段访问系统钥匙链，因 `org.freedesktop.secrets` 服务缺失失败；没有跳过后把全库报告成绿，该项仍归 backlog F。最后只调整静态错误值的 `ok_or` 写法，两平台对应模块测试与最终 example 对拍再过。
+这是 Linux Rust 读 Windows 盘上合成文件的验收，不是完整 Linux DSH backend / Node 捕获验收。`9caf18b` 提交时：Windows `cargo test --lib --features store,dsh-experimental` 为 432 passed，默认 / store bin、experimental all-target 编译与 all-feature clippy 均通过；Linux `cargo test --lib --features dsh-experimental` 为 256 passed，store + experimental 的 bin 编译通过，而 Linux 全库 store 测试当时为 416 passed / 1 failed（`open_existing_returns_the_store_when_it_is_there` 在建库准备阶段默认访问系统钥匙链，因无桌面 Linux 缺少 `org.freedesktop.secrets` 服务失败；后续本批已在 [store.rs](../src/store.rs) 改用显式测试钥匙文件修复并全绿，见 §9）。最后只调整静态错误值的 `ok_or` 写法，两平台对应模块测试与最终 example 对拍再过。
 
 现有 Rust 消费方另外用 Cargo 临时 `paths` 覆盖指向本仓当前开发源码，先由 metadata 正向核依赖实际落点，再跑 `cargo check --locked --lib`，结果通过；未改消费方 manifest、lock 或子模块指针。这里验证其既有 store 用法，不表示它启用了 experimental feature。CLI、Rust 既有构造 / 穷举及逐字段读取、`discover` 的 SourceMode 过滤没有新增值域或字段；没有改 Cursor、RawEvent、schema 或正式 CLI。
 
-只读入口成功输出 `physically_validated`、退出 0；阻断输出类型与原因、退出 2；路径参数或输出失败为非零。`--positions` 才输出逐记录位置。Rust 路径尚无 Node §7 的同句柄身份、选代、来源实例 / 生命周期与旧前缀核对，也没有 codec / restore admission、归一化位置或写库门；输出固定保留 `source_observation_validated=false`、`normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。对拍只使用没有并发 writer 的新建副本，不能据此前后摘要相同推断来源原子性。下一步仍是这些证据与生产观察 / 提交门的接合，而不是把物理成功包装成 Clean / Degraded。
+只读入口成功输出 `physically_validated`、退出 0；阻断输出类型与原因、退出 2；路径参数或输出失败为非零。`--positions` 才输出逐记录位置。本节初版（`9caf18b`）尚无 Node §7 的同句柄身份、选代、来源实例 / 生命周期与旧前缀核对，也没有 codec / restore admission、归一化位置或写库门；后续原生 admission 接缝见 §9。物理模式输出固定保留 `source_observation_validated=false`、`normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。对拍只使用没有并发 writer 的新建副本，不能据此前后摘要相同推断来源原子性。下一步仍是这些证据与生产观察 / 提交门的接合，而不是把物理成功包装成 Clean / Degraded。
+
+## 9. Rust 原生 admission 接缝
+
+2026-11-06，在 §8 物理核验后新增 [NativeRuntime](../src/dsh_snapshot/native.rs) 和共享 [dsh-native-admission.mjs](../scripts/dsh-native-admission.mjs)。`PhysicalSnapshot` 现在保留实际核验过的私有 JSONL；`Debug` 仅显示其长度。调用 `NativeRuntime::admit` 消费该快照，正文只经 stdin 交给显式 Node / DSH 安装。子进程没有来源文件路径，不能重开来源混用第二次读取的证据。原生严格 codec、restore 与 detached Session 仍复用安装版实现，Rust 不重写事件 schema。
+
+安装约束、共享 admission 脚本与限额配置通过 `include_str!` 嵌入，不依赖仓库脚本的运行时位置，不嵌入编译机家目录。Node 和 package.json 必须是显式绝对路径，支持版仍为 `0.2.1-rc.5`；移除继承的 `NODE_OPTIONS` / `NODE_PATH`，不自动发现或安装工具。这里依赖可信的本地运行时配置：不是对恶意 Node / SDK 的认证或隔离。
+
+成功响应必须同时满足退出 0、JSONL / 原 header 摘要相符、事件数覆盖完整位置表、继承边界不越界、两个原生摘要形状正确及版本非空，才能构造字段私有的 `AdmittedSnapshot`。输出摘要不能反序列化为该凭据。错误 JSON、缺字段、错绑快照 / header / 覆盖范围、错误退出状态均保留阻断结果。成功报告为 `native_admitted_snapshot`、`semantic_admission_validated=true`；未给原生参数时仍走原有 `physically_validated` 模式。
+
+执行预算取调用方 Deadline 剩余值与共享单次上限的较小值，spawn 前再检查；stdout、stderr 单流及总量均有上限。超时、管道失败或单流超限触发本次 PID 的 Windows 进程树 / Unix 独立进程组终止。终止命令成功、子进程退出且三条管道结束才返回原失败分类；收尾无法确认时改报 `unavailable/native_cleanup_unconfirmed`，不以 timeout 掩盖。日志和返回值不携带正文或原始 stderr。
+
+同轮修正 Node 捕获的生命周期摘要：之前只 hash `codec.encodeHeader(header, inheritedEventCount)`，但安装版 v4 编码器只验证 cut，不把它写进物理 header，因此没有实际绑定继承边界。现在唯一出口 `nativeLifecycleHash` 同时 hash 编码后的 header 和 cut，Node 捕获与 Rust 原生 helper 共用。实际合法反例的逻辑 / 编码 / 物理 header 全相同，旧事件前缀完整保留，cut 为 10 / 17、事件数为 17 / 24；两编码的 capture / compare 都报 `lifecycle_changed`。捕获矩阵由 §7 当时的 36 组增至 38 组并全部通过。
+
+本轮 Windows / WSL Linux 的原生模式各通过 140 份快照和五组附加对照：在 §8 的 136 份基础上加入两编码各两份 seeded 样本，核实同 header 不同 cut 得到不同原生生命周期摘要。未知必需事件、断裂 call/result 两编码共四份在 Rust 实际入口被原生 admission 拒绝；纯物理模式仍接受它们且 semantic 标志为 false，Windows 同一矩阵回归通过。独立 Python 审计、逐记录位置及帧位置比较继续保留。
+
+[verify-dsh-native-admission.mjs](../scripts/verify-dsh-native-admission.mjs) 另在每个平台通过 17 组失败 / 收尾检查：模块加载边界上的合成 SDK 制造错配响应、无效 JSON、字段缺失、退出状态不符、单流 / 总输出超限、缺 Node / 安装、版本不符及已过期预算；真实成功由上面的安装版矩阵负责。超时夹具先写本次随机 ready 标记和父子 PID，子进程不继承输出管道；返回后逐个核 PID。两平台父子进程均为 absent，没有把“管道排空”当作树已停止。ready 使用随机标记，避免跨 Windows / WSL 比较时钟。
+
+Windows `store,dsh-experimental` 库测试 435 passed，Linux `dsh-experimental` 库测试 259 passed；同时将 [store.rs](../src/store.rs) 中 `open_existing_returns_the_store_when_it_is_there` 的建库准备与 `open_existing` 调用改为显式测试文件钥匙（`open_with_source` / `open_existing_from`，不改生产默认钥匙来源），Linux 全库 `--features store`（415 passed, 0 failed）与 `--features store,dsh-experimental`（421 passed, 0 failed）均全部通过；默认 / store 相关 bin 与 all-feature clippy 两平台通过。新类型仅在 experimental feature 下添加；既有 CLI、Rust 构造 / 穷举、逐字段读取及 SourceMode 过滤均无值域变化。
+
+```sh
+node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>' --native-node '<absolute-node>'
+node scripts/verify-dsh-native-admission.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>' --native-node '<absolute-node>'
+cargo run --example dsh_snapshot --features dsh-experimental -- --path '<absolute-snapshot>' --compression zstd --node '<absolute-node>' --dsh-package '<absolute-package.json>' --native-timeout-ms 3000
+```
+
+WSL 模式仍用 `--wsl-reader`；`--native-node` 必须是 Linux 可执行路径，快照矩阵另须显式 `--native-dsh-package '<absolute-linux-package.json>'`，不会猜测 Windows 安装路径。此次在项目 `target` 内安装 Linux Node `v25.2.1`，没有修改全局工具链；夹具与 Python 审计在 Windows，Rust 和其原生 Node 在 Linux。此组合不等于完整 WSL DSH 来源捕获验收。
+
+来源句柄身份、实例 / 选代、生命周期对照及旧前缀核对尚未接入 Rust；本轮只得到可供后续比较的原生摘要。`source_observation_validated`、`normalized_positions_available`、`atomic_source_snapshot_proven`、`production_advance_permit` 仍为 false。没有接 RawEvent 归一化、生产观察 / CommitPlan、写库或持久化重放，H.4 仍未完成。

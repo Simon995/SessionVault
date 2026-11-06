@@ -11383,11 +11383,15 @@ mod project_identity_tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("total_store.db");
+        let source = KeySource::File(dir.join("store.key"));
         // 先用写入口建出来 —— 这正是 `open` 该做而 `open_existing` 不该做的事。
-        drop(TotalStore::open(&path).unwrap());
+        drop(TotalStore::open_with_source(&path, &source).unwrap());
         assert!(path.exists());
 
-        assert!(matches!(TotalStore::open_existing(&path), Probed::Found(_)));
+        assert!(matches!(
+            TotalStore::open_existing_from(&path, &source),
+            Probed::Found(_)
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

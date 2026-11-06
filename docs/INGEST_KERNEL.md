@@ -2,9 +2,9 @@
 
 > **本仓当前任务、顺序与发布记录统一见 [backlog.md](backlog.md)**；消费方自己的接入与产品进度回各仓维护。本文保存职责与数据契约，§15 保留历史抽取记录，不再作为当前排期。
 
-现状（2026-11-05 对照源码整理）：Claude Code / Codex 会话摄取、状态快照、总库正文加密、墓碑擦除、防复活、项目归属及多机只读副本能力已实现。宿主与子 CLI 的新来源、临时排除、真实发送方及血缘契约尚未交付，见 §2.2；源码完成与正式发布的差别见待做清单 B / E。
+现状（2026-11-06 对照源码整理）：Claude Code / Codex 会话摄取、状态快照、总库正文加密、墓碑擦除、防复活、项目归属及多机只读副本能力已实现。宿主与子 CLI 的新来源、临时排除、真实发送方及血缘契约尚未交付，见 §2.2；源码完成与正式发布的差别见待做清单 B / E。
 
-本文包含现行接口、设计候选与历史记录；标为候选 / 预留的内容不能视为已实现能力。最后整理：2026-11-05。
+本文包含现行接口、设计候选与历史记录；标为候选 / 预留的内容不能视为已实现能力。最后整理：2026-11-06。
 
 > **外部引用约定**：本文出现的 `DECISIONS.md`（ADR-0xx）、`SYSTEM_DESIGN.md`、`INTEGRATION.md`、`AGENT_MEMORY_POSITION.md` 均为**其它仓库的跨仓库文档**，不在 SessionVault 仓内：
 >
@@ -30,16 +30,16 @@
 
 ## 2. 边界：内核做什么、不做什么
 
-| 内核负责（唯一一份）                                          | 内核不做（消费者各自负责）                                          |
-| ------------------------------------------------------------- | ------------------------------------------------------------------- |
-| 维护来源目录（provider × 平台 × 路径）                        | 自带 GUI（仅产出扫描报告，宿主渲染）                                |
-| 发现来源（本地 / WSL；配置根环境变量覆盖）                   | 脱敏 / 敏感信息处理                                                 |
-| 增量字节读、`safe_offset`、坏行 / 半截行处理                  | 下游产品领域数据库（总库另属同仓 `store` 组件）                     |
-| Codex 累计 token parser state                                 | 候选 / 记忆 / Dream（TumeFlow）                                     |
-| WSL `wsl.exe` 桥接（只回传 `safe_offset` 后新字节）           | `usage_facts` / 成本 / ROI 投影（QuotaBar）                         |
-| 按已知项目根注册表归属；无法判定时保留未知                    | 游标持久化（消费者各存各的库；`svault` CLI 自带默认实现 `--state`） |
-| 归一化为 `RawEvent`、产出结构化扫描报告                       | LLM 调用、联网                                                      |
-| —                                                             | 反向写回或原地改写各 Agent 原生会话目录（续接 / `resume` 物化归上层） |
+| 内核负责（唯一一份）                                | 内核不做（消费者各自负责）                                            |
+| --------------------------------------------------- | --------------------------------------------------------------------- |
+| 维护来源目录（provider × 平台 × 路径）              | 自带 GUI（仅产出扫描报告，宿主渲染）                                  |
+| 发现来源（本地 / WSL；配置根环境变量覆盖）          | 脱敏 / 敏感信息处理                                                   |
+| 增量字节读、`safe_offset`、坏行 / 半截行处理        | 下游产品领域数据库（总库另属同仓 `store` 组件）                       |
+| Codex 累计 token parser state                       | 候选 / 记忆 / Dream（TumeFlow）                                       |
+| WSL `wsl.exe` 桥接（只回传 `safe_offset` 后新字节） | `usage_facts` / 成本 / ROI 投影（QuotaBar）                           |
+| 按已知项目根注册表归属；无法判定时保留未知          | 游标持久化（消费者各存各的库；`svault` CLI 自带默认实现 `--state`）   |
+| 归一化为 `RawEvent`、产出结构化扫描报告             | LLM 调用、联网                                                        |
+| —                                                   | 反向写回或原地改写各 Agent 原生会话目录（续接 / `resume` 物化归上层） |
 
 上述边界指**扫描 / 解析层**：读取来源与调用方给出的游标、注册表，返回事件、新游标及报告；不持有总库、不持久化游标、不发网络、不弹界面、不改动上游源文件。同仓 `TotalStore`（`store` feature）另管持久化，CLI 负责编排。来源探测与项目归属以本仓源码及 [project-attribution.md](project-attribution.md) 为准；外仓 `SYSTEM_DESIGN.md` 的旧章节仅作设计背景。
 
@@ -49,27 +49,27 @@
 
 本仓与 AgentGit 都处理 Claude Code / Codex 会话历史，但目标正交：本仓管**「过去发生过什么」**（全自动后台入库、本地端到端加密、多机只读副本、物理擦除传播、Windows ⇄ WSL 路径与项目身份收敛）；AgentGit 管**「怎么从某一步继续跑」**（手动快照、会话分叉、跨运行时恢复）。对照结论：
 
-| 维度 | AgentGit 的做法（源码核实） | 本仓取舍与边界 |
-| --- | --- | --- |
-| **运行时与 Hub 依赖** | 本地每事件拆成单文件存 Git 对象库；`~/.agit/store/` 只存软链不自动兜底上游 30 天清理；本地 `commit` 强制先登录闭源 Hub，服务端持钥（非端到端加密）且只追加不可擦除；源码零 WSL 路径支持；读 Codex `.jsonl.zst` 时 `codex_rollout::restore` 会在原目录解压并**删掉原 `.zst`** | **不安装、不接入其 CLI 或 Hub**。不在真实会话目录运行它，以免原地删 `.zst` 干扰扫描现场或破坏本仓的端到端加密与 `erase` 物理删除契约 |
+| 维度                             | AgentGit 的做法（源码核实）                                                                                                                                                                                                                                                          | 本仓取舍与边界                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **运行时与 Hub 依赖**            | 本地每事件拆成单文件存 Git 对象库；`~/.agit/store/` 只存软链不自动兜底上游 30 天清理；本地 `commit` 强制先登录闭源 Hub，服务端持钥（非端到端加密）且只追加不可擦除；源码零 WSL 路径支持；读 Codex `.jsonl.zst` 时 `codex_rollout::restore` 会在原目录解压并**删掉原 `.zst`**         | **不安装、不接入其 CLI 或 Hub**。不在真实会话目录运行它，以免原地删 `.zst` 干扰扫描现场或破坏本仓的端到端加密与 `erase` 物理删除契约                                                                                                                                                                                                    |
 | **跨工具恢复与 `RawEvent` 体积** | 核心 IR 极简（不含工具入参、`call_id` 与 `Thinking`），同格式恢复走原始行闭集改写，跨格式恢复（`resume --as`）靠 `enrich.rs` 按行号**回读源 JSONL** 配对入参与输出，并用 `close_open_calls` 补齐末尾悬空工具调用；跨格式损失判定只是 `a.format() != b.format()` 布尔值加固定三行提示 | **不为此扩大 `RawEvent` 存原始 JSONL 行**。单靠总库现有的瘦 `RawEvent`（工具入参只留 `[Tool: <名>]`）不能反向生成原生 `--resume` 文件；实时接力场景源文件仍在盘上，上层编排方若选原生转写路线，按本仓给出的 `(source_location, source_path)` 与路径换算回读源文件、参考其 MIT `src/adapter/` 转换即可；软交接单路线则直接读总库有效视图 |
-| **压缩边界与有效视图（借鉴 ①）** | `LOG`（审计全史）与 `VIEW`（有效上下文，默认自最近一次压缩边界起算）分离；`EventKind` 区分无损过滤（Codex `compacted`）与有损合成摘要（Claude `isCompactSummary: true`，禁止喂给 `merge`、提首条意图时跳过） | **值得借鉴**（见 [backlog.md](backlog.md) G.1）：在解析层标出压缩边界与合成摘要，帮下游切出当前有效窗口，并防止记忆层把模型二手摘要当用户原话重复蒸馏 |
-| **重放血缘防重（借鉴 ②）** | 恢复/分叉在 `link` 与 `meta.json` 记血缘基线 | **上层做原生转写时的硬前提**（见 [backlog.md](backlog.md) G.4）：往原生目录写重放文件必须带血缘标记，让本仓扫描跳过重放段，防重复计 token 与重复入记忆 |
-| **Codex 上游格式线索（借鉴 ③）** | `codex_rollout.rs` 处理 `<thread>_<segment>` 分页续写段（沿 `session_meta.payload.history_base` 拼接）与 `.jsonl.zst` 流式首行早停；`codex_index.rs` 只读查 `state_<N>.sqlite` | **反哺扫描器核查**（见 [backlog.md](backlog.md) G.2、G.3）：核查分段 rollout 是否已在本机 / WSL 出现，以及优化 `session-origin` 压缩件流式早停 |
+| **压缩边界与有效视图（借鉴 ①）** | `LOG`（审计全史）与 `VIEW`（有效上下文，默认自最近一次压缩边界起算）分离；`EventKind` 区分无损过滤（Codex `compacted`）与有损合成摘要（Claude `isCompactSummary: true`，禁止喂给 `merge`、提首条意图时跳过）                                                                         | **值得借鉴**（见 [backlog.md](backlog.md) G.1）：在解析层标出压缩边界与合成摘要，帮下游切出当前有效窗口，并防止记忆层把模型二手摘要当用户原话重复蒸馏                                                                                                                                                                                   |
+| **重放血缘防重（借鉴 ②）**       | 恢复/分叉在 `link` 与 `meta.json` 记血缘基线                                                                                                                                                                                                                                         | **上层做原生转写时的硬前提**（见 [backlog.md](backlog.md) G.4）：往原生目录写重放文件必须带血缘标记，让本仓扫描跳过重放段，防重复计 token 与重复入记忆                                                                                                                                                                                  |
+| **Codex 上游格式线索（借鉴 ③）** | `codex_rollout.rs` 处理 `<thread>_<segment>` 分页续写段（沿 `session_meta.payload.history_base` 拼接）与 `.jsonl.zst` 流式首行早停；`codex_index.rs` 只读查 `state_<N>.sqlite`                                                                                                       | **反哺扫描器核查**（见 [backlog.md](backlog.md) G.2、G.3）：核查分段 rollout 是否已在本机 / WSL 出现，以及优化 `session-origin` 压缩件流式早停                                                                                                                                                                                          |
 
 ### 2.2 宿主与子 CLI 来源适配：职责与待定契约
 
-> **2026-11-04 登记，运行时适配尚未实现或发布**。11-05 已启动首轮只读核查，证据、脱敏片段与输入契约草案见 [dsh-ingest-survey.md](dsh-ingest-survey.md)。本节不新增已可消费的字段、命令或默认行为；任务与顺序只记在 [backlog.md](backlog.md) H 节，正式实现遵守 `AGENTS.md` §4 规则 2。
+> **2026-11-04 登记，运行时适配尚未实现或发布**。11-05 至 11-06 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获及 Rust `dsh-experimental` 物理核验与原生语义 admission 接缝，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。本节不新增已可消费的字段、命令或默认行为；任务与顺序只记在 [backlog.md](backlog.md) H 节，正式实现遵守 `AGENTS.md` §4 规则 2。
 
 宿主对话摄取与执行后端选型分开：宿主已选用 DSH 时，其会话来源可以独立核查，不必等 Worker 选型结束。上层若复用 DSH 原生日志，只摄取同一份事实来源；只有上层另有独立会话记录时才评估新增 provider，避免宿主导出与原始日志重复计量、重复进入记忆。当前通用 JSONL 的实验入口不等于专用接入已交付。
 
-| 事项 | 本仓承接 | 上层编排方 / 记忆引擎承接 |
-| --- | --- | --- |
-| 正式会话来源 | 发现、解压、格式解析、稳定来源身份、项目归属、增量与损坏恢复；核清旧版 / 新版并存时的逻辑来源与去重 | 提供实际配置根、脱敏样本及启动绑定；决定是否产生独立宿主记录，不另写路径换算或原生格式解析器 |
-| 临时会话 | 设计统一排除契约，使 CLI 与 Rust 写入路径遵守同一判据；可观察地说明排除与无法判定 | 启动宿主与子 CLI 时传递临时属性；记忆引擎与消费缓存遵守临时范围，不把临时输出蒸馏进长期记忆 |
-| 真实发送方与 peer 来源 | 保留可核来源、控制面绑定证据及未知状态，不凭日志角色或正文自称推断人类身份 | 产生真实发送方 / 接收方绑定；执行授权由控制层判定，peer 输入与历史检索结果不能升级成人类授权 |
-| 父子与重放血缘 | 区分父事件、父子会话与重放前缀关系；保留可核证据，无法确认时不猜；重放防重与 G.4 共用契约 | 记录任务到宿主 / 子 CLI 的执行绑定、派单与接力；若做原生转写则提供重放基线 |
-| 删除与可回源状态 | 复用本地只读读取、稳定引用、墓碑与防复活；明确不可用、已擦除及缺证据的差别 | 消费删除记录并清理索引、缓存与派生记忆；跨主机认证、请求路由、离线等待与删除回执编排归上层 |
+| 事项                   | 本仓承接                                                                                            | 上层编排方 / 记忆引擎承接                                                                    |
+| ---------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 正式会话来源           | 发现、解压、格式解析、稳定来源身份、项目归属、增量与损坏恢复；核清旧版 / 新版并存时的逻辑来源与去重 | 提供实际配置根、脱敏样本及启动绑定；决定是否产生独立宿主记录，不另写路径换算或原生格式解析器 |
+| 临时会话               | 设计统一排除契约，使 CLI 与 Rust 写入路径遵守同一判据；可观察地说明排除与无法判定                   | 启动宿主与子 CLI 时传递临时属性；记忆引擎与消费缓存遵守临时范围，不把临时输出蒸馏进长期记忆  |
+| 真实发送方与 peer 来源 | 保留可核来源、控制面绑定证据及未知状态，不凭日志角色或正文自称推断人类身份                          | 产生真实发送方 / 接收方绑定；执行授权由控制层判定，peer 输入与历史检索结果不能升级成人类授权 |
+| 父子与重放血缘         | 区分父事件、父子会话与重放前缀关系；保留可核证据，无法确认时不猜；重放防重与 G.4 共用契约           | 记录任务到宿主 / 子 CLI 的执行绑定、派单与接力；若做原生转写则提供重放基线                   |
+| 删除与可回源状态       | 复用本地只读读取、稳定引用、墓碑与防复活；明确不可用、已擦除及缺证据的差别                          | 消费删除记录并清理索引、缓存与派生记忆；跨主机认证、请求路由、离线等待与删除回执编排归上层   |
 
 临时属性与来源身份须来自约定的控制面绑定或可核来源元数据，不能靠消息正文里的标签自证。排除须在持久化内容与用量事件前生效，并覆盖全量、增量、重扫、子会话及不同写者；属性缺失或冲突须显式表示未知，隔离场景的拒入规则与既有普通会话兼容策略需要共同约定。`scan-all --only` 按来源类型过滤、`--stateless` 控制游标、`metadata` 抑制正文，均不能充当端到端临时会话排除。
 
@@ -83,14 +83,14 @@
 
 **2026-11-05 实现对照**：以下旧来源表还保留了设计候选，并非每一行均已摄取；未列入当前描述符的候选不能据此启用。
 
-| 已实现来源 | 形态与状态 |
-| --- | --- |
-| Claude `projects/**/*.jsonl`、`sessions/**/*.jsonl` | `append_log`，`stable` |
-| Claude 全局 `CLAUDE.md`、`projects/**/memory/*.md`、`skills/**/*.md`、`tasks/**/*.json`、`plans/*.md`、`history.jsonl` | `snapshot_file`，`experimental`；history 目前仍是整份指纹快照，增量化见 [backlog.md](backlog.md) E 节 |
-| Codex `sessions/**/*.jsonl`、`archived_sessions/**/*.jsonl` | `append_log`，前者 `stable`、后者 `experimental`；都支持逻辑路径对应 `.zst` |
-| Codex 全局 `AGENTS.md`、`memories/*.md`、`memories/rollout_summaries/*.md`、`memories/extensions/ad_hoc/notes/*.md`、`rules/*.rules`、`skills/**/*.md` | `snapshot_file`，`experimental` |
-| 宿主已确认项目根内的指令文件 | `discover_project_snapshots` 单独发现，不能把全部项目层候选都算作已实现 |
-| 通用 JSONL `sessions/**/*.jsonl` | `append_log`，`experimental`；仅显式设置 `SVAULT_JSONL_DIR` 时发现 |
+| 已实现来源                                                                                                                                             | 形态与状态                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| Claude `projects/**/*.jsonl`、`sessions/**/*.jsonl`                                                                                                    | `append_log`，`stable`                                                                                |
+| Claude 全局 `CLAUDE.md`、`projects/**/memory/*.md`、`skills/**/*.md`、`tasks/**/*.json`、`plans/*.md`、`history.jsonl`                                 | `snapshot_file`，`experimental`；history 目前仍是整份指纹快照，增量化见 [backlog.md](backlog.md) E 节 |
+| Codex `sessions/**/*.jsonl`、`archived_sessions/**/*.jsonl`                                                                                            | `append_log`，前者 `stable`、后者 `experimental`；都支持逻辑路径对应 `.zst`                           |
+| Codex 全局 `AGENTS.md`、`memories/*.md`、`memories/rollout_summaries/*.md`、`memories/extensions/ad_hoc/notes/*.md`、`rules/*.rules`、`skills/**/*.md` | `snapshot_file`，`experimental`                                                                       |
+| 宿主已确认项目根内的指令文件                                                                                                                           | `discover_project_snapshots` 单独发现，不能把全部项目层候选都算作已实现                               |
+| 通用 JSONL `sessions/**/*.jsonl`                                                                                                                       | `append_log`，`experimental`；仅显式设置 `SVAULT_JSONL_DIR` 时发现                                    |
 
 `sqlite_store` / `opaque_family`、任意派生配置根与其他 provider 仍是预留设计；当前描述符没有 Cursor / Gemini 的可扫描实现。
 
@@ -113,8 +113,10 @@
     快照文件本身就是下游写的，那会让它把自己的写入读成新活动。
     ⚠️ 问不到（stat 失败 / WSL 桥不可用 / 非 Windows 构建）一律 `None`，
     **不折进 0，也不折进 `observed_at`**。
+
   - `sqlite_store`：SQLite 状态库（Codex `CODEX_SQLITE_HOME`、Cursor `state.vscdb`），用表游标（`rowid` / `wal_lsn` / `content_hash`），**不可按字节读**。
   - `opaque_family`：官方未公开稳定结构的状态族（Claude background/supervisor state、Codex plugin bundle），只登记为"保留来源族"先不写死 glob。
+
 - **两层契约**：§3 区分**来源族**（稳定层：session log / snapshot 指令 / rules / hooks / skill root / plugin root / sqlite state root / derived 任务根）与**已验证实现**（易变层：具体子目录 glob，如 Codex `sessions/YYYY/MM/DD/rollout-*.jsonl`）。子目录漂移只动易变层，**不拖公开契约升 major**。
 
 下面 §3.2 / §3.3 的"主表"是 `append_log` 主数据源；其后的"控制面/行为塑形补充表"多为 `snapshot_file` / `sqlite_store` / `opaque_family`。
@@ -137,8 +139,8 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 | 类别(kind)  | 相对路径 / glob                                                                                                                            | 含正文 | 说明                                                                                                           |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------ | -------------------------------------------------------------------------------------------------------------- |
 | session     | 来源族=`projects/` **与 `sessions/`** 两根下**递归任意 `*.jsonl`**（已验证实现，非 `projects/<enc>/<uuid>.jsonl` 单一模式）                | 是     | 会话事件流，主数据源。QuotaBar 实证：`.claude/projects` + `.claude/sessions` 两根、`find -name '*.jsonl'` 递归 |
-| memory      | `projects/<项目>/memory/*.md` | 是 | 已按 `snapshot_file` / `experimental` 摄取；`autoMemoryDirectory` 改写属于待核派生配置根，不能视为已接线 |
-| history     | `history.jsonl` | 是 | 当前按 `snapshot_file` / `experimental` 保存整份；尚未按行增量解析 |
+| memory      | `projects/<项目>/memory/*.md`                                                                                                              | 是     | 已按 `snapshot_file` / `experimental` 摄取；`autoMemoryDirectory` 改写属于待核派生配置根，不能视为已接线       |
+| history     | `history.jsonl`                                                                                                                            | 是     | 当前按 `snapshot_file` / `experimental` 保存整份；尚未按行增量解析                                             |
 | instruction | 用户 `<config>/CLAUDE.md`；项目 `./CLAUDE.md`、`./.claude/CLAUDE.md`、`./CLAUDE.local.md`、`./.claude/rules/*.md`；托管 policy（平台相关） | 是     | 只读不改写；须解析 `@import`（≤4 跳）与 rules 的 `paths` 作用域                                                |
 | config      | `<config>/settings.json` 等                                                                                                                | 否     | 仅用于解析 `autoMemoryDirectory` / `cleanupPeriodDays`，不作事件                                               |
 
@@ -146,17 +148,17 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 
 **控制面 / 行为塑形来源（补充，多为 `snapshot_file` / `opaque_family`）**——它们解释"Agent 为什么按这种工作流做事"，是流程性/偏好记忆的证据；下列相对配置根 `<config>`（默认 `~/.claude`，受 `CLAUDE_CONFIG_DIR` 覆盖），项目层在 `./.claude/` 下：
 
-| 类别(kind)   | 相对路径 / glob                                                              | source_mode   | 含正文         | 说明 / 置信度                                                                               |
-| ------------ | ---------------------------------------------------------------------------- | ------------- | -------------- | ------------------------------------------------------------------------------------------- |
-| command      | `<config>/commands/*.md`；项目 `./.claude/commands/*.md`                     | snapshot_file | 否             | 自定义 slash 命令=可调用工作流证据。较可信                                                  |
-| agent        | `<config>/agents/*.md`；项目 `./.claude/agents/*.md`                         | snapshot_file | 否             | subagent 定义改系统提示/工具/模型，行为塑形。较可信                                         |
-| skill        | `<config>/skills/**/SKILL.md`（含插件分发载体）                              | snapshot_file | 部分           | `CLAUDE_CODE_SYNC_SKILLS=1` 会下载 skills；程序性记忆。较可信                               |
-| plugin       | `<config>/plugins/**`（marketplaces / cache）                                | opaque_family | 否             | 装了哪些插件/来源；至少读来解析能力面。env `CLAUDE_CODE_PLUGIN_CACHE_DIR` / `_SEED_DIR`。中 |
-| task         | `<config>/tasks/**/*.json` | snapshot_file | 是 | 已按 `experimental` 摄取，只收 JSON，排除锁 / 游标文件；`CLAUDE_CODE_TASK_LIST_ID` 派生根未接线 |
-| mcp/config   | 项目 `./.mcp.json`；`<config>/settings.json`、项目 `./.claude/settings.json` | snapshot_file | 否             | 解析 MCP / hooks / `autoMemoryDirectory` / worktree 行为，定位真实数据根。中                |
-| worktree     | 项目 `./.claude/worktrees/**`                                                | opaque_family | 间接           | background session 隔离编辑快照；作 provenance，不默认全文摄取。中                          |
-| forensic log | `OTEL_LOG_RAW_API_BODIES=file:<dir>` 指定目录                                | append_log    | 可能含完整正文 | 完整请求/响应落盘；路径全由 env 决定，作"条件来源族"，不写死。高确信存在                    |
-| bg state     | `<config>/` 下未公开 supervisor/background-session state                     | opaque_family | 可能           | 官方确认持久化在 config dir，文件名未公开；保留来源族，不硬编码                             |
+| 类别(kind)   | 相对路径 / glob                                                              | source_mode   | 含正文         | 说明 / 置信度                                                                                   |
+| ------------ | ---------------------------------------------------------------------------- | ------------- | -------------- | ----------------------------------------------------------------------------------------------- |
+| command      | `<config>/commands/*.md`；项目 `./.claude/commands/*.md`                     | snapshot_file | 否             | 自定义 slash 命令=可调用工作流证据。较可信                                                      |
+| agent        | `<config>/agents/*.md`；项目 `./.claude/agents/*.md`                         | snapshot_file | 否             | subagent 定义改系统提示/工具/模型，行为塑形。较可信                                             |
+| skill        | `<config>/skills/**/SKILL.md`（含插件分发载体）                              | snapshot_file | 部分           | `CLAUDE_CODE_SYNC_SKILLS=1` 会下载 skills；程序性记忆。较可信                                   |
+| plugin       | `<config>/plugins/**`（marketplaces / cache）                                | opaque_family | 否             | 装了哪些插件/来源；至少读来解析能力面。env `CLAUDE_CODE_PLUGIN_CACHE_DIR` / `_SEED_DIR`。中     |
+| task         | `<config>/tasks/**/*.json`                                                   | snapshot_file | 是             | 已按 `experimental` 摄取，只收 JSON，排除锁 / 游标文件；`CLAUDE_CODE_TASK_LIST_ID` 派生根未接线 |
+| mcp/config   | 项目 `./.mcp.json`；`<config>/settings.json`、项目 `./.claude/settings.json` | snapshot_file | 否             | 解析 MCP / hooks / `autoMemoryDirectory` / worktree 行为，定位真实数据根。中                    |
+| worktree     | 项目 `./.claude/worktrees/**`                                                | opaque_family | 间接           | background session 隔离编辑快照；作 provenance，不默认全文摄取。中                              |
+| forensic log | `OTEL_LOG_RAW_API_BODIES=file:<dir>` 指定目录                                | append_log    | 可能含完整正文 | 完整请求/响应落盘；路径全由 env 决定，作"条件来源族"，不写死。高确信存在                        |
+| bg state     | `<config>/` 下未公开 supervisor/background-session state                     | opaque_family | 可能           | 官方确认持久化在 config dir，文件名未公开；保留来源族，不硬编码                                 |
 
 > 本表是控制面候选与已实现来源的混合记录，当前覆盖以上方实现对照为准。已接入的快照在 `full` 档可产 `RawEvent.content`；未实现来源的发现、配置解析与版本化不能据此宣称完成。
 
@@ -197,11 +199,11 @@ Windows 上每个 provider 都要同时考虑 **Windows 原生**与**一个或�
 
 下列 provider 先以**描述符**登记占位，准确路径以探测 + 用户配置为准，验证后再升 `experimental` / `stable`，**不要把候选路径当稳定接口**。
 
-| provider   | 候选位置（待验证）                                                                                                            | 形态线索                                                                                          |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Cursor     | Windows `%APPDATA%\Cursor\User\...`；macOS `~/Library/Application Support/Cursor/User/...`；Linux `~/.config/Cursor/User/...` | VS Code fork，会话多在 `workspaceStorage/<hash>/state.vscdb`、`globalStorage`（SQLite），非 JSONL |
-| Gemini CLI | 候选 `~/.gemini/`（按平台展开）                                                                                               | 待验证文件结构                                                                                    |
-| ~~通用 JSONL~~ | —— | **已升 `experimental`，见 §3.5** |
+| provider       | 候选位置（待验证）                                                                                                            | 形态线索                                                                                          |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Cursor         | Windows `%APPDATA%\Cursor\User\...`；macOS `~/Library/Application Support/Cursor/User/...`；Linux `~/.config/Cursor/User/...` | VS Code fork，会话多在 `workspaceStorage/<hash>/state.vscdb`、`globalStorage`（SQLite），非 JSONL |
+| Gemini CLI     | 候选 `~/.gemini/`（按平台展开）                                                                                               | 待验证文件结构                                                                                    |
+| ~~通用 JSONL~~ | ——                                                                                                                            | **已升 `experimental`，见 §3.5**                                                                  |
 
 新增 provider 的标准流程见 §4。
 
@@ -214,11 +216,11 @@ agent 会话逐字相同**的摄取路径 —— 同一套物化、去重、游�
 写进内核文档的消费者名字，会在那个消费者消失之后仍然留在这里，声称一个不再成立
 的理由。判据是「这批数据是不是对话」，不是「谁要用」。
 
-| | |
-| --- | --- |
-| `source_type` | `jsonl` |
-| 根 | **只认 `$SVAULT_JSONL_DIR`，没有默认值** |
-| 产物 | `sessions/**/*.jsonl`，`append_log` + `byte_offset` |
+|               |                                                     |
+| ------------- | --------------------------------------------------- |
+| `source_type` | `jsonl`                                             |
+| 根            | **只认 `$SVAULT_JSONL_DIR`，没有默认值**            |
+| 产物          | `sessions/**/*.jsonl`，`append_log` + `byte_offset` |
 
 🔴 **没有默认根是刻意的，而且是它能进内置清单的全部理由。** 环境变量没设 ⇒
 `config_dir: None` ⇒ 发现器跳过并记 `no_config_dir` ⇒ **既有消费者的行为一个字节
@@ -348,12 +350,12 @@ request_id                # Claude 来源适用时
 
 **保真度按 `source_mode` 分档**：
 
-| source_mode     | 时间信号                                                                          | 保真度                                                         |
-| --------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `append_log`    | 每行 `occurred_at`（Claude 顶层 `timestamp` / Codex `value.timestamp`）           | 高（精确点）                                                   |
-| `sqlite_store`  | 行级时间戳（有则用）+ `rowid`/`wal_lsn` 顺序                                      | 中                                                             |
-| `snapshot_file` | `content_hash` 判变，`observed_at` 记观测、`modified_at` 另记 mtime | 低；真实有效期由下游推导，RawEvent 没有 `valid_from_confidence` 字段 |
-| `opaque_family` | 仅 `observed_at`（何时见到）                                                      | 仅 provenance，不进语义时间                                    |
+| source_mode     | 时间信号                                                                | 保真度                                                               |
+| --------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `append_log`    | 每行 `occurred_at`（Claude 顶层 `timestamp` / Codex `value.timestamp`） | 高（精确点）                                                         |
+| `sqlite_store`  | 行级时间戳（有则用）+ `rowid`/`wal_lsn` 顺序                            | 中                                                                   |
+| `snapshot_file` | `content_hash` 判变，`observed_at` 记观测、`modified_at` 另记 mtime     | 低；真实有效期由下游推导，RawEvent 没有 `valid_from_confidence` 字段 |
+| `opaque_family` | 仅 `observed_at`（何时见到）                                            | 仅 provenance，不进语义时间                                          |
 
 **两条铁律**：
 
@@ -407,14 +409,14 @@ Cursor {
 
 当前 Rust 库与 CLI 复用摄取实现，接口粒度不同；PyO3 尚未交付。以下对应 [`src/lib.rs`](../src/lib.rs)：
 
-| 库接口 | 入参 / 结果 | 用途 |
-| --- | --- | --- |
-| `catalog()` | 无入参，返回 `Vec<ProviderDescriptor>` | 当前内置描述符；配置根读取环境变量，尚未接 `user_config` |
-| `discover()` / `discover_local()` | 无入参，返回 `Result<Vec<SourceRef>>` | 全来源发现 / 仅本地发现，不读正文 |
-| `discover_transcripts()` / `discover_snapshots()` | 无入参，返回相应来源清单 | 分开会话与状态制品 |
-| `discover_transcripts_reported(deadline)` | 返回 `DiscoveryOutcome` | 显式报告哪些位置没问成；依发现结果清存量的调用方须用它 |
-| `discover_project_snapshots(roots, deadline)` | 已确认的项目根与预算，返回 `ProjectSnapshotOutcome` | 项目指令快照发现，保留无法探测的状态 |
-| `scan(source, cursor_in, profile, roots)` | `&SourceRef`、`Option<Cursor>`、`Profile`、`Arc<RootRegistry>` → `ScanResult` | 单来源扫描；空注册表表示无法归属，不退回 cwd 猜根 |
+| 库接口                                            | 入参 / 结果                                                                   | 用途                                                     |
+| ------------------------------------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `catalog()`                                       | 无入参，返回 `Vec<ProviderDescriptor>`                                        | 当前内置描述符；配置根读取环境变量，尚未接 `user_config` |
+| `discover()` / `discover_local()`                 | 无入参，返回 `Result<Vec<SourceRef>>`                                         | 全来源发现 / 仅本地发现，不读正文                        |
+| `discover_transcripts()` / `discover_snapshots()` | 无入参，返回相应来源清单                                                      | 分开会话与状态制品                                       |
+| `discover_transcripts_reported(deadline)`         | 返回 `DiscoveryOutcome`                                                       | 显式报告哪些位置没问成；依发现结果清存量的调用方须用它   |
+| `discover_project_snapshots(roots, deadline)`     | 已确认的项目根与预算，返回 `ProjectSnapshotOutcome`                           | 项目指令快照发现，保留无法探测的状态                     |
+| `scan(source, cursor_in, profile, roots)`         | `&SourceRef`、`Option<Cursor>`、`Profile`、`Arc<RootRegistry>` → `ScanResult` | 单来源扫描；空注册表表示无法归属，不退回 cwd 猜根        |
 
 - 一轮编排由 CLI `svault scan-all --profile metadata|full` 提供；没有同名公开 `scan_all(user_config, ...)` 库函数，也没有 `svault scan --source ...` 子命令。
 - `svault discover` 输出来源 NDJSON。`scan-all` 默认将事件、每来源报告与汇总都写到 stdout NDJSON，诊断写 stderr；带 `--write-store` 时不再逐条输出事件，见 §13.1.1。
@@ -558,14 +560,14 @@ ScanReport {
 svault scan-all --write-store [--store <path>] [--state <path>] [--only <type>]...
 ```
 
-| 事 | 怎么定的 |
-| --- | --- |
-| profile | 默认 `full`（§13.1「总库以 full 物化」）。**显式 `--profile metadata` 直接拒绝**：去重键 `(type, location, path, session_id, seq)` **不含正文**，metadata 事件的 seq 与 full 逐一相同 ⇒ 先写进去就把之后的正文永久挡在 `INSERT OR IGNORE` 外面，而总库 append-only、**不可逆** |
-| 投影模式 | 交给 `scan_plan::CommitPlan`，**不在 CLI 里重算**（见下） |
-| 事件流 | 带 `--write-store` 时**不再逐条吐 `event`**（一次全量是几个 GB 的 stdout，而写库的调用方本来就要从库里读）。观测走每来源一条 `store_write` / `store_held` / `store_write_failed` + 收尾 `summary` |
-| 只写 append-log | 快照来源**不由这条路写** —— Class-B 归 `sync-snapshots`（另一套枚举 + 另一套变更检测）。在这里再写一遍就是第二条 Class-B 写路径。摘要里报 `snapshot_sources`，因为「这轮写了 0 条快照」不该被读成「本机没有快照来源」 |
-| 退出码 | `0` 正常；`1` 起步就没跑成（参数/发现/开库）；`2` 游标没落盘；`3` 有来源没写进库（本轮**不完整**）。`held_sources` **不进退出码** —— 那不是失败，是计划里的一格 |
-| 范围 | `--only <source-type>`（可重复，取值同 `SourceType`）。**不给 = 扫全部**，既有行为逐字不变。过滤发生在**发现之后**（`retain_only`），因为只有那一处看得见全部发现路径的产物 |
+| 事              | 怎么定的                                                                                                                                                                                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| profile         | 默认 `full`（§13.1「总库以 full 物化」）。**显式 `--profile metadata` 直接拒绝**：去重键 `(type, location, path, session_id, seq)` **不含正文**，metadata 事件的 seq 与 full 逐一相同 ⇒ 先写进去就把之后的正文永久挡在 `INSERT OR IGNORE` 外面，而总库 append-only、**不可逆** |
+| 投影模式        | 交给 `scan_plan::CommitPlan`，**不在 CLI 里重算**（见下）                                                                                                                                                                                                                      |
+| 事件流          | 带 `--write-store` 时**不再逐条吐 `event`**（一次全量是几个 GB 的 stdout，而写库的调用方本来就要从库里读）。观测走每来源一条 `store_write` / `store_held` / `store_write_failed` + 收尾 `summary`                                                                              |
+| 只写 append-log | 快照来源**不由这条路写** —— Class-B 归 `sync-snapshots`（另一套枚举 + 另一套变更检测）。在这里再写一遍就是第二条 Class-B 写路径。摘要里报 `snapshot_sources`，因为「这轮写了 0 条快照」不该被读成「本机没有快照来源」                                                          |
+| 退出码          | `0` 正常；`1` 起步就没跑成（参数/发现/开库）；`2` 游标没落盘；`3` 有来源没写进库（本轮**不完整**）。`held_sources` **不进退出码** —— 那不是失败，是计划里的一格                                                                                                                |
+| 范围            | `--only <source-type>`（可重复，取值同 `SourceType`）。**不给 = 扫全部**，既有行为逐字不变。过滤发生在**发现之后**（`retain_only`），因为只有那一处看得见全部发现路径的产物                                                                                                    |
 
 🔴 **`--only` 存在是因为「靠环境变量做隔离」不成立。** 调用方想把一轮扫描限制在
 自己的数据上时，最自然的做法是把各 provider 的根环境变量指到别处
