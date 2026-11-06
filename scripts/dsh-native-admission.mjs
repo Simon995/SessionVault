@@ -63,6 +63,10 @@ export function nativeLifecycleHash(artifact, codec) {
   );
 }
 
+export function nativeEventHashes(events) {
+  return events.map((event) => nativeHash(JSON.stringify(event)));
+}
+
 /** Rust 内嵌本模块和安装约束，再显式调用此 stdin/stdout 入口；不依赖运行时脚本路径。 */
 export async function runNativeAdmission(loadInstallation, limits, args) {
   const emit = (value, exitCode) => {
@@ -113,15 +117,18 @@ export async function runNativeAdmission(loadInstallation, limits, args) {
     emit({ kind: "rejected", reason: "semantic_admission" }, 2);
     return;
   }
+  const eventHashes = nativeEventHashes(artifact.events);
   emit(
     {
       kind: "native_admitted",
+      session_id: artifact.header.id,
       jsonl_sha256: nativeHash(plain),
       header_sha256: nativeHash(plain.subarray(0, plain.indexOf(10) + 1)),
       native_events: artifact.events.length,
       inherited_event_count: artifact.inheritedEventCount,
       lifecycle_sha256: nativeLifecycleHash(artifact, toolkit.codec),
       native_events_sha256: nativeHash(JSON.stringify(artifact.events)),
+      event_sha256s: eventHashes,
       dsh_version: installedVersion,
     },
     0,

@@ -532,6 +532,211 @@ pub fn with_reader<T>(
     }
 }
 
+/// 普通文件的身份印记（大小 + 平台元数据特征），字段私有，只能由 `probe` 边界内构造。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    len: u64,
+    #[cfg(unix)]
+    unix: (u64, u64, i64, i64, i64, i64),
+    #[cfg(windows)]
+    windows: (u32, u64, u64),
+    #[cfg(not(any(unix, windows)))]
+    modified_ns: u128,
+}
+
+impl FileStamp {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn from_meta(meta: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Self {
+                len: meta.size(),
+                unix: (
+                    meta.dev(),
+                    meta.ino(),
+                    meta.mtime(),
+                    meta.mtime_nsec(),
+                    meta.ctime(),
+                    meta.ctime_nsec(),
+                ),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let created = meta.creation_time();
+            let written = meta.last_write_time();
+            if created == 0 && written == 0 {
+                return None;
+            }
+            Some(Self {
+                len: meta.file_size(),
+                windows: (meta.file_attributes(), created, written),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let modified_ns = meta
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some(Self {
+                len: meta.len(),
+                modified_ns,
+            })
+        }
+    }
+}
+
+/// 不跟随符号链接的路径类型与普通文件身份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealEntryKind {
+    RegularFile(FileStamp),
+    Directory,
+    /// 符号链接、FIFO、设备文件等（`symlink_metadata` 下既非普通文件也非普通目录）。
+    Other,
+}
+
+/// 不跟随符号链接探测路径身份 —— 三态。
+#[allow(clippy::disallowed_methods)]
+pub fn lstat_entry(path: &Path, anchor_root: Option<&Path>) -> Probed<RealEntryKind> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_file() {
+                match FileStamp::from_meta(&meta) {
+                    Some(stamp) => Probed::Found(RealEntryKind::RegularFile(stamp)),
+                    None => Probed::Unknown(ProbeError::new(
+                        path,
+                        "file identity fields unavailable on this filesystem",
+                    )),
+                }
+            } else if ft.is_dir() {
+                Probed::Found(RealEntryKind::Directory)
+            } else {
+                Probed::Found(RealEntryKind::Other)
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            namespace_confirms_absence(path, &anchor(anchor_root)).map(|_| RealEntryKind::Other)
+        }
+        Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+    }
+}
+
+/// 同句柄身份核对的有界普通文件读取结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedRead {
+    /// 打开前 `lstat`、打开后同句柄 `fstat`、读完后同句柄 `fstat` 与关闭后 `lstat` 全部一致。
+    Complete { stamp: FileStamp, bytes: Vec<u8> },
+    /// 路径存在，但不是普通文件（例如目录或符号链接）。
+    NotRegularFile,
+    /// 文件初始大小超过调用方给定的 `max_bytes` 预算。
+    ExceedsBudget { len: u64 },
+    /// 打开前后或读取期间观测到身份变化、大小变化或短读。
+    Changed(&'static str),
+}
+
+/// 打开普通文件并在同一个句柄上做前后身份核对与有界读取 —— 三态。
+#[allow(clippy::disallowed_methods)]
+pub fn read_pinned_regular_file(
+    path: &Path,
+    max_bytes: u64,
+    anchor_root: Option<&Path>,
+) -> Probed<PinnedRead> {
+    use std::io::Read;
+    let before_path = match lstat_entry(path, anchor_root) {
+        Probed::Found(RealEntryKind::RegularFile(stamp)) => stamp,
+        Probed::Found(RealEntryKind::Directory | RealEntryKind::Other) => {
+            return Probed::Found(PinnedRead::NotRegularFile);
+        }
+        Probed::Absent => return Probed::Absent,
+        Probed::Unknown(e) => return Probed::Unknown(e),
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Probed::Found(PinnedRead::Changed("opened_different_file"));
+        }
+        Err(e) => return Probed::Unknown(ProbeError::new(path, e)),
+    };
+    let handle_meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Probed::Unknown(ProbeError::new(path, e)),
+    };
+    if !handle_meta.file_type().is_file() {
+        return Probed::Found(PinnedRead::NotRegularFile);
+    }
+    let Some(before_handle) = FileStamp::from_meta(&handle_meta) else {
+        return Probed::Unknown(ProbeError::new(
+            path,
+            "file handle identity fields unavailable",
+        ));
+    };
+    if before_handle != before_path {
+        return Probed::Found(PinnedRead::Changed("opened_different_file"));
+    }
+    if before_handle.len() > max_bytes {
+        return Probed::Found(PinnedRead::ExceedsBudget {
+            len: before_handle.len(),
+        });
+    }
+    let expected = usize::try_from(before_handle.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(expected);
+    if let Err(e) = (&mut file)
+        .take(before_handle.len().saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        return Probed::Unknown(ProbeError::new(path, e));
+    }
+    let read_len = bytes.len() as u64;
+    if read_len < before_handle.len() {
+        return Probed::Found(PinnedRead::Changed("short_read"));
+    }
+    if read_len > before_handle.len() {
+        return Probed::Found(PinnedRead::Changed("handle_changed"));
+    }
+    let after_handle_meta = match file.metadata() {
+        Ok(meta) => meta,
+        Err(e) => return Probed::Unknown(ProbeError::new(path, e)),
+    };
+    let Some(after_handle) = FileStamp::from_meta(&after_handle_meta) else {
+        return Probed::Unknown(ProbeError::new(
+            path,
+            "file handle identity fields unavailable after read",
+        ));
+    };
+    if after_handle != before_handle {
+        return Probed::Found(PinnedRead::Changed("handle_changed"));
+    }
+    drop(file);
+    match lstat_entry(path, anchor_root) {
+        Probed::Found(RealEntryKind::RegularFile(after_path)) if after_path == before_handle => {
+            Probed::Found(PinnedRead::Complete {
+                stamp: before_handle,
+                bytes,
+            })
+        }
+        Probed::Found(RealEntryKind::RegularFile(_)) | Probed::Absent => {
+            Probed::Found(PinnedRead::Changed("file_changed"))
+        }
+        Probed::Found(RealEntryKind::Directory | RealEntryKind::Other) => {
+            Probed::Found(PinnedRead::Changed("artifact_kind_changed"))
+        }
+        Probed::Unknown(e) => Probed::Unknown(e),
+    }
+}
+
 fn anchor(root: Option<&Path>) -> Anchor {
     match root {
         Some(r) => Anchor::Under(r.to_path_buf()),
@@ -1162,5 +1367,53 @@ mod tests {
             Probed::<FileKind>::Unknown(e.clone()).map(|_| 1),
             Probed::<i32>::Unknown(e)
         );
+    }
+
+    #[test]
+    fn pinned_read_and_lstat_distinguish_regular_files_directories_and_budgets() {
+        let dir = std::env::temp_dir().join(format!(
+            "sv-probe-pinned-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            lstat_entry(&dir, Some(&dir)),
+            Probed::Found(RealEntryKind::Directory)
+        );
+        assert_eq!(
+            read_pinned_regular_file(&dir, 64, Some(&dir)),
+            Probed::Found(PinnedRead::NotRegularFile)
+        );
+
+        let missing = dir.join("missing.jsonl");
+        assert_eq!(lstat_entry(&missing, Some(&dir)), Probed::Absent);
+        assert_eq!(
+            read_pinned_regular_file(&missing, 64, Some(&dir)),
+            Probed::Absent
+        );
+
+        let file = dir.join("session.v4.jsonl");
+        std::fs::write(&file, b"hello\n").unwrap();
+        let Probed::Found(PinnedRead::Complete { stamp, bytes }) =
+            read_pinned_regular_file(&file, 64, Some(&dir))
+        else {
+            panic!("expected Complete");
+        };
+        assert_eq!(bytes, b"hello\n");
+        assert_eq!(stamp.len(), 6);
+        assert!(!stamp.is_empty());
+        assert_eq!(
+            lstat_entry(&file, Some(&dir)),
+            Probed::Found(RealEntryKind::RegularFile(stamp))
+        );
+        assert_eq!(
+            read_pinned_regular_file(&file, 5, Some(&dir)),
+            Probed::Found(PinnedRead::ExceedsBudget { len: 6 })
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

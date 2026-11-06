@@ -3,7 +3,6 @@
 //! 物理完整不包含 DSH codec / restore admission、来源选代或生命周期稳定性。
 //! 即使成功也不能转换成 AppendLogObservation 或生产推进凭据。
 
-use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -12,11 +11,17 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::compressed::{checked_frames, FrameCheckFailure};
-use crate::probe::{self, Probed};
+use crate::probe::{self, PinnedRead, Probed};
 use crate::rawevent::EventKey;
 
 mod native;
+mod source;
 pub use native::{AdmittedSnapshot, NativeRuntime};
+pub use source::{
+    capture_source, evaluate_commit_gate, parse_canonical_log_filename, select_generation,
+    CommitGateDecision, HoldReason, RebuildReason, SelectedGeneration, SnapshotRelation,
+    SourceConfig, SourceSnapshot,
+};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct Limits {
@@ -45,10 +50,20 @@ pub enum Compression {
     Zstd,
 }
 
+impl Compression {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Zstd => "zstd",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
 pub enum Blocked {
     Unavailable(&'static str),
+    Changed(&'static str),
     Incomplete(&'static str),
     Unverified(&'static str),
     Unsupported(&'static str),
@@ -79,6 +94,7 @@ struct FrameSpan {
 /// 只能由实际捕获/验证路径构造；摘要与位置表不提供可变访问。
 #[derive(Debug)]
 pub struct PhysicalSnapshot {
+    header_id: String,
     physical_hash: String,
     jsonl_hash: String,
     header_hash: String,
@@ -125,15 +141,18 @@ impl PhysicalSnapshot {
     }
 }
 
-/// 一次打开、有界取得字节，再在同一 Vec 上校验；不把 open 的 NotFound 当命名空间事实。
+/// 一次打开、同句柄身份核对并有界取得字节，再在同一 Vec 上校验；不把 open 的 NotFound 当命名空间事实。
 pub fn capture(path: &Path, compression: Compression) -> Result<PhysicalSnapshot, Blocked> {
     let limit = limits().input_bytes;
-    match probe::with_reader(path, |reader| {
-        let mut bytes = Vec::new();
-        reader.take(limit + 1).read_to_end(&mut bytes)?;
-        Ok(verify(&bytes, compression))
-    }) {
-        Probed::Found(result) => result,
+    match probe::read_pinned_regular_file(path, limit, None) {
+        Probed::Found(PinnedRead::Complete { bytes, .. }) => verify(&bytes, compression),
+        Probed::Found(PinnedRead::ExceedsBudget { .. }) => {
+            Err(Blocked::BudgetExceeded("input_budget"))
+        }
+        Probed::Found(PinnedRead::Changed(reason)) => Err(Blocked::Changed(reason)),
+        Probed::Found(PinnedRead::NotRegularFile) => {
+            Err(Blocked::Unavailable("source_read_failed"))
+        }
         Probed::Absent => Err(Blocked::Unavailable("open_not_found_unconfirmed")),
         Probed::Unknown(_) => Err(Blocked::Unavailable("source_read_failed")),
     }
@@ -191,6 +210,7 @@ fn verify(bytes: &[u8], compression: Compression) -> Result<PhysicalSnapshot, Bl
     let mut start = 0;
     let mut frame_index = 0;
     let mut positions = Vec::new();
+    let mut header_id = None;
     let mut header_hash = None;
     for (record_index, raw) in plain.split_inclusive(|&b| b == b'\n').enumerate() {
         let text = std::str::from_utf8(&raw[..raw.len() - 1])
@@ -207,13 +227,14 @@ fn verify(bytes: &[u8], compression: Compression) -> Result<PhysicalSnapshot, Bl
             if object.get("version").and_then(Value::as_u64) != Some(4) {
                 return Err(Blocked::Unsupported("header_generation"));
             }
-            if object
+            let Some(id) = object
                 .get("id")
                 .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
+                .filter(|s| !s.is_empty())
+            else {
                 return Err(Blocked::Rejected("header_identity"));
-            }
+            };
+            header_id = Some(id.to_string());
             header_hash = Some(hash(raw));
         } else {
             let seq = object
@@ -246,6 +267,7 @@ fn verify(bytes: &[u8], compression: Compression) -> Result<PhysicalSnapshot, Bl
         start += raw.len();
     }
     Ok(PhysicalSnapshot {
+        header_id: header_id.ok_or(Blocked::Incomplete("missing_header"))?,
         physical_hash: hash(bytes),
         jsonl_hash: hash(&plain),
         header_hash: header_hash.ok_or(Blocked::Incomplete("missing_header"))?,

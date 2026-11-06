@@ -109,12 +109,14 @@ async function main() {
   await writeFile(source, plain, { flag: "wx" });
   const baseline = {
     kind: "native_admitted",
+    session_id: artifact.header.id,
     jsonl_sha256: hash(plain),
     header_sha256: hash(plain.subarray(0, plain.indexOf(10) + 1)),
     native_events: artifact.events.length,
     inherited_event_count: 0,
     lifecycle_sha256: hash("fixture-lifecycle"),
     native_events_sha256: hash("fixture-events"),
+    event_sha256s: artifact.events.map((event) => hash(JSON.stringify(event))),
     dsh_version: SUPPORTED_DSH_VERSION,
   };
   const hold = "await new Promise(() => setInterval(() => {}, 1000));";
@@ -223,6 +225,18 @@ async function main() {
     [
       "wrong_cut",
       reply({ ...baseline, inherited_event_count: artifact.events.length + 1 }),
+      "unverified",
+      "native_binding_mismatch",
+    ],
+    [
+      "wrong_session_id",
+      reply({ ...baseline, session_id: `${artifact.header.id}-other` }),
+      "unverified",
+      "native_binding_mismatch",
+    ],
+    [
+      "wrong_event_hashes",
+      reply({ ...baseline, event_sha256s: ["short"] }),
       "unverified",
       "native_binding_mismatch",
     ],

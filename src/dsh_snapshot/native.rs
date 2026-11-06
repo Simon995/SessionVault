@@ -28,12 +28,14 @@ pub struct AdmittedSnapshot {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Evidence {
+    session_id: String,
     jsonl_sha256: String,
     header_sha256: String,
     native_events: usize,
     inherited_event_count: usize,
     lifecycle_sha256: String,
     native_events_sha256: String,
+    event_sha256s: Vec<String>,
     dsh_version: String,
 }
 
@@ -228,6 +230,22 @@ impl NativeRuntime {
 }
 
 impl AdmittedSnapshot {
+    pub(super) fn session_id(&self) -> &str {
+        &self.evidence.session_id
+    }
+
+    pub(super) fn lifecycle_sha256(&self) -> &str {
+        &self.evidence.lifecycle_sha256
+    }
+
+    pub(super) fn inherited_event_count(&self) -> usize {
+        self.evidence.inherited_event_count
+    }
+
+    pub(super) fn event_sha256s(&self) -> &[String] {
+        &self.evidence.event_sha256s
+    }
+
     /// 原生接受仍不证明来源稳定、归一化位置或生产推进。
     pub fn report(&self, include_positions: bool) -> serde_json::Value {
         let mut report = self.physical.report(include_positions);
@@ -253,12 +271,15 @@ fn bind_reply(
         .map_err(|_| Blocked::Unavailable("native_response_invalid"))?;
     match reply {
         Reply::NativeAdmitted(evidence) if status.success() => {
-            if evidence.jsonl_sha256 != snapshot.jsonl_hash
+            if evidence.session_id != snapshot.header_id
+                || evidence.jsonl_sha256 != snapshot.jsonl_hash
                 || evidence.header_sha256 != snapshot.header_hash
                 || evidence.native_events != snapshot.positions.len()
+                || evidence.event_sha256s.len() != snapshot.positions.len()
                 || evidence.inherited_event_count > evidence.native_events
                 || !digest_shape(&evidence.lifecycle_sha256)
                 || !digest_shape(&evidence.native_events_sha256)
+                || !evidence.event_sha256s.iter().all(|item| digest_shape(item))
                 || evidence.dsh_version.is_empty()
             {
                 return Err(Blocked::Unverified("native_binding_mismatch"));
@@ -366,9 +387,21 @@ fn stop_with<T>(
 }
 
 #[cfg(all(test, any(windows, unix)))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::dsh_snapshot::{hash, verify, Compression};
+
+    pub(in crate::dsh_snapshot) fn bind_verified_reply(
+        snapshot: PhysicalSnapshot,
+        reply: &serde_json::Value,
+    ) -> AdmittedSnapshot {
+        let evidence =
+            bind_reply(status(0), &serde_json::to_vec(reply).unwrap(), &snapshot).unwrap();
+        AdmittedSnapshot {
+            physical: snapshot,
+            evidence,
+        }
+    }
 
     fn status(code: u32) -> ExitStatus {
         #[cfg(windows)]
@@ -390,10 +423,13 @@ mod tests {
 
     fn response(snapshot: &PhysicalSnapshot) -> serde_json::Value {
         json!({
-            "kind":"native_admitted", "jsonl_sha256":snapshot.jsonl_hash,
+            "kind":"native_admitted", "session_id":snapshot.header_id,
+            "jsonl_sha256":snapshot.jsonl_hash,
             "header_sha256":snapshot.header_hash, "native_events":snapshot.positions.len(),
             "inherited_event_count":0, "lifecycle_sha256":hash(b"lifecycle"),
-            "native_events_sha256":hash(b"events"), "dsh_version":"fixture",
+            "native_events_sha256":hash(b"events"),
+            "event_sha256s":vec![hash(b"e0"); snapshot.positions.len()],
+            "dsh_version":"fixture",
         })
     }
 
@@ -408,12 +444,15 @@ mod tests {
         )
         .is_ok());
         for (field, wrong) in [
+            ("session_id", json!("other")),
             ("jsonl_sha256", json!(hash(b"other"))),
             ("header_sha256", json!(hash(b"other"))),
             ("native_events", json!(2)),
             ("inherited_event_count", json!(2)),
             ("lifecycle_sha256", json!("short")),
             ("native_events_sha256", json!("short")),
+            ("event_sha256s", json!([])),
+            ("event_sha256s", json!(["short"])),
             ("dsh_version", json!("")),
         ] {
             let mut changed = baseline.clone();

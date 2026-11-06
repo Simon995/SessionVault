@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§17；独立快照审计、Node 捕获、Rust 字节 / 原生位置及原生 admission 接缝见本文 §6–§9。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§18；独立快照审计、Node 捕获、Rust 字节 / 原生位置、原生 admission 及 Rust 来源选代 / 保守提交门见本文 §6–§10。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -76,9 +76,9 @@ CARGO_TARGET_DIR=target/dsh-read-state cargo test --features store --test cli_sc
 
 ## 5. 下一步完成判据
 
-- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7，Rust 字节与原生位置核验见 §8，Rust 原生语义 admission 接缝见 §9。Rust 尚需接入来源 / 生命周期 / 选代对照及旧前缀核对；Node 原型通过不能代替 Rust 对应路径验收，也不证明任意 ABA 已排除。
-- 将实际 reader 的阻断 / 已验证结果接入观察前的提交门；未知完整性不得落成既有 Clean / Degraded 后继续推进。明确快照验证与生产推进之间所需的稳定性条件。
-- 同事件数改写、双追加旧前缀、修尾中间态、读取后发布未来代和写库后未保存状态的重放，须经过生产读取 / 写库 / 状态保存路径核验。§7 的旧快照保留仅在 reader 内存中成立，尚未验证 DSH 总库投影事务。
+- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7，Rust 字节与原生位置核验见 §8，Rust 原生语义 admission 接缝见 §9，Rust 会话目录选代、同句柄文件身份捕获、完整旧前缀对照与观察前保守提交门见 §10。两端的同句柄复查均不证明任意 ABA 已排除。
+- 接下来将 `CommitGateDecision` 的已验证候选映射到 `RawEvent` 归一化位置，并接入生产 `AppendLogObservation` / `CommitPlan`；未知完整性不得落成既有 Clean / Degraded 后继续推进。明确快照验证与生产推进之间所需的稳定性条件。
+- 同事件数改写、双追加旧前缀、修尾中间态、读取后发布未来代和写库后未保存状态的重放，须经过生产读取 / 写库 / 状态保存路径核验。§7 与 §10 的旧快照保留仅在 reader 内存与提交门决策中成立，尚未验证 DSH 总库投影事务。
 - 再决定是否需要公开类型、持久化字段或 schema 变化；改动时按四类消费者及旧读者 / 并存写者逐项验证。当前没有理由先给公开 Cursor 加字段，也不把一次内存模型通过称作生产验收。
 - H.1 可信载体、统一临时排除、用量保真、复杂语义与首版支持范围仍是正式适配的独立实施门。
 
@@ -219,4 +219,39 @@ cargo run --example dsh_snapshot --features dsh-experimental -- --path '<absolut
 
 WSL 模式仍用 `--wsl-reader`；`--native-node` 必须是 Linux 可执行路径，快照矩阵另须显式 `--native-dsh-package '<absolute-linux-package.json>'`，不会猜测 Windows 安装路径。此次在项目 `target` 内安装 Linux Node `v25.2.1`，没有修改全局工具链；夹具与 Python 审计在 Windows，Rust 和其原生 Node 在 Linux。此组合不等于完整 WSL DSH 来源捕获验收。
 
-来源句柄身份、实例 / 选代、生命周期对照及旧前缀核对尚未接入 Rust；本轮只得到可供后续比较的原生摘要。`source_observation_validated`、`normalized_positions_available`、`atomic_source_snapshot_proven`、`production_advance_permit` 仍为 false。没有接 RawEvent 归一化、生产观察 / CommitPlan、写库或持久化重放，H.4 仍未完成。
+本节（`495bd46`）时尚未将来源句柄身份、实例 / 选代、生命周期对照及旧前缀核对接入 Rust；后续 Rust 来源选代、同句柄身份捕获与保守提交门见 §10。
+
+## 10. Rust 来源选代、同句柄身份、旧前缀对照与保守提交门
+
+2026-11-06，在 [probe.rs](../src/probe.rs)、[source.rs](../src/dsh_snapshot/source.rs)、[native.rs](../src/dsh_snapshot/native.rs)、[dsh-native-admission.mjs](../scripts/dsh-native-admission.mjs) 与 [examples/dsh_snapshot.rs](../examples/dsh_snapshot.rs) 中补齐 Rust 会话目录选代、同句柄文件身份捕获、旧前缀与生命周期对照及观察前保守提交门，并新增 [verify-dsh-rust-source-capture.mjs](../scripts/verify-dsh-rust-source-capture.mjs)。
+
+所有 `std::fs` 观察仍严格收在 `probe.rs` 边界内，不向外泄露 `File`、`Metadata` 或 `DirEntry`：
+
+1. `probe.rs` 新增不透明 `FileStamp`（Unix 记录 `dev, ino, size, mtime, mtime_nsec, ctime, ctime_nsec`，缺少正 `dev/ino` 时拒绝；Windows 记录 `file_attributes, creation_time, last_write_time, file_size`，任一时间戳为 0 时拒绝）、非跟随路径探测 `lstat_entry` 与同句柄读取 `read_pinned_regular_file`。
+2. `read_pinned_regular_file` 顺序核对：打开前 `lstat` 为普通文件 $\to$ 只读打开句柄 $\to$ 同句柄 `file.metadata()` 与打开前 `FileStamp` 一致 $\to$ 校验字节上限 $\to$ `take(len + 1)` 有界读取（区分短读与读中变长）$\to$ 读完后同句柄 `file.metadata()` 再次一致 $\to$ 关闭句柄后再 `lstat` 核对路径身份未变。
+3. `source.rs` 对会话目录先 `lstat_entry` 确认是真实目录（非符号链接），再遍历全部目录项（不吞任何条目错误），用 `parse_canonical_log_filename` 识别 `session.jsonl[.zstd]`（v0）与 `session.v<1..>.jsonl[.zstd]`（v1+，拒绝 `.v0`、`.v04`、`.tmp` 等非规范名），拒绝同目录编码后缀冲突（`encoding_conflict`）与非普通文件（`artifact_kind`），按最高规范代选代（不看 `mtime`）；最高代 `!= 4`（含 v0–v3 待迁移或 v5+ 未来代）返回 `Unsupported("physical_generation")`。
+4. `capture_source` 在 `read_pinned_regular_file` 取得字节与初始 `FileStamp` 后，在同缓冲区物理核验及原生 admission 前后两次复查目录最高代与目标文件 `FileStamp`，并校验可选预期 `session_id`；全部通过才构造字段私有的 `SourceSnapshot`。
+5. `dsh-native-admission.mjs` 与 `native.rs` 新增绑定恢复后的 `session_id` 与逐事件语义摘要数组 `event_sha256s`（长度须等于物理记录位置数且每项为 64 位小写 hex）；[verify-dsh-native-admission.mjs](../scripts/verify-dsh-native-admission.mjs) 同步新增 `wrong_session_id` 与 `wrong_event_hashes`，由 17 组扩展为 19 组。
+
+`SourceSnapshot::compare` 与 `evaluate_commit_gate` 将 §4 的保守提交表编码为类型安全的 `SnapshotRelation` 与 `CommitGateDecision`：
+
+| 观察与比较结果                                              | `SnapshotRelation` | `CommitGateDecision`                                                                                  |
+| ----------------------------------------------------------- | ------------------ | ----------------------------------------------------------------------------------------------------- |
+| 无旧基线且本次捕获阻断                                      | —                  | `RejectInitial { blocked }`                                                                           |
+| 无旧基线且本次捕获与原生 admission 通过                     | —                  | `InitialProjectionCandidate { verified_events, inherited_event_count }`                               |
+| 存在旧基线，本次捕获阻断（断尾、语义拒绝、并发变化、发 v5） | —                  | `HoldPriorProjection { prior_events, reason: CaptureBlocked { blocked } }`                            |
+| 不同来源实例、目录、session id、编码或物理代                | `DifferentSource`  | `RejectDifferentSource`                                                                               |
+| 同一来源下旧事件前缀完整且无新增（含 zstd 重分帧）          | `PrefixPreserved`  | `NoOpUnchanged { verified_events }`                                                                   |
+| 同一来源下旧事件前缀完整且尾部新增已验证事件                | `PrefixPreserved`  | `IncrementalAppendCandidate { prior_events, verified_events, appended_events }`                       |
+| 当前已验证事件数少于旧前缀（如 zstd 修尾 truncate 中间态）  | `PrefixShrank`     | `HoldPriorProjection { prior_events, reason: PrefixShrank { current_events, shared_prefix_intact } }` |
+| 同一生命周期下旧前缀内某条事件内容改写                      | `PrefixRewritten`  | `RebuildProjectionCandidate { invalidates_prior_credential: true, reason: PrefixRewritten { .. } }`   |
+| 同一来源下 header 编码或 `inheritedEventCount` 变化         | `LifecycleChanged` | `RebuildProjectionCandidate { invalidates_prior_credential: true, reason: LifecycleChanged }`         |
+
+Windows 与 WSL Linux 实跑 [verify-dsh-rust-source-capture.mjs](../scripts/verify-dsh-rust-source-capture.mjs) 各 35 组全部通过（两种编码各 17 组，加 zstd 重分帧 1 组）：覆盖选代忽略非规范名与旧代 v0、只读 `recheck`、原生 `open("write") + append + flush` 增量追加、同事件数改写、header 生命周期变化、同物理 header 下 `inheritedEventCount` 变化、原生修尾 `truncate` 中间态（明文 10 事件 `no_op_unchanged`；zstd 9 事件 `prefix_shrank` 触发 `hold_prior_projection`，修复并追加后均为 16 事件 `incremental_append_candidate`）、断尾 / 语义拒绝 / 发布 v5 保持旧投影、Rust 读取后进入原生 admission 期间发生追加 / 同长原地覆盖 / 两次原子替换恢复原字节 ABA / 发布 v5 的真实拦截、同目录编码冲突、session id 不符、空或仅 v0 目录，以及跨目录 `different_source` 拒绝。两平台 19 组 `verify-dsh-native-admission.mjs` 与 140 份快照 + 5 组对照的 `verify-dsh-rust-snapshot.mjs`（物理 + 原生模式）回归全部通过。Windows `store,dsh-experimental` 库测试 439 passed，WSL Linux `store,dsh-experimental` 库测试 425 passed，两平台零警告 clippy 通过。
+
+```sh
+node scripts/verify-dsh-rust-source-capture.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>' --native-node '<absolute-node>'
+MSYS_NO_PATHCONV=1 node scripts/verify-dsh-rust-source-capture.mjs --dsh-package '<dsh-package.json>' --wsl-reader '<absolute-linux-example-binary>' --native-node '<absolute-linux-node>' --native-dsh-package '<absolute-linux-package.json>'
+```
+
+成功报告显式保留 `source_observation_validated=true`、`semantic_admission_validated=true`，同时 `normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。`CommitGateDecision` 是进入生产观察 / `CommitPlan` 前的保守门决策，尚未映射 `RawEvent` 归一化位置，也未接入 `scan`、总库投影事务或状态文件持久化。

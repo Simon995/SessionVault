@@ -384,4 +384,14 @@ Windows 与 WSL Linux 二进制分别通过 136 份合成快照及四组附加�
 
 Windows / WSL Linux 各通过 140 份原生模式快照和五组附加对照，包括上述 seeded 样本、原生语义拒绝、同缓冲区摘要、全部字节 / 帧位置与物理失败；Windows 纯物理模式同一矩阵回归通过。每个平台另过 17 组异常响应、错绑、资源预算与进程收尾检查，超时后本次父子 PID 均已消失；ready 用随机标记，不跨系统比较时间。Windows 库测试 435 passed，Linux experimental 库测试 259 passed；修复 `open_existing_returns_the_store_when_it_is_there` 改用显式测试文件钥匙后，Linux 全库 `store`（415 passed）与 `store,dsh-experimental`（421 passed）均 0 失败通过，相关 feature 编译与零警告 clippy 通过。
 
-原生模式成功将 `semantic_admission_validated` 置为 true，其他来源观察、归一化、原子来源证明和生产推进标志仍为 false；无参数的物理模式保留原语义。没有接生产来源 / 生命周期对照、选代、完整旧前缀门、RawEvent、CommitPlan、写库及持久化重放，也没有完成 H.4 或 provider。当前批源码尚未提交，`9caf18b` 只代表 §16，不代表本节接缝已发布。
+原生模式成功将 `semantic_admission_validated` 置为 true，其他来源观察、归一化、原子来源证明和生产推进标志仍为 false；无参数的物理模式保留原语义。本节已提交为 `495bd46`，尚未合并发布；后续 Rust 来源选代、同句柄身份捕获与保守提交门见 §18。
+
+## 18. 后续实现：Rust 来源选代、同句柄捕获与保守提交门
+
+2026-11-06，在 [probe.rs](../src/probe.rs)、[source.rs](../src/dsh_snapshot/source.rs)、[native.rs](../src/dsh_snapshot/native.rs) 与 [examples/dsh_snapshot.rs](../examples/dsh_snapshot.rs) 中实现 Rust 会话目录最高规范代选择、同句柄文件身份（`FileStamp`）读取与前后复查、逐事件语义摘要（`event_sha256s`）绑定、`SourceSnapshot::compare` 生命周期 / 旧前缀对照及观察前保守提交门 `evaluate_commit_gate`；详见 [读取状态设计 §10](dsh-read-state-design.md#10-rust-来源选代同句柄身份旧前缀对照与保守提交门)。
+
+所有 `std::fs` 操作仍收在 `probe.rs` 内：`read_pinned_regular_file` 对目标路径依次核打开前 `lstat`、同句柄 `file.metadata()`、有界读取、读后同句柄 `file.metadata()` 及关闭句柄后 `lstat`；`capture_source` 在原生 admission 前后两次重查目录选代与文件身份。`evaluate_commit_gate` 将修尾中间态（zstd `prefix_shrank`）与任何捕获阻断统一归为 `HoldPriorProjection`，阻止缩短或未完成读取覆盖旧投影；只有旧前缀完整保持才进入 `NoOpUnchanged` 或 `IncrementalAppendCandidate`，生命周期变化或旧前缀改写则标 `invalidates_prior_credential=true` 并进入 `RebuildProjectionCandidate`。
+
+Windows 与 WSL Linux 实跑 [verify-dsh-rust-source-capture.mjs](../scripts/verify-dsh-rust-source-capture.mjs) 各 35 组检查全部通过，两平台 19 组 `verify-dsh-native-admission.mjs` 与 140 份快照 + 5 组对照的 `verify-dsh-rust-snapshot.mjs`（物理 + 原生模式）回归全部通过；Windows `store,dsh-experimental` 库测试 439 passed，WSL Linux `store,dsh-experimental` 库测试 425 passed，两平台零警告 clippy 通过。
+
+成功摘要将 `source_observation_validated` 与 `semantic_admission_validated` 置为 true，同时保留 `normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。本批源码尚未提交，尚未接入 `RawEvent` 归一化位置、`AppendLogObservation` / `CommitPlan`、总库写库事务与状态文件重放。
