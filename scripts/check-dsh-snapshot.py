@@ -7,7 +7,8 @@
     uv run scripts/check-dsh-snapshot.py --self-test
 
 供 verify-dsh-snapshot.mjs 通过 --batch 传入合成快照路径。每个文件只读取
-一次；输出摘要、计数和原因，不输出路径或正文。不写文件、不连接总库。
+一次；--bytes --compression 接收调用方已取得的 stdin 字节，不重开来源。
+输出摘要、帧边界、计数和原因，不输出路径或正文。不写文件、不连接总库。
 complete 只描述该字节快照的物理与 JSONL 完整性，不是生产推进凭据。
 """
 
@@ -22,9 +23,12 @@ from typing import TypedDict
 
 import zstandard
 
-MAX_INPUT_BYTES = 8 * 1024 * 1024
-MAX_DECODED_BYTES = 32 * 1024 * 1024
-DECODE_CHUNK_BYTES = 64
+LIMITS = json.loads(
+    Path(__file__).with_name("dsh-snapshot-limits.json").read_text("utf-8")
+)
+MAX_INPUT_BYTES = LIMITS["input_bytes"]
+MAX_DECODED_BYTES = LIMITS["decoded_bytes"]
+DECODE_CHUNK_BYTES = LIMITS["decode_chunk_bytes"]
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 
@@ -36,6 +40,7 @@ class Progress(TypedDict):
     records: int
     frames: int
     checksummed_frames: int
+    frame_spans: list[list[int]]
 
 
 def reject_constant(_value: str) -> None:
@@ -52,6 +57,7 @@ def inspect_bytes(data: bytes, compression: str) -> dict:
         "records": 0,
         "frames": 0,
         "checksummed_frames": 0,
+        "frame_spans": [],
     }
     logical = hashlib.sha256()
 
@@ -145,6 +151,7 @@ def inspect_bytes(data: bytes, compression: str) -> dict:
         problem = records(b"".join(chunks), first_frame=(offset == 0))
         if problem:
             return finish("invalid", problem)
+        result["frame_spans"].append([offset, offset + consumed])
         offset += consumed
         result["frames"] += 1
         result["checksummed_frames"] += 1
@@ -177,6 +184,7 @@ def self_test() -> None:
     assert baseline["frames"] == baseline["checksummed_frames"] == 2
     assert baseline["records"] == 2
     assert baseline["verified_physical_bytes"] == len(complete)
+    assert baseline["frame_spans"] == [[0, len(first)], [len(first), len(complete)]]
     assert (
         baseline["verified_jsonl_sha256"] == hashlib.sha256(header + event).hexdigest()
     )
@@ -232,9 +240,21 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--self-test", action="store_true")
     mode.add_argument("--batch", action="store_true")
+    mode.add_argument("--bytes", action="store_true")
+    parser.add_argument("--compression", choices=["none", "zstd"])
     args = parser.parse_args()
     if args.self_test:
         self_test()
+    elif args.bytes:
+        if args.compression is None:
+            parser.error("--bytes requires --compression")
+        data = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        result = (
+            {"status": "budget_exceeded", "reason": "input_budget"}
+            if len(data) > MAX_INPUT_BYTES
+            else inspect_bytes(data, args.compression)
+        )
+        print(json.dumps(result))
     else:
         requests = json.load(sys.stdin)
         print(

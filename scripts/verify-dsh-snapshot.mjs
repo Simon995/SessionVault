@@ -24,7 +24,7 @@ import {
   SUPPORTED_DSH_VERSION,
 } from "./dsh-installed.mjs";
 
-const AUDIT_TIMEOUT_MS = 45_000;
+import limits from "./dsh-snapshot-limits.json" with { type: "json" };
 const counts = {};
 let stage = "arguments";
 let observation;
@@ -303,8 +303,8 @@ async function main() {
       input: JSON.stringify(
         cases.map(({ path, compression }) => ({ path, compression })),
       ),
-      timeout: AUDIT_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
+      timeout: limits.audit_timeout_ms,
+      maxBuffer: limits.audit_output_bytes,
     },
   );
   assert.ifError(auditProcess.error);

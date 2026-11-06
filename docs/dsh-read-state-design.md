@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-05。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录 §13](dsh-ingest-survey.md#13-后续核查并发窗口与读取状态反例)（`dcf1b50`）。本文是实施设计，不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§15；独立快照审计与实际捕获原型见本文 §6–§7。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -76,9 +76,9 @@ CARGO_TARGET_DIR=target/dsh-read-state cargo test --features store --test cli_sc
 
 ## 5. 下一步完成判据
 
-- v4 明文 / zstd 的独立快照验证路线见 §6；继续把活跃来源的选代、生命周期与变化观察绑定到取得的快照。已冻结夹具通过不证明真实并发来源的快照捕获安全；原生公开 read 缺少的诊断不能只读取私有状态或复制字段名冒充证据。
-- 将实际 reader 的阻断 / 已验证结果接入观察前的提交门；未知完整性不得落成既有 Clean / Degraded 后继续推进。
-- 同事件数改写、双追加旧前缀、修尾中间态、读取后发布未来代和写库后未保存状态的重放，须经过实际拟接入路径核验。
+- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7。后续实现 Rust 读取路径时必须保留同缓冲区验证、来源 / 生命周期 / 选代绑定及旧前缀核对；Node 原型通过不能代替 Rust 路径验收，也不证明任意 ABA 已排除。
+- 将实际 reader 的阻断 / 已验证结果接入观察前的提交门；未知完整性不得落成既有 Clean / Degraded 后继续推进。明确快照验证与生产推进之间所需的稳定性条件。
+- 同事件数改写、双追加旧前缀、修尾中间态、读取后发布未来代和写库后未保存状态的重放，须经过生产读取 / 写库 / 状态保存路径核验。§7 的旧快照保留仅在 reader 内存中成立，尚未验证 DSH 总库投影事务。
 - 再决定是否需要公开类型、持久化字段或 schema 变化；改动时按四类消费者及旧读者 / 并存写者逐项验证。当前没有理由先给公开 Cursor 加字段，也不把一次内存模型通过称作生产验收。
 - H.1 可信载体、统一临时排除、用量保真、复杂语义与首版支持范围仍是正式适配的独立实施门。
 
@@ -112,4 +112,45 @@ node scripts/verify-dsh-snapshot.mjs --dsh-package '<dsh-package.json>'
 
 该工具不启动 Host / LLM，不写真实日志或总库，运行物保留。报告明确 `frozen_fixture_snapshots_validated=true`、`live_source_capture_validated=false`、`production_advance_gate_integrated=false` 与 `provider_registered=false`。这是独立诊断路线的运行证据，不是已发布能力，也不是可直接持久化的生产推进凭据。
 
-下一步先在拟接入的实际读取路径取得快照，同时保留所选物理代、header 生命周期、明确来源实例与读取期间变化；再把已验证字节到原生事件位置的映射、旧前缀对照和阻断状态接入扫描 / 提交门。当前未改公开 Cursor、schema 或 SourceType，未把试验性状态塞进 Clean / Degraded。
+本节冻结副本核验已提交为 `6b2a0b3`，尚未合并发布；活跃来源捕获原型另见 §7。生产接线仍需已验证字节到原生事件位置的映射、持久化旧前缀证据和阻断状态到扫描 / 提交门的接合。当前未改公开 Cursor、schema 或 SourceType，未把试验性状态塞进 Clean / Degraded。
+
+## 7. 活跃来源的实际捕获原型
+
+2026-11-06 新增 [dsh-snapshot-reader.mjs](../scripts/dsh-snapshot-reader.mjs)、显式只读入口 [read-dsh-snapshot.mjs](../scripts/read-dsh-snapshot.mjs) 与 [verify-dsh-capture.mjs](../scripts/verify-dsh-capture.mjs)。这是使用固定安装版原生 codec 的 Node 实验 reader，不是 Rust provider 或正式 `svault` 子命令。它不调用原生 read 后再另读一份文件拼接证据，而是在真实文件句柄取得的私有 Buffer 上完成物理审计与语义解码。
+
+捕获顺序：
+
+1. 通过同一原生 service 的 `stat` 观察 header、revision、物化大小与格式状态。`locate(header).path` 只用于定位当前格式的目标目录，不能据此认定实际选中了该代；对目录再用公开文件名 parser 选数字最高的规范代，拒绝冲突编码、非 regular 文件及本原型不支持的代。
+2. 对所选路径 `lstat`，打开只读句柄，再用同句柄 `fstat` 核 dev / ino / size / 纳秒 mtime / ctime。字段不可得就阻断；按初始大小有界读取，短读、取消和前后身份变化均阻断。关闭句柄后，再核路径身份、原生 metadata 与目录选代。
+3. 将取得的同一 Buffer 经 stdin 传给 Python `--bytes --compression` 审计，不让审计器重开来源。审计返回完整通过校验的帧范围；Node 按这些范围解压原 Buffer，核物理摘要、完整覆盖及原始 JSONL 摘要，再严格解码 UTF-8 / JSON，用原生 codec、restore 与 detached Session 做 admission，核 header / id / 物理代和记录覆盖。
+4. 再观察一次来源并核取消，才在 reader 私有 `WeakMap` 中登记 receipt。输入、解码、审计超时与输出预算共用 [dsh-snapshot-limits.json](../scripts/dsh-snapshot-limits.json)，不在多个工具中各留一份阈值。
+
+`capture()` 成功只返回不可变的 `{kind:"verified_snapshot"}` 句柄；字节、事件、绑定与观察证据留在闭包。`describe()` 只导出摘要，`events()` 返回深复制。手工对象、JSON 往返副本、CLI 摘要及其他 reader 的 receipt 都不能被本 reader 当作有效句柄。这里约束的是 API 构造与引用归属，不是在同一 JS 进程中隔离恶意代码。
+
+来源绑定包括调用方明确提供的 `sourceInstance`、规范目录、session id、压缩格式及物理代；生命周期另用原生 header 编码和 inherited cut 计算。`sourceInstance` 是配置标识，尚非已认证主机身份或跨重启生产凭据。`compare()` 依次区分不同来源、生命周期变化、旧前缀缩短、内容改写与前缀保持，内容比较覆盖完整事件及顺序；重新分帧而事件不变仍为前缀保持。`recheck()` 只再观察文件身份、metadata 与选代，不重读正文，也不与后续写库原子绑定。
+
+Windows、Node `v25.2.1`、DSH `0.2.1-rc.5`、`zstandard` `0.25.0` 实跑 36 组全部通过；每种编码 17 组，另有重分帧和输入预算两组：
+
+| 实际路径上的对照 | 结果与边界 |
+| --- | --- |
+| 稳定读取、只读 CLI、不可伪造引用与导出副本隔离 | 取得完整 10 事件、来源字节未变；伪造引用均拒绝 |
+| 原生追加、同事件数改写、header 生命周期变化 | 分别为前缀保持、`prefix_rewritten`、`lifecycle_changed`；旧 receipt 不因失败或新读取而被改写 |
+| 真实句柄读完、返回调用方之前发生追加 / 同长度原地覆盖 | 两种编码均阻断为 `changed`；追加后下一轮可取得完整新快照 |
+| 关闭读取句柄后，另一进程两次替换、最终字节恢复 | 最终摘要相同仍因文件身份变化阻断；只覆盖此受控替换，不能排除 metadata 不可见的任意 ABA |
+| 读取中发布 v5，或有效 receipt 取得后才发布 v5 | 本轮捕获或后续 recheck 均报不支持，未静默回退到 v4 |
+| 断尾、未知必需事件、缺 metadata、注入 EIO、取消、超预算 | 分别保留阻断结果，不构造空成功；EIO 通过公开 open 注入，非实机磁盘故障 |
+| 原生修尾已 truncate、恢复记录未写入 | JSONL 中间快照 10 事件、前缀保持；zstd 为 9 事件、`prefix_shrank`。完成恢复与追加后均为 16 事件，旧前缀保持；中间快照也没有生产推进许可 |
+| zstd 事件重新分帧 | 物理摘要改变，JSONL 摘要及事件前缀保持 |
+
+验证复用 [io-harness.mjs](../tests/fixtures/dsh-v4/io-harness.mjs) 的公共 I/O 屏障与独立进程回执，每个窗口断言实际命中；操作只落本轮 `target/dsh-capture-*` 全新合成目录。保留运行物，不读真日志或写总库，不启动 Host / LLM。相同 helper 提取后，原生并发 21 组与冻结快照 29 组回归均通过。
+
+```sh
+node scripts/verify-dsh-capture.mjs --dsh-package '<dsh-package.json>'
+node scripts/read-dsh-snapshot.mjs --dsh-package '<dsh-package.json>' --root '<absolute-existing-root>' --id '<session-id>' --compression zstd --source-instance '<configured-source>'
+```
+
+只读入口要求根已存在、为绝对目录且非符号链接，不创建来源根；成功仅输出摘要（退出 0），阻断输出状态（退出 2），基础设施 / 参数异常为退出 1。入口不输出正文，不连接总库。
+
+审计取消另做了真实 `uv → Python` 进程链对照：Windows 只 kill uv 时，合成 Python 仍运行到三秒后的自然结束；因此不再使用 spawn 的 `signal` 自动先杀 wrapper。取消、审计超时和输出超限均走统一终止路径，Windows 对本次子进程 PID 用 `taskkill /T /F`，POSIX 启动独立进程组后终止该组；不会按进程名处理其他运行物。清理另有共享配置中的截止时间，未确认结束时返回 `unavailable/auditor_cleanup_unconfirmed`，不被取消状态掩盖。新增两编码反例从 Python 的 ready 屏障触发取消，并断言它未走到自然结束标记，随后重新捕获成功。WSL 的 Node `v12.22.9` 只验证了进程组终止原语；该环境没有 uv，未运行完整 reader，不将其算作 WSL 捕获验收。
+
+报告明确 `controlled_capture_windows_validated=true` 与 `same_buffer_validation_and_decode=true`，同时保留 `general_stress_validated=false`、`arbitrary_aba_excluded=false`、`production_advance_gate_integrated=false`、`provider_registered=false`。每份成功摘要也明确 `atomic_source_snapshot_proven=false` 与 `production_advance_permit=false`：前后多次观察不能保证期间没有任意 ABA，`matches_observation` 更不能证明未来提交时来源仍稳定。下一步是 Rust 实际读取 / 提交门、位置映射和持久化重放；本轮不把 reader 内存 receipt 序列化为生产游标。

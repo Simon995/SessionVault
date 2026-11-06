@@ -4,10 +4,8 @@
  * 不改安装源码或私有状态；不启动 Host/LLM，不打开真实日志或总库。
  */
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
 import fs from "node:fs/promises";
-import { syncBuiltinESMExports } from "node:module";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { constants, zstdCompressSync } from "node:zlib";
@@ -17,146 +15,15 @@ import {
 } from "./dsh-installed.mjs";
 import { seedWithTurn } from "../tests/fixtures/dsh-v4/scenarios.mjs";
 
-const DEADLINE_MS = 15_000;
+import {
+  inside,
+  ioWindow,
+  startPeer,
+} from "../tests/fixtures/dsh-v4/io-harness.mjs";
+
 const counts = {};
 const observations = {};
 let stage = "arguments";
-
-function inside(root, path) {
-  const rel = relative(root, path);
-  assert(
-    rel !== "" &&
-      !isAbsolute(rel) &&
-      rel !== ".." &&
-      !rel.startsWith("../") &&
-      !rel.startsWith("..\\"),
-  );
-}
-
-async function bounded(promise) {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("fixture deadline exceeded")),
-          DEADLINE_MS,
-        );
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function startPeer(run, packagePath) {
-  const child = fork(
-    new URL("../tests/fixtures/dsh-v4/persistence-peer.mjs", import.meta.url),
-    ["--run", run, "--dsh-package", packagePath],
-    { stdio: ["ignore", "ignore", "pipe", "ipc"] },
-  );
-  const pending = new Map();
-  let next = 0;
-  let ready;
-  let readyFailed;
-  const startup = new Promise((accept, reject) => {
-    ready = accept;
-    readyFailed = reject;
-  });
-  const exited = new Promise((accept) => {
-    child.once("exit", (code, signal) => {
-      const error = new Error(`fixture peer exited (${code ?? signal})`);
-      readyFailed(error);
-      for (const waiter of pending.values()) waiter.reject(error);
-      pending.clear();
-      accept({ code, signal });
-    });
-  });
-  child.on("error", (error) => {
-    readyFailed(error);
-    for (const waiter of pending.values()) waiter.reject(error);
-  });
-  // 排空 stderr，错误类型由 IPC 或进程退出码报告，不输出安装路径或正文。
-  child.stderr.resume();
-  child.on("message", (message) => {
-    if (message.ready) return ready(message.pid);
-    const waiter = pending.get(message.id);
-    if (!waiter) return;
-    pending.delete(message.id);
-    if (message.ok) waiter.resolve(message.result);
-    else
-      waiter.reject(
-        Object.assign(
-          new Error("fixture peer operation failed"),
-          message.error,
-        ),
-      );
-  });
-  const call = async (op, data = {}) => {
-    const requestId = next++;
-    try {
-      return await bounded(
-        new Promise((accept, reject) => {
-          pending.set(requestId, { resolve: accept, reject });
-          child.send({ ...data, op, requestId }, (error) => {
-            if (error) reject(error);
-          });
-        }),
-      );
-    } finally {
-      pending.delete(requestId);
-    }
-  };
-  try {
-    const pid = await bounded(startup);
-    assert.notEqual(pid, process.pid);
-    return {
-      call,
-      async stop() {
-        try {
-          await call("stop");
-          assert.equal((await bounded(exited)).code, 0);
-        } finally {
-          if (child.exitCode === null && child.signalCode === null) {
-            child.kill();
-            await bounded(exited);
-          }
-        }
-      },
-    };
-  } catch (error) {
-    child.kill();
-    await bounded(exited);
-    throw error;
-  }
-}
-
-/** 在真实 I/O 返回后、backend 获得结果前让另一进程完成指定动作。 */
-async function ioWindow(operation, path, onHit, action) {
-  const original = fs[operation];
-  const trace = [];
-  fs[operation] = async (...args) => {
-    const result = await original(...args);
-    if (typeof args[0] === "string" && resolve(args[0]) === resolve(path)) {
-      trace.push({ call: trace.length + 1, bytes: result?.byteLength });
-      await onHit(trace.length);
-    }
-    return result;
-  };
-  syncBuiltinESMExports();
-  try {
-    const value = await bounded(Promise.resolve().then(action));
-    assert(
-      trace.length > 0,
-      "the intended native I/O boundary was not reached",
-    );
-    return { value, trace };
-  } finally {
-    fs[operation] = original;
-    syncBuiltinESMExports();
-  }
-}
 
 async function main() {
   const { values } = parseArgs({

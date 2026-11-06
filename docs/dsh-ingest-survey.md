@@ -1,13 +1,13 @@
 # DSH 来源核查与适配判据
 
-> 2026-11-05 来源核查。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生合成样本、恢复边界、用量保真草案、原生 backend 与受控并发验证见 §8–§13。**正式 provider、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
+> 2026-11-06 更新。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生合成样本、恢复边界、用量保真草案、原生 backend、受控并发、独立快照审计与实际捕获原型见 §8–§15。**正式 provider、生产推进、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
 ## 1. 证据范围
 
 - **安装源码**：本机 `@deepseek-ai/dsh` 及下列相关包，已核版本均为 `0.2.1-rc.5`。这是安装包快照，不声称 npm 最新版或上游 `main` 当前仍相同。包元数据指向 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)，查证日期为 2026-11-05。
-- **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。原生 restore、codec 与 reducer 用于完全合成的内存夹具（§9–§10）；原生 backend 只对本仓 `target` 新建目录内的合成文件做读写 / 修尾（§12–§13）。未对真实日志调用恢复 API，未启动 Host / LLM、读取凭据、写真实会话日志或总库。
+- **实读范围**：显式指定 `<DSH_HOME>/sessions` 下的本地日志，使用 [inspect-dsh.py](../scripts/inspect-dsh.py)。原生 restore、codec 与 reducer 用于完全合成的内存夹具（§9–§10）；原生 backend、独立审计与实际捕获只对本仓 `target` 新建目录内的合成文件做读写 / 修尾（§12–§15）。未对真实日志调用恢复 API，未启动 Host / LLM、读取凭据、写真实会话日志或总库。
 - **未覆盖**：WSL / 其他机器来源、当前活动 Host 的启动环境及额外 `--patch`、真实会话恢复、复杂迁移、无约束并发压力和崩溃持久性。受控双进程窗口见 §13；本机两个 profile 的静态配置见 §8，这仍不证明覆盖全部活动来源。
-- **工具限制**：探针只统计物理 JSONL、白名单字段形状并输出脱敏结构投影，不解码完整 DSH 事件语义、attempt stream 或有效 surface。`complete` 仅表示本轮流读取未中断；`valid_jsonl` 不代表通过 DSH schema 校验。压缩帧完整性没有独立验证，不能用本轮退出码证明 torn-frame 恢复正确。
+- **初始探针限制**：`inspect-dsh.py` 只统计物理 JSONL、白名单字段形状并输出脱敏结构投影，不解码完整 DSH 事件语义、attempt stream 或有效 surface。它的 `complete` 仅表示流读取未中断，`valid_jsonl` 不代表通过 DSH schema 校验，也没有独立验证压缩帧完整性。§14–§15 后加独立审计与原生 admission，不回填成初始真实日志探针已验证。
 
 ## 2. 本机观察
 
@@ -99,7 +99,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 - user-role 的人工、注入、agent relay、settlement 与未知来源；可信属性缺失 / 冲突、多写者及记忆缓存不绕过临时范围。
 - CLI / Rust 构造与穷举 / 逐字段读取 / `SourceMode` 过滤兼容；旧版读者与并存写者协调。
 
-建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§13 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾，以及双进程受控追加 / 修尾 / 代发布窗口。正式实现仍缺生产读取状态与安全推进位置、活动启动配置、复杂迁移 / 有效视图样本、§11 用量保真草案的实现与兼容验证，以及 H.1 的可信载体；一般并发压力、崩溃及租约争夺仍未验。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
+建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§15 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾、双进程受控窗口、独立快照审计与 Node 同缓冲区捕获原型。正式实现仍缺生产读取状态与安全推进位置、活动启动配置、复杂迁移 / 有效视图样本、§11 用量保真草案的实现与兼容验证，以及 H.1 的可信载体；一般并发压力、崩溃及租约争夺仍未验。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
 
 ## 7. 安装源码索引
 
@@ -350,4 +350,18 @@ node scripts/verify-dsh-concurrency.mjs --dsh-package '<dsh-package.json>'
 
 关键结果：最后一个 checksum 字节缺失时，原生 read 仍可返回全部 10 事件；追加新事件但缺 checksum 时甚至可取得 11 事件，独立审计均阻断。正文坏 UTF-8 可被原生替换后接受，严格审计拒绝。反向对照确认物理完整不等于语义可接受，而重新分帧可以只改变物理摘要、保留相同 JSONL 与事件。旧副本的完整性结果不能配给改写后的副本。
 
-当前只证明新建、无并发 writer 的合成副本可核，不证明从活跃来源捕获快照的原子性；两端 hash 相同也不能防 ABA。报告保留 `live_source_capture_validated=false`、`production_advance_gate_integrated=false` 与 `provider_registered=false`。下一步仍是来源实例 / 生命周期 / 选代与所捕获快照绑定、旧前缀核对及生产提交门接线，未改 Cursor、schema 或 SourceType；H.4 整体未完成。
+本节只证明新建、无并发 writer 的合成副本可核，不证明从活跃来源捕获快照的原子性；两端 hash 相同也不能防 ABA。该脚本报告保留 `live_source_capture_validated=false`、`production_advance_gate_integrated=false` 与 `provider_registered=false`，已提交为 `6b2a0b3`，尚未合并发布。后续实际捕获原型见 §15；它不改变本脚本的范围，也没有完成 H.4。
+
+## 15. 后续实现：同缓冲区捕获与旧前缀核对
+
+2026-11-06，新增 [dsh-snapshot-reader.mjs](../scripts/dsh-snapshot-reader.mjs)、显式只读 [read-dsh-snapshot.mjs](../scripts/read-dsh-snapshot.mjs) 与 [verify-dsh-capture.mjs](../scripts/verify-dsh-capture.mjs)。同一真实文件句柄取得的私有 Buffer 同时用于独立物理审计和原生 codec / restore / detached Session admission；Python 新增 stdin 字节入口与已验证帧范围，Node 不重开来源拼接证据。输入 / 解码 / 审计资源上限归同一份 JSON 配置。完整流程、状态与命令见 [读取状态设计 §7](dsh-read-state-design.md#7-活跃来源的实际捕获原型)。
+
+选代依据重新核过安装源码（查证日期 2026-11-06）：`dsh-session-persistence-jsonl/lib/index.js:2450` 的 `locate` 是当前格式目标的诊断路径；`:2570` 的 `stat` 提供同 service 内 revision / header 观察；`:3411,3444,3468` 是目录最高规范代、跨项目目录歧义及 header 绑定检查。公开规范文件名 parser 见 `dsh-session-format/lib/types/filename.d.ts`。捕获入口据此另列目录选择实际物理代，并在真实句柄读取前后、审计后重查文件身份、metadata 与选代；不拿逻辑版本号代替物理代。
+
+Windows、Node `v25.2.1`、DSH `0.2.1-rc.5`、`zstandard` `0.25.0` 上 36 组捕获检查全部通过：两种编码各 17 组，另加重分帧及输入预算。包括稳定读取与只读 CLI、receipt 归属、导出副本隔离、原生追加、同事件数改写、生命周期变化、断尾、读中追加 / 原地覆盖、读后两次路径替换的受控 ABA、未来代发布 / 后续复查、读取取消及运行中审计进程树取消、EIO 注入、语义拒绝与 metadata 缺失。每个受控 I/O 窗口均断言真实命中，复用 [io-harness.mjs](../tests/fixtures/dsh-v4/io-harness.mjs) 及独立进程；原生并发 21 组和冻结快照 29 组回归通过。
+
+原生修尾在 truncate 已完成、恢复记录未写时，明文中间快照仍有 10 事件，zstd 只有 9 事件并返回 `prefix_shrank`；修复完成并追加后均为 16 事件，旧前缀保持。这里对照的是完整内容及顺序，不能凭事件数复用旧证据；失败后仍可读取旧内存快照，也不等于已接入总库事务保留。重新分帧只改变物理摘要时，JSONL 摘要与事件前缀仍保持。
+
+receipt 仅可由该 reader 的实际验证路径登记，外部对象 / JSON / 另一 reader 的句柄不能冒充；内部 Buffer 不导出，事件导出为深复制。来源绑定含调用方明确配置的实例、规范目录、session id、压缩与物理代，生命周期含 header 和继承边界。配置实例尚非可信主机身份，receipt 也不是跨重启持久化凭据。
+
+报告为 `controlled_capture_windows_validated=true`、`same_buffer_validation_and_decode=true`；一般压力、任意 ABA 排除、生产提交门及 provider 仍为 false。成功摘要显式保留 `atomic_source_snapshot_proven=false` 和 `production_advance_permit=false`，后续 `matches_observation` 仅代表再一轮观察。整个原型不改 Rust 公开 API、Cursor、SourceType 或 schema，不连接真库，也不提供正式 `svault` 命令。下一步仍需 Rust 实际读取 / 提交门、原生到归一化位置映射及写库 / 状态保存重放验收。

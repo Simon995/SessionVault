@@ -95,6 +95,13 @@ async function main() {
         await appendFile(path, Buffer.from(message.bytes, "base64"));
         return { bytes: (await readFile(path)).length };
       }
+      case "overwrite": {
+        const path = await checkedPath(message.path);
+        await writeFile(path, Buffer.from(message.bytes, "base64"), {
+          flag: "r+",
+        });
+        return { bytes: (await readFile(path)).length };
+      }
       case "replace": {
         const path = await checkedPath(message.path);
         const staged = `${path}.peer-${serial++}`;

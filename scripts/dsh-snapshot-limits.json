@@ -1,0 +1,8 @@
+{
+  "input_bytes": 8388608,
+  "decoded_bytes": 33554432,
+  "decode_chunk_bytes": 64,
+  "audit_timeout_ms": 45000,
+  "audit_cleanup_timeout_ms": 5000,
+  "audit_output_bytes": 1048576
+}
