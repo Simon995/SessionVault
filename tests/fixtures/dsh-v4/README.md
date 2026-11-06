@@ -29,4 +29,11 @@ node scripts/verify-dsh-concurrency.mjs --dsh-package '<dsh-package.json>'
 
 该脚本仅操作 `target/dsh-concurrency-*` 的全新合成目录，保留运行物，等待自己启动的子进程退出；不改安装源码或私有 backend 状态。报告区分受控窗口已验与公开物理完整性证据不可得；没有交付生产读取状态或安全推进位置。`eventState` 表示事件所有权，不是来源完整性；事件数防倒退不能证明内容未改。
 
+2026-11-06 新增 [verify-dsh-snapshot.mjs](../../../scripts/verify-dsh-snapshot.mjs) 与 [check-dsh-snapshot.py](../../../scripts/check-dsh-snapshot.py)：原生 codec 生成明文 / zstd 快照，独立 `zstandard==0.25.0` 审计分行、帧尾与 checksum，再与同副本上的原生 persistence / restore 对照。29 组检查通过；审计自测另逐一截断第二帧的 45 个非空切点、破坏四个 checksum 字节。覆盖坏 UTF-8、物理完整但语义拒绝、合法 JSON 空白、同事件数改写、重分帧及错配快照证据。这里只核无并发 writer 的新建合成副本，未实现活跃来源快照捕获、生产提交门或持久化推进凭据。
+
+```sh
+uv run scripts/check-dsh-snapshot.py --self-test
+node scripts/verify-dsh-snapshot.mjs --dsh-package '<dsh-package.json>'
+```
+
 当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、0→4 全链迁移、无约束并发压力、租约争夺、崩溃持久性、WSL 或真实 provider。19 组 backend 脚本仍报告 `concurrent_races_validated=false`；21 组并发脚本另报 `controlled_concurrent_windows_validated=true`，两者分别限定自身范围。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§13。

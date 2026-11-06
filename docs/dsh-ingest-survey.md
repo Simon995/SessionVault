@@ -343,3 +343,11 @@ node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
 ```sh
 node scripts/verify-dsh-concurrency.mjs --dsh-package '<dsh-package.json>'
 ```
+
+## 14. 后续核查：独立快照完整性
+
+2026-11-06，新增 Python 逐帧 / checksum / 严格 UTF-8 审计及原生 persistence / restore 对照，29 组检查通过；审计器自测另覆盖第二帧的 45 个非空截断点及四个 checksum 字节破坏。DSH 安装版仍由脚本核为 `0.2.1-rc.5`，Node 实跑 `v25.2.1`，独立解码依赖固定 `zstandard==0.25.0`。实现、命令和完整边界见 [读取状态设计 §6](dsh-read-state-design.md#6-独立快照完整性验证)。
+
+关键结果：最后一个 checksum 字节缺失时，原生 read 仍可返回全部 10 事件；追加新事件但缺 checksum 时甚至可取得 11 事件，独立审计均阻断。正文坏 UTF-8 可被原生替换后接受，严格审计拒绝。反向对照确认物理完整不等于语义可接受，而重新分帧可以只改变物理摘要、保留相同 JSONL 与事件。旧副本的完整性结果不能配给改写后的副本。
+
+当前只证明新建、无并发 writer 的合成副本可核，不证明从活跃来源捕获快照的原子性；两端 hash 相同也不能防 ABA。报告保留 `live_source_capture_validated=false`、`production_advance_gate_integrated=false` 与 `provider_registered=false`。下一步仍是来源实例 / 生命周期 / 选代与所捕获快照绑定、旧前缀核对及生产提交门接线，未改 Cursor、schema 或 SourceType；H.4 整体未完成。
