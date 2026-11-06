@@ -32,9 +32,15 @@ required-features = ["parity"]
 name = "identity_probe"
 required-features = ["store"]
 
+[[example]]
+name = "dsh_snapshot"
+required-features = ["dsh-experimental"]
+
 [features]
 # 仅启用 parity diff 工具（纯逻辑，复用既有 serde_json/clap，无新依赖）。
 parity = []
+# 隔离的 DSH 字节/位置核验原型；不注册 provider，不开放总库写入口。
+dsh-experimental = []
 # 不可变 RawEvent 总库（§13 / ADR-020）。门控 rusqlite——纯 parser 用户不被迫拉它，
 # 保住「解析内核无状态」（§14）；QuotaBar 作总库默认写者时开此 feature。
 store = [

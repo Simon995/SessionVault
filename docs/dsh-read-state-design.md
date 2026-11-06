@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§15；独立快照审计与实际捕获原型见本文 §6–§7。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§15；独立快照审计、Node 捕获与 Rust 字节 / 原生位置原型见本文 §6–§8。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -76,7 +76,7 @@ CARGO_TARGET_DIR=target/dsh-read-state cargo test --features store --test cli_sc
 
 ## 5. 下一步完成判据
 
-- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7。后续实现 Rust 读取路径时必须保留同缓冲区验证、来源 / 生命周期 / 选代绑定及旧前缀核对；Node 原型通过不能代替 Rust 路径验收，也不证明任意 ABA 已排除。
+- v4 明文 / zstd 的独立快照验证见 §6，Node 实际捕获函数与受控窗口见 §7，Rust 字节与原生位置核验见 §8。Rust 尚需接入来源 / 生命周期 / 选代绑定及旧前缀核对；Node 原型通过不能代替 Rust 对应路径验收，也不证明任意 ABA 已排除。
 - 将实际 reader 的阻断 / 已验证结果接入观察前的提交门；未知完整性不得落成既有 Clean / Degraded 后继续推进。明确快照验证与生产推进之间所需的稳定性条件。
 - 同事件数改写、双追加旧前缀、修尾中间态、读取后发布未来代和写库后未保存状态的重放，须经过生产读取 / 写库 / 状态保存路径核验。§7 的旧快照保留仅在 reader 内存中成立，尚未验证 DSH 总库投影事务。
 - 再决定是否需要公开类型、持久化字段或 schema 变化；改动时按四类消费者及旧读者 / 并存写者逐项验证。当前没有理由先给公开 Cursor 加字段，也不把一次内存模型通过称作生产验收。
@@ -153,4 +153,42 @@ node scripts/read-dsh-snapshot.mjs --dsh-package '<dsh-package.json>' --root '<a
 
 审计取消另做了真实 `uv → Python` 进程链对照：Windows 只 kill uv 时，合成 Python 仍运行到三秒后的自然结束；因此不再使用 spawn 的 `signal` 自动先杀 wrapper。取消、审计超时和输出超限均走统一终止路径，Windows 对本次子进程 PID 用 `taskkill /T /F`，POSIX 启动独立进程组后终止该组；不会按进程名处理其他运行物。清理另有共享配置中的截止时间，未确认结束时返回 `unavailable/auditor_cleanup_unconfirmed`，不被取消状态掩盖。新增两编码反例从 Python 的 ready 屏障触发取消，并断言它未走到自然结束标记，随后重新捕获成功。WSL 的 Node `v12.22.9` 只验证了进程组终止原语；该环境没有 uv，未运行完整 reader，不将其算作 WSL 捕获验收。
 
-报告明确 `controlled_capture_windows_validated=true` 与 `same_buffer_validation_and_decode=true`，同时保留 `general_stress_validated=false`、`arbitrary_aba_excluded=false`、`production_advance_gate_integrated=false`、`provider_registered=false`。每份成功摘要也明确 `atomic_source_snapshot_proven=false` 与 `production_advance_permit=false`：前后多次观察不能保证期间没有任意 ABA，`matches_observation` 更不能证明未来提交时来源仍稳定。下一步是 Rust 实际读取 / 提交门、位置映射和持久化重放；本轮不把 reader 内存 receipt 序列化为生产游标。
+报告明确 `controlled_capture_windows_validated=true` 与 `same_buffer_validation_and_decode=true`，同时保留 `general_stress_validated=false`、`arbitrary_aba_excluded=false`、`production_advance_gate_integrated=false`、`provider_registered=false`。每份成功摘要也明确 `atomic_source_snapshot_proven=false` 与 `production_advance_permit=false`：前后多次观察不能保证期间没有任意 ABA，`matches_observation` 更不能证明未来提交时来源仍稳定。本节捕获与进程树取消修复已提交为 `86c34aa`，尚未合并发布；不把 reader 内存 receipt 序列化为生产游标。后续 Rust 字节与原生位置核验见 §8，生产提交与持久化重放仍待接线。
+
+## 8. Rust 同缓冲区物理核验与原生记录位置
+
+2026-11-06 新增显式 feature `dsh-experimental`、[dsh_snapshot.rs](../src/dsh_snapshot.rs) 与只读 [example](../examples/dsh_snapshot.rs)。默认构建不开放该模块。入口要求显式绝对文件路径与压缩格式，不发现来源、不创建来源目录，也不注册正式 provider 或 `svault` 子命令。
+
+实际路径为 `probe::with_reader → 有界 Vec → compressed::checked_frames → 严格 UTF-8 / JSONL → 最小 v4 envelope 与位置表`。只打开一次，输入预算加一字节区分完整读取和超限；摘要与验证来自同一份字节。zstd 复用 `compressed.rs` 原有唯一帧头解析与解码器，在分配解码窗口前核窗口 / 声明长度预算，逐帧核内容长度和 checksum。第一帧只含 header，每帧结束于记录边界，允许空事件帧。输入 / 解码预算仍只取共享 `dsh-snapshot-limits.json`，没有新增依赖。
+
+结果 `PhysicalSnapshot` 的字段私有，只有实际核验路径能构造；`Blocked` 用穷举 enum 保留 unavailable、incomplete、unverified、unsupported、budget_exceeded、invalid 与 rejected。坏尾与 checksum 解码失败尚未全部精确分类，统一保留未核结论时返回 `unverified`，不会猜成永久损坏或空会话。读取未完成、来源打不开与超预算均不输出全文摘要或成功位置表。核验完成只保留摘要与位置，不导出原始 header / 正文，也未提供摄取重放内容。
+
+| 输出位置 / 摘要 | 含义与限制 |
+| --- | --- |
+| `record_index`、`native_seq` | header 占第 0 条记录，事件原生 seq 从 0 连续；不是 `RawEvent.seq` 或 `Cursor.next_seq` |
+| `jsonl_start/end` | 解压后 UTF-8 字节范围，包含该行末尾 LF；CRLF 的 CR 也计入，不按字符数算 |
+| `frame_index`、`frame_spans` | 对应物理帧与该帧解压后的字节范围；明文的事件 frame_index 为 null，空帧不占事件序号 |
+| `record_fingerprint` | 复用现有 `EventKey::fingerprint_of`，对 trim 后原记录截断摘要；没有构造 EventKey、RawEvent 或生产身份 |
+| `snapshot_sha256`、`jsonl_sha256`、`header_sha256` | 物理文件、原始 JSONL 与含 LF 的原 header 行摘要；header 摘要没有规范化，不是已验证生命周期凭据 |
+
+[verify-dsh-rust-snapshot.mjs](../scripts/verify-dsh-rust-snapshot.mjs) 用原生 v4 codec 从共享 artifact 生成全新合成文件，加入中文正文与 JSON 空白；Python `zstandard==0.25.0` 独立审计同副本，Rust example 实际打开核验，再与 Node 按审计帧范围解码所得的每条位置、摘要和原生 admission 对拍。上游 v4 物理编码出处为安装版 `dsh-session-format-v3-to-v4/lib/index.js:1057–1099`，查证日期 2026-11-06。未知必需事件与断裂 call/result 可以通过本轮 Rust 物理核验、同时被原生 admission 拒绝；脚本明确断言成功摘要的 `semantic_admission_validated=false`，不把最小 envelope 检查称作语义接入。
+
+Windows 实跑 136 份快照，另有重分帧位置保持、默认省略位置表、缺路径不建目录及目录不能冒充空会话四组对照。最后一帧逐一截断 89 个非空切点，全部阻断；四个 checksum 字节分别破坏也全部阻断。无 checksum、字典、超大窗口、声明 / 流式解码超预算、跨帧半行、混合 header 帧、坏 UTF-8、重复 / 缺失序号与未来 header 均覆盖。重分帧后原始 JSONL 摘要和原生记录字节位置相同，物理摘要与 frame_index 改变。
+
+```sh
+CARGO_TARGET_DIR=target/dsh-read-state cargo build --example dsh_snapshot --features dsh-experimental
+node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>'
+cargo run --example dsh_snapshot --features dsh-experimental -- --path '<absolute-snapshot>' --compression zstd --positions
+```
+
+WSL 另用 Linux 工具链编译 example，并由 Windows Node / Python 生成、审计新副本后通过 `wsl.exe --exec` 调用该二进制，136 份快照及上述四组对照也全部通过。`--wsl-reader` 与 `--rust-reader` 二选一；脚本只对自身新建的夹具根调用 `wslpath`，不换算消费方会话路径。Git Bash 调用时禁用参数路径改写：
+
+```sh
+MSYS_NO_PATHCONV=1 node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --wsl-reader '<absolute-linux-example-binary>'
+```
+
+这是 Linux Rust 读 Windows 盘上合成文件的验收，不是完整 Linux DSH backend / Node 捕获验收。Windows `cargo test --lib --features store,dsh-experimental` 为 432 passed，默认 / store bin、experimental all-target 编译与 all-feature clippy 均通过。Linux `cargo test --lib --features dsh-experimental` 为 256 passed，store + experimental 的 bin 编译通过。Linux 全库 store 测试实际为 416 passed / 1 failed：现有 `open_existing_returns_the_store_when_it_is_there` 在建库准备阶段访问系统钥匙链，因 `org.freedesktop.secrets` 服务缺失失败；没有跳过后把全库报告成绿，该项仍归 backlog F。最后只调整静态错误值的 `ok_or` 写法，两平台对应模块测试与最终 example 对拍再过。
+
+现有 Rust 消费方另外用 Cargo 临时 `paths` 覆盖指向本仓当前开发源码，先由 metadata 正向核依赖实际落点，再跑 `cargo check --locked --lib`，结果通过；未改消费方 manifest、lock 或子模块指针。这里验证其既有 store 用法，不表示它启用了 experimental feature。CLI、Rust 既有构造 / 穷举及逐字段读取、`discover` 的 SourceMode 过滤没有新增值域或字段；没有改 Cursor、RawEvent、schema 或正式 CLI。
+
+只读入口成功输出 `physically_validated`、退出 0；阻断输出类型与原因、退出 2；路径参数或输出失败为非零。`--positions` 才输出逐记录位置。Rust 路径尚无 Node §7 的同句柄身份、选代、来源实例 / 生命周期与旧前缀核对，也没有 codec / restore admission、归一化位置或写库门；输出固定保留 `source_observation_validated=false`、`normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。对拍只使用没有并发 writer 的新建副本，不能据此前后摘要相同推断来源原子性。下一步仍是这些证据与生产观察 / 提交门的接合，而不是把物理成功包装成 Clean / Degraded。

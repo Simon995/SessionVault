@@ -52,6 +52,8 @@ fn invalid(what: impl Into<String>) -> io::Error {
 struct FrameHeader {
     content_size: Option<u64>,
     checksum: bool,
+    window_size: u64,
+    dictionary_id: u64,
     raw: Vec<u8>,
 }
 
@@ -103,11 +105,15 @@ fn read_next<R: Read + ?Sized>(r: &mut R) -> io::Result<Next> {
         return Err(invalid("zstd frame header has the reserved bit set"));
     }
     let checksum = descriptor & 0x04 != 0;
-    if !single_segment {
-        read_exact_into(r, &mut raw, 1)?; // Window_Descriptor
-    }
+    let window = if !single_segment {
+        let descriptor = read_exact_into(r, &mut raw, 1)? as u8;
+        let base = 1u64 << (10 + (descriptor >> 3));
+        Some(base + (base / 8) * u64::from(descriptor & 7))
+    } else {
+        None
+    };
     let dict_bytes = [0, 1, 2, 4][usize::from(descriptor & 0x03)];
-    read_exact_into(r, &mut raw, dict_bytes)?;
+    let dictionary_id = read_exact_into(r, &mut raw, dict_bytes)?;
     let content_size = match (fcs_flag, single_segment) {
         (0, false) => None,
         (0, true) => Some(read_exact_into(r, &mut raw, 1)?),
@@ -118,6 +124,10 @@ fn read_next<R: Read + ?Sized>(r: &mut R) -> io::Result<Next> {
     Ok(Next::Data(FrameHeader {
         content_size,
         checksum,
+        window_size: window
+            .or(content_size)
+            .ok_or_else(|| invalid("zstd window size is unavailable"))?,
+        dictionary_id,
         raw,
     }))
 }
@@ -169,6 +179,87 @@ fn decode_frame<R: Read + ?Sized>(
         }
     }
     Ok(true)
+}
+
+#[cfg(feature = "dsh-experimental")]
+#[derive(Debug)]
+pub(crate) struct CheckedFrame {
+    pub physical_start: usize,
+    pub physical_end: usize,
+    pub decoded: Vec<u8>,
+}
+
+#[cfg(feature = "dsh-experimental")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameCheckFailure {
+    Incomplete,
+    Unverified,
+    ChecksumAbsent,
+    DictionaryRequired,
+    UnsupportedFrame,
+    BudgetExceeded,
+}
+
+/// 完整验证每一帧后才交出字节与边界；沿用上面的唯一帧头/解码实现。
+#[cfg(feature = "dsh-experimental")]
+pub(crate) fn checked_frames(
+    bytes: &[u8],
+    decoded_limit: u64,
+) -> Result<Vec<CheckedFrame>, FrameCheckFailure> {
+    use FrameCheckFailure as F;
+    let mut source = io::Cursor::new(bytes);
+    let mut frames = Vec::new();
+    let mut produced = 0u64;
+    while source.position() < bytes.len() as u64 {
+        let start = source.position() as usize;
+        let remaining = &bytes[start..];
+        let magic = ZSTD_MAGIC.to_le_bytes();
+        if remaining.len() < magic.len() && magic.starts_with(remaining) {
+            return Err(F::Incomplete);
+        }
+        let header = match read_next(&mut source).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                F::Incomplete
+            } else {
+                F::Unverified
+            }
+        })? {
+            Next::Data(header) => header,
+            Next::Skippable(_) => return Err(F::UnsupportedFrame),
+            Next::End => break,
+        };
+        if !header.checksum {
+            return Err(F::ChecksumAbsent);
+        }
+        if header.dictionary_id != 0 {
+            return Err(F::DictionaryRequired);
+        }
+        let left = decoded_limit - produced;
+        if header.window_size > decoded_limit || header.content_size.is_some_and(|n| n > left) {
+            return Err(F::BudgetExceeded);
+        }
+        let mut decoded = Vec::new();
+        let mut exceeded = false;
+        let finished = decode_frame(&mut source, &header, &mut |chunk| {
+            if chunk.len() as u64 > left - decoded.len() as u64 {
+                exceeded = true;
+                return false;
+            }
+            decoded.extend_from_slice(chunk);
+            true
+        })
+        .map_err(|_| F::Unverified)?;
+        if exceeded || !finished {
+            return Err(F::BudgetExceeded);
+        }
+        produced += decoded.len() as u64;
+        frames.push(CheckedFrame {
+            physical_start: start,
+            physical_end: source.position() as usize,
+            decoded,
+        });
+    }
+    Ok(frames)
 }
 
 /// 逐帧解压整个流，解出的字节依次交给 `sink`，`sink` 返回 `false` 就停。
@@ -368,6 +459,47 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[cfg(feature = "dsh-experimental")]
+    #[test]
+    fn checked_frames_bind_boundaries_and_refuse_every_torn_suffix() {
+        let frame = include_bytes!("../tests/fixtures/zst/checksum.jsonl.zst");
+        let plain = include_bytes!("../tests/fixtures/zst/rollout.jsonl");
+        let budget = plain.len() as u64 * 2;
+        let bytes = [frame.as_slice(), frame.as_slice()].concat();
+        let frames = checked_frames(&bytes, budget).unwrap();
+        assert_eq!(frames.len(), 2);
+        for (index, found) in frames.iter().enumerate() {
+            assert_eq!(found.physical_start, index * frame.len());
+            assert_eq!(found.physical_end, (index + 1) * frame.len());
+            assert_eq!(found.decoded, plain);
+        }
+        for cut in 1..frame.len() {
+            let torn = [frame.as_slice(), &frame[..cut]].concat();
+            assert!(checked_frames(&torn, budget).is_err(), "cut {cut}");
+        }
+        for byte in 1..=4 {
+            let mut corrupt = bytes.clone();
+            let at = corrupt.len() - byte;
+            corrupt[at] ^= 1;
+            assert_eq!(
+                checked_frames(&corrupt, budget).unwrap_err(),
+                FrameCheckFailure::Unverified
+            );
+        }
+        assert_eq!(
+            checked_frames(&bytes, plain.len() as u64).unwrap_err(),
+            FrameCheckFailure::BudgetExceeded
+        );
+        assert_eq!(
+            checked_frames(
+                include_bytes!("../tests/fixtures/zst/like-codex.jsonl.zst"),
+                budget
+            )
+            .unwrap_err(),
+            FrameCheckFailure::ChecksumAbsent
+        );
     }
 
     /// 长度是不解压、照帧头答的；帧头说的与解出来的对不上，读全文时必须报错 —— 否则 `stat`

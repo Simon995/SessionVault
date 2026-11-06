@@ -18,6 +18,9 @@ pub mod cursor;
 pub mod deadline;
 pub mod discover;
 pub mod discovery;
+/// DSH 同缓冲区物理核验与记录位置原型；不提供 RawEvent 或生产推进凭据。
+#[cfg(feature = "dsh-experimental")]
+pub mod dsh_snapshot;
 pub mod identity;
 pub mod logging;
 pub mod memory_roots;

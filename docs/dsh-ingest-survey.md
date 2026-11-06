@@ -1,6 +1,6 @@
 # DSH 来源核查与适配判据
 
-> 2026-11-06 更新。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生合成样本、恢复边界、用量保真草案、原生 backend、受控并发、独立快照审计与实际捕获原型见 §8–§15。**正式 provider、生产推进、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
+> 2026-11-06 更新。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生样本、恢复边界、用量保真、原生 backend、受控并发、快照审计、Node 捕获及 Rust 字节 / 原生位置核验见 §8–§16。**正式 provider、生产推进、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
 ## 1. 证据范围
 
@@ -364,4 +364,14 @@ Windows、Node `v25.2.1`、DSH `0.2.1-rc.5`、`zstandard` `0.25.0` 上 36 组捕
 
 receipt 仅可由该 reader 的实际验证路径登记，外部对象 / JSON / 另一 reader 的句柄不能冒充；内部 Buffer 不导出，事件导出为深复制。来源绑定含调用方明确配置的实例、规范目录、session id、压缩与物理代，生命周期含 header 和继承边界。配置实例尚非可信主机身份，receipt 也不是跨重启持久化凭据。
 
-报告为 `controlled_capture_windows_validated=true`、`same_buffer_validation_and_decode=true`；一般压力、任意 ABA 排除、生产提交门及 provider 仍为 false。成功摘要显式保留 `atomic_source_snapshot_proven=false` 和 `production_advance_permit=false`，后续 `matches_observation` 仅代表再一轮观察。整个原型不改 Rust 公开 API、Cursor、SourceType 或 schema，不连接真库，也不提供正式 `svault` 命令。下一步仍需 Rust 实际读取 / 提交门、原生到归一化位置映射及写库 / 状态保存重放验收。
+报告为 `controlled_capture_windows_validated=true`、`same_buffer_validation_and_decode=true`；一般压力、任意 ABA 排除、生产提交门及 provider 仍为 false。成功摘要显式保留 `atomic_source_snapshot_proven=false` 和 `production_advance_permit=false`，后续 `matches_observation` 仅代表再一轮观察。整个原型不改 Rust 公开 API、Cursor、SourceType 或 schema，不连接真库，也不提供正式 `svault` 命令。本节实现已提交为 `86c34aa`，尚未合并发布。后续 Rust 字节 / 原生位置核验见 §16；生产读取 / 提交门、归一化位置映射与持久化重放仍未完成。
+
+## 16. 后续实现：Rust 字节与原生记录位置
+
+2026-11-06，新增 `dsh-experimental` feature、[dsh_snapshot.rs](../src/dsh_snapshot.rs)、只读 [example](../examples/dsh_snapshot.rs) 和 [verify-dsh-rust-snapshot.mjs](../scripts/verify-dsh-rust-snapshot.mjs)。通过 `probe` 一次打开、取得有界字节后，在同一 Vec 上复用 `compressed.rs` 唯一帧头 / 解码器，核 checksum、分行、UTF-8 与最小 v4 envelope。私有构造的成功结果只导出摘要及可选记录位置，不注册 provider，不产生 RawEvent、观察或推进凭据。
+
+Windows 与 WSL Linux 二进制分别通过 136 份合成快照及四组附加对照；独立 Python 帧审计、Node 解压与原生 codec / restore / Session admission 用于交叉检查。覆盖最后一帧的 89 个非空截断点、四个 checksum 字节破坏、输入 / 解码 / 窗口预算、字典与无 checksum、坏 JSON / UTF-8、混合 header 帧、重复 / 缺失 seq、重分帧与空帧位置。重分帧后原生记录的 JSONL 字节范围不变，物理帧位置改变。原生 seq、记录索引、UTF-8 字节位置和物理帧位置分别输出；它们没有被当成 RawEvent.seq 或 Cursor 的位置。
+
+Windows 432 个库测试与所需功能组合 / 零警告 clippy 通过；Linux experimental 组合 256 个库测试与 store 编译通过。Linux 全库 store 测试另有一项既有钥匙链准备失败，仍未通过全库，详见 [读取状态设计 §8](dsh-read-state-design.md#8-rust-同缓冲区物理核验与原生记录位置) 与 backlog F。现有 Rust 消费方临时指向本仓源码的编译也通过，未改其 manifest、lock 或子模块指针。
+
+本轮是 Rust 物理与原生记录位置的隔离验收；语义 admission、来源 / 生命周期 / 选代与旧前缀核对尚未移植，归一化位置和生产写库门也未接入。未知必需事件或断裂 call/result 能通过 Rust 物理检查、同时被原生 admission 拒绝，对拍明确保留这一差别。所有成功摘要的 `production_advance_permit`、`semantic_admission_validated`、`source_observation_validated` 与 `normalized_positions_available` 均为 false；没有完成 H.4 或完整 WSL DSH 捕获。

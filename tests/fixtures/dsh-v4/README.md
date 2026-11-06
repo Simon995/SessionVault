@@ -48,4 +48,13 @@ node scripts/read-dsh-snapshot.mjs --dsh-package '<dsh-package.json>' --root '<a
 
 只读实验入口要求来源根已存在、绝对路径且非符号链接，不创建来源目录，只输出摘要，不连接总库。捕获报告区分 `controlled_capture_windows_validated=true`、`same_buffer_validation_and_decode=true` 与 `arbitrary_aba_excluded=false`、`production_advance_gate_integrated=false`。成功摘要也标 `atomic_source_snapshot_proven=false`、`production_advance_permit=false`；后续 `matches_observation` 仅是又一轮观察，不是与写库原子绑定的许可。旧 receipt 可读不等于已验证总库事务保留。
 
-当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、0→4 全链迁移、无约束并发压力、任意 ABA、租约争夺、崩溃持久性、WSL 或真实 provider。19 组 backend 脚本仍报告 `concurrent_races_validated=false`；21 组并发脚本另报 `controlled_concurrent_windows_validated=true`，各自限定范围。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§15 与 [读取状态设计](../../../docs/dsh-read-state-design.md) §7。
+2026-11-06 新增 Rust `dsh-experimental` feature 与 [dsh_snapshot example](../../../examples/dsh_snapshot.rs)，[verify-dsh-rust-snapshot.mjs](../../../scripts/verify-dsh-rust-snapshot.mjs) 在 `target/dsh-rust-snapshot-*` 新建合成副本，对拍 Rust 实际读取、Python 逐帧审计和 Node 原生 admission / 字节位置。Windows 与 WSL Linux 二进制各通过 136 份快照及四组附加对照；其中 89 个最后一帧截断点、四个 checksum 字节破坏全部阻断。中文 / CRLF 的范围按 UTF-8 字节计数，重分帧保持 JSONL 位置而改变物理帧位置；空事件帧不占原生 seq。
+
+```sh
+CARGO_TARGET_DIR=target/dsh-read-state cargo build --example dsh_snapshot --features dsh-experimental
+node scripts/verify-dsh-rust-snapshot.mjs --dsh-package '<dsh-package.json>' --rust-reader '<absolute-example-binary>'
+```
+
+WSL Linux 二进制可在 Windows Node 脚本中改用 `--wsl-reader '<absolute-linux-example-binary>'`（与 `--rust-reader` 二选一）；Git Bash 必须在 node 命令前设置 `MSYS_NO_PATHCONV=1`，避免 Linux 参数被改写。夹具与独立审计在 Windows，Rust 在 Linux 读取本次夹具；不表示 Linux DSH backend 或完整 Node 捕获已验。Rust 仅完成物理核验、最小 envelope 与原生记录位置；未知事件 / 断裂关系仍可通过该层但被原生 admission 拒绝。正式归一化位置、来源绑定与生产推进标志全部保留未接入，详见 [读取状态设计 §8](../../../docs/dsh-read-state-design.md#8-rust-同缓冲区物理核验与原生记录位置)。
+
+当前未覆盖附件、原生 `buildForkSeed` 复杂修复、descriptor、compaction、0→4 全链迁移、无约束并发压力、任意 ABA、租约争夺、崩溃持久性、完整 WSL DSH 捕获或真实 provider。19 组 backend 脚本仍报告 `concurrent_races_validated=false`；21 组并发脚本另报 `controlled_concurrent_windows_validated=true`，各自限定范围。字段映射、实测边界、源码出处与待实施门见 [DSH 核查记录](../../../docs/dsh-ingest-survey.md) §9–§15 与 [读取状态设计](../../../docs/dsh-read-state-design.md) §7。
