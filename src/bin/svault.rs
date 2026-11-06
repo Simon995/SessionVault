@@ -1514,18 +1514,19 @@ struct Prefetched {
     snapshots: session_vault::scan::SnapshotPrefetch,
 }
 
-/// 扫一个来源。**append-log 走权威入口并带上一版指纹**，其余走既有的 `scan_source`。
+/// 扫一个来源。全读的起点与旧来源基线分开；其余走既有的 `scan_source`。
 fn scan_one(
     s: &SourceRef,
     cursor_in: Option<Cursor>,
     prior_fingerprint: Option<session_vault::observation::SourceFingerprint>,
+    prior_cursor: Option<&Cursor>,
     profile: Profile,
     roots: std::sync::Arc<session_vault::attribution::RootRegistry>,
     prefetch: &Prefetched,
 ) -> (Scanned, session_vault::report::SourceReport) {
     match s.source_mode {
         SourceMode::AppendLog => {
-            let (obs, report) = session_vault::scan::scan_append_log_prefetched(
+            let (mut obs, mut report) = session_vault::scan::scan_append_log_prefetched(
                 s,
                 cursor_in,
                 prior_fingerprint,
@@ -1534,6 +1535,17 @@ fn scan_one(
                 session_vault::deadline::Deadline::unbounded(),
                 &prefetch.stats,
             );
+            // 全读丢掉的是起点，不是旧来源基线。短于旧指纹时无法比较内容，
+            // 扫描器的 stat 又只见到新游标；这里恢复旧已消费范围的对照。
+            // 只删未消费尾巴不算回退，读取失败也不能用重置后的游标判变化。
+            if let Some(previous) = prior_cursor.filter(|_| obs.events_are_usable()) {
+                if obs.cursor.size < previous.safe_offset
+                    || matches!((obs.cursor.mtime, previous.mtime), (Some(now), Some(old)) if now < old)
+                {
+                    obs.source_change = session_vault::observation::SourceChange::RollbackOrRewrite;
+                    report.rollback_detected = true;
+                }
+            }
             (Scanned::Observed(obs), report)
         }
         SourceMode::SnapshotFile => {
@@ -1905,10 +1917,16 @@ fn run_scan_all(
             )
         });
 
+        let prior_cursor = if full_read {
+            prev.as_ref().map(|p| &p.cursor)
+        } else {
+            None
+        };
         let (scanned, report) = scan_one(
             s,
             cursor_in,
             prior_fingerprint,
+            prior_cursor,
             profile,
             roots.clone(),
             &prefetch,
@@ -3878,6 +3896,7 @@ mod tests {
             &src,
             None,
             None,
+            None,
             Profile::Full,
             roots(),
             &Default::default(),
@@ -3899,6 +3918,7 @@ mod tests {
         };
         let (scanned, _) = scan_one(
             &snap,
+            None,
             None,
             None,
             Profile::Full,

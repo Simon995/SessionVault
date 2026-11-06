@@ -338,6 +338,8 @@ node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
 
 报告明确 `controlled_concurrent_windows_validated=true`、`public_physical_completeness_available=false`、`general_stress_validated=false` 与 `crash_durability_validated=false`。无约束压力、崩溃持久性、租约争夺、WSL、0→4 全链迁移、复杂 fork / descriptor / compaction 仍未验；正式 provider、可信临时属性和统一排除仍未交付。
 
+下一阶段的生产接缝与旧消费基线修复见 [读取状态设计](dsh-read-state-design.md)。上游公开 `stat.revision` 已有变化观察能力，但只允许在同 service 实例 / session id 内比较；不能当成跨重启持久化游标或来源完整性证明。现有扫描的全读意图与旧来源基线也要分开保留，不能因解析器刷新丢掉缩短 / 时间回退的证据。
+
 ```sh
 node scripts/verify-dsh-concurrency.mjs --dsh-package '<dsh-package.json>'
 ```
