@@ -9,6 +9,7 @@
 //! 与 QuotaBar 的有意差异：无时间戳的事件**不丢弃**，照发但 `time_confidence=low`
 //! （reconciliation §3 的设计意图）。Codex 累计 token 的 delta 数学与 QuotaBar 完全一致。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -21,6 +22,10 @@ use crate::project_root::ProjectRoot;
 use crate::rawevent::{
     Actor, EventAttribution, EventKey, EventType, RawEvent, SourceLocation, SourceMode, SourceType,
     TimeConfidence, TokenUsage, EVENT_KEY_VERSION, SCHEMA_VERSION,
+};
+use crate::session_binding::{
+    classify_user_input_origin, extract_record_parent_session_id,
+    extract_subagent_parent_session_id,
 };
 
 /// 解析器语义版本。**从同一份字节里能提取出什么**发生变化时 +1。
@@ -63,6 +68,8 @@ pub struct ParseOut {
     /// 跳过的坏行数（坏 JSON）。
     pub skipped: u64,
     pub warnings: Vec<String>,
+    /// 行级或路径级识别出的子会话 → 父会话映射（供 H.2 临时会话血缘继承使用）。
+    pub session_parents: HashMap<String, String>,
 }
 
 /// 解析上下文：填充 `RawEvent` 来源定位字段所需。
@@ -143,6 +150,7 @@ impl ParseCtx {
             modified_at: None,
             message_id: None,
             request_id: None,
+            input_origin: None,
         }
     }
 }
@@ -241,6 +249,7 @@ pub fn parse_lines(
 /// ```
 fn parse_jsonl(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
     let fallback = session_id_from_path(&ctx.source_path);
+    let path_parent = extract_subagent_parent_session_id(&ctx.source_path);
     let mut out = ParseOut::default();
     let mut seq = base_seq;
     let mut cache: Option<(String, ProjectRoot)> = None;
@@ -278,6 +287,12 @@ fn parse_jsonl(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| fallback.clone());
+        let parent_sid = extract_record_parent_session_id(&value).or_else(|| path_parent.clone());
+        if let Some(ref p) = parent_sid {
+            if p != &session_id {
+                out.session_parents.insert(session_id.clone(), p.clone());
+            }
+        }
         let cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         let occurred_at = jsonl_timestamp(value.get("timestamp"));
         let pr = resolve_cached(
@@ -297,6 +312,14 @@ fn parse_jsonl(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             cwd,
             pr.as_ref(),
         );
+        ev.parent_ref = parent_sid.filter(|p| p != &session_id);
+        if actor == Actor::User {
+            ev.input_origin = Some(classify_user_input_origin(
+                Some(&value),
+                content,
+                &ctx.source_path,
+            ));
+        }
         if ctx.want_content() {
             ev.content = Some(content.to_string());
         }
@@ -339,6 +362,7 @@ fn jsonl_timestamp(v: Option<&Value>) -> Option<String> {
 
 fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
     let fallback = session_id_from_path(&ctx.source_path);
+    let path_parent = extract_subagent_parent_session_id(&ctx.source_path);
     let mut out = ParseOut::default();
     let mut seq = base_seq;
     let mut cache: Option<(String, ProjectRoot)> = None;
@@ -360,6 +384,13 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
         let session_id = extract_claude_session_id(&value)
             .map(str::to_string)
             .unwrap_or_else(|| fallback.clone());
+        let parent_sid = extract_record_parent_session_id(&value)
+            .or_else(|| path_parent.clone())
+            .or_else(|| out.session_parents.get(&session_id).cloned())
+            .filter(|p| p != &session_id);
+        if let Some(ref p) = parent_sid {
+            out.session_parents.insert(session_id.clone(), p.clone());
+        }
         let cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         let occurred_at = value
             .get("timestamp")
@@ -384,6 +415,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
                 cwd.clone(),
                 pr.as_ref(),
             );
+            ev.parent_ref = parent_sid.clone();
             if ctx.want_content() {
                 ev.content = Some(text);
             }
@@ -405,7 +437,15 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
                 cwd.clone(),
                 pr.as_ref(),
             );
+            ev.parent_ref = parent_sid.clone();
             ev.model = extract_claude_model(&value);
+            if actor == Some(Actor::User) {
+                ev.input_origin = Some(classify_user_input_origin(
+                    Some(&value),
+                    &content,
+                    &ctx.source_path,
+                ));
+            }
             if ctx.want_content() {
                 ev.content = Some(content);
             }
@@ -427,6 +467,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
                 cwd.clone(),
                 pr.as_ref(),
             );
+            ev.parent_ref = parent_sid.clone();
             ev.model = u.model;
             ev.effort = u.effort;
             ev.usage = Some(u.usage);
@@ -573,6 +614,7 @@ fn parse_codex(
     if state.current_session_id.is_none() {
         state.current_session_id = Some(session_id_from_path(&ctx.source_path));
     }
+    let path_parent = extract_subagent_parent_session_id(&ctx.source_path);
     let mut out = ParseOut::default();
     let mut seq = base_seq;
     let mut cache: Option<(String, ProjectRoot)> = None;
@@ -613,6 +655,11 @@ fn parse_codex(
                         state.current_cwd = None;
                     }
                     state.current_session_id = Some(id.to_string());
+                    if let Some(parent_id) = extract_record_parent_session_id(&value) {
+                        if parent_id != id {
+                            out.session_parents.insert(id.to_string(), parent_id);
+                        }
+                    }
                 }
                 if let Some(c) = payload.get("cwd").and_then(Value::as_str) {
                     state.current_cwd = Some(c.to_string());
@@ -638,6 +685,13 @@ fn parse_codex(
             .current_session_id
             .clone()
             .unwrap_or_else(|| session_id_from_path(&ctx.source_path));
+        let parent_sid = extract_record_parent_session_id(&value)
+            .or_else(|| out.session_parents.get(&session_id).cloned())
+            .or_else(|| path_parent.clone())
+            .filter(|p| p != &session_id);
+        if let Some(ref p) = parent_sid {
+            out.session_parents.insert(session_id.clone(), p.clone());
+        }
         let cwd = state.current_cwd.clone();
         let pr = resolve_cached(
             &mut cache,
@@ -662,6 +716,7 @@ fn parse_codex(
                     cwd.clone(),
                     pr.as_ref(),
                 );
+                ev.parent_ref = parent_sid.clone();
                 if ctx.want_content() {
                     ev.content = text;
                 }
@@ -682,8 +737,16 @@ fn parse_codex(
                     cwd.clone(),
                     pr.as_ref(),
                 );
+                ev.parent_ref = parent_sid.clone();
                 ev.model = state.current_model.clone();
                 ev.effort = state.current_effort.clone();
+                if event_type == EventType::Message && actor == Some(Actor::User) {
+                    ev.input_origin = Some(classify_user_input_origin(
+                        Some(&value),
+                        &content,
+                        &ctx.source_path,
+                    ));
+                }
                 if ctx.want_content() {
                     ev.content = Some(content);
                 }
@@ -714,6 +777,7 @@ fn parse_codex(
                     cwd.clone(),
                     pr.as_ref(),
                 );
+                ev.parent_ref = parent_sid.clone();
                 ev.model = state.current_model.clone();
                 ev.effort = state.current_effort.clone();
                 ev.usage = Some(usage);

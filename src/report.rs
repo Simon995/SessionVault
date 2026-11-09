@@ -39,6 +39,17 @@ pub struct SourceReport {
 
     /// 跳过/告警信息（非致命）。
     pub warnings: Vec<String>,
+
+    /// H.2 控制面准入状态（`"persistent_unmanaged"` / `"persistent_bound"` /
+    /// `"temporary_excluded"` / `"unknown_hold"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_status: Option<String>,
+    /// 本轮因临时会话策略（含子会话血缘继承）被排除的事件数（含内容事件与 `Usage`）。
+    #[serde(default)]
+    pub events_excluded_temporary: u64,
+    /// 临时排除或未决搁置的依据说明（供消费方观察区分「临时会话被排除」与「空会话/普通读取失败」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_detail: Option<String>,
 }
 
 /// 单 provider 报告（聚合其下多个来源）。
@@ -57,4 +68,6 @@ pub struct ScanReport {
     pub providers: Vec<ProviderReport>,
     pub total_events: u64,
     pub total_errors: u64,
+    #[serde(default)]
+    pub total_excluded_temporary: u64,
 }

@@ -133,6 +133,92 @@ pub enum Actor {
     System,
 }
 
+/// 输入消息的真实发送方类别（H.1 / H.3）。
+///
+/// 🔴 `Actor::User` 只表示模型上下文里的 user 槽位，**不等于人类亲自输入或授权**。
+/// 原生日志中的 `role=user`、正文里的自称标签、或未绑定的 `principal="human"`
+/// 均不得自证为 [`Self::HumanVerified`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SenderKind {
+    /// 经控制面受控入口绑定核实的人类直接输入，且未见同侪/派单/子会话注入特征。
+    HumanVerified,
+    /// 跨会话同侪（peer）消息（如 `<cross-session-message ...>`、`[xs id=...]`）。
+    PeerSession,
+    /// 控制面协调器派单或跨执行者显式交接（coordinator dispatch / handoff）。
+    CoordinatorDispatch,
+    /// 子会话（subagent / sidechain）或运行时合成注入的上下文提示。
+    SubagentOrRuntime,
+    /// 仅凭当前证据无法核实真实发送方（如普通未绑定 CLI 日志的 `role=user`，或信封残缺/冲突）。
+    Unknown,
+}
+
+impl SenderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HumanVerified => "human_verified",
+            Self::PeerSession => "peer_session",
+            Self::CoordinatorDispatch => "coordinator_dispatch",
+            Self::SubagentOrRuntime => "subagent_or_runtime",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// 来源证据的可信度等级（H.1 / H.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputTrustLevel {
+    /// 经控制面受控入口绑定核实的人类输入。
+    HumanVerified,
+    /// 经控制面绑定核实的协调器派单或跨执行者显式交接。
+    ControlPlaneBound,
+    /// 入站同侪或子代理消息：不可授予审批、不可放宽权限、不可改配置。
+    PeerUntrusted,
+    /// 仅来自本地日志观测、未经控制面绑定核实（或信封不完整）。
+    Unverified,
+}
+
+impl InputTrustLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HumanVerified => "human_verified",
+            Self::ControlPlaneBound => "control_plane_bound",
+            Self::PeerUntrusted => "peer_untrusted",
+            Self::Unverified => "unverified",
+        }
+    }
+}
+
+/// 单条输入事件的真实发送方与消息级血缘证据（H.1 / H.3）。
+///
+/// 挂在 [`RawEvent::input_origin`] 上；非用户输入事件（如 `Assistant` / `Tool` / `Usage`）
+/// 为 `None`。未知或不完整时显式标 `sender_kind = Unknown` / `trust_level = Unverified`，
+/// **绝不伪造 `parent_ref`**。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputOrigin {
+    pub sender_kind: SenderKind,
+    pub trust_level: InputTrustLevel,
+    /// 判定依据（如 `"xs_header"`、`"cross_session_envelope"`、`"control_plane_verified"`、
+    /// `"log_role_only"`、`"cross_session_envelope_incomplete"` 等）。
+    pub basis: String,
+    /// 同侪发送方会话标识（如 `<cross-session-message from-session="...">`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_session: Option<String>,
+    /// 同侪发送方地址或管道标识（如 `from="..."` 或 `from-name="..."`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_address: Option<String>,
+    /// `xs` 跨会话消息 ID（如 `[xs id=...]` 中的 ID）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xs_message_id: Option<String>,
+    /// 控制面执行绑定 Assignment ID（如 `namespace:id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<String>,
+    /// 跨执行者显式交接 Handoff ID（如 `namespace:id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
+}
+
 /// 事件类型。`Usage` 是 QuotaBar 当前唯一持久化的类别；其余多为 TumeFlow 增量需求。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -359,6 +445,14 @@ pub struct RawEvent {
     // --- Claude-only ---
     pub message_id: Option<String>,
     pub request_id: Option<String>,
+
+    // --- 真实发送方与同侪/派单证据（H.1 / H.3）---
+    /// 用户侧输入消息的真实发送方、可信度与消息级来源证据。
+    ///
+    /// 🔴 `actor == Some(Actor::User)` 只表示上下文里的 user 槽位，不等于人类亲自输入。
+    /// 下游判断「是否人类亲自发出/授权」必须看此字段而非 `actor`。
+    #[serde(default)]
+    pub input_origin: Option<InputOrigin>,
 }
 
 impl RawEvent {

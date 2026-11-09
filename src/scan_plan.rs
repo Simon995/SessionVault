@@ -489,6 +489,7 @@ mod tests {
             modified_at: None,
             message_id: None,
             request_id: None,
+            input_origin: None,
         }
     }
 

@@ -40,6 +40,7 @@ pub mod scan;
 /// 同一组问题。理由写在模块头。
 #[cfg(feature = "store")]
 pub mod scan_plan;
+pub mod session_binding;
 pub mod session_origin;
 /// 不可变 RawEvent 总库（§13 / ADR-020）——`store` feature 门控（持久化组件，内核仍无状态）。
 #[cfg(feature = "store")]
@@ -65,10 +66,13 @@ pub use discover::{
 pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
-    Actor, EventAttribution, EventType, RawEvent, SourceLocation, SourceMode, SourceType,
-    TimeConfidence,
+    Actor, EventAttribution, EventType, InputOrigin, InputTrustLevel, RawEvent, SenderKind,
+    SourceLocation, SourceMode, SourceType, TimeConfidence,
 };
 pub use report::ScanReport;
+pub use session_binding::{
+    BindingUncertainty, IngestAdmissionVerdict, SessionBindingRegistry, TemporaryExclusionBasis,
+};
 #[cfg(feature = "store")]
 pub use store::{
     AdoptStats, AmbiguousSpelling, AppendStats, AttributionChange, EraseStats, FileProjectionBatch,

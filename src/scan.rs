@@ -20,6 +20,7 @@ use crate::observation::{
     AppendLogObservation, ParseDiagnostics, ParseQuality, ScanFailure, SourceChange,
     SourceFingerprint,
 };
+use crate::session_binding::{IngestAdmissionVerdict, SessionBindingRegistry};
 use crate::Profile;
 
 /// scan 主入口：按形态分派。append_log 的字节来源（本地 `File` vs WSL `wsl.exe`）
@@ -341,6 +342,31 @@ pub fn scan_append_log_prefetched(
     deadline: crate::deadline::Deadline,
     prefetch: &StatPrefetch,
 ) -> (AppendLogObservation, SourceReport) {
+    let bindings = SessionBindingRegistry::load_for_context(None, None);
+    scan_append_log_with_bindings(
+        source,
+        cursor_in,
+        prior_fingerprint,
+        profile,
+        roots,
+        deadline,
+        prefetch,
+        &bindings,
+    )
+}
+
+/// 带显式控制面会话绑定注册表的 append-log 扫描入口（H.1 / H.2 / H.3）。
+#[allow(clippy::too_many_arguments)]
+pub fn scan_append_log_with_bindings(
+    source: &SourceRef,
+    cursor_in: Option<Cursor>,
+    prior_fingerprint: Option<SourceFingerprint>,
+    profile: Profile,
+    roots: Arc<RootRegistry>,
+    deadline: crate::deadline::Deadline,
+    prefetch: &StatPrefetch,
+    bindings: &SessionBindingRegistry,
+) -> (AppendLogObservation, SourceReport) {
     match &source.source_location {
         SourceLocation::Local => scan_append_log(
             &LocalSource::new(&source.path),
@@ -349,6 +375,7 @@ pub fn scan_append_log_prefetched(
             prior_fingerprint,
             profile,
             roots,
+            bindings,
         ),
         SourceLocation::Wsl(distro) => {
             let abs = source.path.to_string_lossy().into_owned();
@@ -369,6 +396,7 @@ pub fn scan_append_log_prefetched(
                 prior_fingerprint,
                 profile,
                 roots,
+                bindings,
             )
         }
     }
@@ -638,6 +666,7 @@ fn scan_snapshot_file(
         modified_at,
         message_id: None,
         request_id: None,
+        input_origin: None,
     };
     cursor.content_hash = Some(hash);
     cursor.next_seq += 1;
@@ -887,6 +916,7 @@ fn scan_append_log<S: ByteSource>(
     prior_fingerprint: Option<SourceFingerprint>,
     profile: Profile,
     roots: Arc<RootRegistry>,
+    bindings: &SessionBindingRegistry,
 ) -> (AppendLogObservation, SourceReport) {
     let mut report = SourceReport {
         source_path: source.path.display().to_string(),
@@ -943,7 +973,41 @@ fn scan_append_log<S: ByteSource>(
     };
 
     if start >= size {
-        // 无新增。
+        // 无新增字节时，仍检查控制面绑定状态（确保未决/损坏 fail-closed，且临时排除状态可观察）。
+        let pre_verdict = bindings.evaluate(
+            source.source_type,
+            &source.source_location,
+            &report.source_path,
+            cursor
+                .codex_state
+                .as_ref()
+                .and_then(|s| s.current_session_id.as_deref()),
+            None,
+        );
+        match pre_verdict {
+            IngestAdmissionVerdict::UnknownHold { reason } => {
+                report.admission_status = Some("unknown_hold".to_string());
+                report.admission_detail = Some(reason.to_string());
+                let msg = format!("session binding uncertain (hold): {reason}");
+                report.warnings.push(msg.clone());
+                return (
+                    observe(
+                        change,
+                        ParseQuality::Unavailable(ScanFailure::Read(msg)),
+                        cursor,
+                        None,
+                    ),
+                    report,
+                );
+            }
+            IngestAdmissionVerdict::TemporaryExcluded { basis } => {
+                report.admission_status = Some("temporary_excluded".to_string());
+                report.admission_detail = Some(basis.to_string());
+            }
+            IngestAdmissionVerdict::PersistentAllowed { .. } => {
+                report.admission_status = Some(pre_verdict.status_key().to_string());
+            }
+        }
         cursor.size = size;
         cursor.mtime = mtime;
         return (
@@ -1043,6 +1107,60 @@ fn scan_append_log<S: ByteSource>(
     report.items_skipped = parsed.skipped;
     report.warnings.extend(parsed.warnings);
 
+    // H.1 / H.2 / H.3：在坏行决策与输出前执行统一的控制面绑定准入与临时会话排除。
+    let filtered = match bindings.filter_and_enrich_events(
+        source.source_type,
+        &source.source_location,
+        &report.source_path,
+        parsed.events,
+        &parsed.session_parents,
+    ) {
+        Ok(f) => f,
+        Err(uncertainty) => {
+            cursor.safe_offset = start;
+            cursor.codex_state = codex_state_before;
+            report.events_emitted = 0;
+            report.admission_status = Some("unknown_hold".to_string());
+            report.admission_detail = Some(uncertainty.to_string());
+            let msg = format!("session binding uncertain (hold): {uncertainty}");
+            report.warnings.push(msg.clone());
+            return (
+                observe(
+                    change,
+                    ParseQuality::Unavailable(ScanFailure::Read(msg)),
+                    cursor,
+                    fingerprint,
+                ),
+                report,
+            );
+        }
+    };
+    report.admission_status = Some(filtered.admission_status.to_string());
+    report.events_excluded_temporary = filtered.excluded_events;
+    report.admission_detail = filtered.admission_detail;
+
+    // 若整批事件因临时会话策略被排除（无保留事件且有排除计数），直接作为 Clean 空批返回，
+    // 并将 safe_offset 保持在 0，确保后续增量追加时第 1 行的会话/父血缘元信息始终在场。
+    if filtered.kept_events.is_empty() && filtered.excluded_events > 0 {
+        cursor.safe_offset = 0;
+        cursor.next_seq = base_seq;
+        cursor.codex_state = codex_state_before;
+        report.events_emitted = 0;
+        return (
+            observe(
+                change,
+                ParseQuality::Clean {
+                    deferred_tail_bytes: pending as u64,
+                },
+                cursor,
+                fingerprint,
+            ),
+            report,
+        );
+    }
+
+    let kept_events = filtered.kept_events;
+
     // P1：坏 JSON 行的处理按读取形态分两路（坏行总是 status≠Ok + 留 warning，不静默）：
     //
     // - **增量**（`Some(cursor)`）→ **冻结整批尾**（对齐 QuotaBar 实证，见 rawevent-reconciliation
@@ -1058,13 +1176,13 @@ fn scan_append_log<S: ByteSource>(
     if parsed.skipped > 0 {
         if one_shot {
             cursor.safe_offset = size - pending as u64;
-            cursor.next_seq = base_seq + parsed.events.len() as u64;
+            cursor.next_seq = base_seq + kept_events.len() as u64;
             cursor.codex_state = parsed.codex_state;
-            report.events_emitted = parsed.events.len() as u64;
+            report.events_emitted = kept_events.len() as u64;
             log::warn!(
                 target: tag::SCAN,
                 "append_log one-shot kept good events despite bad json: path={} skipped={} events={}",
-                report.source_path, parsed.skipped, parsed.events.len()
+                report.source_path, parsed.skipped, kept_events.len()
             );
             let diagnostics = ParseDiagnostics {
                 skipped_lines: parsed.skipped,
@@ -1076,7 +1194,7 @@ fn scan_append_log<S: ByteSource>(
                 cursor,
                 fingerprint,
             );
-            obs.events = parsed.events;
+            obs.events = kept_events;
             return (obs, report);
         }
         cursor.safe_offset = start; // 不前进
@@ -1106,9 +1224,9 @@ fn scan_append_log<S: ByteSource>(
 
     // 全部好行：推进 safe_offset 到「完整行」边界（size - pending），半行留下轮。
     cursor.safe_offset = size - pending as u64;
-    cursor.next_seq = base_seq + parsed.events.len() as u64;
+    cursor.next_seq = base_seq + kept_events.len() as u64;
     cursor.codex_state = parsed.codex_state;
-    report.events_emitted = parsed.events.len() as u64;
+    report.events_emitted = kept_events.len() as u64;
 
     log::info!(
         target: tag::SCAN,
@@ -1127,7 +1245,7 @@ fn scan_append_log<S: ByteSource>(
         cursor,
         fingerprint,
     );
-    obs.events = parsed.events;
+    obs.events = kept_events;
     (obs, report)
 }
 

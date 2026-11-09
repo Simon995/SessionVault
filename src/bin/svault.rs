@@ -1515,6 +1515,7 @@ struct Prefetched {
 }
 
 /// 扫一个来源。全读的起点与旧来源基线分开；其余走既有的 `scan_source`。
+#[allow(clippy::too_many_arguments)]
 fn scan_one(
     s: &SourceRef,
     cursor_in: Option<Cursor>,
@@ -1523,10 +1524,11 @@ fn scan_one(
     profile: Profile,
     roots: std::sync::Arc<session_vault::attribution::RootRegistry>,
     prefetch: &Prefetched,
+    bindings: &session_vault::SessionBindingRegistry,
 ) -> (Scanned, session_vault::report::SourceReport) {
     match s.source_mode {
         SourceMode::AppendLog => {
-            let (mut obs, mut report) = session_vault::scan::scan_append_log_prefetched(
+            let (mut obs, mut report) = session_vault::scan::scan_append_log_with_bindings(
                 s,
                 cursor_in,
                 prior_fingerprint,
@@ -1534,6 +1536,7 @@ fn scan_one(
                 roots,
                 session_vault::deadline::Deadline::unbounded(),
                 &prefetch.stats,
+                bindings,
             );
             // 全读丢掉的是起点，不是旧来源基线。短于旧指纹时无法比较内容，
             // 扫描器的 stat 又只见到新游标；这里恢复旧已消费范围的对照。
@@ -1782,6 +1785,8 @@ fn run_scan_all(
     // 归属的唯一输入。读不出来就是空注册表 ⇒ 一致地 `Unattributed`，**不退回 cwd**。
     // 🔴 空表要说出来：一份静默为空的注册表会让整轮扫描的 `project_root` 全成兜底值，
     // 而那与「本机确实一个项目根都没发现」在输出里长得一模一样。
+    let session_bindings =
+        session_vault::SessionBindingRegistry::load_for_context(None, store_arg.as_deref());
     let roots = std::sync::Arc::new(project_roots(store_arg));
     let roots_empty = roots.is_empty();
     if roots_empty {
@@ -1930,6 +1935,7 @@ fn run_scan_all(
             profile,
             roots.clone(),
             &prefetch,
+            &session_bindings,
         );
         total_events += report.events_emitted;
 
@@ -1965,60 +1971,71 @@ fn run_scan_all(
             // `prior` 在扫之前就问过了（它决定了这一轮读多少），这里**复用同一个
             // 答案**而不是再查一次：中间那次扫描可能长达几分钟，重查会让「决定读多少」
             // 与「决定怎么写」用上两个不同代的库状态。
-            (Some(w), Scanned::Observed(obs)) => match w.commit(s, obs, reasons, prior) {
-                Ok((committed, plan)) => {
-                    let quality = plan.quality();
-                    match committed {
-                        Committed::Preserved => {
-                            held_sources += 1;
-                            // 🔴 「这一轮没写」必须有自己的一行，而不是让 `store_write`
-                            // 缺席 —— 缺席在 NDJSON 里读作什么，取决于消费方记不记得
-                            // 去数，而它多半不会。
-                            emit(&Out::StoreHeld {
-                                source_path: &report.source_path,
-                                quality: quality.key(),
-                                detail: quality.detail(),
-                            });
-                            // 三种 Preserve（没读成 / 主动拒绝坏行 / 降级到零好行）
-                            // 都要下轮从同一个偏移重来 —— 游标冻住。
-                            false
-                        }
-                        Committed::Wrote { mode, stats } => {
-                            written_events += stats.appended;
-                            if let Some((before, after)) = stats.loses_events {
-                                // 头照切（当前答案必须是最新那份解析），但旧投影不删 ——
-                                // 「新解析器合法地少产出」与「一次退化」在这个观测上一样。
-                                log::warn!(
-                                    target: tag::CLI,
-                                    "{key}: new projection has fewer events ({before} → {after}); \
-                                     the superseded one was kept"
-                                );
+            (Some(w), Scanned::Observed(obs)) => {
+                if report.admission_status.as_deref() == Some("temporary_excluded")
+                    && obs.events.is_empty()
+                {
+                    // H.2：临时会话（或其子会话）在入库前统一排除，不向总库写空代、不记游标。
+                    false
+                } else {
+                    match w.commit(s, obs, reasons, prior) {
+                        Ok((committed, plan)) => {
+                            let quality = plan.quality();
+                            match committed {
+                                Committed::Preserved => {
+                                    held_sources += 1;
+                                    // 🔴 「这一轮没写」必须有自己的一行，而不是让 `store_write`
+                                    // 缺席 —— 缺席在 NDJSON 里读作什么，取决于消费方记不记得
+                                    // 去数，而它多半不会。
+                                    emit(&Out::StoreHeld {
+                                        source_path: &report.source_path,
+                                        quality: quality.key(),
+                                        detail: quality
+                                            .detail()
+                                            .or(report.admission_detail.as_deref()),
+                                    });
+                                    // 三种 Preserve（没读成 / 主动拒绝坏行 / 降级到零好行）
+                                    // 都要下轮从同一个偏移重来 —— 游标冻住。
+                                    false
+                                }
+                                Committed::Wrote { mode, stats } => {
+                                    written_events += stats.appended;
+                                    if let Some((before, after)) = stats.loses_events {
+                                        // 头照切（当前答案必须是最新那份解析），但旧投影不删 ——
+                                        // 「新解析器合法地少产出」与「一次退化」在这个观测上一样。
+                                        log::warn!(
+                                            target: tag::CLI,
+                                            "{key}: new projection has fewer events ({before} → {after}); \
+                                             the superseded one was kept"
+                                        );
+                                    }
+                                    emit(&Out::StoreWrite {
+                                        source_path: &report.source_path,
+                                        mode: mode.origin_key(),
+                                        quality: quality.key(),
+                                        appended: stats.appended,
+                                        skipped_dup: stats.skipped_dup,
+                                        skipped_erased: stats.skipped_erased,
+                                        head_moved: stats.head_moved,
+                                        superseded_removed: stats.superseded_removed,
+                                        loses_events: stats.loses_events.map(|(b, a)| [b, a]),
+                                    });
+                                    plan.cursor() == session_vault::scan_plan::CursorAction::Advance
+                                }
                             }
-                            emit(&Out::StoreWrite {
+                        }
+                        Err(why) => {
+                            write_failures += 1;
+                            log::error!(target: tag::CLI, "store write failed for {key}: {why}");
+                            emit(&Out::StoreWriteFailed {
                                 source_path: &report.source_path,
-                                mode: mode.origin_key(),
-                                quality: quality.key(),
-                                appended: stats.appended,
-                                skipped_dup: stats.skipped_dup,
-                                skipped_erased: stats.skipped_erased,
-                                head_moved: stats.head_moved,
-                                superseded_removed: stats.superseded_removed,
-                                loses_events: stats.loses_events.map(|(b, a)| [b, a]),
+                                reason: &why,
                             });
-                            plan.cursor() == session_vault::scan_plan::CursorAction::Advance
+                            false
                         }
                     }
                 }
-                Err(why) => {
-                    write_failures += 1;
-                    log::error!(target: tag::CLI, "store write failed for {key}: {why}");
-                    emit(&Out::StoreWriteFailed {
-                        source_path: &report.source_path,
-                        reason: &why,
-                    });
-                    false
-                }
-            },
+            }
         };
         #[cfg(not(feature = "store"))]
         let advance = true;
@@ -3120,6 +3137,7 @@ mod tests {
             modified_at: None,
             message_id: None,
             request_id: None,
+            input_origin: None,
         }
     }
 
@@ -3900,6 +3918,7 @@ mod tests {
             Profile::Full,
             roots(),
             &Default::default(),
+            &Default::default(),
         );
         assert!(
             matches!(scanned, Scanned::Observed(_)),
@@ -3923,6 +3942,7 @@ mod tests {
             None,
             Profile::Full,
             roots(),
+            &Default::default(),
             &Default::default(),
         );
         assert!(matches!(scanned, Scanned::Projected { .. }));

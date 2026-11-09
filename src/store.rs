@@ -81,6 +81,9 @@ pub enum StoreError {
     /// 换钥拒绝动手（库正被别的进程开着、有数据密钥哪把钥匙都解不开……）。拒绝时库与钥匙都原样。
     #[error("rekey refused: {0}")]
     Rekey(String),
+    /// 控制面会话绑定处于未决、冲突或损坏状态（H.1 / H.2 fail-closed 搁置）。
+    #[error("session binding uncertain (hold): {0}")]
+    BindingUncertain(String),
 }
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
@@ -1247,6 +1250,8 @@ CREATE INDEX IF NOT EXISTS idx_data_keys_project ON data_keys(project_root);
 pub struct TotalStore {
     conn: Mutex<Connection>,
     cipher: StoreCipher,
+    /// 数据库文件所在路径（内存库为 `None`），用于定位同目录下的 `session_bindings.json`。
+    db_path: Option<std::path::PathBuf>,
     /// 本进程已为哪些 `(source_type, source_location, project_root)` 记过身份。
     ///
     /// 🔴 **它省掉的是文件 IO，不是正确性**：算身份要读 `.git/config`，而
@@ -1295,7 +1300,7 @@ impl TotalStore {
         };
         let conn = Connection::open(path)?;
         restrict_permissions(path, 0o600);
-        Self::from_conn(conn, key)
+        Self::from_conn_with_path(conn, key, Some(path.to_path_buf()))
     }
 
     /// **只读地**打开一个已存在的总库 —— 不存在就说不存在，**绝不建**。
@@ -1374,6 +1379,7 @@ impl TotalStore {
         let store = Self {
             conn: Mutex::new(conn),
             cipher: StoreCipher::new(key),
+            db_path: Some(path.to_path_buf()),
             identity_seen: Mutex::new(HashSet::new()),
         };
         store.validate_cipher()?;
@@ -1387,7 +1393,7 @@ impl TotalStore {
         }
         let conn = Connection::open(path)?;
         restrict_permissions(path, 0o600);
-        Self::from_conn(conn, key)
+        Self::from_conn_with_path(conn, key, Some(path.to_path_buf()))
     }
 
     /// 把本机主密钥写进一个**新建**的受保护文件（已存在就拒绝），给同一个用户的另一台设备导入。
@@ -1558,6 +1564,14 @@ impl TotalStore {
     }
 
     fn from_conn(conn: Connection, key: StoreKey) -> StoreResult<Self> {
+        Self::from_conn_with_path(conn, key, None)
+    }
+
+    fn from_conn_with_path(
+        conn: Connection,
+        key: StoreKey,
+        db_path: Option<std::path::PathBuf>,
+    ) -> StoreResult<Self> {
         // WAL 让读不挡写（QuotaBar 常驻写、未来 TumeFlow 并发读）。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         // 🔴 **两个写者时，缺的不是「锁」，是「等」。**
@@ -1589,11 +1603,65 @@ impl TotalStore {
         let store = Self {
             conn: Mutex::new(conn),
             cipher: StoreCipher::new(key),
+            db_path,
             identity_seen: Mutex::new(std::collections::HashSet::new()),
         };
         store.migrate()?;
         store.validate_cipher()?;
         Ok(store)
+    }
+
+    /// 将控制面会话绑定清单持久化到 `store_meta (k = 'session_bindings_json')`，
+    /// 使打开同一总库的所有写者（CLI 与各 Rust 进程）共享同一份临时会话排除与来源判据（H.1 / H.2）。
+    pub fn set_session_bindings(
+        &self,
+        bindings: &crate::session_binding::SessionBindingRegistry,
+    ) -> StoreResult<()> {
+        if let crate::session_binding::IngestAdmissionVerdict::UnknownHold { reason } = bindings
+            .evaluate(
+                SourceType::Jsonl,
+                &SourceLocation::Local,
+                "__binding_registry_check__",
+                None,
+                None,
+            )
+        {
+            return Err(StoreError::BindingUncertain(reason.to_string()));
+        }
+        let Some(raw_json) = bindings.to_canonical_json() else {
+            return Ok(());
+        };
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO store_meta (k, v) VALUES ('session_bindings_json', ?1) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![raw_json],
+        )?;
+        Ok(())
+    }
+
+    fn load_session_bindings_with_conn(
+        &self,
+        conn: &Connection,
+    ) -> crate::session_binding::SessionBindingRegistry {
+        let meta_json: Option<String> = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'session_bindings_json'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let from_meta = meta_json
+            .as_deref()
+            .map(crate::session_binding::SessionBindingRegistry::from_json_str)
+            .unwrap_or_else(crate::session_binding::SessionBindingRegistry::empty);
+        let from_ctx = crate::session_binding::SessionBindingRegistry::load_for_context(
+            None,
+            self.db_path.as_deref(),
+        );
+        from_meta.merged_with(&from_ctx)
     }
 
     fn validate_cipher(&self) -> StoreResult<()> {
@@ -3133,9 +3201,44 @@ impl TotalStore {
             });
         }
 
-        let events = &batch.events;
         let projection = batch.mode;
         let mut conn = self.conn.lock().unwrap();
+
+        // ── H.1 / H.2 / H.3 控制面绑定与临时会话排除守卫 ─────────────────────
+        //
+        // 在任何 token 记账、`projections` 创建与 `raw_events` 入库之前执行同一套判据：
+        // - `UnknownHold` ⇒ 返回 `Err(StoreError::BindingUncertain)` 拒绝入库；
+        // - `TemporaryExcluded`（且过滤后无保留事件）⇒ 不建空代、不写事件，返回 `appended: 0`；
+        // - `PersistentAllowed` ⇒ 写入过滤并补齐 `input_origin` 后的事件。
+        let bindings = self.load_session_bindings_with_conn(&conn);
+        let filtered = bindings
+            .filter_and_enrich_events(
+                batch.source.source_type,
+                &batch.source.source_location,
+                &source_path,
+                batch.events,
+                &std::collections::HashMap::new(),
+            )
+            .map_err(|u| StoreError::BindingUncertain(u.to_string()))?;
+        if filtered.admission_status == "temporary_excluded" && filtered.kept_events.is_empty() {
+            let head = head_of(&conn, &source_type, &source_location, &source_path)?;
+            let max_offset: i64 =
+                conn.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
+                    r.get(0)
+                })?;
+            return Ok(Some(ProjectionStats {
+                appended: 0,
+                skipped_dup: 0,
+                skipped_erased: 0,
+                max_offset,
+                source_revision: head.0,
+                projection_revision: head.1,
+                head_moved: false,
+                superseded_removed: 0,
+                loses_events: None,
+            }));
+        }
+        let events = &filtered.kept_events;
 
         // ── 幂等短路（ADR-051 I7）────────────────────────────────────────
         //
@@ -6752,6 +6855,7 @@ mod tests {
             modified_at: None,
             message_id: None,
             request_id: None,
+            input_origin: None,
         }
     }
 
@@ -10135,6 +10239,7 @@ mod project_identity_tests {
             modified_at: None,
             message_id: None,
             request_id: None,
+            input_origin: None,
         }
     }
 

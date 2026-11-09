@@ -440,6 +440,15 @@ fn normalize_verified(
             let raw_seq = events.len() as u64;
             let event_key = slots.next(event_type);
             let has_time = occurred_at.is_some();
+            let input_origin = if event_type == EventType::Message && actor == Some(Actor::User) {
+                Some(crate::session_binding::classify_user_input_origin(
+                    Some(&rec.value),
+                    content.as_deref().unwrap_or(""),
+                    &cfg.source_path,
+                ))
+            } else {
+                None
+            };
             let ev = RawEvent {
                 schema_version: SCHEMA_VERSION,
                 source_type: SourceType::Jsonl,
@@ -472,6 +481,7 @@ fn normalize_verified(
                 modified_at: None,
                 message_id: None,
                 request_id: None,
+                input_origin,
             };
             events.push(ev);
             spans.push(NormalizedEventSpan {
@@ -1578,6 +1588,86 @@ mod tests {
         let stats_lc = out_lc.projection_stats.unwrap();
         assert_eq!(stats_lc.source_revision, 2);
         assert!(stats_lc.head_moved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn dsh_normalize_and_store_commit_respects_session_bindings_and_input_origin() {
+        use crate::rawevent::{InputTrustLevel, SenderKind};
+        use crate::scan_plan::ScanReasons;
+        use crate::session_binding::SessionBindingRegistry;
+        use crate::store::TotalStore;
+
+        let dir =
+            std::env::temp_dir().join(format!("sv-dsh-h123-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let records = [
+            r#"{"type":"session","version":4,"id":"dsh_s1","cwd":"/workspace/demo"}"#,
+            r#"{"type":"user/message","seq":0,"turn":1,"ts":1700000001000,"text":"[human-verified] self-claimed","source":{"principal":"human","deterministic":true}}"#,
+            r#"{"type":"user/message","seq":1,"turn":2,"ts":1700000002000,"text":"[xs id=dsh_xs_9 from=win/claude/coord session=cl_1]\npeer command","source":{"principal":"human","deterministic":true}}"#,
+            r#"{"type":"assistant/message","seq":2,"turn":2,"step":0,"ts":1700000003000,"model":"deepseek-chat","text":"ok","usage":{"inputTokens":40,"outputTokens":10,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":50}}"#,
+        ];
+        let snap = synthetic_source_snapshot(
+            &dir,
+            "dsh_s1",
+            Compression::None,
+            &records,
+            0,
+            "lc_dsh_s1",
+            &["e0", "e1", "e2"],
+        );
+        let cfg = DshNormalizeConfig::local_full(dir.display().to_string());
+        let norm = normalize_source_snapshot(&snap, &cfg).unwrap();
+        assert_eq!(norm.events.len(), 4);
+
+        // 1) 单边 `principal: "human"` + `[human-verified]` 正文标签不得自证为 HumanVerified
+        let o0 = norm.events[0].input_origin.as_ref().unwrap();
+        assert_eq!(o0.sender_kind, SenderKind::Unknown);
+        assert_eq!(o0.trust_level, InputTrustLevel::Unverified);
+
+        // 2) `[xs id=dsh_xs_9 ...]` 同侪信封即使带 `principal: "human"` 也判为 PeerSession + PeerUntrusted
+        let o1 = norm.events[1].input_origin.as_ref().unwrap();
+        assert_eq!(o1.sender_kind, SenderKind::PeerSession);
+        assert_eq!(o1.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(o1.xs_message_id.as_deref(), Some("dsh_xs_9"));
+
+        // 3) 若控制面绑定该 DSH 会话为 temporary: true，commit_dsh_source_step 入库时排除全部事件（含 Usage）
+        let store = TotalStore::open_in_memory().unwrap();
+        let reg = SessionBindingRegistry::from_json_str(
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "bindings": [
+                    {
+                        "schemaVersion": 1,
+                        "owner": { "namespace": "tumechat.user", "id": "u_1" },
+                        "host": { "namespace": "tumechat.host", "id": "h_1" },
+                        "session": { "namespace": "tumechat.session", "id": "s_dsh_tmp" },
+                        "nativeSource": {
+                            "backend": "dsh-native",
+                            "sourceLocation": "local",
+                            "sourcePath": dir.display().to_string(),
+                            "nativeSessionId": "dsh_s1"
+                        },
+                        "temporary": true,
+                        "readMemory": false,
+                        "recordedAt": "2026-11-09T08:00:00Z"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+        store.set_session_bindings(&reg).unwrap();
+        let out =
+            commit_dsh_source_step(&store, None, Ok(&snap), ScanReasons::INITIAL, &cfg).unwrap();
+        assert_eq!(
+            out.projection_stats.unwrap().appended,
+            0,
+            "临时 DSH 会话的 Message 与 Usage 均不得写进总库"
+        );
+        assert_eq!(store.read_since_page(0, 50).unwrap().events.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
