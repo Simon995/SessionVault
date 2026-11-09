@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{hash, limits, verify, AdmittedSnapshot, Blocked, Compression, NativeRuntime};
@@ -329,6 +329,22 @@ pub fn capture_source(
 }
 
 impl SourceSnapshot {
+    pub(super) fn admitted(&self) -> &AdmittedSnapshot {
+        &self.admitted
+    }
+
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
+
+    pub fn selected(&self) -> &SelectedGeneration {
+        &self.selected
+    }
+
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
     pub fn source_binding(&self) -> &str {
         &self.source_binding
     }
@@ -339,6 +355,18 @@ impl SourceSnapshot {
 
     pub fn lifecycle_sha256(&self) -> &str {
         self.admitted.lifecycle_sha256()
+    }
+
+    pub fn native_events_sha256(&self) -> &str {
+        self.admitted.native_events_sha256()
+    }
+
+    pub fn event_sha256s(&self) -> &[String] {
+        self.admitted.event_sha256s()
+    }
+
+    pub fn dsh_version(&self) -> &str {
+        self.admitted.dsh_version()
     }
 
     pub fn native_events(&self) -> usize {
@@ -361,37 +389,12 @@ impl SourceSnapshot {
 
     /// 对照两份已验证来源快照的来源绑定、生命周期及完整旧事件前缀。
     pub fn compare(&self, next: &Self) -> SnapshotRelation {
-        if self.source_binding != next.source_binding {
-            return SnapshotRelation::DifferentSource;
-        }
-        if self.lifecycle_sha256() != next.lifecycle_sha256() {
-            return SnapshotRelation::LifecycleChanged;
-        }
-        let old = self.admitted.event_sha256s();
-        let current = next.admitted.event_sha256s();
-        if current.len() < old.len() {
-            return SnapshotRelation::PrefixShrank {
-                prior_events: old.len(),
-                current_events: current.len(),
-                shared_prefix_intact: old[..current.len()] == current[..],
-            };
-        }
-        if let Some(first_diff_seq) = old
-            .iter()
-            .zip(current.iter())
-            .position(|(left, right)| left != right)
-        {
-            return SnapshotRelation::PrefixRewritten {
-                prior_events: old.len(),
-                current_events: current.len(),
-                first_diff_seq,
-            };
-        }
-        SnapshotRelation::PrefixPreserved {
-            prior_events: old.len(),
-            current_events: current.len(),
-            appended_events: current.len() - old.len(),
-        }
+        compare_parts(
+            &self.source_binding,
+            self.lifecycle_sha256(),
+            self.admitted.event_sha256s(),
+            next,
+        )
     }
 
     /// 输出包含来源观察与原生 admission 的摘要；仍保留 `production_advance_permit=false`。
@@ -408,6 +411,167 @@ impl SourceSnapshot {
             "compression": self.compression.as_str(),
         });
         report
+    }
+}
+
+/// 跨进程持久化的 DSH 来源推进凭据：绑定来源、生命周期、物理格式代、完整旧前缀摘要与解析/归属版本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DshSavedState {
+    pub source_binding: String,
+    pub session_id: String,
+    pub compression: Compression,
+    pub physical_generation: u32,
+    pub dsh_version: String,
+    pub parser_revision: u32,
+    pub attribution_revision: i64,
+    pub inherited_event_count: usize,
+    pub lifecycle_sha256: String,
+    pub native_events_sha256: String,
+    pub event_sha256s: Vec<String>,
+    pub normalized_next_seq: u64,
+}
+
+impl DshSavedState {
+    /// 从已验证的来源快照与归一化计数构造新的持久化状态。
+    pub fn from_verified(
+        snapshot: &SourceSnapshot,
+        normalized_next_seq: u64,
+        parser_revision: u32,
+        attribution_revision: i64,
+    ) -> Self {
+        Self {
+            source_binding: snapshot.source_binding().to_string(),
+            session_id: snapshot.session_id().to_string(),
+            compression: snapshot.compression(),
+            physical_generation: snapshot.selected().generation(),
+            dsh_version: snapshot.dsh_version().to_string(),
+            parser_revision,
+            attribution_revision,
+            inherited_event_count: snapshot.inherited_event_count(),
+            lifecycle_sha256: snapshot.lifecycle_sha256().to_string(),
+            native_events_sha256: snapshot.native_events_sha256().to_string(),
+            event_sha256s: snapshot.event_sha256s().to_vec(),
+            normalized_next_seq,
+        }
+    }
+
+    /// 校验从磁盘加载的状态文件结构是否完整。
+    pub fn is_well_formed(&self) -> bool {
+        let is_hex64 = |s: &str| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        !self.session_id.is_empty()
+            && !self.dsh_version.is_empty()
+            && self.physical_generation == SUPPORTED_PHYSICAL_GENERATION
+            && self.inherited_event_count <= self.event_sha256s.len()
+            && is_hex64(&self.source_binding)
+            && is_hex64(&self.lifecycle_sha256)
+            && is_hex64(&self.native_events_sha256)
+            && self.event_sha256s.iter().all(|item| is_hex64(item))
+    }
+
+    pub fn native_events(&self) -> usize {
+        self.event_sha256s.len()
+    }
+
+    pub fn compare(&self, next: &SourceSnapshot) -> SnapshotRelation {
+        compare_parts(
+            &self.source_binding,
+            &self.lifecycle_sha256,
+            &self.event_sha256s,
+            next,
+        )
+    }
+}
+
+fn compare_parts(
+    old_binding: &str,
+    old_lifecycle: &str,
+    old: &[String],
+    next: &SourceSnapshot,
+) -> SnapshotRelation {
+    if old_binding != next.source_binding {
+        return SnapshotRelation::DifferentSource;
+    }
+    if old_lifecycle != next.lifecycle_sha256() {
+        return SnapshotRelation::LifecycleChanged;
+    }
+    let current = next.admitted.event_sha256s();
+    if current.len() < old.len() {
+        return SnapshotRelation::PrefixShrank {
+            prior_events: old.len(),
+            current_events: current.len(),
+            shared_prefix_intact: old[..current.len()] == current[..],
+        };
+    }
+    if let Some(first_diff_seq) = old
+        .iter()
+        .zip(current.iter())
+        .position(|(left, right)| left != right)
+    {
+        return SnapshotRelation::PrefixRewritten {
+            prior_events: old.len(),
+            current_events: current.len(),
+            first_diff_seq,
+        };
+    }
+    SnapshotRelation::PrefixPreserved {
+        prior_events: old.len(),
+        current_events: current.len(),
+        appended_events: current.len() - old.len(),
+    }
+}
+
+fn gate_from_relation(
+    prior_events: usize,
+    next_events: usize,
+    relation: SnapshotRelation,
+) -> CommitGateDecision {
+    match relation {
+        SnapshotRelation::DifferentSource => CommitGateDecision::RejectDifferentSource,
+        SnapshotRelation::PrefixShrank {
+            current_events,
+            shared_prefix_intact,
+            ..
+        } => CommitGateDecision::HoldPriorProjection {
+            prior_events,
+            reason: HoldReason::PrefixShrank {
+                current_events,
+                shared_prefix_intact,
+            },
+        },
+        SnapshotRelation::PrefixPreserved {
+            current_events,
+            appended_events: 0,
+            ..
+        } => CommitGateDecision::NoOpUnchanged {
+            verified_events: current_events,
+        },
+        SnapshotRelation::PrefixPreserved {
+            prior_events,
+            current_events,
+            appended_events,
+        } => CommitGateDecision::IncrementalAppendCandidate {
+            prior_events,
+            verified_events: current_events,
+            appended_events,
+        },
+        SnapshotRelation::LifecycleChanged => CommitGateDecision::RebuildProjectionCandidate {
+            prior_events,
+            verified_events: next_events,
+            invalidates_prior_credential: true,
+            reason: RebuildReason::LifecycleChanged,
+        },
+        SnapshotRelation::PrefixRewritten { first_diff_seq, .. } => {
+            CommitGateDecision::RebuildProjectionCandidate {
+                prior_events,
+                verified_events: next_events,
+                invalidates_prior_credential: true,
+                reason: RebuildReason::PrefixRewritten { first_diff_seq },
+            }
+        }
     }
 }
 
@@ -430,57 +594,116 @@ pub fn evaluate_commit_gate(
                 blocked: blocked.clone(),
             },
         },
-        (Some(old), Ok(next)) => match old.compare(next) {
-            SnapshotRelation::DifferentSource => CommitGateDecision::RejectDifferentSource,
-            SnapshotRelation::PrefixShrank {
-                current_events,
-                shared_prefix_intact,
-                ..
-            } => CommitGateDecision::HoldPriorProjection {
+        (Some(old), Ok(next)) => {
+            gate_from_relation(old.native_events(), next.native_events(), old.compare(next))
+        }
+    }
+}
+
+/// 根据磁盘持久化的 `DshSavedState`（若有）与本轮捕获结果，计算关系与保守提交门判定。
+pub fn evaluate_saved_commit_gate(
+    prior: Option<&DshSavedState>,
+    current: Result<&SourceSnapshot, &Blocked>,
+) -> (Option<SnapshotRelation>, CommitGateDecision) {
+    match (prior, current) {
+        (None, Err(blocked)) => (
+            None,
+            CommitGateDecision::RejectInitial {
+                blocked: blocked.clone(),
+            },
+        ),
+        (None, Ok(snapshot)) => (
+            None,
+            CommitGateDecision::InitialProjectionCandidate {
+                verified_events: snapshot.native_events(),
+                inherited_event_count: snapshot.inherited_event_count(),
+            },
+        ),
+        (Some(old), Err(blocked)) => (
+            None,
+            CommitGateDecision::HoldPriorProjection {
                 prior_events: old.native_events(),
-                reason: HoldReason::PrefixShrank {
-                    current_events,
-                    shared_prefix_intact,
+                reason: HoldReason::CaptureBlocked {
+                    blocked: blocked.clone(),
                 },
             },
-            SnapshotRelation::PrefixPreserved {
-                current_events,
-                appended_events: 0,
-                ..
-            } => CommitGateDecision::NoOpUnchanged {
-                verified_events: current_events,
-            },
-            SnapshotRelation::PrefixPreserved {
-                prior_events,
-                current_events,
-                appended_events,
-            } => CommitGateDecision::IncrementalAppendCandidate {
-                prior_events,
-                verified_events: current_events,
-                appended_events,
-            },
-            SnapshotRelation::LifecycleChanged => CommitGateDecision::RebuildProjectionCandidate {
-                prior_events: old.native_events(),
-                verified_events: next.native_events(),
-                invalidates_prior_credential: true,
-                reason: RebuildReason::LifecycleChanged,
-            },
-            SnapshotRelation::PrefixRewritten { first_diff_seq, .. } => {
-                CommitGateDecision::RebuildProjectionCandidate {
-                    prior_events: old.native_events(),
-                    verified_events: next.native_events(),
-                    invalidates_prior_credential: true,
-                    reason: RebuildReason::PrefixRewritten { first_diff_seq },
-                }
+        ),
+        (Some(old), Ok(next)) => {
+            if !old.is_well_formed() {
+                return (
+                    None,
+                    CommitGateDecision::HoldPriorProjection {
+                        prior_events: old.native_events(),
+                        reason: HoldReason::CaptureBlocked {
+                            blocked: Blocked::Invalid("corrupt_saved_state"),
+                        },
+                    },
+                );
             }
-        },
+            let relation = old.compare(next);
+            let gate =
+                gate_from_relation(old.native_events(), next.native_events(), relation.clone());
+            (Some(relation), gate)
+        }
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    pub(in crate::dsh_snapshot) fn synthetic_source_snapshot(
+        dir: &Path,
+        session_id: &str,
+        compression: Compression,
+        jsonl_lines: &[&str],
+        inherited: usize,
+        lifecycle: &str,
+        event_tags: &[&str],
+    ) -> SourceSnapshot {
+        let mut raw = String::new();
+        for line in jsonl_lines {
+            raw.push_str(line);
+            raw.push('\n');
+        }
+        let file = dir.join(match compression {
+            Compression::None => "session.v4.jsonl",
+            Compression::Zstd => "session.v4.jsonl.zstd",
+        });
+        std::fs::write(&file, raw.as_bytes()).unwrap();
+        let stamp = match probe::lstat_entry(&file, None) {
+            Probed::Found(RealEntryKind::RegularFile(s)) => s,
+            other => panic!("unexpected lstat: {other:?}"),
+        };
+        let physical = super::super::verify(raw.as_bytes(), Compression::None).unwrap();
+        let event_hashes: Vec<String> = event_tags.iter().map(|e| hash(e.as_bytes())).collect();
+        let reply = json!({
+            "kind": "native_admitted",
+            "session_id": session_id,
+            "jsonl_sha256": physical.jsonl_hash,
+            "header_sha256": physical.header_hash,
+            "native_events": event_hashes.len(),
+            "inherited_event_count": inherited,
+            "lifecycle_sha256": hash(lifecycle.as_bytes()),
+            "native_events_sha256": hash(serde_json::to_string(&event_hashes).unwrap().as_bytes()),
+            "event_sha256s": event_hashes,
+            "dsh_version": "0.2.1-rc.5",
+        });
+        let admitted = super::super::native::tests::bind_verified_reply(physical, &reply);
+        SourceSnapshot {
+            session_dir: dir.to_path_buf(),
+            selected: SelectedGeneration {
+                generation: 4,
+                file_name: file.file_name().unwrap().to_string_lossy().into_owned(),
+                path: file,
+            },
+            compression,
+            stamp,
+            source_binding: hash(format!("{}:{session_id}", dir.display()).as_bytes()),
+            admitted,
+        }
+    }
 
     #[test]
     fn canonical_log_filename_parser_rejects_non_canonical_names() {

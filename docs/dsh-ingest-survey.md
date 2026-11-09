@@ -344,9 +344,9 @@ node scripts/verify-dsh-backend.mjs --dsh-package '<dsh-package.json>'
 node scripts/verify-dsh-concurrency.mjs --dsh-package '<dsh-package.json>'
 ```
 
-## 14. 后续核查：独立快照完整性
+## 14. 后续核查：独立快照完整性与 Rust 实验核验链
 
-2026-11-06，新增 Python 逐帧 / checksum / 严格 UTF-8 审计及原生 persistence / restore 对照，29 组检查通过；审计器自测另覆盖第二帧的 45 个非空截断点及四个 checksum 字节破坏。DSH 安装版仍由脚本核为 `0.2.1-rc.5`，Node 实跑 `v25.2.1`，独立解码依赖固定 `zstandard==0.25.0`。实现、命令和完整边界见 [读取状态设计 §6](dsh-read-state-design.md#6-独立快照完整性验证)。
+2026-11-06，新增 Python 逐帧 / checksum / 严格 UTF-8 审计及原生 persistence / restore 对照，29 组检查通过；审计器自测另覆盖第二帧的 45 个非空截断点及四个 checksum 字节破坏。同日在 `dsh-experimental` 门控下依次完成 Rust 同缓冲区物理核验、原生 semantic admission 接缝、会话目录选代与同句柄身份捕获、保守提交门 `CommitGateDecision`、原生位置到 `RawEvent` 归一化位置映射（`NormalizedDshSnapshot`）以及实验性 `TotalStore` + `DshSavedState` 提交与崩溃重放幂等验证。DSH 安装版仍由脚本核为 `0.2.1-rc.5`，Node 实跑 `v25.2.1`，独立解码依赖固定 `zstandard==0.25.0`。实现、命令和完整边界见 [读取状态设计 §6–§11](dsh-read-state-design.md#6-独立快照完整性验证)。
 
 关键结果：最后一个 checksum 字节缺失时，原生 read 仍可返回全部 10 事件；追加新事件但缺 checksum 时甚至可取得 11 事件，独立审计均阻断。正文坏 UTF-8 可被原生替换后接受，严格审计拒绝。反向对照确认物理完整不等于语义可接受，而重新分帧可以只改变物理摘要、保留相同 JSONL 与事件。旧副本的完整性结果不能配给改写后的副本。
 

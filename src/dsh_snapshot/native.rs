@@ -230,6 +230,10 @@ impl NativeRuntime {
 }
 
 impl AdmittedSnapshot {
+    pub(super) fn physical(&self) -> &PhysicalSnapshot {
+        &self.physical
+    }
+
     pub(super) fn session_id(&self) -> &str {
         &self.evidence.session_id
     }
@@ -238,12 +242,20 @@ impl AdmittedSnapshot {
         &self.evidence.lifecycle_sha256
     }
 
+    pub(super) fn native_events_sha256(&self) -> &str {
+        &self.evidence.native_events_sha256
+    }
+
     pub(super) fn inherited_event_count(&self) -> usize {
         self.evidence.inherited_event_count
     }
 
     pub(super) fn event_sha256s(&self) -> &[String] {
         &self.evidence.event_sha256s
+    }
+
+    pub(super) fn dsh_version(&self) -> &str {
+        &self.evidence.dsh_version
     }
 
     /// 原生接受仍不证明来源稳定、归一化位置或生产推进。

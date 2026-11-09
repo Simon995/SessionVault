@@ -15,12 +15,22 @@ use crate::probe::{self, PinnedRead, Probed};
 use crate::rawevent::EventKey;
 
 mod native;
+mod normalize;
 mod source;
 pub use native::{AdmittedSnapshot, NativeRuntime};
+#[cfg(feature = "store")]
+pub use normalize::{
+    commit_dsh_source_step, plan_dsh_source_step, DshPlannedStep, DshStoreCommitOutcome,
+};
+pub use normalize::{
+    epoch_ms_to_iso8601_utc, normalize_admitted_snapshot, normalize_source_snapshot,
+    DshNormalizeConfig, DshUsageEntry, DshUsageStatus, NativeEventOwnership, NormalizedDshSnapshot,
+    NormalizedEventSpan,
+};
 pub use source::{
-    capture_source, evaluate_commit_gate, parse_canonical_log_filename, select_generation,
-    CommitGateDecision, HoldReason, RebuildReason, SelectedGeneration, SnapshotRelation,
-    SourceConfig, SourceSnapshot,
+    capture_source, evaluate_commit_gate, evaluate_saved_commit_gate, parse_canonical_log_filename,
+    select_generation, CommitGateDecision, DshSavedState, HoldReason, RebuildReason,
+    SelectedGeneration, SnapshotRelation, SourceConfig, SourceSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -44,7 +54,8 @@ fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Compression {
     None,
     Zstd,
@@ -83,6 +94,32 @@ pub struct RecordPosition {
     record_fingerprint: String,
 }
 
+impl RecordPosition {
+    pub fn record_index(&self) -> usize {
+        self.record_index
+    }
+
+    pub fn native_seq(&self) -> u64 {
+        self.native_seq
+    }
+
+    pub fn jsonl_start(&self) -> usize {
+        self.jsonl_start
+    }
+
+    pub fn jsonl_end(&self) -> usize {
+        self.jsonl_end
+    }
+
+    pub fn frame_index(&self) -> Option<usize> {
+        self.frame_index
+    }
+
+    pub fn record_fingerprint(&self) -> &str {
+        &self.record_fingerprint
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FrameSpan {
     physical_start: usize,
@@ -115,6 +152,18 @@ impl std::fmt::Debug for VerifiedJsonl {
 }
 
 impl PhysicalSnapshot {
+    pub(super) fn header_id(&self) -> &str {
+        &self.header_id
+    }
+
+    pub(super) fn jsonl_bytes(&self) -> &[u8] {
+        &self.jsonl.0
+    }
+
+    pub(super) fn positions(&self) -> &[RecordPosition] {
+        &self.positions
+    }
+
     /// 输出计数、摘要与可选的原生记录位置；不输出 header 或正文。
     pub fn report(&self, include_positions: bool) -> Value {
         let mut report = json!({

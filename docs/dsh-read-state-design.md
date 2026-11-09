@@ -254,4 +254,30 @@ node scripts/verify-dsh-rust-source-capture.mjs --dsh-package '<dsh-package.json
 MSYS_NO_PATHCONV=1 node scripts/verify-dsh-rust-source-capture.mjs --dsh-package '<dsh-package.json>' --wsl-reader '<absolute-linux-example-binary>' --native-node '<absolute-linux-node>' --native-dsh-package '<absolute-linux-package.json>'
 ```
 
-成功报告显式保留 `source_observation_validated=true`、`semantic_admission_validated=true`，同时 `normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。`CommitGateDecision` 是进入生产观察 / `CommitPlan` 前的保守门决策，尚未映射 `RawEvent` 归一化位置，也未接入 `scan`、总库投影事务或状态文件持久化。
+成功报告显式保留 `source_observation_validated=true`、`semantic_admission_validated=true`，同时在未开启 `--normalize` 时保持 `normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。后续归一化位置映射、持久化凭据 `DshSavedState` 及实验性总库提交接线见 §11。
+
+## 11. Rust 归一化位置映射与实验性总库提交接线
+
+2026-11-06，新增 [normalize.rs](../src/dsh_snapshot/normalize.rs)、[verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs)，并扩展 [source.rs](../src/dsh_snapshot/source.rs) 与 [examples/dsh_snapshot.rs](../examples/dsh_snapshot.rs)，在 `dsh-experimental`（及可选 `store`）门控下完成原生记录位置到 `RawEvent` 归一化位置映射、跨进程持久化读取凭据 `DshSavedState`，以及 `CommitGateDecision` 到 `AppendLogObservation` / `CommitPlan` / `TotalStore::apply_projection` 的保守接线：
+
+1. **继承前缀抑制与逐记录归一化跨度（`NormalizedDshSnapshot` / `NormalizedEventSpan`）**：
+   - 只消费已通过物理核验与原生 admission 的 `AdmittedSnapshot` / `SourceSnapshot`；
+   - `native_seq < inherited_event_count` 的父会话历史记录标为 `NativeEventOwnership::InheritedPrefix` 并统计在 `suppressed_inherited_records` 中，不发射为当前 child 会话的 `RawEvent`，避免父历史消息与 token 用量在 child 会话中重复入库与重复计量；
+   - `native_seq >= inherited_event_count` 的本会话记录映射为 `RawEvent`：`system/message`（`Actor::System`）、`developer/message`（`actor = None`，不与 `system/message` 混同）、`user/message`（`Actor::User`）、`assistant/message`（依序提取 `Thinking`、`Message`、`Usage`）、`assistant/attempt`（经同 step 决议后的 `Usage`）、`tool/call`（`ToolUse`）与 `tool/result`（`ToolResult`）；
+   - 每条发射事件分配独立的 `EventKey { version: EVENT_KEY_VERSION, record_fingerprint, slot_ordinal }`，并在 `NormalizedEventSpan` 中绑定 `raw_seq`、`event_type`、`event_key`、`record_index`、`native_seq`、`jsonl_start..jsonl_end` 与 `frame_index`；毫秒时间戳经纯整数算术 `epoch_ms_to_iso8601_utc` 转为 UTC ISO-8601，与 `rawevent::occurred_at_unix_ms` 精确互逆。
+2. **同 `(turn, step)` 用量槽位与四桶诚实性（`DshUsageEntry` / `DshUsageStatus`）**：
+   - 同 `(turn, step)` 内若出现成对的 `llm/retry` $\to$ `llm/retry-started`，保留重试前失败 `assistant/attempt` 的 usage；否则同 `(turn, step)` 后一条 usage 覆盖前一条槽位（前一条记为 `SupersededBySameStep`，不发射为 `RawEvent::Usage`）；
+   - 失败 `assistant/attempt` 只使用其自身携带的 `model`（缺失则为 `None`），绝不借用同 step 后续成功 `assistant/message` 的 `model`；
+   - 仅当 `inputTokens`、`outputTokens`、`cacheReadTokens`、`cacheWriteTokens` 四项均显式存在且与 `totalTokens` 加总一致时发射 `EventType::Usage`（`ExactFourBucket`）；缺失任一 cache 桶或加总不符时记入 `usage_ledger` 为 `PartialOrUnreconciled`，绝不填 `0` 冒充已知四桶。
+3. **跨进程持久化凭据 `DshSavedState` 与保守总库提交（`plan_dsh_source_step` / `commit_dsh_source_step`）**：
+   - `DshSavedState` 持久化 `source_binding`、`session_id`、`compression`、`physical_generation`、`dsh_version`、`parser_revision`、`attribution_revision`、`inherited_event_count`、`lifecycle_sha256`、`native_events_sha256`、完整旧前缀摘要 `event_sha256s` 与 `normalized_next_seq`，经 `evaluate_saved_commit_gate` 执行跨进程完整旧前缀核对（含两次追加后改写第 0 段旧前缀检测）；
+   - `RejectInitial`、`HoldPriorProjection`（含捕获阻断与 zstd 修尾中间态 `PrefixShrank`）、`RejectDifferentSource` 一律映射为 `ParseQuality::Unavailable` + 空事件 + 旧游标，使 `CommitPlan::plan` 即使面对 `FORCE` / `PARSER_STALE` 也稳定产出 `StoreAction::Preserve` 与 `CursorAction::Freeze`，不覆盖库内既有投影、不推进 `DshSavedState`；
+   - `IncrementalAppendCandidate` 校验前 `prior_events` 条原生记录产出的归一化事件数是否仍等于 `saved.normalized_next_seq`：一致时只切出 `native_seq >= prior_events` 的新增事件后缀（保留其在全量归一化中的真实 `seq`），不一致时自动升级为 `PARSER_STALE` 全量重读，防止增量 `seq` 断号或撞号；
+   - `RebuildProjectionCandidate`（`PrefixRewritten` 或 `LifecycleChanged`）映射为 `SourceChange::RollbackOrRewrite` 全量事件，在库内已有前代时由 `CommitPlan::plan` 产出 `StoreAction::Project(Projection::Rollback)`；`ProjectionToken` 绑定 `(source_key, lifecycle_sha256, native_events_sha256, parser_revision, attribution_revision, native_events)`，保证写库成功但未保存 `DshSavedState` 时的崩溃重放严格幂等、不重复开新代。
+
+Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 16 项检查全部通过：覆盖带配对重试与部分 cache 桶未知的 usage 决议、失败 attempt 不借用后续 model、child 会话抑制 `inherited_event_count` 前缀、真实 `TotalStore` 首次追加、无变化重扫、连续两次增量追加、两次追加后改写第 0 段触发 `Rollback`、写库后未保存 `state_file` 崩溃重放幂等（`head_moved=false`，`source_revision` 不变）、zstd 修尾变短在 `--force` 下仍 `HoldPriorProjection` + `Preserve` + `Freeze`、同 session id 生命周期变化触发 `Rollback` 开第 2 代，以及出现未来代 `session.v5.jsonl.zstd` 时保持旧投影与旧状态文件。Windows `store,dsh-experimental` 库测试增至 442 passed，WSL Linux `store,dsh-experimental` 库测试增至 428 passed。
+
+```sh
+node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.json>' --binary '<absolute-example-binary>'
+```
+
