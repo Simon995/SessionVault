@@ -99,7 +99,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 - user-role 的人工、注入、agent relay、settlement 与未知来源；可信属性缺失 / 冲突、多写者及记忆缓存不绕过临时范围。
 - CLI / Rust 构造与穷举 / 逐字段读取 / `SourceMode` 过滤兼容；旧版读者与并存写者协调。
 
-建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§19 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾、双进程受控窗口、独立快照审计、Node 同缓冲区捕获原型、Rust 物理核验与原生 admission、会话目录选代与保守提交门（`faed841`）、`RawEvent` 归一化位置映射与实验性 `TotalStore` + `DshSavedState` 提交接线（`9d64cce`），以及控制面绑定、双层临时排除与 `InputOrigin` 真实来源保真（`a151997`）。正式默认启用仍缺活动启动配置、复杂迁移 / fork / compaction 有效视图样本与 §11 扩展用量结构的公开 DTO 落地；一般并发压力、崩溃及租约争夺仍未验。不能因核查脚本退出 0 就默认启用自动入库。
+**2026-11-09 拍板（首版支持代范围）**：首版正式 DSH provider 仅支持会话日志格式第 4 代（`session.v4.jsonl[.zstd]`，header `version: 4`；注：指 DSH 会话日志存储 schema 的第 4 代，与对话调用的大模型版本无关），仅存旧代 `v0..v3` 或出现未来代 `v5+` 时显式报 `UnsupportedGeneration` 且不回退旧代，不在 Rust 中重复移植 0→4 历史迁移链。§8–§19 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾、双进程受控窗口、独立快照审计、Node 同缓冲区捕获原型、Rust 物理核验与原生 admission、会话目录选代与保守提交门（`faed841`）、`RawEvent` 归一化位置映射与实验性 `TotalStore` + `DshSavedState` 提交接线（`9d64cce`），以及控制面绑定、双层临时排除与 `InputOrigin` 真实来源保真（`a151997`）。正式默认启用仍缺活动启动配置、fork / descriptor 与 compaction 有效视图样本及 §11 扩展用量结构的公开 DTO 落地；一般并发压力、崩溃及租约争夺仍未验。不能因核查脚本退出 0 就默认启用自动入库。
 
 ## 7. 安装源码索引
 
