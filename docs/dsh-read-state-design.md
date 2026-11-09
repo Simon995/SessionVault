@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-06 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§18；独立快照审计、Node 捕获、Rust 字节 / 原生位置、原生 admission 及 Rust 来源选代 / 保守提交门见本文 §6–§10。本文不表示 DSH provider、生产凭据或临时排除已实现；执行顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-09 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§19；独立快照审计、Node 捕获、Rust 字节 / 原生位置、原生 admission、Rust 来源选代 / 保守提交门及归一化位置映射与实验性总库提交接线见本文 §6–§11。控制面绑定与临时排除已于 `a151997` 落地；DSH 默认 `SourceType` / `discover` 正式注册仍待复杂语义收尾后开启，执行顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -30,7 +30,7 @@ DSH 原生 `SessionPersistence.stat()` 已有 `revision`，不是没有版本观
 - 总库接受显式来源的空 Rollback / Reparse，能实际切到空头；保留旧代不等于当前投影不会被不完整结果替换。
 - `Cursor.next_seq` 是归一化事件序号，当前 `safe_offset` 是既有来源的逻辑字节位置；它们不能直接装入 DSH 原生事件位置或压缩 offset。
 
-依据：[scan.rs](../src/scan.rs)、[observation.rs](../src/observation.rs)、[scan_plan.rs](../src/scan_plan.rs)、[svault.rs](../src/bin/svault.rs) 的 `scan_one` / `ScanWriter::commit` / `run_scan_all`；总库行为见 [store.rs](../src/store.rs) 的 `apply_projection`。这些是当前实现事实；新 DSH reader 尚未接入这些生产出口。
+依据：[scan.rs](../src/scan.rs)、[observation.rs](../src/observation.rs)、[scan_plan.rs](../src/scan_plan.rs)、[svault.rs](../src/bin/svault.rs) 的 `scan_one` / `ScanWriter::commit` / `run_scan_all`；总库行为见 [store.rs](../src/store.rs) 的 `apply_projection`。在 `dsh-experimental` 门控下，[normalize.rs](../src/dsh_snapshot/normalize.rs) 的 `plan_dsh_source_step` / `commit_dsh_source_step` 已将这些生产出口与 `CommitGateDecision`、`DshSavedState` 及控制面 `SessionBindingRegistry` 接合（见 §11，`9d64cce` / `a151997`）；默认 `discover` / `scan-all` 的正式 provider 注册尚未开启。
 
 ## 3. 读取范围与历史基线分开
 
@@ -275,7 +275,7 @@ MSYS_NO_PATHCONV=1 node scripts/verify-dsh-rust-source-capture.mjs --dsh-package
    - `IncrementalAppendCandidate` 校验前 `prior_events` 条原生记录产出的归一化事件数是否仍等于 `saved.normalized_next_seq`：一致时只切出 `native_seq >= prior_events` 的新增事件后缀（保留其在全量归一化中的真实 `seq`），不一致时自动升级为 `PARSER_STALE` 全量重读，防止增量 `seq` 断号或撞号；
    - `RebuildProjectionCandidate`（`PrefixRewritten` 或 `LifecycleChanged`）映射为 `SourceChange::RollbackOrRewrite` 全量事件，在库内已有前代时由 `CommitPlan::plan` 产出 `StoreAction::Project(Projection::Rollback)`；`ProjectionToken` 绑定 `(source_key, lifecycle_sha256, native_events_sha256, parser_revision, attribution_revision, native_events)`，保证写库成功但未保存 `DshSavedState` 时的崩溃重放严格幂等、不重复开新代。
 
-Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 16 项检查全部通过：覆盖带配对重试与部分 cache 桶未知的 usage 决议、失败 attempt 不借用后续 model、child 会话抑制 `inherited_event_count` 前缀、真实 `TotalStore` 首次追加、无变化重扫、连续两次增量追加、两次追加后改写第 0 段触发 `Rollback`、写库后未保存 `state_file` 崩溃重放幂等（`head_moved=false`，`source_revision` 不变）、zstd 修尾变短在 `--force` 下仍 `HoldPriorProjection` + `Preserve` + `Freeze`、同 session id 生命周期变化触发 `Rollback` 开第 2 代，以及出现未来代 `session.v5.jsonl.zstd` 时保持旧投影与旧状态文件。Windows `store,dsh-experimental` 库测试增至 442 passed，WSL Linux `store,dsh-experimental` 库测试增至 428 passed。
+Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 16 项检查全部通过（`9d64cce`）：覆盖带配对重试与部分 cache 桶未知的 usage 决议、失败 attempt 不借用后续 model、child 会话抑制 `inherited_event_count` 前缀、真实 `TotalStore` 首次追加、无变化重扫、连续两次增量追加、两次追加后改写第 0 段触发 `Rollback`、写库后未保存 `state_file` 崩溃重放幂等（`head_moved=false`，`source_revision` 不变）、zstd 修尾变短在 `--force` 下仍 `HoldPriorProjection` + `Preserve` + `Freeze`、同 session id 生命周期变化触发 `Rollback` 开第 2 代，以及出现未来代 `session.v5.jsonl.zstd` 时保持旧投影与旧状态文件。随后在 `a151997` 中进一步为 DSH `user/message` 接入 `RawEvent::input_origin` 与 `TotalStore::apply_projection_if` 控制面临时会话拦截，Windows `store,dsh-experimental` 库测试 449 passed，WSL Linux `store,dsh-experimental` 库测试 435 passed。
 
 ```sh
 node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.json>' --binary '<absolute-example-binary>'

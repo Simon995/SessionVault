@@ -1,6 +1,6 @@
 # DSH 来源核查与适配判据
 
-> 2026-11-06 更新。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生样本、恢复边界、用量保真、原生 backend、受控并发、快照审计、Node 捕获及 Rust 字节 / 原生位置核验见 §8–§16。**正式 provider、生产推进、临时排除与可信来源接口仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
+> 2026-11-09 更新。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生样本、恢复边界、用量保真、原生 backend、受控并发、快照审计、Node 捕获、Rust 字节 / 原生位置、原生 admission、来源选代 / 保守提交门及 `RawEvent` 归一化位置映射与实验性总库提交接线见 §8–§19。控制面会话绑定、双层临时排除与真实来源保真（H.1–H.3）已于 `a151997` 落地；**DSH 正式默认 provider 注册与复杂语义（fork / compaction）仍待交付**。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
 ## 1. 证据范围
 
@@ -84,7 +84,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 | 控制面绑定     | 可把一次启动 / 执行绑定到具体来源实例与会话生命周期，区分临时 / 持久，并传给子 CLI；正式入口有可复现样例 | 隔离模式拒入；既有普通来源兼容策略另定，不全局猜成非临时 |
 | 摄取与记忆消费 | CLI / Rust 写者统一在入库前排除，报告计数；缓存与记忆引擎遵守同一临时范围；旧写者不能绕过                | 显式阻断或协调版本，不只改单个 parser                    |
 
-载体可评估原生正式扩展或单独的控制面绑定记录，但本轮不选定文件名、签名方式或公开 DTO。无论哪种载体，都必须说明信任边界、绑定真实性、生命周期复用、并发写入、属性继承与冲突处理；正文标签和自填 `principal` 不能自证。授权裁定仍归上层控制层。
+载体可评估原生正式扩展或单独的控制面绑定记录；**2026-11-09 落地进展（`a151997`）**：已在 [session_binding.rs](../src/session_binding.rs) 与 [rawevent.rs](../src/rawevent.rs) 实现控制面绑定清单（`store_meta['session_bindings_json']` / `session_bindings.json` / `SVAULT_SESSION_BINDINGS`）、三态准入 `IngestAdmissionVerdict`（`PersistentAllowed` / `TemporaryExcluded` / `UnknownHold`）、扫描与 `TotalStore::apply_projection_if` 双层排除及 `RawEvent::input_origin` 同侪信封识别。正文标签和自填 `principal` 不能自证；授权裁定仍归上层控制层。
 
 ## 6. 执行过的检查与后续实施门
 
@@ -99,7 +99,7 @@ v4 每份日志只有 header 不带 `seq/time`，其余顶层对象均有这两�
 - user-role 的人工、注入、agent relay、settlement 与未知来源；可信属性缺失 / 冲突、多写者及记忆缓存不绕过临时范围。
 - CLI / Rust 构造与穷举 / 逐字段读取 / `SourceMode` 过滤兼容；旧版读者与并存写者协调。
 
-建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§15 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾、双进程受控窗口、独立快照审计与 Node 同缓冲区捕获原型。正式实现仍缺生产读取状态与安全推进位置、活动启动配置、复杂迁移 / 有效视图样本、§11 用量保真草案的实现与兼容验证，以及 H.1 的可信载体；一般并发压力、崩溃及租约争夺仍未验。正式摄取、临时排除与来源保真按 H.7 一起验证交付，不能因核查脚本退出 0 就启用自动入库。
+建议首个隔离实现以已核 v4 为范围，旧代与未来代显式报不支持，先不在 Rust 中复制整条迁移链；该建议不是上线兼容承诺。§8–§19 已补静态 profile 根、合法合成 fixture、消息 / 工具 / usage、重试 / 继承、codec 坏尾、原生 backend 读取 / 修尾、双进程受控窗口、独立快照审计、Node 同缓冲区捕获原型、Rust 物理核验与原生 admission、会话目录选代与保守提交门（`faed841`）、`RawEvent` 归一化位置映射与实验性 `TotalStore` + `DshSavedState` 提交接线（`9d64cce`），以及控制面绑定、双层临时排除与 `InputOrigin` 真实来源保真（`a151997`）。正式默认启用仍缺活动启动配置、复杂迁移 / fork / compaction 有效视图样本与 §11 扩展用量结构的公开 DTO 落地；一般并发压力、崩溃及租约争夺仍未验。不能因核查脚本退出 0 就默认启用自动入库。
 
 ## 7. 安装源码索引
 
@@ -394,4 +394,10 @@ Windows / WSL Linux 各通过 140 份原生模式快照和五组附加对照，�
 
 Windows 与 WSL Linux 实跑 [verify-dsh-rust-source-capture.mjs](../scripts/verify-dsh-rust-source-capture.mjs) 各 35 组检查全部通过，两平台 19 组 `verify-dsh-native-admission.mjs` 与 140 份快照 + 5 组对照的 `verify-dsh-rust-snapshot.mjs`（物理 + 原生模式）回归全部通过；Windows `store,dsh-experimental` 库测试 439 passed，WSL Linux `store,dsh-experimental` 库测试 425 passed，两平台零警告 clippy 通过。
 
-成功摘要将 `source_observation_validated` 与 `semantic_admission_validated` 置为 true，同时保留 `normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。本批源码尚未提交，尚未接入 `RawEvent` 归一化位置、`AppendLogObservation` / `CommitPlan`、总库写库事务与状态文件重放。
+成功摘要将 `source_observation_validated` 与 `semantic_admission_validated` 置为 true，同时在未开启 `--normalize` 时保留 `normalized_positions_available=false`、`atomic_source_snapshot_proven=false`、`production_advance_permit=false`。本节已提交为 `faed841`，尚未合并发布；后续 `RawEvent` 归一化位置映射与实验性总库提交接线见 §19。
+
+## 19. 后续实现：归一化位置映射、实验性总库提交与控制面绑定接线
+
+2026-11-06 至 11-09，在 [normalize.rs](../src/dsh_snapshot/normalize.rs)、[verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 与 [session_binding.rs](../src/session_binding.rs) 中完成原生记录位置到 `RawEvent` 归一化位置映射（`NormalizedDshSnapshot` / `NormalizedEventSpan`）、跨进程持久化凭据 `DshSavedState`、`CommitGateDecision` 到 `AppendLogObservation` / `CommitPlan` / `TotalStore::apply_projection` 的保守接线（`9d64cce`），以及 `user/message` 的 `InputOrigin` 分类与控制面临时会话排除验证（`a151997`）；详见 [读取状态设计 §11](dsh-read-state-design.md#11-rust-归一化位置映射与实验性总库提交接线)。
+
+Windows 与 WSL Linux 实跑 `verify-dsh-rust-normalize-store.mjs` 各 16 项检查全部通过（覆盖配对重试与部分 cache 桶未知的 usage 决议、失败 attempt 不借用后续 model、child 会话抑制 `inherited_event_count` 前缀、真实 `TotalStore` 首次追加、无变化重扫、连续两次增量追加、两次追加后改写第 0 段触发 `Rollback`、写库后未保存 `state_file` 崩溃重放幂等、zstd 修尾变短在 `--force` 下仍 `HoldPriorProjection` + `Preserve` + `Freeze`、同 session id 生命周期变化触发 `Rollback` 开第 2 代、未来代 v5 保持旧投影与旧状态文件）；`normalize::tests::dsh_normalize_and_store_commit_respects_session_bindings_and_input_origin` 进一步验证 DSH 归一化与写库同样遵守控制面绑定与同侪信封保真。Windows `store,dsh-experimental` 库测试 449 passed，WSL Linux `store,dsh-experimental` 库测试 435 passed。

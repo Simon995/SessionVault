@@ -9,7 +9,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 ## 1. 命令与门
 
 - 克隆后先执行 `git config core.hooksPath .githooks`：pre-push 在推送时跑下面两道闸，不过就拒绝推送；没配的克隆不受保护。
-- 提交前：`cargo fmt --all`、`cargo test --lib --features store`。feature 组合逐个编：`cargo check --bins`（默认）与 `--features store` 都要过。
+- 提交前：`cargo fmt --all`、`cargo test --lib --features store`（动到 `dsh_snapshot` 时带 `--features store,dsh-experimental`）。feature 组合逐个编：`cargo check --bins`（默认）与 `--features store` 都要过。
 - clippy：`cargo clippy --all-targets --all-features -- -D warnings` 保持 0 条。
 - 公开仓闸：`uv run python scripts/check-public-safe.py`（扫整个工作区和 `origin/main..HEAD` 的 commit message，先自检再扫）。
 - 体量闸：`uv run python scripts/check-agents-budget.py`（本文件 ≤200 行、≤24 KB、单行 ≤320 字符；`CLAUDE.md` 只能是 `@AGENTS.md` 导入壳）。
@@ -38,12 +38,13 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 | -------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
 | QuotaBar | Rust 库编进去（`features = ["store"]`）；也是总库会话正文的写入者                             | 它的子模块指针                                                     |
 | TumeFlow | 子模块 + 把 `svault` 内嵌进 PyInstaller onefile；也经 `svault sync-snapshots` 做快照同步      | 它重新冻结时子模块指针钉住的那一版（不 bump 指针，重冻也还是旧版） |
-| TumeChat | 只读 CLI（`pull` / `changes` / `sessions-read`；多机时 `stores`、`--all-stores`、`erasures`） | 本仓发布的那份 svault（2026-10-09 定）                             |
+| TumeChat | 只读 CLI（`pull` / `changes` / `sessions-read` / `sessions-recent` / `roots` / `attribute`；多机时 `stores`、`--all-stores`、`erasures`） | 本仓发布的那份 svault（2026-10-09 定）                             |
 
 - 本仓的测试只证明本仓自洽。动 `pub` 项前问「另一个消费者编不编得过」，能编就去那个仓编一次，编不了就明说没验。
 - 优先只加不删、不改签名。给公开结构体加字段：字面量构造会编不过，逐字段读取会安静少报一格；收紧 `#[cfg(feature)]` 等于删。
 - 不替消费方 bump 它们的子模块指针。
 - 运行时会有不止一份 svault 同时打开同一个总库（`<data_local_dir>/svault/total_store.db`），子模块指针拦不住。写入类打开都跑 `migrate()`；只读子命令与 `open_existing` 走 `TotalStore::open_read_only`（不建库、不迁移，库缺表列时报 `SchemaBehind`），新的读路径也必须走它。
+- 控制面会话绑定（`SessionBindingRegistry`）存于 `store_meta['session_bindings_json']` 与同目录 `session_bindings.json`，扫描与 `TotalStore::apply_projection_if` 双层执行同一三态准入（`PersistentAllowed` / `TemporaryExcluded` / `UnknownHold`），不加表列。
 - 多机（`docs/linux-replica.md`）：每台只写自己的库，副本目录 `<data_local_dir>/svault/replicas/<store_id>.db` 只读；合读走 `--all-stores`，挑哪份只看内容与 `store_id`、不看哪个是本机；删除跨库传播走 `erasures` / `adopt-erasures`。
 - 改 schema 前必须回答「落后一版的消费者读不读得动」：核心表做过整表重建，「旧版还读得动」是纪律，不是构造。
 - 判断一份 svault 是哪一版看 `svault --version` 括号里的提交（`build.rs` 写入，`-dirty` = 构建时有未提交改动，`unknown` = 构建时没有 git）；前面是发布号（`release.py` 传入）或 `dev`（从源码自己编的），只供人看。消费方应正向断言提交与子命令，不靠「没报错」。
@@ -98,7 +99,7 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 
 - 是什么：`README.md`；设计契约：`docs/INGEST_KERNEL.md`；字段对账：`docs/rawevent-reconciliation.md`；扫描 / 投影状态模型：`docs/scan-state-model.md`。
 - 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
-- DSH 来源核查与读取状态设计（实验接缝，未注册正式 provider）：`docs/dsh-ingest-survey.md`、`docs/dsh-read-state-design.md`。
+- 控制面绑定、临时会话排除与真实来源契约：`docs/INGEST_KERNEL.md` §2.2、`src/session_binding.rs`；DSH 来源核查与读取状态设计（`dsh-experimental` 门控，未注册默认 provider）：`docs/dsh-ingest-survey.md`、`docs/dsh-read-state-design.md`。
 - 总库体积与待优化项（存了什么、哪些可回收，只记录未动手）：`docs/storage-growth.md`。
 - 总库在多台机器之间同步（现状、决定、方案、实测记录）：`docs/linux-replica.md`。
 - **待做清单**（各项做到哪、谁来做，做完划掉写提交号）：`docs/backlog.md`。

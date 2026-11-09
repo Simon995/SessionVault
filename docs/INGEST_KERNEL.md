@@ -57,23 +57,23 @@
 | **重放血缘防重（借鉴 ②）**       | 恢复/分叉在 `link` 与 `meta.json` 记血缘基线                                                                                                                                                                                                                                         | **上层做原生转写时的硬前提**（见 [backlog.md](backlog.md) G.4）：往原生目录写重放文件必须带血缘标记，让本仓扫描跳过重放段，防重复计 token 与重复入记忆                                                                                                                                                                                  |
 | **Codex 上游格式线索（借鉴 ③）** | `codex_rollout.rs` 处理 `<thread>_<segment>` 分页续写段（沿 `session_meta.payload.history_base` 拼接）与 `.jsonl.zst` 流式首行早停；`codex_index.rs` 只读查 `state_<N>.sqlite`                                                                                                       | **反哺扫描器核查**（见 [backlog.md](backlog.md) G.2、G.3）：核查分段 rollout 是否已在本机 / WSL 出现，以及优化 `session-origin` 压缩件流式早停                                                                                                                                                                                          |
 
-### 2.2 宿主与子 CLI 来源适配：职责与待定契约
+### 2.2 宿主与子 CLI 来源适配：职责与控制面绑定契约
 
-> **2026-11-04 登记，运行时适配尚未实现或发布**。11-05 至 11-06 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获及 Rust `dsh-experimental` 物理核验与原生语义 admission 接缝，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。本节不新增已可消费的字段、命令或默认行为；任务与顺序只记在 [backlog.md](backlog.md) H 节，正式实现遵守 `AGENTS.md` §4 规则 2。
+> **2026-11-04 登记，2026-11-09 落地控制面绑定、临时会话排除与真实来源保真（H.1 / H.2 / H.3）**。11-05 至 11-09 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获、Rust `dsh-experimental` 物理核验与原生语义 admission 接缝、会话目录选代、保守提交门及 `RawEvent` 归一化位置映射，并在 [`src/session_binding.rs`](../src/session_binding.rs) 与 [`src/rawevent.rs`](../src/rawevent.rs) 实现控制面准入契约与真实来源字段，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。DSH 正式 provider 注册与默认发现待定，任务与顺序记在 [backlog.md](backlog.md) H 节，遵守 `AGENTS.md` §4 规则 2。
 
 宿主对话摄取与执行后端选型分开：宿主已选用 DSH 时，其会话来源可以独立核查，不必等 Worker 选型结束。上层若复用 DSH 原生日志，只摄取同一份事实来源；只有上层另有独立会话记录时才评估新增 provider，避免宿主导出与原始日志重复计量、重复进入记忆。当前通用 JSONL 的实验入口不等于专用接入已交付。
 
-| 事项                   | 本仓承接                                                                                            | 上层编排方 / 记忆引擎承接                                                                    |
-| ---------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| 正式会话来源           | 发现、解压、格式解析、稳定来源身份、项目归属、增量与损坏恢复；核清旧版 / 新版并存时的逻辑来源与去重 | 提供实际配置根、脱敏样本及启动绑定；决定是否产生独立宿主记录，不另写路径换算或原生格式解析器 |
-| 临时会话               | 设计统一排除契约，使 CLI 与 Rust 写入路径遵守同一判据；可观察地说明排除与无法判定                   | 启动宿主与子 CLI 时传递临时属性；记忆引擎与消费缓存遵守临时范围，不把临时输出蒸馏进长期记忆  |
-| 真实发送方与 peer 来源 | 保留可核来源、控制面绑定证据及未知状态，不凭日志角色或正文自称推断人类身份                          | 产生真实发送方 / 接收方绑定；执行授权由控制层判定，peer 输入与历史检索结果不能升级成人类授权 |
-| 父子与重放血缘         | 区分父事件、父子会话与重放前缀关系；保留可核证据，无法确认时不猜；重放防重与 G.4 共用契约           | 记录任务到宿主 / 子 CLI 的执行绑定、派单与接力；若做原生转写则提供重放基线                   |
-| 删除与可回源状态       | 复用本地只读读取、稳定引用、墓碑与防复活；明确不可用、已擦除及缺证据的差别                          | 消费删除记录并清理索引、缓存与派生记忆；跨主机认证、请求路由、离线等待与删除回执编排归上层   |
+| 事项                   | 本仓承接                                                                                                                                                                   | 上层编排方 / 记忆引擎承接                                                                    |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| 正式会话来源           | 发现、解压、格式解析、稳定来源身份、项目归属、增量与损坏恢复；核清旧版 / 新版并存时的逻辑来源与去重                                                                        | 提供实际配置根、脱敏样本及启动绑定；决定是否产生独立宿主记录，不另写路径换算或原生格式解析器 |
+| 临时会话               | `SessionBindingRegistry` 统一三态准入（`PersistentAllowed` / `TemporaryExcluded` / `UnknownHold`），扫描与 `TotalStore::apply_projection_if` 执行同一判据；区分 `temporary` 与 `read_memory` | 启动宿主与子 CLI 时传递控制面绑定；记忆引擎与消费缓存遵守临时范围，不把临时输出蒸馏进长期记忆 |
+| 真实发送方与 peer 来源 | `RawEvent::input_origin`（`SenderKind` + `InputTrustLevel` + `sender_session` / `sender_address` / `xs_message_id` / `assignment_id` / `handoff_id`）保留可核来源与未知状态 | 产生真实发送方 / 接收方绑定；执行授权由控制层判定，peer 输入与历史检索结果不能升级成人类授权 |
+| 父子与重放血缘         | 区分父事件、父子会话（目录 `<parent>/subagents/agent-*.jsonl` 及显式 `parentSession` / 控制面 `parent_session_id`）与重放前缀关系；无法确认时显式 `ParentLineageUnknown`     | 记录任务到宿主 / 子 CLI 的执行绑定、派单与接力；若做原生转写则提供重放基线                   |
+| 删除与可回源状态       | 复用本地只读读取、稳定引用、墓碑与防复活；明确不可用、已擦除及缺证据的差别                                                                                                 | 消费删除记录并清理索引、缓存与派生记忆；跨主机认证、请求路由、离线等待与删除回执编排归上层   |
 
-临时属性与来源身份须来自约定的控制面绑定或可核来源元数据，不能靠消息正文里的标签自证。排除须在持久化内容与用量事件前生效，并覆盖全量、增量、重扫、子会话及不同写者；属性缺失或冲突须显式表示未知，隔离场景的拒入规则与既有普通会话兼容策略需要共同约定。`scan-all --only` 按来源类型过滤、`--stateless` 控制游标、`metadata` 抑制正文，均不能充当端到端临时会话排除。
+临时属性与来源身份来自控制面绑定（`TotalStore` 的 `store_meta['session_bindings_json']`、与库同目录的 `session_bindings.json` 或 `SVAULT_SESSION_BINDINGS`）及可核同侪信封元数据，不靠自由文本自称。排除在持久化任何 `Message` / `Thinking` / `ToolUse` / `ToolResult` / `Usage` 事件前生效，覆盖全量、增量、重扫、子会话血缘传递及多写者；绑定缺失必填字段、处于 `pending` 未决、存在冲突或清单损坏时显式进入 `UnknownHold`（fail-closed，扫描返回 `Unavailable` 冻住游标，写库返回 `StoreError::BindingUncertain`），绝不静默当成 `temporary: false`。既有未登记普通历史会话默认以 `verified_human_input: false`、`InputTrustLevel::Unknown` 保持兼容摄取。`scan-all --only` 按来源类型过滤、`--stateless` 控制游标、`metadata` 抑制正文，均不替代 `SessionBindingRegistry` 的端到端排除。
 
-日志 `role=user` / `Actor::User` 不是人类亲自输入或授权的证明。现有解析器把 `parent_ref` 留空，且它是父事件引用槽位，不能视为父子会话契约已交付；也不预先指定新增 `Actor` / `SourceType` 变体或挪用该字段。公开类型、序列化与 schema 的兼容方案要覆盖 CLI、Rust 构造 / 穷举、逐字段读取及按 `SourceMode` 过滤的消费者。
+日志 `role=user` / `Actor::User` 不是人类亲自输入或授权的证明：`RawEvent::input_origin` 将用户角色消息细分为 `HumanVerified`、`PeerSession`（如 `<cross-session-message ...>`、`[xs id=...]`）、`CoordinatorDispatch`、`SubagentOrRuntime` 与 `Unknown`，即使会话绑定了人类发起者，混入该会话的同侪跨会话消息仍保持 `PeerSession` / `PeerEnvelope` 或 `IncompleteEnvelope`，绝不升格为 `HumanVerified`。`parent_ref` 保持为父事件引用槽位，父子会话血缘由 `ParseOut::session_parents` 与 `SessionBindingRegistry` 独立承载。
 
 **原始总库留在来源主机、记忆就地处理**的需求不以复制整库为前提。现有 [多机副本模型](linux-replica.md) 仍是另一条已记录方案；它的 `--all-stores` 不是远程回源 RPC。新模式下，本仓提供来源主机上的本地证据与状态出口，上层承担远程编排；具体传输与身份绑定尚待契约确认。`erase` 不删除上游原生日志，也不会自动清理下游缓存；`session-origin` 只读 Codex 记录的仓库远端，不查墓碑，不能据它绕过擦除限制回读正文。总库不可读、会话找不到、证据版本变化、已擦除与来源主机离线，不得合并成一个空结果或“可恢复”。
 
@@ -316,6 +316,7 @@ project_root_source       # 归属判定依据；须据此区分已归属与未�
 workspace_location        # 项目物理位置，与 transcript 的 source_location 分开
 event_type                # message / tool_use / tool_result / usage / meta / config_snapshot / thinking
 actor                     # Option<Actor>，user / assistant / tool / system；不是授权证明
+input_origin              # Option<InputOrigin>：sender_kind / trust_level / sender_session / sender_address / xs_message_id / assignment_id / handoff_id
 occurred_at               # Option<String>，保留来源原始时间戳
 time_confidence           # high / low；现行主要按有无 occurred_at 标记，不替代时间解析
 model

@@ -65,6 +65,7 @@ QuotaBar 把"事件"拆成 `UsageFactRow` + `TranscriptMessage`，没有统一 R
 | `occurred_at` | `ts_unix`（Claude 顶层 `timestamp`；Codex `value.timestamp`），`parse_ts` 收秒/毫秒/RFC3339 | ✓ 有，质量好 |
 | `time_confidence` | **无**——Codex 无时间戳的 token 事件直接跳过；Claude hint 记 `None` | **greenfield**（实践中多数行有时间戳） |
 | `actor` | `TranscriptMessage.role`（user/assistant/tool/system/**thinking**） | ✓ 但仅在即时 transcript 路径，未落库 |
+| `input_origin` | **无**——QuotaBar 不区分人类真实输入、跨会话同侪消息或协调派单 | **greenfield**（2026-11-09 于 `src/rawevent.rs` / `src/session_binding.rs` 落地 `Option<InputOrigin>`，保留 `SenderKind`、`InputTrustLevel` 及同侪/派单证据字段） |
 | `event_type` | 隐含：usage / message / function_call / function_call_output / reasoning(thinking) | **需显式建模**；Codex payload.type 已能区分 |
 | `content` | `TranscriptMessage.content`（`extract_text`） | ✓ 有抽取函数，但**即时、不持久** |
 | `cwd` / `project_root` / `_source` / `_confidence` | `resolve_project_root` + `normalize_cwd_for_location` | ✓；source 实际值=`git`/`marker:<file>`/`cwd`/`wsl_cwd`/`missing_cwd`（§7 写的 `none` 应改 `missing_cwd`，且 marker 带文件名） |
