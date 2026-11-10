@@ -4,9 +4,9 @@
 > 把"发现各 Agent 本地数据 → 增量扫描 → 归一化为 `RawEvent` → 追加保存到总库"
 > 这件最容易踩坑的事，**只实现一次**；用户主动擦除受墓碑与防复活规则保护。
 
-**现状（2026-11-09 核对）**：Claude Code / Codex 本地与 WSL 摄取、状态快照、总库正文加密、用户擦除、项目归属及多机副本读取已实现；控制面会话绑定（`session_binding`）、扫描与总库双层临时会话排除、子会话血缘继承、真实发送方 / 同侪来源保真（`RawEvent::input_origin`）以及 `reclaim-rollbacks` 已随 `v2026.11.09.1`（`ccfbdca`）正式发布（发布记录见 [待做清单 B 节](docs/backlog.md#b-发版)）；DSH 宿主来源已在 `dsh-experimental` 门控下完成同缓冲区物理核验、原生 admission、会话目录选代、保守提交门（`faed841`）及 `RawEvent` 归一化位置映射与实验性 `TotalStore` + `DshSavedState` 提交接线（`9d64cce`）。
+**现状（2026-11-10 核对）**：Claude Code / Codex 本地与 WSL 摄取、状态快照、总库正文加密、用户擦除、项目归属及多机副本读取已实现；控制面会话绑定、双层临时会话排除、子会话血缘、`RawEvent::input_origin` 与 `reclaim-rollbacks` 已随 `v2026.11.09.1`（`ccfbdca`）正式发布。DSH v4 复杂语义与细粒度用量证据已合入 `main`（`dc682ff` / `498b7a3`），尚未发新 Release。当前开发分支 `feat/dsh-source-integration` 将显式配置的 DSH 来源接到常规 `catalog` / `discover` / `scan-all`，复用 `Jsonl` + `AppendLog`，未配置时不扩大发现范围。
 
-**接下来**：按 2026-11-09 拍板（首版仅支持 DSH 会话日志格式第 4 代 `session.v4.jsonl[.zstd]`，旧代 / 未来代显式报不支持），推进 DSH 复杂语义（fork / descriptor、compaction 有效视图）与正式 `SourceType` / `discover` 注册。证据与设计见 [DSH 核查记录](docs/dsh-ingest-survey.md)、[读取状态设计](docs/dsh-read-state-design.md) 与 [内核设计](docs/INGEST_KERNEL.md) §2.2；任务顺序与阻塞只维护在 [待做清单](docs/backlog.md)。
+**接下来**：review 当前分支的来源接线与有限兼容验收结果，再协调写者升级、合并和发布。旧版 CLI 能结构读取新事件，但不会输出未知的 `usage_evidence`；旧版整代重写会丢失证据，因此接入前需升级所有可能重写事件的写者。配置方式见下文，证据与兼容边界见 [读取状态设计](docs/dsh-read-state-design.md) §14–§15；任务顺序只维护在 [待做清单](docs/backlog.md)。
 
 历史抽取 / 迁移记录保留在下文，均按当时日期理解。消费方的迁移收尾、发布与实际接入由各仓维护，本仓不据历史记录推断它们的当前进度。
 
@@ -26,7 +26,7 @@
 
 | 模块                         | 职责                                                                                                                                                                                                                                                                                                                                                                                        | 状态                                                                         |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `catalog`                    | 声明式来源目录（provider × 子目录 × 形态）                                                                                                                                                                                                                                                                                                                                                  | ✅ Claude / Codex                                                            |
+| `catalog`                    | 声明式来源目录（provider × 子目录 × 形态） | ✅ Claude / Codex / 显式配置的 DSH v4（开发分支） |
 | `discover`                   | 发现本地 + WSL 来源清单（不读内容）                                                                                                                                                                                                                                                                                                                                                         | ✅ 本地 + WSL                                                                |
 | `parser`                     | 行级 JSONL → `RawEvent`（Claude / Codex 字段映射、Codex 累计 token delta）                                                                                                                                                                                                                                                                                                                  | ✅                                                                           |
 | `pathnorm`                   | 宿主感知路径规范化（`HostPlatform`、UNC↔规范形、`workspace_location`）                                                                                                                                                                                                                                                                                                                     | ✅                                                                           |
@@ -34,7 +34,7 @@
 | `scan`                       | 增量扫描：append_log 字节游标；snapshot_file SHA-256 指纹                                                                                                                                                                                                                                                                                                                                   | ✅ append_log + snapshot_file                                                |
 | `compressed`                 | Codex 就地压缩的 `*.jsonl.zst`：按逻辑路径 `*.jsonl` 发现，偏移按解压后的字节算（纯 Rust 解压）                                                                                                                                                                                                                                                                                             | ✅ 2026-10-20 本机 88 个实测                                                 |
 | `session_binding`            | 控制面会话绑定（`SessionBindingRegistry`）、三态准入（`PersistentAllowed` / `TemporaryExcluded` / `UnknownHold`）、扫描与总库双层临时会话排除、子会话血缘传递及 `RawEvent::input_origin` 同侪信封分类                                                                                                                                                                                       | ✅ 已发布（`v2026.11.09.1` / `a151997`）                                    |
-| `dsh_snapshot`               | DSH v4 同缓冲区物理核验、原生 admission、会话目录选代、同句柄身份、旧前缀对照、保守提交门、`RawEvent` 归一化位置映射与实验性 `TotalStore` + `DshSavedState` 提交接线                                                                                                                                                                                                                        | ✅ `dsh-experimental` 门控（`faed841` / `9d64cce`），默认 provider 待注册    |
+| `dsh_snapshot` / `dsh_provider` | DSH v4 物理与原生核验、选代、旧前缀与生命周期、复杂语义、细粒度用量及正式扫描接线 | ✅ 当前分支默认编译核验模块；扫描要求 `store` 与显式配置，未发布 |
 | `cursor`                     | 多形态游标（字节偏移 / fingerprint + Codex 状态 + `next_seq`）                                                                                                                                                                                                                                                                                                                              | ✅                                                                           |
 | `svault` CLI                 | 子命令（NDJSON 出 stdout）：`discover` / `scan-all` / `pull` / `sessions-recent` / `sessions-read` / `session-origin` / `snapshots` / `sync-snapshots` / `roots` / `attribute` / `memory-roots` / `store-path` / `store-info` / `stores` / `erasures` / `adopt-erasures` / `key-export` / `key-import` / `changes` / `gc` / `erase` / `reattribute` / `reclaim-rollbacks`；跨运行游标持久化 | ✅ 已发布（`v2026.11.09.1`，发布记录见待做清单 B 节）                        |
 | `parity` 工具                | P2 影子并跑 diff：QuotaBar `usage_facts` ⇄ RawEvent(usage)（`required-features=["parity"]`）                                                                                                                                                                                                                                                                                                | ✅ 首测 must-match=0                                                         |
@@ -96,6 +96,21 @@ CLI：
   各出一行 `snapshot_excluded`，带原因：`source_gone`（确认不在）/ `decode_failed`
   （没读成，**不是**删了）。**判「已删」要凭 `source_gone`，不能凭「不在列表里」** ——
   本仓从没采到的来源也不在列表里。
+
+## DSH 来源配置（当前开发分支）
+
+使用带 `store` feature 的构建，并在运行进程中显式配置：
+
+| 环境变量 | 要求 |
+| --- | --- |
+| `SVAULT_DSH_SESSIONS_DIR` | 本机绝对会话根，直接包含各会话目录；优先于 `SVAULT_DSH_HOME` |
+| `SVAULT_DSH_HOME` | 可选替代，读取其 `sessions` 子目录 |
+| `SVAULT_DSH_NODE` | 可信本机 Node 可执行文件的绝对路径 |
+| `SVAULT_DSH_PACKAGE` | 可信本机 `@deepseek-ai/dsh/package.json` 的绝对路径 |
+
+未配置根时不发现 DSH。配置后沿用 `svault discover` 与 `svault scan-all`，来源类型仍为 `jsonl`、模式仍为 `append_log`，`source_path` 是稳定的会话目录。仅摄取最高规范格式代为 v4 的会话；旧代、未来代、冲突编码、坏尾、缺少运行时或核验失败会报告并冻结旧状态与投影。`--only jsonl` 同时包括显式配置的通用 JSONL 来源，不是 DSH 独占过滤。Windows 进程只接本机配置根；发行版内扫描需在 Linux 进程内配置对应根与运行时。
+
+接入写库前需协调所有写者升级：旧版整代重写会丢掉 `usage_evidence`，包含旧 CLI `reattribute --apply`，以及消费方旧版归属重算路径。Rust 消费方还需持久化 `Cursor.dsh_state`，适配 `SourceChange::ReparseRequired` 的完整重投影语义；DSH 写库应使用 `dsh_provider::scan_source` 与 `apply_dsh_planned_projection`，以完整目标核对总库、避免只读游标领先时漏写。只读取原四桶的消费方不会自动获得新的细粒度用量汇总。完整证据与可复跑命令见 [读取状态设计 §14–§15](docs/dsh-read-state-design.md#14-常规来源接线与持久化凭据)。
 
 ## 历史落地路线（绞杀者迁移）
 

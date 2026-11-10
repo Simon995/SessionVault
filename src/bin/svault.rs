@@ -1404,6 +1404,8 @@ fn resolve_scan_profile(profile: Option<ProfileArg>, write_store: bool) -> Resul
 /// events 存两份会让「改了一份忘了另一份」成为可能。
 enum Scanned {
     Observed(session_vault::observation::AppendLogObservation),
+    #[cfg(feature = "store")]
+    Dsh(Box<session_vault::dsh_snapshot::DshPlannedStep>),
     Projected {
         events: Vec<RawEvent>,
         cursor_out: Cursor,
@@ -1414,6 +1416,8 @@ impl Scanned {
     fn events(&self) -> &[RawEvent] {
         match self {
             Self::Observed(o) => &o.events,
+            #[cfg(feature = "store")]
+            Self::Dsh(planned) => &planned.observation.events,
             Self::Projected { events, .. } => events,
         }
     }
@@ -1426,6 +1430,8 @@ impl Scanned {
     fn fingerprint(&self) -> Option<&session_vault::observation::SourceFingerprint> {
         match self {
             Self::Observed(o) => o.source_fingerprint.as_ref(),
+            #[cfg(feature = "store")]
+            Self::Dsh(planned) => planned.observation.source_fingerprint.as_ref(),
             Self::Projected { .. } => None,
         }
     }
@@ -1502,6 +1508,8 @@ fn next_state(scanned: Scanned, prev: Option<&SourceState>, write_store: bool) -
         fingerprint,
         cursor: match scanned {
             Scanned::Observed(o) => o.cursor,
+            #[cfg(feature = "store")]
+            Scanned::Dsh(planned) => planned.observation.cursor,
             Scanned::Projected { cursor_out, .. } => cursor_out,
         },
     }
@@ -1512,6 +1520,13 @@ fn next_state(scanned: Scanned, prev: Option<&SourceState>, write_store: bool) -
 struct Prefetched {
     stats: session_vault::scan::StatPrefetch,
     snapshots: session_vault::scan::SnapshotPrefetch,
+}
+
+#[cfg(feature = "store")]
+struct DshScanContext {
+    reasons: session_vault::scan_plan::ScanReasons,
+    prior: session_vault::scan_plan::PriorProjection,
+    attribution_revision: i64,
 }
 
 /// 扫一个来源。全读的起点与旧来源基线分开；其余走既有的 `scan_source`。
@@ -1525,7 +1540,29 @@ fn scan_one(
     roots: std::sync::Arc<session_vault::attribution::RootRegistry>,
     prefetch: &Prefetched,
     bindings: &session_vault::SessionBindingRegistry,
+    #[cfg(feature = "store")] dsh_context: Option<DshScanContext>,
 ) -> (Scanned, session_vault::report::SourceReport) {
+    #[cfg(feature = "store")]
+    if session_vault::dsh_provider::is_source(s) {
+        let context = dsh_context.unwrap_or(DshScanContext {
+            reasons: session_vault::scan_plan::ScanReasons::NONE,
+            prior: session_vault::scan_plan::PriorProjection::no_store(),
+            attribution_revision: 0,
+        });
+        let prior = prior_cursor.cloned().or(cursor_in);
+        let (planned, report) = session_vault::dsh_provider::scan_source(
+            s,
+            prior,
+            profile,
+            roots,
+            bindings,
+            context.reasons,
+            context.prior,
+            context.attribution_revision,
+            session_vault::deadline::Deadline::unbounded(),
+        );
+        return (Scanned::Dsh(Box::new(planned)), report);
+    }
     match s.source_mode {
         SourceMode::AppendLog => {
             let (mut obs, mut report) = session_vault::scan::scan_append_log_with_bindings(
@@ -1655,11 +1692,44 @@ impl ScanWriter {
         reasons: session_vault::scan_plan::ScanReasons,
         prior: session_vault::scan_plan::PriorProjection,
     ) -> Result<(Committed, session_vault::scan_plan::CommitPlan), String> {
-        use session_vault::scan_plan::{CommitPlan, StoreAction};
+        let plan = session_vault::scan_plan::CommitPlan::plan(obs, reasons, prior);
+        self.commit_plan(source, obs, plan)
+    }
 
+    fn commit_dsh(
+        &self,
+        source: &SourceRef,
+        planned: &session_vault::dsh_snapshot::DshPlannedStep,
+    ) -> Result<(Committed, session_vault::scan_plan::CommitPlan), String> {
+        let plan = planned.plan.clone();
+        let key = source_key_of(source);
+        let before = self
+            .store
+            .current_head("jsonl", &key.source_location.as_key(), &key.source_path)
+            .map_err(|e| e.to_string())?;
+        let stats =
+            session_vault::dsh_snapshot::apply_dsh_planned_projection(&self.store, key, planned)
+                .map_err(|e| e.to_string())?;
+        let Some(stats) = stats else {
+            return Ok((Committed::Preserved, plan));
+        };
+        let session_vault::scan_plan::StoreAction::Project(mut mode) = plan.store() else {
+            unreachable!("preserved plans do not write")
+        };
+        if stats.head_moved && stats.source_revision > before.0 {
+            mode = Projection::Rollback;
+        }
+        Ok((Committed::Wrote { mode, stats }, plan))
+    }
+
+    fn commit_plan(
+        &self,
+        source: &SourceRef,
+        obs: &session_vault::observation::AppendLogObservation,
+        plan: session_vault::scan_plan::CommitPlan,
+    ) -> Result<(Committed, session_vault::scan_plan::CommitPlan), String> {
+        use session_vault::scan_plan::StoreAction;
         let source_key = source_key_of(source);
-        let plan = CommitPlan::plan(obs, reasons, prior);
-
         let mode = match plan.store() {
             StoreAction::Preserve => return Ok((Committed::Preserved, plan)),
             StoreAction::Project(mode) => mode,
@@ -1682,17 +1752,21 @@ impl ScanWriter {
 
         // 🔴 `Append` 不传 token（靠 seq 去重，重放天然幂等）；**开新代的两种一律要传**，
         // 否则一次崩溃重放就多留一代，而 `Rollback` 那代按设计永不自动回收（ADR-051 I7）。
-        let token = match mode {
-            Projection::Append => None,
-            Projection::Rollback | Projection::Reparse => {
-                Some(session_vault::token::ProjectionToken::new(
-                    &source_key,
-                    obs.source_fingerprint.as_ref().map(|f| f.as_str()),
-                    session_vault::PARSER_REVISION,
-                    self.attribution_revision,
-                    // 全读 ⇒ 字节范围从 0 起。上面刚断言过这一点。
-                    (0, obs.cursor.safe_offset),
-                ))
+        let token = if let Some(state) = obs.cursor.dsh_state.as_ref() {
+            Some(state.projection_token(&source_key))
+        } else {
+            match mode {
+                Projection::Append => None,
+                Projection::Rollback | Projection::Reparse => {
+                    Some(session_vault::token::ProjectionToken::new(
+                        &source_key,
+                        obs.source_fingerprint.as_ref().map(|f| f.as_str()),
+                        session_vault::PARSER_REVISION,
+                        self.attribution_revision,
+                        // 全读 ⇒ 字节范围从 0 起。上面刚断言过这一点。
+                        (0, obs.cursor.safe_offset),
+                    ))
+                }
             }
         };
         self.store
@@ -1787,6 +1861,11 @@ fn run_scan_all(
     // 而那与「本机确实一个项目根都没发现」在输出里长得一模一样。
     let session_bindings =
         session_vault::SessionBindingRegistry::load_for_context(None, store_arg.as_deref());
+    #[cfg(feature = "store")]
+    let session_bindings = match writer.as_ref() {
+        Some(writer) => writer.store.load_session_bindings(),
+        None => session_bindings,
+    };
     let roots = std::sync::Arc::new(project_roots(store_arg));
     let roots_empty = roots.is_empty();
     if roots_empty {
@@ -1936,6 +2015,14 @@ fn run_scan_all(
             roots.clone(),
             &prefetch,
             &session_bindings,
+            #[cfg(feature = "store")]
+            Some(DshScanContext {
+                reasons,
+                prior,
+                attribution_revision: writer
+                    .as_ref()
+                    .map_or(0, |writer| writer.attribution_revision),
+            }),
         );
         total_events += report.events_emitted;
 
@@ -1957,6 +2044,10 @@ fn run_scan_all(
         // 不会被扫到，而且没有任何报错。
         #[cfg(feature = "store")]
         let advance = match (writer.as_ref(), &scanned) {
+            (None, Scanned::Dsh(planned)) => {
+                planned.plan.cursor() == session_vault::scan_plan::CursorAction::Advance
+                    && planned.candidate_state.is_some()
+            }
             (None, _) => true,
             // 🔴 **快照来源不由这条路写。** Class-B 的写入口是 `sync-snapshots`
             // （走 `class_b::enumerate()` + `TotalStore::sync_snapshots`，有自己的
@@ -1971,14 +2062,23 @@ fn run_scan_all(
             // `prior` 在扫之前就问过了（它决定了这一轮读多少），这里**复用同一个
             // 答案**而不是再查一次：中间那次扫描可能长达几分钟，重查会让「决定读多少」
             // 与「决定怎么写」用上两个不同代的库状态。
-            (Some(w), Scanned::Observed(obs)) => {
+            (Some(w), scanned) => {
+                let (obs, dsh_plan) = match scanned {
+                    Scanned::Observed(obs) => (obs, None),
+                    Scanned::Dsh(planned) => (&planned.observation, Some(planned.as_ref())),
+                    Scanned::Projected { .. } => unreachable!("snapshots handled above"),
+                };
                 if report.admission_status.as_deref() == Some("temporary_excluded")
                     && obs.events.is_empty()
                 {
                     // H.2：临时会话（或其子会话）在入库前统一排除，不向总库写空代、不记游标。
                     false
                 } else {
-                    match w.commit(s, obs, reasons, prior) {
+                    let committed = match dsh_plan {
+                        Some(planned) => w.commit_dsh(s, planned),
+                        None => w.commit(s, obs, reasons, prior),
+                    };
+                    match committed {
                         Ok((committed, plan)) => {
                             let quality = plan.quality();
                             match committed {
@@ -2171,9 +2271,11 @@ fn run_pull(since: i64, projection: ProjectionArg, limit: u64, store_arg: Option
             return 1;
         }
     };
-    let (store_max_offset, store_id) = match store.status().and_then(|s| Ok((s, store.store_id()?)))
+    let (store_max_offset, store_id) = match store
+        .max_offset()
+        .and_then(|max_offset| Ok((max_offset, store.store_id()?)))
     {
-        Ok((s, id)) => (s.max_offset, id),
+        Ok(result) => result,
         Err(e) => {
             log::error!(target: tag::CLI, "store status failed: {e}");
             return 1;
@@ -2414,7 +2516,7 @@ fn run_stores(store_arg: Option<PathBuf>, replicas_arg: Option<PathBuf>) -> i32 
                 store_id,
                 store,
             } => {
-                let status = match store.status() {
+                let status = match store.event_summary() {
                     Ok(s) => s,
                     Err(e) => {
                         log::error!(target: tag::CLI, "store status failed: {e}");
@@ -3920,6 +4022,7 @@ mod tests {
             roots(),
             &Default::default(),
             &Default::default(),
+            None,
         );
         assert!(
             matches!(scanned, Scanned::Observed(_)),
@@ -3945,6 +4048,7 @@ mod tests {
             roots(),
             &Default::default(),
             &Default::default(),
+            None,
         );
         assert!(matches!(scanned, Scanned::Projected { .. }));
         assert!(scanned.fingerprint().is_none(), "投影那条给不出指纹");

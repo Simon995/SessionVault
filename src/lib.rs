@@ -18,8 +18,9 @@ pub mod cursor;
 pub mod deadline;
 pub mod discover;
 pub mod discovery;
-/// DSH 同缓冲区物理核验与记录位置原型；不提供 RawEvent 或生产推进凭据。
-#[cfg(feature = "dsh-experimental")]
+/// 显式配置的 DSH v4 来源接线；未配置时不扩大发现范围。
+pub mod dsh_provider;
+/// DSH v4 同缓冲区核验、原生 admission、归一化与保守提交门。
 pub mod dsh_snapshot;
 pub mod identity;
 pub mod logging;

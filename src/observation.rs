@@ -54,6 +54,8 @@ pub enum SourceChange {
     Appended,
     /// 变短、时间戳倒退，或指纹与上次不符 ⇒ 之前读到的字节已经不作数。
     RollbackOrRewrite,
+    /// 原生前缀未改，但既有归一化事件的语义或控制面丰富改变，须完整重投影。
+    ReparseRequired,
 }
 
 /// 这一批**字节**读得怎么样。

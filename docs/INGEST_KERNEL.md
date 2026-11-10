@@ -59,7 +59,7 @@
 
 ### 2.2 宿主与子 CLI 来源适配：职责与控制面绑定契约
 
-> **2026-11-04 登记，2026-11-09 落地控制面绑定、临时会话排除与真实来源保真（H.1 / H.2 / H.3），2026-11-10 合入 DSH v4 复杂语义与会话根批量扫描（H.4，`dc682ff`）及有效视图切点（G.1–G.3，`d7d3315`）**。11-05 至 11-10 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获、Rust `dsh-experimental` 物理核验与原生语义 admission 接缝、会话目录选代、保守提交门、`RawEvent` 归一化位置映射、表面折叠/压缩/子代理/多层 fork 及会话根目录批量发现与扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`），并在 [`src/session_binding.rs`](../src/session_binding.rs) 与 [`src/rawevent.rs`](../src/rawevent.rs) 实现控制面准入契约、真实来源字段与压缩边界切点，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。DSH 默认 `default_providers()` 注册待宿主固定线上会话根后开启，任务与顺序记在 [backlog.md](backlog.md) H 节，遵守 `AGENTS.md` §4 规则 2。
+> **2026-11-04 登记，2026-11-09 落地控制面绑定、临时会话排除与真实来源保真（H.1 / H.2 / H.3），2026-11-10 合入 DSH v4 复杂语义与会话根批量扫描（H.4，`dc682ff`）及有效视图切点（G.1–G.3，`d7d3315`）**。11-05 至 11-10 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获、Rust `dsh-experimental` 物理核验与原生语义 admission 接缝、会话目录选代、保守提交门、`RawEvent` 归一化位置映射、表面折叠/压缩/子代理/多层 fork 及会话根目录批量发现与扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`），并在 [`src/session_binding.rs`](../src/session_binding.rs) 与 [`src/rawevent.rs`](../src/rawevent.rs) 实现控制面准入契约、真实来源字段与压缩边界切点，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。细粒度用量证据已合入 `main`（`498b7a3`）。当前开发分支 `feat/dsh-source-integration` 将显式配置根下的 DSH 来源接到 `catalog::builtin_descriptors()` / `discover` / `scan-all`（见 [读取状态设计 §14–§15](dsh-read-state-design.md#14-常规来源接线与持久化凭据)），尚未合并或发布；任务与顺序记在 [backlog.md](backlog.md) H 节，遵守 `AGENTS.md` §4 规则 2。
 
 宿主对话摄取与执行后端选型分开：宿主已选用 DSH 时，其会话来源可以独立核查，不必等 Worker 选型结束。上层若复用 DSH 原生日志，只摄取同一份事实来源；只有上层另有独立会话记录时才评估新增 provider，避免宿主导出与原始日志重复计量、重复进入记忆。当前通用 JSONL 的实验入口不等于专用接入已交付。
 
@@ -91,6 +91,7 @@
 | Codex 全局 `AGENTS.md`、`memories/*.md`、`memories/rollout_summaries/*.md`、`memories/extensions/ad_hoc/notes/*.md`、`rules/*.rules`、`skills/**/*.md` | `snapshot_file`，`experimental`                                                                       |
 | 宿主已确认项目根内的指令文件                                                                                                                           | `discover_project_snapshots` 单独发现，不能把全部项目层候选都算作已实现                               |
 | 通用 JSONL `sessions/**/*.jsonl`                                                                                                                       | `append_log`，`experimental`；仅显式设置 `SVAULT_JSONL_DIR` 时发现                                    |
+| DSH 会话目录内最高规范代 `session.v4.jsonl[.zstd]`（当前开发分支） | `append_log`，复用 `Jsonl` 类型；仅显式 `SVAULT_DSH_SESSIONS_DIR` 或 `SVAULT_DSH_HOME` 时发现，逻辑来源为会话目录；扫描需 `store`、`SVAULT_DSH_NODE` 与 `SVAULT_DSH_PACKAGE`，核验失败冻结 |
 
 `sqlite_store` / `opaque_family`、任意派生配置根与其他 provider 仍是预留设计；当前描述符没有 Cursor / Gemini 的可扫描实现。
 
@@ -99,7 +100,7 @@
 数据源审计（结论已并入本文，原始报告已移除）揭示一个关键点：**不能把所有来源都默认当成"追加写的 JSONL、按字节增量读"**——一旦后面接 rules / hooks / agents / 任务状态 / SQLite，就会被迫改核心层。为此来源目录给每个 artifact 标两个正交属性：
 
 - **`source_mode`（形态）**：决定怎么读、用什么游标——
-  - `append_log`：只增长的 JSONL（会话、history 的常态），按字节 `safe_offset` 增量读。
+  - `append_log`：会话日志的增量读取形态；既有 Claude / Codex 按逻辑字节 `safe_offset` 增量读。DSH 用 `Cursor.dsh_state` 保存完整原生旧前缀、生命周期及丰富前后归一化摘要，不能把通用字节游标当作它的推进依据。既有事件语义变化经 `SourceChange::ReparseRequired` 传出；写库走 `apply_dsh_planned_projection` 完整目标核对，读取游标不充当已入库水位。
   - `snapshot_file`：会被整体重写/覆盖的文本（CLAUDE.md / AGENTS.md / rules / memory 等），按 SHA-256 内容指纹判变，变了产 `config_snapshot`。**已落地选择**：`full` 档把正文写入 `RawEvent.content`，随事件一起进入 AES-256-GCM 加密总库；`content_hash` 用于版本和增量，`observed_at` 只表示扫描观测时间，不伪造真实生效时间。后续体积证明需要时再评估按 hash 去重的 `snapshot_blob`，当前不提前增加第二存储契约。
 
     🔴 **2026-08-29 新增 `modified_at`（源文件 mtime，Unix 秒串）。** 这**不是**推翻

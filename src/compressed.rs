@@ -181,7 +181,6 @@ fn decode_frame<R: Read + ?Sized>(
     Ok(true)
 }
 
-#[cfg(feature = "dsh-experimental")]
 #[derive(Debug)]
 pub(crate) struct CheckedFrame {
     pub physical_start: usize,
@@ -189,7 +188,6 @@ pub(crate) struct CheckedFrame {
     pub decoded: Vec<u8>,
 }
 
-#[cfg(feature = "dsh-experimental")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameCheckFailure {
     Incomplete,
@@ -201,7 +199,6 @@ pub(crate) enum FrameCheckFailure {
 }
 
 /// 完整验证每一帧后才交出字节与边界；沿用上面的唯一帧头/解码实现。
-#[cfg(feature = "dsh-experimental")]
 pub(crate) fn checked_frames(
     bytes: &[u8],
     decoded_limit: u64,

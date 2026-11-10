@@ -384,9 +384,10 @@ impl CommitPlan {
         // 🔴 **只有确知有前代才开新代。** `NoStore` 与 `Absent` 在这里落到同一处，
         // 但那是因为「不确定时不做不可逆的那一步」，不是因为它们是一回事。
         let has_prior = prior.is_present();
+        let reparse = reasons.wants_reparse() || obs.source_change == SourceChange::ReparseRequired;
         let projection = if rewritten && has_prior {
             Projection::Rollback
-        } else if reasons.wants_reparse() && has_prior {
+        } else if reparse && has_prior {
             // 同一份字节、更好的解析器/更全的注册表 ⇒ 取代被超越的那一代。
             Projection::Reparse
         } else {
@@ -398,7 +399,7 @@ impl CommitPlan {
         // 两批都从 seq 0 起，合并必然撞 `(provider, location, source_path, seq)` 主键
         // —— 事务回滚，此后每轮刷新都失败。
         let full_read = rewritten
-            || reasons.wants_reparse()
+            || reparse
             || reasons.wants_full_read()
             || matches!(quality, QualityState::Degraded(_));
 
@@ -810,7 +811,11 @@ mod tests {
             ParseQuality::RejectedPoisonLine(diag()),
             ParseQuality::Unavailable(ScanFailure::Read("io".into())),
         ];
-        let changes = [SourceChange::Appended, SourceChange::RollbackOrRewrite];
+        let changes = [
+            SourceChange::Appended,
+            SourceChange::RollbackOrRewrite,
+            SourceChange::ReparseRequired,
+        ];
         let reason_sets = [
             ScanReasons::NONE,
             ScanReasons::INITIAL,
@@ -853,7 +858,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(seen, 5 * 2 * 7 * 2, "矩阵要跑满");
+        assert_eq!(
+            seen,
+            qualities.len() * changes.len() * reason_sets.len() * 2,
+            "矩阵要跑满"
+        );
     }
 
     #[test]

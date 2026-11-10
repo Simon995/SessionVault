@@ -318,6 +318,8 @@ pub struct SourceSnapshot {
     compression: Compression,
     stamp: FileStamp,
     source_binding: String,
+    // 接受同一逻辑来源的另一种物理编码；兼容既有含编码的持久化绑定，不放宽来源身份。
+    alternate_encoding_binding: Option<String>,
     admitted: AdmittedSnapshot,
 }
 
@@ -431,6 +433,24 @@ fn observe_again(
     }
 }
 
+fn source_binding_for(
+    config: &SourceConfig,
+    session_id: &str,
+    compression: Compression,
+    generation: u32,
+) -> String {
+    hash(
+        &serde_json::to_vec(&json!([
+            &config.source_instance,
+            config.session_dir.to_string_lossy(),
+            session_id,
+            compression.as_str(),
+            generation,
+        ]))
+        .expect("serializable source binding"),
+    )
+}
+
 /// 从显式会话目录执行选代、同句柄有界读取、物理核验、原生 admission 与前后复查。
 pub fn capture_source(
     config: &SourceConfig,
@@ -468,20 +488,29 @@ pub fn capture_source(
     }
     let admitted = runtime.admit(physical, deadline)?;
     observe_again(&config.session_dir, config.compression, &selected, stamp)?;
-    let binding_payload = serde_json::to_vec(&json!([
-        &config.source_instance,
-        config.session_dir.to_string_lossy(),
+    let source_binding = source_binding_for(
+        config,
         admitted.session_id(),
-        config.compression.as_str(),
+        config.compression,
         selected.generation,
-    ]))
-    .expect("serializable source binding");
+    );
+    let other_encoding = match config.compression {
+        Compression::None => Compression::Zstd,
+        Compression::Zstd => Compression::None,
+    };
+    let alternate_encoding_binding = Some(source_binding_for(
+        config,
+        admitted.session_id(),
+        other_encoding,
+        selected.generation,
+    ));
     Ok(SourceSnapshot {
         session_dir: config.session_dir.clone(),
         selected,
         compression: config.compression,
         stamp,
-        source_binding: hash(&binding_payload),
+        source_binding,
+        alternate_encoding_binding,
         admitted,
     })
 }
@@ -587,6 +616,12 @@ pub struct DshSavedState {
     pub native_events_sha256: String,
     pub event_sha256s: Vec<String>,
     pub normalized_next_seq: u64,
+    /// 归一化事件在控制面丰富前的完整摘要；闭合 turn 可能只改变旧事件的证据而不改变条数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized_events_sha256: Option<String>,
+    /// 完整落库事件（含控制面丰富与 profile）的摘要，区分同原生内容的不同投影目标。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_events_sha256: Option<String>,
 }
 
 impl DshSavedState {
@@ -610,6 +645,8 @@ impl DshSavedState {
             native_events_sha256: snapshot.native_events_sha256().to_string(),
             event_sha256s: snapshot.event_sha256s().to_vec(),
             normalized_next_seq,
+            normalized_events_sha256: None,
+            projected_events_sha256: None,
         }
     }
 
@@ -634,6 +671,27 @@ impl DshSavedState {
         self.event_sha256s.len()
     }
 
+    /// 常规 CLI 与原生提交入口共用同一投影 token，跨写者崩溃重放不会重复开代。
+    #[cfg(feature = "store")]
+    pub fn projection_token(
+        &self,
+        source: &crate::store::SourceKey,
+    ) -> crate::token::ProjectionToken {
+        let fingerprint = format!(
+            "dsh4:target:{}:{}:{}",
+            self.lifecycle_sha256,
+            self.native_events_sha256,
+            self.projected_events_sha256.as_deref().unwrap_or("legacy")
+        );
+        crate::token::ProjectionToken::new(
+            source,
+            Some(&fingerprint),
+            self.parser_revision,
+            self.attribution_revision,
+            (0, self.native_events() as u64),
+        )
+    }
+
     pub fn compare(&self, next: &SourceSnapshot) -> SnapshotRelation {
         compare_parts(
             &self.source_binding,
@@ -650,7 +708,9 @@ fn compare_parts(
     old: &[String],
     next: &SourceSnapshot,
 ) -> SnapshotRelation {
-    if old_binding != next.source_binding {
+    if old_binding != next.source_binding
+        && next.alternate_encoding_binding.as_deref() != Some(old_binding)
+    {
         return SnapshotRelation::DifferentSource;
     }
     if old_lifecycle != next.lifecycle_sha256() {
@@ -859,8 +919,55 @@ pub(super) mod tests {
             compression,
             stamp,
             source_binding: hash(format!("{}:{session_id}", dir.display()).as_bytes()),
+            alternate_encoding_binding: None,
             admitted,
         }
+    }
+
+    #[cfg(any(windows, unix))]
+    #[test]
+    fn saved_state_accepts_an_encoding_switch_but_still_rejects_another_source() {
+        let dir = std::env::temp_dir().join(format!("sv-dsh-encoding-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let records = [
+            r#"{"type":"session","version":4,"id":"s0"}"#,
+            r#"{"seq":0,"type":"x"}"#,
+        ];
+        let cfg = SourceConfig::new("instance", &dir, None, Compression::None).unwrap();
+        let mut plain =
+            synthetic_source_snapshot(&dir, "s0", Compression::None, &records, 0, "life", &["e0"]);
+        plain.source_binding = source_binding_for(&cfg, "s0", Compression::None, 4);
+        let saved = DshSavedState::from_verified(&plain, 0, 1, 0);
+        let mut compressed =
+            synthetic_source_snapshot(&dir, "s0", Compression::Zstd, &records, 0, "life", &["e0"]);
+        compressed.source_binding = source_binding_for(&cfg, "s0", Compression::Zstd, 4);
+        compressed.alternate_encoding_binding =
+            Some(source_binding_for(&cfg, "s0", Compression::None, 4));
+        assert!(matches!(
+            saved.compare(&compressed),
+            SnapshotRelation::PrefixPreserved {
+                appended_events: 0,
+                ..
+            }
+        ));
+        let compressed_saved = DshSavedState::from_verified(&compressed, 0, 1, 0);
+        plain.alternate_encoding_binding =
+            Some(source_binding_for(&cfg, "s0", Compression::Zstd, 4));
+        assert!(matches!(
+            compressed_saved.compare(&plain),
+            SnapshotRelation::PrefixPreserved { .. }
+        ));
+        let other = SourceConfig::new("another-instance", &dir, None, Compression::Zstd).unwrap();
+        compressed.source_binding = source_binding_for(&other, "s0", Compression::Zstd, 4);
+        compressed.alternate_encoding_binding =
+            Some(source_binding_for(&other, "s0", Compression::None, 4));
+        assert_eq!(
+            saved.compare(&compressed),
+            SnapshotRelation::DifferentSource
+        );
+        std::fs::remove_file(dir.join("session.v4.jsonl")).unwrap();
+        std::fs::remove_file(dir.join("session.v4.jsonl.zstd")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]
@@ -987,6 +1094,7 @@ pub(super) mod tests {
                 compression: Compression::None,
                 stamp,
                 source_binding: hash(source_binding.as_bytes()),
+                alternate_encoding_binding: None,
                 admitted,
             }
         };

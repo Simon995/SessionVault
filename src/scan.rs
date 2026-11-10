@@ -367,6 +367,43 @@ pub fn scan_append_log_with_bindings(
     prefetch: &StatPrefetch,
     bindings: &SessionBindingRegistry,
 ) -> (AppendLogObservation, SourceReport) {
+    if crate::dsh_provider::is_source(source) {
+        #[cfg(feature = "store")]
+        {
+            let (planned, report) = crate::dsh_provider::scan_source(
+                source,
+                cursor_in,
+                profile,
+                roots,
+                bindings,
+                crate::scan_plan::ScanReasons::NONE,
+                crate::scan_plan::PriorProjection::no_store(),
+                0,
+                deadline,
+            );
+            return (planned.observation, report);
+        }
+        #[cfg(not(feature = "store"))]
+        {
+            let detail = "DSH scanning requires a build with the store feature".to_string();
+            let report = SourceReport {
+                source_path: source.path.display().to_string(),
+                source_mode: Some(SourceMode::AppendLog),
+                warnings: vec![detail.clone()],
+                ..Default::default()
+            };
+            return (
+                AppendLogObservation {
+                    source_change: SourceChange::Appended,
+                    quality: ParseQuality::Unavailable(ScanFailure::Read(detail)),
+                    events: Vec::new(),
+                    cursor: cursor_in.unwrap_or_else(Cursor::new_byte_offset),
+                    source_fingerprint: None,
+                },
+                report,
+            );
+        }
+    }
     match &source.source_location {
         SourceLocation::Local => scan_append_log(
             &LocalSource::new(&source.path),

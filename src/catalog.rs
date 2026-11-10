@@ -172,7 +172,7 @@ pub fn jsonl_config_dir() -> Option<PathBuf> {
 
 /// 内置 provider 描述符（§3.2 Claude / §3.3 Codex / 通用 JSONL）。
 pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
-    vec![
+    let mut descriptors = vec![
         ProviderDescriptor {
             source_type: SourceType::ClaudeCode,
             name: "Claude Code".to_string(),
@@ -389,7 +389,9 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
                 may_be_compressed: false,
             }],
         },
-    ]
+    ];
+    descriptors.push(crate::dsh_provider::descriptor());
+    descriptors
 }
 
 #[cfg(test)]
@@ -442,9 +444,11 @@ mod tests {
             );
             assert_eq!(art.source_mode, SourceMode::SnapshotFile);
         }
-        // 「配置根不该递归」对根下**所有**制品成立，与类别无关。
+        // 根下的快照制品只读本层；会话日志可声明递归发现其会话子目录。
         for (_, art) in &found {
-            assert!(!art.recursive, "配置根不该递归扫：{}", art.glob);
+            if art.source_mode == SourceMode::SnapshotFile {
+                assert!(!art.recursive, "配置根快照不该递归扫：{}", art.glob);
+            }
         }
     }
 

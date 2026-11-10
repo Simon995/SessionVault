@@ -172,6 +172,22 @@ fn union_reads_pick_the_same_copy_on_every_machine() {
         ids,
         vec![Value::from(id_a.as_str()), Value::from(id_b.as_str())]
     );
+    let store_rows = of_kind(&listed, "store");
+    assert_eq!(store_rows[0]["events"], 5);
+    assert_eq!(store_rows[1]["events"], 6);
+    for row in store_rows {
+        let mut fields: Vec<_> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["events", "kind", "max_offset", "path", "role", "store_id"]
+        );
+    }
     assert_eq!(of_kind(&listed, "store_unavailable").len(), 1);
     assert_eq!(of_kind(&listed, "stores_summary")[0]["unavailable"], 1);
     // 副本目录列不出来（这里给的是个文件）≠ 没有副本：报错退出。

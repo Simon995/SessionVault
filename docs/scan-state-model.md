@@ -75,7 +75,7 @@ pub struct AppendLogObservation {
     pub source_fingerprint: Option<SourceFingerprint>,
 }
 
-pub enum SourceChange { Unchanged, RollbackOrRewrite }
+pub enum SourceChange { Appended, RollbackOrRewrite, ReparseRequired }
 
 pub enum ParseQuality {
     /// 完整行全部有效。半截尾行属于这里（`deferred_tail_bytes > 0` 是常态，不是降级）。
@@ -117,7 +117,7 @@ bitflags! {
 
 ```
 观测到源变化(RollbackOrRewrite)
-  > PARSER_STALE | ATTRIBUTION_STALE
+  > ReparseRequired | PARSER_STALE | ATTRIBUTION_STALE
   > INITIAL | FORCE
   > 增量（无 reason）
 ```
@@ -215,6 +215,8 @@ impl Deadline {
 | `Rollback` / `Reparse` 携带稳定 `ProjectionToken`（`SourceKey` + 源指纹 + `parser_revision` + `attribution_revision` + 字节范围） | ✅ 已落地（`token.rs`） |
 | 本仓对 token 建**唯一约束**，重复应用返回**原来的 head**（不开新代）                                                              | ✅ 已落地（`store.rs`） |
 | `Append` 继续靠 seq 去重                                                                                                          | 不变                    |
+
+2026-11-10 开发分支的 DSH 接线补充：`SourceChange::ReparseRequired` 表示既有归一化事件的语义或控制面丰富已改变，携带在公共扫描观察中；已有投影时选择 Reparse，索引整代替换。DSH 写库提交完整已核目标，防止只读流推进游标后漏写后缀。其专用目标 token 只在目标仍为当前最后一次提交时短路，历史目标 A→B→A 会重新生效；通用操作 token 仍按上表返回原来的 head。实现与兼容边界见 [DSH 读取状态设计 §14–§15](dsh-read-state-design.md#14-常规来源接线与持久化凭据)。
 
 ### 质量与同步是两根轴
 

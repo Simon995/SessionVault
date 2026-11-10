@@ -1,4 +1,4 @@
-//! DSH v4 已验证快照的归一化位置映射、观察与保守写库接线（仅 `dsh-experimental`）。
+//! DSH v4 已验证快照的归一化位置映射、观察与保守写库接线。
 //!
 //! 严格对齐 `docs/dsh-ingest-survey.md` §7–§12 与 `docs/dsh-read-state-design.md` §6–§9：
 //! - 只消费已经通过物理核验与原生 admission 的 `AdmittedSnapshot` / `SourceSnapshot`；
@@ -13,11 +13,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::native::AdmittedSnapshot;
-use super::source::{CommitGateDecision, DshSavedState, SnapshotRelation, SourceSnapshot};
+use super::source::SourceSnapshot;
+#[cfg(feature = "store")]
+use super::source::{CommitGateDecision, DshSavedState, SnapshotRelation};
 use super::{Blocked, PhysicalSnapshot, RecordPosition};
 use crate::attribution::RootRegistry;
 use crate::catalog::Profile;
-use crate::parser::{attribution_from_cwd, scan_default_distro, PARSER_REVISION};
+#[cfg(feature = "store")]
+use crate::parser::PARSER_REVISION;
+use crate::parser::{attribution_from_cwd, scan_default_distro};
 use crate::pathnorm::HostPlatform;
 use crate::rawevent::{
     summarize_session_usage_evidence, Actor, EventKey, EventType, RawEvent, SessionUsageSummary,
@@ -1854,7 +1858,6 @@ mod store_wiring {
     use crate::store::{
         FileProjectionBatch, ProjectionStats, SourceKey, StoreError, StoreResult, TotalStore,
     };
-    use crate::token::ProjectionToken;
 
     /// 单步 DSH 来源观察与提交规划产物。
     #[derive(Debug, Clone)]
@@ -1866,6 +1869,8 @@ mod store_wiring {
         pub plan: CommitPlan,
         pub normalized: Option<NormalizedDshSnapshot>,
         pub candidate_state: Option<DshSavedState>,
+        // 只由 planner 携带旧落库目标证据；提交时核当前代，防止过期 Reparse 删除别人的内容。
+        prior_projected_events_sha256: Option<String>,
         pub admission_status: Option<String>,
         pub admission_detail: Option<String>,
         pub events_excluded_temporary: u64,
@@ -1880,12 +1885,13 @@ mod store_wiring {
         pub advanced_saved_state: bool,
     }
 
-    fn semantic_stream_bytes(snapshot: &SourceSnapshot) -> Vec<u8> {
+    fn semantic_stream_bytes(snapshot: &SourceSnapshot, projected_hash: &str) -> Vec<u8> {
         format!(
-            "dsh4:{}:{}:{}",
+            "dsh4:{}:{}:{}:{}",
             snapshot.session_id(),
             snapshot.lifecycle_sha256(),
-            snapshot.native_events_sha256()
+            snapshot.native_events_sha256(),
+            projected_hash
         )
         .into_bytes()
     }
@@ -1897,17 +1903,23 @@ mod store_wiring {
             cursor.size = saved.native_events() as u64;
             cursor.content_hash = Some(format!("sha256:{}", saved.native_events_sha256));
             cursor.next_seq = saved.normalized_next_seq;
+            cursor.dsh_state = Some(Box::new(saved.clone()));
         }
         cursor
     }
 
-    fn cursor_from_verified(snapshot: &SourceSnapshot, next_seq: u64) -> Cursor {
+    fn cursor_from_verified(snapshot: &SourceSnapshot, state: &DshSavedState) -> Cursor {
         let mut cursor = Cursor::new_byte_offset();
         cursor.safe_offset = snapshot.native_events() as u64;
         cursor.size = snapshot.native_events() as u64;
         cursor.content_hash = Some(format!("sha256:{}", snapshot.native_events_sha256()));
-        cursor.next_seq = next_seq;
+        cursor.next_seq = state.normalized_next_seq;
+        cursor.dsh_state = Some(Box::new(state.clone()));
         cursor
+    }
+
+    fn normalized_events_hash(events: &[RawEvent]) -> String {
+        super::super::hash(&serde_json::to_vec(events).expect("RawEvent is serializable"))
     }
 
     /// 对候选归一化产物与待提交事件列表执行控制面绑定准入与 `InputOrigin` 丰富。
@@ -1915,17 +1927,18 @@ mod store_wiring {
     fn finalize_verified_step(
         relation: Option<SnapshotRelation>,
         gate: CommitGateDecision,
-        effective_reasons: ScanReasons,
+        mut effective_reasons: ScanReasons,
         prior_state: Option<&DshSavedState>,
         prior_projection: PriorProjection,
         snapshot: &SourceSnapshot,
         mut normalized: NormalizedDshSnapshot,
-        candidate_events: Vec<RawEvent>,
+        mut candidate_events: Vec<RawEvent>,
         source_change: SourceChange,
         include_fingerprint: bool,
         cfg: &DshNormalizeConfig,
         bindings: &SessionBindingRegistry,
     ) -> DshPlannedStep {
+        let normalized_hash = normalized_events_hash(&normalized.events);
         let mut session_parents = std::collections::HashMap::new();
         if let Some(ref p) = normalized.parent_session_id {
             session_parents.insert(normalized.session_id.clone(), p.clone());
@@ -1978,11 +1991,30 @@ mod store_wiring {
                 plan,
                 normalized: Some(normalized),
                 candidate_state: None,
+                prior_projected_events_sha256: prior_state
+                    .and_then(|saved| saved.projected_events_sha256.clone()),
                 admission_status: Some("unknown_hold".to_string()),
                 admission_detail: Some(detail),
                 events_excluded_temporary: 0,
             };
         }
+
+        let projected_hash = normalized_events_hash(&normalized.events);
+        if let Some(saved) = prior_state {
+            let prefix_len = (saved.normalized_next_seq as usize).min(normalized.events.len());
+            if saved.projected_events_sha256.as_deref()
+                != Some(normalized_events_hash(&normalized.events[..prefix_len]).as_str())
+            {
+                effective_reasons |= ScanReasons::PARSER_STALE;
+                candidate_events = normalized.events.clone();
+            }
+        }
+        let source_change =
+            if source_change == SourceChange::Appended && effective_reasons.wants_reparse() {
+                SourceChange::ReparseRequired
+            } else {
+                source_change
+            };
 
         match bindings.filter_and_enrich_events(
             SourceType::Jsonl,
@@ -2011,6 +2043,8 @@ mod store_wiring {
                     plan,
                     normalized: Some(normalized),
                     candidate_state: None,
+                    prior_projected_events_sha256: prior_state
+                        .and_then(|saved| saved.projected_events_sha256.clone()),
                     admission_status: Some("unknown_hold".to_string()),
                     admission_detail: Some(detail),
                     events_excluded_temporary: 0,
@@ -2052,27 +2086,33 @@ mod store_wiring {
                         plan,
                         normalized: Some(normalized),
                         candidate_state: None,
+                        prior_projected_events_sha256: prior_state
+                            .and_then(|saved| saved.projected_events_sha256.clone()),
                         admission_status: Some("temporary_excluded".to_string()),
                         admission_detail: detail,
                         events_excluded_temporary: filtered.excluded_events,
                     };
                 }
 
-                let next_state = DshSavedState::from_verified(
+                let mut next_state = DshSavedState::from_verified(
                     snapshot,
                     normalized.next_seq(),
                     PARSER_REVISION,
                     cfg.attribution_revision,
                 );
+                next_state.normalized_events_sha256 = Some(normalized_hash);
+                next_state.projected_events_sha256 = Some(projected_hash.clone());
                 let observation = AppendLogObservation {
                     source_change,
                     quality: ParseQuality::Clean {
                         deferred_tail_bytes: 0,
                     },
                     events: filtered.kept_events,
-                    cursor: cursor_from_verified(snapshot, normalized.next_seq()),
-                    source_fingerprint: include_fingerprint
-                        .then(|| SourceFingerprint::of(&semantic_stream_bytes(snapshot))),
+                    cursor: cursor_from_verified(snapshot, &next_state),
+                    source_fingerprint: (include_fingerprint || effective_reasons.wants_reparse())
+                        .then(|| {
+                            SourceFingerprint::of(&semantic_stream_bytes(snapshot, &projected_hash))
+                        }),
                 };
                 let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
                 DshPlannedStep {
@@ -2083,6 +2123,8 @@ mod store_wiring {
                     plan,
                     normalized: Some(normalized),
                     candidate_state: Some(next_state),
+                    prior_projected_events_sha256: prior_state
+                        .and_then(|saved| saved.projected_events_sha256.clone()),
                     admission_status: Some(filtered.admission_status.to_string()),
                     admission_detail: filtered.admission_detail,
                     events_excluded_temporary: filtered.excluded_events,
@@ -2152,6 +2194,8 @@ mod store_wiring {
                     plan,
                     normalized: None,
                     candidate_state: None,
+                    prior_projected_events_sha256: prior_state
+                        .and_then(|saved| saved.projected_events_sha256.clone()),
                     admission_status: None,
                     admission_detail: None,
                     events_excluded_temporary: 0,
@@ -2176,6 +2220,8 @@ mod store_wiring {
                     plan,
                     normalized: None,
                     candidate_state: None,
+                    prior_projected_events_sha256: prior_state
+                        .and_then(|saved| saved.projected_events_sha256.clone()),
                     admission_status: None,
                     admission_detail: None,
                     events_excluded_temporary: 0,
@@ -2200,6 +2246,8 @@ mod store_wiring {
                     plan,
                     normalized: None,
                     candidate_state: None,
+                    prior_projected_events_sha256: prior_state
+                        .and_then(|saved| saved.projected_events_sha256.clone()),
                     admission_status: None,
                     admission_detail: None,
                     events_excluded_temporary: 0,
@@ -2209,6 +2257,13 @@ mod store_wiring {
                 let snapshot = current.expect("InitialProjectionCandidate requires Ok snapshot");
                 let normalized = normalize_source_snapshot(snapshot, cfg)?;
                 let events = normalized.events.clone();
+                // 旧写者可能保存 Cursor 时抹掉 dsh_state；库里已有投影时无法证明旧前缀未变。
+                // 完整重建并保留旧源版本，不能 Append 去重后静默留住旧正文，也不能 Reparse 回收它。
+                let source_change = if prior_projection.state() == PriorState::Absent {
+                    SourceChange::Appended
+                } else {
+                    SourceChange::RollbackOrRewrite
+                };
                 Ok(finalize_verified_step(
                     relation,
                     gate,
@@ -2218,7 +2273,7 @@ mod store_wiring {
                     snapshot,
                     normalized,
                     events,
-                    SourceChange::Appended,
+                    source_change,
                     true,
                     cfg,
                     bindings,
@@ -2228,7 +2283,10 @@ mod store_wiring {
                 let snapshot = current.expect("NoOpUnchanged requires Ok snapshot");
                 let normalized = normalize_source_snapshot(snapshot, cfg)?;
                 let saved = prior_state.expect("NoOpUnchanged requires prior_state");
-                if saved.normalized_next_seq != normalized.next_seq() {
+                if saved.normalized_next_seq != normalized.next_seq()
+                    || saved.normalized_events_sha256.as_deref()
+                        != Some(normalized_events_hash(&normalized.events).as_str())
+                {
                     effective_reasons |= ScanReasons::PARSER_STALE;
                 }
                 let need_full_events = effective_reasons.wants_reparse()
@@ -2263,8 +2321,14 @@ mod store_wiring {
                     .iter()
                     .filter(|span| (span.native_seq as usize) < *prior_events)
                     .count() as u64;
-                if prefix_emitted != saved.normalized_next_seq {
-                    // 前缀归一化产出的事件数发生变化（例如同 step 的 usage 被新追加的事件覆盖，或解析规则升级）
+                if prefix_emitted != saved.normalized_next_seq
+                    || saved.normalized_events_sha256.as_deref()
+                        != Some(
+                            normalized_events_hash(&normalized.events[..prefix_emitted as usize])
+                                .as_str(),
+                        )
+                {
+                    // 条数相同也可能变化：例如闭合 turn 后未知 cache 的证据由 incomplete 转为可结算。
                     // 必须重出整代，防止增量 seq 断号或旧 attempt usage 残留在当前头代。
                     effective_reasons |= ScanReasons::PARSER_STALE;
                 }
@@ -2356,32 +2420,7 @@ mod store_wiring {
             ))
         })?;
 
-        let projection_stats = match planned.plan.store() {
-            StoreAction::Preserve => None,
-            StoreAction::Project(mode) => {
-                let snapshot = current.expect("StoreAction::Project requires verified snapshot");
-                let fp = format!(
-                    "dsh4:{}:{}",
-                    snapshot.lifecycle_sha256(),
-                    snapshot.native_events_sha256()
-                );
-                let token = ProjectionToken::new(
-                    &source_key,
-                    Some(&fp),
-                    PARSER_REVISION,
-                    cfg.attribution_revision,
-                    (0, snapshot.native_events() as u64),
-                );
-                let stats = store.apply_projection(FileProjectionBatch {
-                    source: source_key,
-                    parser_revision: Some(PARSER_REVISION),
-                    mode,
-                    events: planned.observation.events.clone(),
-                    token: Some(token),
-                })?;
-                Some(stats)
-            }
-        };
+        let projection_stats = apply_dsh_planned_projection(store, source_key, &planned)?;
 
         let advanced_saved_state = planned.plan.cursor() == CursorAction::Advance
             && planned.admission_status.as_deref() != Some("temporary_excluded")
@@ -2398,6 +2437,44 @@ mod store_wiring {
             next_state,
             advanced_saved_state,
         })
+    }
+
+    /// 提交完整 DSH 目标：读取游标可能领先于总库，不能仅把本轮流式后缀当作待入库范围。
+    /// 当前目标重复提交短路，历史目标再次出现则重建；通用操作 token 的语义不变。
+    pub fn apply_dsh_planned_projection(
+        store: &TotalStore,
+        source: SourceKey,
+        planned: &DshPlannedStep,
+    ) -> StoreResult<Option<ProjectionStats>> {
+        if matches!(
+            planned.admission_status.as_deref(),
+            Some("temporary_excluded" | "unknown_hold")
+        ) {
+            return Ok(None);
+        }
+        let StoreAction::Project(mode) = planned.plan.store() else {
+            return Ok(None);
+        };
+        let state = planned
+            .candidate_state
+            .as_ref()
+            .expect("project requires verified state");
+        let normalized = planned
+            .normalized
+            .as_ref()
+            .expect("project requires complete normalization");
+        store
+            .apply_full_projection_target(
+                FileProjectionBatch {
+                    token: Some(state.projection_token(&source)),
+                    source,
+                    parser_revision: Some(PARSER_REVISION),
+                    mode,
+                    events: normalized.events.clone(),
+                },
+                planned.prior_projected_events_sha256.as_deref(),
+            )
+            .map(Some)
     }
 
     /// DSH 会话根目录批量扫描中单个会话子目录的扫描与写库结果。
@@ -2557,9 +2634,9 @@ mod store_wiring {
 
 #[cfg(feature = "store")]
 pub use store_wiring::{
-    commit_dsh_source_step, commit_dsh_source_step_with_bindings, plan_dsh_source_step,
-    plan_dsh_source_step_with_bindings, scan_dsh_sessions_root_to_store, DshPlannedStep,
-    DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
+    apply_dsh_planned_projection, commit_dsh_source_step, commit_dsh_source_step_with_bindings,
+    plan_dsh_source_step, plan_dsh_source_step_with_bindings, scan_dsh_sessions_root_to_store,
+    DshPlannedStep, DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
 };
 
 #[cfg(all(test, any(windows, unix)))]
@@ -2900,7 +2977,210 @@ mod tests {
         let stats_lc = out_lc.projection_stats.unwrap();
         assert_eq!(stats_lc.source_revision, 2);
         assert!(stats_lc.head_moved);
+
+        // 历史目标再次成为真实来源时必须生效；同一次转换的崩溃重放仍不开重复代。
+        let prior_lc = out_lc.next_state.unwrap();
+        let returned =
+            commit_dsh_source_step(&store, Some(&prior_lc), Ok(&snap1), ScanReasons::NONE, &cfg)
+                .unwrap();
+        let returned_stats = returned.projection_stats.unwrap();
+        assert!(returned_stats.head_moved);
+        assert_eq!(returned_stats.source_revision, 3);
+        assert!(store
+            .read_current_since_page(0, 100)
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, ev)| ev.content.as_deref() == Some("world")));
+        let replay =
+            commit_dsh_source_step(&store, Some(&prior_lc), Ok(&snap1), ScanReasons::NONE, &cfg)
+                .unwrap();
+        assert!(!replay.projection_stats.as_ref().unwrap().head_moved);
+        assert_eq!(replay.projection_stats.unwrap().source_revision, 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn missing_saved_evidence_rebuilds_existing_projection_and_retains_old_content() {
+        use crate::scan_plan::{ScanReasons, StoreAction};
+        use crate::store::{Projection, TotalStore};
+        let dir = std::env::temp_dir().join(format!("sv-dsh-lost-state-{}", std::process::id()));
+        crate::probe::create_dir_all(&dir).unwrap();
+        let records = [
+            r#"{"type":"session","version":4,"id":"lost1"}"#,
+            r#"{"type":"user/message","seq":0,"turn":1,"ts":1700000001000,"text":"before rewrite"}"#,
+        ];
+        let rewritten = [
+            records[0],
+            r#"{"type":"user/message","seq":0,"turn":1,"ts":1700000001000,"text":"after rewrite"}"#,
+        ];
+        let before = synthetic_source_snapshot(
+            &dir,
+            "lost1",
+            Compression::None,
+            &records,
+            0,
+            "life",
+            &["before"],
+        );
+        let after = synthetic_source_snapshot(
+            &dir,
+            "lost1",
+            Compression::None,
+            &rewritten,
+            0,
+            "life",
+            &["after"],
+        );
+        let cfg = DshNormalizeConfig::local_full(dir.display().to_string());
+        let store = TotalStore::open_in_memory().unwrap();
+        commit_dsh_source_step(&store, None, Ok(&before), ScanReasons::NONE, &cfg).unwrap();
+        let update =
+            commit_dsh_source_step(&store, None, Ok(&after), ScanReasons::NONE, &cfg).unwrap();
+        assert_eq!(
+            update.planned.plan.store(),
+            StoreAction::Project(Projection::Rollback)
+        );
+        let stats = update.projection_stats.unwrap();
+        assert!(stats.head_moved);
+        assert_eq!(stats.source_revision, 1);
+        let current = store.read_current_since_page(0, 100).unwrap().events;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].1.content.as_deref(), Some("after rewrite"));
+        let all = store.read_since_page(0, 100).unwrap().events;
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .any(|(_, ev)| ev.content.as_deref() == Some("before rewrite")));
+        let replay =
+            commit_dsh_source_step(&store, None, Ok(&after), ScanReasons::NONE, &cfg).unwrap();
+        let replay_stats = replay.projection_stats.unwrap();
+        assert!(!replay_stats.head_moved);
+        assert_eq!(replay_stats.source_revision, stats.source_revision);
+        assert!(replay.next_state.is_some());
+
+        let grown_records = [
+            rewritten[0],
+            rewritten[1],
+            r#"{"type":"user/message","seq":1,"turn":2,"ts":1700000002000,"text":"read before write"}"#,
+        ];
+        let grown = synthetic_source_snapshot(
+            &dir,
+            "lost1",
+            Compression::None,
+            &grown_records,
+            0,
+            "life",
+            &["after", "tail"],
+        );
+        let streamed = plan_dsh_source_step(
+            replay.next_state.as_ref(),
+            Ok(&grown),
+            ScanReasons::NONE,
+            crate::scan_plan::PriorProjection::no_store(),
+            &cfg,
+        )
+        .unwrap();
+        let write_after_read = commit_dsh_source_step(
+            &store,
+            streamed.candidate_state.as_ref(),
+            Ok(&grown),
+            ScanReasons::NONE,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(write_after_read.projection_stats.unwrap().appended, 1);
+        assert!(store
+            .read_current_since_page(0, 100)
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, ev)| ev.content.as_deref() == Some("read before write")));
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn closing_a_turn_reprojects_changed_evidence_even_when_event_count_is_unchanged() {
+        use crate::scan_plan::{ScanReasons, StoreAction};
+        use crate::store::{Projection, TotalStore};
+        let dir = std::env::temp_dir().join(format!("sv-dsh-close-{}", std::process::id()));
+        crate::probe::create_dir_all(&dir).unwrap();
+        let open = [
+            r#"{"type":"session","version":4,"id":"close1"}"#,
+            r#"{"seq":0,"type":"turn/start","time":0,"data":{"turn":1}}"#,
+            r#"{"seq":1,"type":"assistant/message","time":1,"data":{"turn":1,"step":0,"message":{"id":"a1","role":"assistant","content":[{"type":"text","text":"answer"}]},"usage":{"inputTokens":8,"outputTokens":2,"totalTokens":10}}}"#,
+        ];
+        let mut closed = open.to_vec();
+        closed.push(r#"{"seq":2,"type":"turn/end","time":2,"data":{"turn":1}}"#);
+        let before = synthetic_source_snapshot(
+            &dir,
+            "close1",
+            Compression::None,
+            &open,
+            0,
+            "life",
+            &["a", "b"],
+        );
+        let after = synthetic_source_snapshot(
+            &dir,
+            "close1",
+            Compression::None,
+            &closed,
+            0,
+            "life",
+            &["a", "b", "c"],
+        );
+        let cfg = DshNormalizeConfig::local_full(dir.display().to_string());
+        let store = TotalStore::open_in_memory().unwrap();
+        let initial =
+            commit_dsh_source_step(&store, None, Ok(&before), ScanReasons::NONE, &cfg).unwrap();
+        let state = initial.next_state.unwrap();
+        let public_scan = plan_dsh_source_step(
+            Some(&state),
+            Ok(&after),
+            ScanReasons::NONE,
+            crate::scan_plan::PriorProjection::no_store(),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            public_scan.observation.source_change,
+            crate::observation::SourceChange::ReparseRequired
+        );
+        let source = crate::store::SourceKey {
+            source_type: SourceType::Jsonl,
+            source_location: cfg.source_location.clone(),
+            source_path: cfg.source_path.clone(),
+        };
+        let replanned = crate::scan_plan::CommitPlan::plan(
+            &public_scan.observation,
+            ScanReasons::NONE,
+            crate::scan_plan::PriorProjection::ask(&store, &source).unwrap(),
+        );
+        assert_eq!(replanned.store(), StoreAction::Project(Projection::Reparse));
+        let update =
+            commit_dsh_source_step(&store, Some(&state), Ok(&after), ScanReasons::NONE, &cfg)
+                .unwrap();
+        assert_eq!(
+            state.normalized_next_seq,
+            update.next_state.as_ref().unwrap().normalized_next_seq
+        );
+        assert_eq!(
+            update.planned.plan.store(),
+            StoreAction::Project(Projection::Reparse)
+        );
+        let events: Vec<_> = store
+            .read_current_since_page(0, 100)
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|(_, ev)| ev)
+            .collect();
+        let summary = summarize_session_usage_evidence(&events);
+        assert_eq!(summary.incomplete_turn_lifecycle_count, 0);
+        assert_eq!(summary.exact_total_with_unknown_cache_count, 1);
+        assert_eq!(summary.settled_exact_total_tokens, 10);
     }
 
     #[cfg(feature = "store")]
@@ -2986,6 +3266,109 @@ mod tests {
             "临时 DSH 会话的 Message 与 Usage 均不得写进总库"
         );
         assert_eq!(store.read_since_page(0, 50).unwrap().events.len(), 0);
+
+        store
+            .set_session_bindings(&SessionBindingRegistry::from_json_str(
+                r#"{"schemaVersion":1,"bindings":[]}"#,
+            ))
+            .unwrap();
+        let unmanaged =
+            commit_dsh_source_step(&store, None, Ok(&snap), ScanReasons::NONE, &cfg).unwrap();
+        assert_eq!(
+            unmanaged.planned.admission_status.as_deref(),
+            Some("persistent_unmanaged")
+        );
+        assert_eq!(unmanaged.projection_stats.as_ref().unwrap().appended, 4);
+        let persistent = SessionBindingRegistry::from_json_str(
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "bindings": [{
+                    "schemaVersion": 1,
+                    "owner": { "namespace": "tumechat.user", "id": "u" },
+                    "host": { "namespace": "tumechat.host", "id": "h" },
+                    "session": { "namespace": "tumechat.session", "id": "s" },
+                    "nativeSource": { "backend": "dsh-native", "sourceLocation": "local",
+                        "sourcePath": dir.display().to_string(), "nativeSessionId": "dsh_s1" },
+                    "temporary": false, "readMemory": true, "verifiedHumanInput": true,
+                    "recordedAt": "2026-11-10T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        );
+        // 绑定变化与原生追加同轮发生时，公共扫描也须带全读指纹，供下游安全替换整代。
+        let mut grown_records = records.to_vec();
+        grown_records
+            .push(r#"{"type":"user/message","seq":3,"turn":3,"ts":1700000004000,"text":"next"}"#);
+        let grown = synthetic_source_snapshot(
+            &dir,
+            "dsh_s1",
+            Compression::None,
+            &grown_records,
+            0,
+            "lc_dsh_s1",
+            &["e0", "e1", "e2", "e3"],
+        );
+        let public_scan = super::store_wiring::plan_dsh_source_step_with_bindings(
+            unmanaged.next_state.as_ref(),
+            Ok(&grown),
+            ScanReasons::NONE,
+            crate::scan_plan::PriorProjection::no_store(),
+            &cfg,
+            &persistent,
+        )
+        .unwrap();
+        assert_eq!(
+            public_scan.observation.source_change,
+            crate::observation::SourceChange::ReparseRequired
+        );
+        assert!(public_scan.observation.source_fingerprint.is_some());
+        assert_eq!(public_scan.observation.events.len(), 5);
+
+        store.set_session_bindings(&persistent).unwrap();
+        let bound = commit_dsh_source_step(
+            &store,
+            unmanaged.next_state.as_ref(),
+            Ok(&snap),
+            ScanReasons::NONE,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            bound.planned.plan.store(),
+            crate::scan_plan::StoreAction::Project(crate::store::Projection::Reparse)
+        );
+        assert!(store
+            .read_current_since_page(0, 50)
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|(_, ev)| ev.usage_evidence.as_ref())
+            .all(
+                |ev| ev.execution_binding_status == UsageExecutionBindingStatus::ControlPlaneBound
+            ));
+        store
+            .set_session_bindings(&SessionBindingRegistry::from_json_str(
+                r#"{"schemaVersion":1,"bindings":[]}"#,
+            ))
+            .unwrap();
+        let unbound_again = commit_dsh_source_step(
+            &store,
+            bound.next_state.as_ref(),
+            Ok(&snap),
+            ScanReasons::NONE,
+            &cfg,
+        )
+        .unwrap();
+        assert!(unbound_again.projection_stats.as_ref().unwrap().head_moved);
+        assert!(store
+            .read_current_since_page(0, 50)
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|(_, ev)| ev.usage_evidence.as_ref())
+            .all(
+                |ev| ev.execution_binding_status != UsageExecutionBindingStatus::ControlPlaneBound
+            ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

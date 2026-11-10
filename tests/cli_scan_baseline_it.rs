@@ -20,7 +20,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        // 跟随构建目录；WSL 在 Linux 文件系统上生成钥匙，才能验证真实的 0600 权限。
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest.join("target"));
+        let target = if target.is_absolute() {
+            target
+        } else {
+            manifest.join(target)
+        };
         let info = std::fs::symlink_metadata(&target).unwrap();
         assert!(info.is_dir() && !info.file_type().is_symlink());
         let root = loop {
@@ -48,6 +57,8 @@ impl Fixture {
     fn run(&self, args: &[&str]) -> Vec<Value> {
         let output = Command::new(env!("CARGO_BIN_EXE_svault"))
             .env("SVAULT_JSONL_DIR", self.root.join("source"))
+            .env_remove("SVAULT_DSH_SESSIONS_DIR")
+            .env_remove("SVAULT_DSH_HOME")
             .env("SVAULT_KEY_FILE", self.root.join("fixture.key"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("empty-claude"))
             .env("CODEX_HOME", self.root.join("empty-codex"))
@@ -132,6 +143,51 @@ fn mode(rows: &[Value]) -> &str {
         .collect();
     assert_eq!(writes.len(), 1);
     writes[0]["mode"].as_str().unwrap()
+}
+
+#[test]
+fn a_streaming_dsh_failure_keeps_the_entire_previous_source_state() {
+    let fixture = Fixture::new();
+    let sessions = fixture.root.join("dsh");
+    let session = sessions.join("s0");
+    std::fs::create_dir(&sessions).unwrap();
+    std::fs::create_dir(&session).unwrap();
+    let mut cursor = session_vault::Cursor::new_byte_offset();
+    cursor.next_seq = 17;
+    cursor.safe_offset = 7;
+    cursor.size = 11;
+    let key = format!("jsonl|local|{}", session.display());
+    let mut state = json!({ (key): cursor });
+    state.as_object_mut().unwrap().values_mut().next().unwrap()["parser_revision"] = json!(1);
+    std::fs::write(&fixture.state, serde_json::to_vec(&state).unwrap()).unwrap();
+    let bindings = fixture.root.join("empty-bindings.json");
+    std::fs::write(&bindings, r#"{"schemaVersion":1,"bindings":[]}"#).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_svault"))
+        .env("SVAULT_JSONL_DIR", "")
+        .env("SVAULT_DSH_SESSIONS_DIR", &sessions)
+        .env_remove("SVAULT_DSH_HOME")
+        .env_remove("SVAULT_DSH_NODE")
+        .env_remove("SVAULT_DSH_PACKAGE")
+        .env("SVAULT_SESSION_BINDINGS", &bindings)
+        .env("CLAUDE_CONFIG_DIR", fixture.root.join("empty-claude"))
+        .env("CODEX_HOME", fixture.root.join("empty-codex"))
+        .args(["scan-all", "--only", "jsonl", "--state"])
+        .arg(&fixture.state)
+        .arg("--store")
+        .arg(&fixture.store)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("native_runtime_not_configured"),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    assert_eq!(fixture.state(), state);
 }
 
 #[test]

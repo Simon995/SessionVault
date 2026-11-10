@@ -331,6 +331,10 @@ fn discover_by_mode(
     let mut out = Vec::new();
     let mut unreachable = Vec::new();
     for desc in catalog::builtin_descriptors() {
+        // DSH 发现的是逻辑会话目录，不按普通文件 glob 发现各物理代。
+        if desc.name == crate::dsh_provider::PROVIDER_NAME {
+            continue;
+        }
         let Some(root) = desc.config_dir.as_ref() else {
             log::debug!(
                 target: tag::DISCOVER,
@@ -388,6 +392,11 @@ fn discover_by_mode(
             }
         }
     }
+    if wanted == SourceMode::AppendLog {
+        if let Some(root) = crate::dsh_snapshot::dsh_sessions_root_from_env() {
+            discover_dsh(&root, &mut out, &mut unreachable, deadline);
+        }
+    }
     if local_only {
         log::debug!(target: tag::DISCOVER, "skip WSL discovery: local-only mode");
     } else {
@@ -403,6 +412,29 @@ fn discover_by_mode(
         sources: out,
         unreachable,
     })
+}
+
+fn discover_dsh(
+    root: &Path,
+    out: &mut Vec<SourceRef>,
+    unreachable: &mut Vec<String>,
+    deadline: crate::deadline::Deadline,
+) {
+    // 根内原生文件由 DSH 唯一摄取；发现失败或选代不支持时也不能回落通用 JSONL。
+    out.retain(|source| {
+        !(source.source_type == SourceType::Jsonl
+            && source.source_location == SourceLocation::Local
+            && crate::dsh_provider::contains_path(root, &source.path))
+    });
+    match crate::dsh_provider::discover(root, deadline) {
+        Ok(sources) => out.extend(sources),
+        Err(error) => {
+            log::warn!(target: tag::DISCOVER, "{error}");
+            if !unreachable.contains(&LOCAL_LOCATION.to_string()) {
+                unreachable.push(LOCAL_LOCATION.to_string());
+            }
+        }
+    }
 }
 
 /// provider 在发行版内 `$HOME` 下的配置根基名（WSL 约定恒 `~/.claude`/`~/.codex`，
@@ -762,6 +794,111 @@ fn collect_files_into(
 // 管的是**生产行为**，而 `#[cfg(test)]` 不在生产路径上。
 #[allow(clippy::disallowed_methods)]
 mod tests {
+    fn dsh_fixture_path() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "sv-dsh-discovery-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn dsh_jsonl_source(path: std::path::PathBuf) -> super::SourceRef {
+        super::SourceRef {
+            source_type: crate::SourceType::Jsonl,
+            source_location: crate::SourceLocation::Local,
+            source_mode: crate::SourceMode::AppendLog,
+            path,
+            project_root: None,
+            artifact_kind: None,
+        }
+    }
+
+    #[test]
+    fn dsh_discovery_excludes_native_files_and_preserves_sibling_sources() {
+        let root = dsh_fixture_path();
+        std::fs::create_dir(&root).unwrap();
+        let logs = [
+            ("legacy", "session.v3.jsonl"),
+            ("future", "session.v5.jsonl"),
+        ];
+        for (session, name) in logs {
+            std::fs::create_dir(root.join(session)).unwrap();
+            std::fs::write(root.join(session).join(name), "{}").unwrap();
+        }
+        #[cfg(windows)]
+        let generic_root =
+            std::path::PathBuf::from(root.to_string_lossy().replace('\\', "/").to_uppercase());
+        #[cfg(not(windows))]
+        let generic_root = root.clone();
+        let mut sources: Vec<_> = super::collect_artifact_files(&generic_root, "**/*.jsonl", true)
+            .into_iter()
+            .map(dsh_jsonl_source)
+            .collect();
+        assert_eq!(sources.len(), 2, "对照组必须确实发现两份物理日志");
+        let sibling = dsh_jsonl_source(root.with_extension("other").join("session.v4.jsonl"));
+        sources.push(sibling.clone());
+        let mut unreachable = Vec::new();
+        super::discover_dsh(
+            &root,
+            &mut sources,
+            &mut unreachable,
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert!(unreachable.is_empty());
+        assert!(sources.contains(&sibling));
+        assert_eq!(sources.len(), 3);
+        for (session, name) in logs {
+            assert!(sources
+                .iter()
+                .any(|source| source.path == root.join(session)));
+            assert!(!sources
+                .iter()
+                .any(|source| source.path.file_name() == Some(name.as_ref())));
+            std::fs::remove_file(root.join(session).join(name)).unwrap();
+            std::fs::remove_dir(root.join(session)).unwrap();
+        }
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn dsh_missing_root_does_not_mark_local_unreachable() {
+        let root = dsh_fixture_path();
+        let unrelated = dsh_jsonl_source(root.with_extension("other").join("source.jsonl"));
+        let mut sources = vec![unrelated.clone()];
+        let mut unreachable = vec!["wsl:dev".to_string()];
+        super::discover_dsh(
+            &root,
+            &mut sources,
+            &mut unreachable,
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert_eq!(sources, vec![unrelated]);
+        assert_eq!(unreachable, vec!["wsl:dev"]);
+    }
+
+    #[test]
+    fn dsh_exhausted_discovery_marks_local_unreachable_without_generic_fallback() {
+        let root = dsh_fixture_path();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("s0")).unwrap();
+        let mut sources = vec![dsh_jsonl_source(root.join("s0/session.v4.jsonl"))];
+        let mut unreachable = Vec::new();
+        super::discover_dsh(
+            &root,
+            &mut sources,
+            &mut unreachable,
+            crate::deadline::Deadline::at(std::time::Instant::now()),
+        );
+        assert!(sources.is_empty());
+        assert_eq!(unreachable, vec![super::LOCAL_LOCATION]);
+        std::fs::remove_dir(root.join("s0")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     /// 🔴 **每一条内置描述符的 `glob`，`artifact_suffix` 都必须认得。**
     ///

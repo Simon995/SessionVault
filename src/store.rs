@@ -577,6 +577,18 @@ pub struct AppendStats {
     pub max_offset: i64,
 }
 
+/// 只读事件目录摘要；包含所有保留投影，不解密正文、不统计钥匙或入库时间。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct StoreEventSummary {
+    pub count: u64,
+    pub max_offset: i64,
+}
+
+// 分开的标量子查询让 COUNT 使用窄索引、MAX 使用主键末端，并保持同一语句快照。
+const EVENT_SUMMARY_SQL: &str =
+    "SELECT (SELECT COUNT(*) FROM raw_events), (SELECT COALESCE(MAX(offset), 0) FROM raw_events)";
+const MAX_OFFSET_SQL: &str = "SELECT COALESCE(MAX(offset), 0) FROM raw_events";
+
 /// 总库状态（宿主渲染 / 验证用）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct StoreStatus {
@@ -1185,6 +1197,8 @@ CREATE TABLE IF NOT EXISTS applied_projections (
     projection_revision INTEGER NOT NULL,
     applied_at          INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_applied_projections_source
+    ON applied_projections(source_type, source_location, source_path);
 "#;
 
 /// 每个源文件的当前头：哪个源版本、以及该源版本的哪份投影是**当前**的。
@@ -3180,6 +3194,19 @@ impl TotalStore {
         }
     }
 
+    /// 完整来源目标的幂等提交：只有目标仍为当前最后一次提交时才短路。
+    /// 历史目标再次出现时保留旧源版本并重新提交；调用方必须提供完整归一化事件。
+    pub(crate) fn apply_full_projection_target(
+        &self,
+        batch: FileProjectionBatch,
+        prior_projected_hash: Option<&str>,
+    ) -> StoreResult<ProjectionStats> {
+        match self.apply_projection_inner(batch, None, true, prior_projected_hash)? {
+            Some(stats) => Ok(stats),
+            None => unreachable!("no expected head was supplied"),
+        }
+    }
+
     /// 同 [`Self::apply_projection`]，另带一个前提：当前头仍是 `expect.0`、那一代仍有 `expect.1` 行，
     /// 否则一个字都不写、返回 `None`。整代重写用：读与写之间有人追加或换了代时，拿旧读数开的新一代
     /// 会盖掉别人的写入。前提与切头在同一事务里核。
@@ -3187,6 +3214,16 @@ impl TotalStore {
         &self,
         batch: FileProjectionBatch,
         expect: Option<(HeadRevisions, u64)>,
+    ) -> StoreResult<Option<ProjectionStats>> {
+        self.apply_projection_inner(batch, expect, false, None)
+    }
+
+    fn apply_projection_inner(
+        &self,
+        batch: FileProjectionBatch,
+        expect: Option<(HeadRevisions, u64)>,
+        revisit_target: bool,
+        prior_projected_hash: Option<&str>,
     ) -> StoreResult<Option<ProjectionStats>> {
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();
@@ -3207,7 +3244,7 @@ impl TotalStore {
             });
         }
 
-        let projection = batch.mode;
+        let mut projection = batch.mode;
         let mut conn = self.conn.lock().unwrap();
 
         // ── H.1 / H.2 / H.3 控制面绑定与临时会话排除守卫 ─────────────────────
@@ -3244,7 +3281,54 @@ impl TotalStore {
                 loses_events: None,
             }));
         }
-        let events = &filtered.kept_events;
+        let mut events = filtered.kept_events;
+        let tx = Self::write_tx(&mut conn)?;
+        let head = head_of(&tx, &source_type, &source_location, &source_path)?;
+        let mut skipped_erased = 0u64;
+        // 完整目标与已保存投影比较前，先应用同一事务中的墓碑；擦除留下的 seq 间隙不是源回退。
+        if revisit_target {
+            let mut tombstoned = tx.prepare(
+                "SELECT EXISTS(SELECT 1 FROM tombstones t WHERE \
+                 (t.scope = 'session' AND t.key = ?1) OR \
+                 (t.scope = 'source_path' AND t.key = ?2) OR \
+                 (t.scope = 'project_root' AND t.key = ?3))",
+            )?;
+            let mut visible = Vec::with_capacity(events.len());
+            for event in events {
+                let erased: bool = tombstoned.query_row(
+                    params![
+                        event.source_session_id,
+                        event.source_path,
+                        event.project_root
+                    ],
+                    |row| row.get(0),
+                )?;
+                if erased {
+                    skipped_erased += 1;
+                } else {
+                    visible.push(event);
+                }
+            }
+            events = visible;
+        }
+        let current = if revisit_target {
+            let (current, undecodable) =
+                self.decode_generation_on(&tx, &source_type, &source_location, &source_path, head)?;
+            if undecodable != 0 {
+                return Err(StoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "cannot verify the existing DSH projection prefix",
+                )));
+            }
+            current
+        } else {
+            Vec::new()
+        };
+        let current_json = if revisit_target {
+            serde_json::to_vec(&current)?
+        } else {
+            Vec::new()
+        };
 
         // ── 幂等短路（ADR-051 I7）────────────────────────────────────────
         //
@@ -3253,7 +3337,7 @@ impl TotalStore {
         // 🔴 返回的是记录里的头，**不是当前头**：中间可能已经有别的操作推进过，
         // 返回当前头会让调用方以为自己这次操作生效了。
         if let Some(token) = batch.token.as_ref() {
-            let prior: Option<(i64, i64)> = conn
+            let prior: Option<(i64, i64)> = tx
                 .query_row(
                     "SELECT source_revision, projection_revision FROM applied_projections \
                        WHERE token = ?1",
@@ -3262,34 +3346,72 @@ impl TotalStore {
                 )
                 .optional()?;
             if let Some((sr, pr)) = prior {
-                log::info!(
-                    target: crate::logging::tag::SQLITE,
-                    "projection already applied, returning prior head: path={source_path} rev={sr}/{pr}"
-                );
-                let max_offset: i64 =
-                    conn.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
-                        r.get(0)
-                    })?;
-                return Ok(Some(ProjectionStats {
-                    appended: 0,
-                    skipped_dup: 0,
-                    skipped_erased: 0,
-                    max_offset,
-                    source_revision: sr,
-                    projection_revision: pr,
-                    // 头没动 —— 这次什么都没做。谎报 true 会让 QuotaBar 推进
-                    // `parser_revision`，而那正是「重投影没落库却以为落了」。
-                    head_moved: false,
-                    superseded_removed: 0,
-                    // 没做任何取代，谈不上「事件变少」。
-                    loses_events: None,
-                }));
+                let current_target = if revisit_target {
+                    tx.query_row(
+                        "SELECT token FROM applied_projections WHERE source_type = ?1 \
+                           AND source_location = ?2 AND source_path = ?3 ORDER BY rowid DESC LIMIT 1",
+                        params![source_type, source_location, source_path],
+                        |r| r.get::<_, String>(0),
+                    )? == token.as_str() && head == (sr, pr)
+                } else {
+                    true
+                };
+                // 其他写者可在同一个 head 内追加，token 与 head 相同仍不足以证明目标未漂移。
+                if current_target
+                    && (!revisit_target || current_json == serde_json::to_vec(&events)?)
+                {
+                    log::info!(
+                        target: crate::logging::tag::SQLITE,
+                        "projection already applied, returning prior head: path={source_path} rev={sr}/{pr}"
+                    );
+                    let max_offset: i64 =
+                        tx.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
+                            r.get(0)
+                        })?;
+                    return Ok(Some(ProjectionStats {
+                        appended: 0,
+                        skipped_dup: 0,
+                        skipped_erased: 0,
+                        max_offset,
+                        source_revision: sr,
+                        projection_revision: pr,
+                        // 头没动 —— 这次什么都没做。谎报 true 会让 QuotaBar 推进
+                        // `parser_revision`，而那正是「重投影没落库却以为落了」。
+                        head_moved: false,
+                        superseded_removed: 0,
+                        // 没做任何取代，谈不上「事件变少」。
+                        loses_events: None,
+                    }));
+                }
+                // 目标已离开当前头；完整快照可重新建立源版本，不能把旧 token 当作本次成功。
+                if projection == Projection::Append {
+                    projection = Projection::Rollback;
+                }
             }
         }
 
-        let head = head_of(&conn, &source_type, &source_location, &source_path)?;
+        if revisit_target && projection == Projection::Reparse {
+            use sha2::{Digest, Sha256};
+            let actual_hash = format!("{:x}", Sha256::digest(&current_json));
+            if prior_projected_hash != Some(actual_hash.as_str()) {
+                // 规划后已有写者换了内容，或读取水位领先于落库。无法证明当前代可再生时保留它。
+                log::warn!(target: crate::logging::tag::SQLITE,
+                    "DSH reparse prior target changed; retaining current generation: path={source_path}");
+                projection = Projection::Rollback;
+            }
+        }
+        let mut verified_prefix_len = 0;
+        if revisit_target && projection == Projection::Append {
+            if current.len() > events.len()
+                || current_json != serde_json::to_vec(&events[..current.len()])?
+            {
+                projection = Projection::Rollback;
+            } else {
+                // 前缀已解密逐字核对；不要再为最终会被 seq 去重的旧行构造加密信封。
+                verified_prefix_len = current.len();
+            }
+        }
         let (source_revision, projection_revision) = projection.target_revisions(head);
-        let tx = Self::write_tx(&mut conn)?;
         if let Some((want_head, want_rows)) = expect {
             let rows: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM raw_events
@@ -3312,6 +3434,12 @@ impl TotalStore {
         // token 记账与事件写入**同一事务** —— 分开写就会造出「token 记了但事件没写」
         // （下轮短路返回一个从未存在的头）或反之（崩溃重放又开一代）的窗口。
         if let Some(token) = batch.token.as_ref() {
+            if revisit_target {
+                tx.execute(
+                    "DELETE FROM applied_projections WHERE token = ?1",
+                    params![token.as_str()],
+                )?;
+            }
             tx.execute(
                 r#"INSERT INTO applied_projections
                      (token, source_type, source_location, source_path,
@@ -3347,8 +3475,7 @@ impl TotalStore {
             ],
         )?;
         let mut appended = 0u64;
-        let mut skipped_dup = 0u64;
-        let mut skipped_erased = 0u64;
+        let mut skipped_dup = verified_prefix_len as u64;
         {
             let mut tombstoned = tx.prepare(
                 r#"SELECT EXISTS(
@@ -3366,7 +3493,7 @@ impl TotalStore {
                       project_root, event_json)
                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
             )?;
-            for ev in events {
+            for ev in &events[verified_prefix_len..] {
                 let erased: bool = tombstoned.query_row(
                     params![ev.source_session_id, ev.source_path, ev.project_root],
                     |row| row.get(0),
@@ -5045,6 +5172,23 @@ impl TotalStore {
             self.cipher.decrypt(&row.envelope, &row.aad())?
         };
         Ok(serde_json::from_slice(&plaintext)?)
+    }
+
+    /// 事件数量与最大 offset（包括保留的旧代），供 `stores` 枚举；COUNT 可利用现有窄索引。
+    pub fn event_summary(&self) -> StoreResult<StoreEventSummary> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(EVENT_SUMMARY_SQL, [], |row| {
+            Ok(StoreEventSummary {
+                count: row.get::<_, i64>(0)? as u64,
+                max_offset: row.get(1)?,
+            })
+        })?)
+    }
+
+    /// 单独查询事件水位，供 `pull` 摘要；不为一条水位统计整库行数或入库时间。
+    pub fn max_offset(&self) -> StoreResult<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(MAX_OFFSET_SQL, [], |row| row.get(0))?)
     }
 
     /// 总库状态（条数 / 最大 offset / 最近入库时间）。
@@ -8101,6 +8245,57 @@ mod tests {
     }
 
     #[test]
+    fn event_summary_preserves_stored_row_semantics_after_rewrite_and_erasure() {
+        let store = TotalStore::open_in_memory().unwrap();
+        assert_eq!(store.event_summary().unwrap(), StoreEventSummary::default());
+        assert_eq!(store.max_offset().unwrap(), 0);
+        let before = mk_event(0, "s", Some("before"));
+        let after = mk_event(0, "s", Some("after"));
+        store.append_events(&[before], Projection::Append).unwrap();
+        store.append_events(&[after], Projection::Rollback).unwrap();
+        let summary = store.event_summary().unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(summary.count, 2, "保留的旧代也是 stores 的事件数");
+        assert_eq!(summary.max_offset, status.max_offset);
+        assert_eq!(store.max_offset().unwrap(), status.max_offset);
+        store.tombstone(TombstoneScope::Session, "s").unwrap();
+        assert_eq!(store.event_summary().unwrap(), StoreEventSummary::default());
+        assert_eq!(
+            store.max_offset().unwrap(),
+            0,
+            "不是 sqlite_sequence 的历史值"
+        );
+    }
+
+    #[test]
+    fn event_summary_avoids_the_status_aggregate_row_walk() {
+        use rusqlite::StatementStatus;
+        let store = TotalStore::open_in_memory().unwrap();
+        let events: Vec<_> = (0..256).map(|seq| mk_event(seq, "s", None)).collect();
+        store.append_events(&events, Projection::Append).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut old = conn
+            .prepare("SELECT COUNT(*), COALESCE(MAX(offset), 0), MAX(ingested_at) FROM raw_events")
+            .unwrap();
+        let baseline: (u64, i64) = old
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        let mut summary = conn.prepare(EVENT_SUMMARY_SQL).unwrap();
+        let result: (u64, i64) = summary
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        assert_eq!(result, baseline);
+        assert!(
+            old.get_status(StatementStatus::FullscanStep) > 0,
+            "旧路径确实逐行聚合"
+        );
+        assert_eq!(summary.get_status(StatementStatus::FullscanStep), 0);
+        assert!(
+            summary.get_status(StatementStatus::VmStep) < old.get_status(StatementStatus::VmStep)
+        );
+    }
+
+    #[test]
     fn event_json_is_authenticated_ciphertext_at_rest() {
         let store = TotalStore::open_in_memory().unwrap();
         store
@@ -8584,6 +8779,103 @@ mod tests {
     fn head_of_store(s: &TotalStore) -> (i64, i64) {
         let conn = s.conn.lock().unwrap();
         head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap()
+    }
+
+    #[test]
+    fn full_target_replay_checks_events_even_when_the_head_and_token_match() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let target = || batch(Projection::Append, 0, "target", Some(token_for("target")));
+        store.apply_full_projection_target(target(), None).unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 1, "other writer", None))
+            .unwrap();
+        assert_eq!(head_of_store(&store), (0, 0));
+
+        let restored = store.apply_full_projection_target(target(), None).unwrap();
+        assert!(restored.head_moved);
+        assert_eq!(head_of_store(&store), (1, 0));
+        let current = store.read_current_since_page(0, 100).unwrap().events;
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].1.content.as_deref(), Some("target"));
+        assert!(store
+            .read_since_page(0, 100)
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, event)| event.content.as_deref() == Some("other writer")));
+        let replay = store.apply_full_projection_target(target(), None).unwrap();
+        assert!(!replay.head_moved);
+    }
+
+    #[test]
+    fn stale_full_target_reparse_preserves_another_writers_generation() {
+        use sha2::{Digest, Sha256};
+        let store = TotalStore::open_in_memory().unwrap();
+        let initial = batch(Projection::Append, 0, "before", Some(token_for("before")));
+        let prior_hash = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&initial.events).unwrap())
+        );
+        store.apply_full_projection_target(initial, None).unwrap();
+        // 另一写者先提交同条数的原生改写，旧 Reparse 计划随后才完成。
+        store
+            .apply_full_projection_target(
+                batch(
+                    Projection::Rollback,
+                    0,
+                    "rewritten",
+                    Some(token_for("rewritten")),
+                ),
+                None,
+            )
+            .unwrap();
+        let result = store
+            .apply_full_projection_target(
+                batch(
+                    Projection::Reparse,
+                    0,
+                    "old snapshot reparsed",
+                    Some(token_for("stale")),
+                ),
+                Some(&prior_hash),
+            )
+            .unwrap();
+        assert_eq!(result.source_revision, 2);
+        assert_eq!(result.superseded_removed, 0);
+        assert!(store
+            .read_since_page(0, 100)
+            .unwrap()
+            .events
+            .iter()
+            .any(|(_, event)| event.content.as_deref() == Some("rewritten")));
+    }
+
+    #[test]
+    fn full_target_append_compares_only_events_allowed_by_tombstones() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut erased = mk_event(0, "s", Some("erased"));
+        erased.project_root = Some("/gone".into());
+        let mut first = batch(Projection::Append, 0, "", Some(token_for("first")));
+        first.events = vec![erased.clone(), mk_event(1, "s", Some("kept"))];
+        store.apply_full_projection_target(first, None).unwrap();
+        store
+            .tombstone(TombstoneScope::ProjectRoot, "/gone")
+            .unwrap();
+        let mut next = batch(Projection::Append, 0, "", Some(token_for("next")));
+        next.events = vec![
+            erased,
+            mk_event(1, "s", Some("kept")),
+            mk_event(2, "s", Some("suffix")),
+        ];
+        let result = store.apply_full_projection_target(next, None).unwrap();
+        assert!(!result.head_moved, "墓碑造成的 seq 间隙不应开回退代");
+        assert_eq!(result.appended, 1);
+        assert_eq!(result.skipped_dup, 1);
+        assert_eq!(result.skipped_erased, 1);
+        assert_eq!(
+            store.read_current_since_page(0, 100).unwrap().events.len(),
+            2
+        );
     }
 
     /// 🔴 **ADR-051 描述的那个崩溃序列，逐步复现。**

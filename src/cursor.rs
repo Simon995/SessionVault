@@ -60,6 +60,9 @@ pub struct Cursor {
 
     // --- provider 私有 ---
     pub codex_state: Option<CodexState>,
+    /// DSH 的生命周期与完整旧前缀凭据；不借用普通 JSONL 的字节偏移判断增量。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_state: Option<Box<crate::dsh_snapshot::DshSavedState>>,
 
     /// 下一条事件的 `seq` 起点（文件内单调，增量批次间延续）。回退重读时归零。
     pub next_seq: u64,
@@ -77,6 +80,7 @@ impl Cursor {
             last_rowid: None,
             schema_fingerprint: None,
             codex_state: None,
+            dsh_state: None,
             next_seq: 0,
         }
     }

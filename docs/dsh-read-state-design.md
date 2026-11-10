@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-09 更新。基于安装版 `@deepseek-ai/dsh` `0.2.1-rc.5` 的公开类型、原生 backend 源码及本仓生产调用点。受控运行证据见 [核查记录](dsh-ingest-survey.md) §13–§19；独立快照审计、Node 捕获、Rust 字节 / 原生位置、原生 admission、Rust 来源选代 / 保守提交门及归一化位置映射与实验性总库提交接线见本文 §6–§11。控制面绑定与临时排除已于 `a151997` 落地；DSH 默认 `SourceType` / `discover` 正式注册仍待复杂语义收尾后开启，执行顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-10 更新。§1–§13 保留各阶段的安装源码核查与运行证据（`0.2.1-rc.5`，后于 §12 升级为 `0.2.2-rc.1`）。控制面绑定与临时排除已随 `v2026.11.09.1` 发布；复杂语义与细粒度用量已合入 `main`（`dc682ff` / `498b7a3`）。当前开发分支 `feat/dsh-source-integration` 的正式 `catalog` / `discover` / `scan-all` 接线与兼容边界见 §14–§15，尚未合并或发布。任务顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -319,3 +319,64 @@ node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.jso
    - `summarize_session_usage_evidence(&[RawEvent]) -> SessionUsageSummary` 从任意已归一化或从 `TotalStore` 读回的事件切片中聚合会话级用量账本与精确计数器。
 
 Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 25 项检查全部通过；Windows `store,dsh-experimental` 库测试 456 passed，WSL Linux `store,dsh-experimental` 库测试 442 passed，两平台零警告 clippy 通过。
+
+## 14. 常规来源接线与持久化凭据
+
+2026-11-10，开发分支 `feat/dsh-source-integration` 将上述核验链接入常规扫描。本节描述本分支，尚未合并或发布；`v2026.11.09.1` 不包含本节能力。
+
+- **目录与身份**：`catalog::builtin_descriptors()` 增加 `DeepSeek Harness` 描述符，沿用 `SourceType::Jsonl` / `SourceMode::AppendLog` / `SourceLocation::Local`。逻辑 `source_path` 为会话目录，选中的物理文件由专用选代器决定；`.jsonl` / `.zstd` 或格式代变化不产生第二份逻辑来源。`discover_transcripts()` 包含该来源，`discover_snapshots()` 不包含；显式 DSH 根内的物理日志从通用 JSONL 发现中排除，避免绕过核验或重复摄取。
+- **显式配置**：优先 `SVAULT_DSH_SESSIONS_DIR`，其次 `SVAULT_DSH_HOME/sessions`；必须是当前进程的本机绝对路径，未配置时不猜默认根。扫描另需可信本机运行时 `SVAULT_DSH_NODE` 与 `SVAULT_DSH_PACKAGE`（分别为 Node 可执行文件与 DSH `package.json` 的绝对路径）。这些配置由启动方传入，来源日志不能指定可执行代码。Windows 宿主直接捕获 WSL 来源尚未接入；在 Linux 进程中可用对应本机路径扫描。
+- **功能开关**：`dsh_snapshot` / `dsh_provider` 默认可编译，保留空的 `dsh-experimental` feature 供原验证入口使用。正式扫描要求 `store` feature；无 `store` 构建遇到 DSH 会显式返回不可用并冻结，不伪装成成功空结果。
+- **唯一提交门**：`scan` 与 CLI `scan_one` 都调用 `dsh_provider::scan_source`，复用 `capture_source` 与 `plan_dsh_source_step_with_bindings`。CLI 传入实际 `ScanReasons`、`PriorProjection`、归属修订和旧游标，并使用已规划的 DSH `CommitPlan`，不再按普通 JSONL 规则重新解释。写库扫描加载总库 `store_meta` 与清单合并后的绑定，临时与未决准入同时约束扫描和最终写入。
+- **失败冻结**：缺运行时、坏尾、原生 admission 拒绝、生命周期或前缀证据不足、未知最高格式代均保留旧投影与旧凭据。仅存 v3 或出现 v5 不回退 v4，混存不同编码不任选一个继续；`--force` 也不能把未知完整性变成推进许可。
+- **跨轮状态**：`Cursor.dsh_state: Option<Box<DshSavedState>>` 独立保存完整旧前缀与生命周期凭据，旧 JSON 缺字段可读、`None` 时不输出字段。消费方自存 Cursor 时须保存和恢复该字段，不能只补 `None` 消除编译错误；通用字节偏移和 `next_seq` 不替代 DSH 凭据。旧 CLI 保存共用游标文件会抹掉该字段；若库里已有投影而凭据缺失，本轮完整核验后保守按 Rollback 重建并保留前代，不走首次 Append 或可回收前代的 Reparse。同内容崩溃重放仍由 token 防重，扫描报告明确提示凭据缺失。
+- **归一化变化**：`DshSavedState.normalized_events_sha256` 记录控制面丰富前的完整事件摘要，`projected_events_sha256` 记录包含控制面丰富与 profile 的完整落库目标摘要。turn 闭合可能只改变既有事件的用量结算证据、条数保持不变；绑定变化也可能只改变旧事件的 `input_origin` 或计量归属。因此增量时既核原生旧前缀，也核旧前缀丰富前后的归一化内容；摘要变化触发 Reparse。缺摘要的旧状态会补做一次 Reparse。
+- **公共扫描出口**：`SourceChange::ReparseRequired` 随 `AppendLogObservation` 保留旧事件须重投影的观察。即使消费方拿公共 `scan` 的结果，以 `ScanReasons::NONE` 重新调用 `CommitPlan::plan`，仍会得到 `ReplaceFile`；已有总库投影时为 Reparse。该枚举新增变体会影响 Rust 穷举匹配。
+- **读取与入库水位**：原型入口和 CLI 使用 `apply_dsh_planned_projection` 提交完整已核目标。游标可能已被只吐流的一轮推进，总库不能据此假定旧前缀已写入；Append 提交在同一事务中先排除墓碑事件，再解密核对现有投影的事件前缀，只为尚未保存的后缀构造加密信封。前缀不符时保守开 Rollback 源版本，解不开则拒绝写入。Reparse 还须证明当前代与规划时保存的旧目标摘要一致；不一致时改为保留旧代的 Rollback，防止过期计划删除另一写者的新内容。
+- **幂等与历史目标**：`DshSavedState::projection_token` 包含已核生命周期、原生内容、丰富后目标摘要、解析修订、归属修订和范围。DSH 专用完整目标提交只在 token 仍对应当前头、是该来源最后一次目标提交且实际事件与墓碑过滤后的目标相同时短路；同头内的其他写者追加也会被发现。来源组合索引支持最后目标查询。A→B→A 的历史目标再次出现会重新提交，保留旧源版本，随后崩溃重放不重复开代。通用 `TotalStore::apply_projection` 的操作 token 仍保持“重复操作返回当年 head”的原语义，无新增表列。
+- **物理编码切换与冻结**：来源核验接受同一实例、会话目录、会话 ID 与格式代的另一物理编码绑定，使已保存的未压缩 / zstd 凭据能够相互续接；其他来源绑定仍拒绝。捕获失败或准入搁置时保留传入的整个 Cursor，CLI 流式扫描也遵守 Freeze，不因缺少 `dsh_state` 而把旧游标归零。
+
+库回归覆盖关闭 turn 后条数不变、绑定加入与移除、绑定变化与原生追加同轮发生时的公共全读指纹、凭据缺失、读取领先入库、历史目标重访、过期 Reparse、同头追加漂移及墓碑过滤；正式 CLI 矩阵另覆盖共用游标被旧写者抹掉凭据、A→B→A、未压缩与 zstd 双向切换，以及先流式读取再写入追加 / 改写内容。
+
+## 15. H.7 兼容验收与升级边界
+
+2026-11-10，在项目内合成来源、独立状态文件、测试总库与显式文件钥匙上运行 [verify-dsh-provider-compat.mjs](../scripts/verify-dsh-provider-compat.mjs)。未读取或改写真库、未覆盖已安装 CLI；旧版取正式发布 `v2026.11.09.1`（`ccfbdca66e7f`）。结论是**有限兼容**，不能把“能反序列化”和“重写仍保真”合成一个通过标志。
+
+| 消费形状 / 操作 | 已核结果与边界 |
+| --- | --- |
+| CLI 旧读者 | 隔离存储矩阵中新版写入 16 个 DSH 事件、3 份 `usage_evidence`；旧 `pull` 返回 16 个事件但不输出新证据字段。只读前后整库逻辑摘要相同，读操作不损坏存储；旧输出不能用作证据保真转存。 |
+| 新旧普通写者 | 旧 `scan-all --only jsonl` 追加普通 JSONL 事件，DSH 密文行、当前头与证据保持不变；重复追加幂等。旧版创建的库能被新版读取。不据此推断旧版重写路径安全。 |
+| 旧 CLI 整代重写 | 同一隔离矩阵中旧 `reattribute --apply` 重写 DSH 来源后，事件总数未减，3 份证据全部丢失；`--projection all` 也无法读回，旧投影已被删除。只核事件数会误判成功。 |
+| Rust 构造 / 穷举 | 未新增 `SourceType`、`SourceMode`、`EventType` 或 `CursorKind` 变体；新增 `SourceChange::ReparseRequired`，穷举匹配需适配其完整重投影语义。`Cursor.dsh_state` 与 `DshSavedState` 的两个摘要字段会影响字面量构造：实际替换依赖路径后 QuotaBar `--lib` 编译报 `E0063`，`src/svault_bridge.rs:252` 缺 `dsh_state`；本轮未修改消费方源码或子模块指针。`DshPlannedStep` 另以私有字段携带旧目标摘要，调用方应经规划入口取得，不能在外部字面量构造。 |
+| Rust 逐字段读取 | 沿用原四桶只得到 `ExactFourBucket` 的结算事件；须显式读取 `usage_evidence` 或调用 `summarize_session_usage_evidence` 才获得未知 cache 下的精确 total、失败 attempt 与诊断。新增状态字段也须纳入消费方自己的 Cursor 持久化。 |
+| Python / TypeScript 逐字段投影 | 对隔离事件实际调用 TumeFlow `RawEvent.from_wire` 与 TumeChat `parsePull` / `EventProjection`：能接受新事件，投影后不保留 `usage_evidence`。这证明结构可读，尚未交付细粒度用量展示或汇总。 |
+| `discover` 按模式过滤 | DSH 描述符为 `append_log`，不会进入 `snapshot_file`；JSONL 类型过滤包含 DSH 与已配置的通用 JSONL。来源路径须作为逻辑目录处理，消费方不能假定所有 append-log 路径都是可直接打开的文件。 |
+
+**升级顺序**：新证据进入共享总库前，先升级所有可能反序列化后重写事件的写者。已实跑的损失路径是旧 CLI `reattribute --apply`。另据消费方 2026-11-10 源码核对，QuotaBar 归档投影前自动调用 `recompute_attribution(..., false)`，其旧依赖经旧 `RawEvent` 与 `write_rewritten` 整代回写；这是已核源码风险，未实跑证明丢失，也未核真库是否含新证据。不能只提醒手动命令。消费方自行升级依赖、Cursor 存储与字段投影，本仓不替其 bump 指针。
+
+本轮验证记录（2026-11-10）：
+
+| 检查 | Windows | WSL Linux |
+| --- | --- | --- |
+| `cargo test --lib --features store,dsh-experimental` | 472 passed | 457 passed |
+| `cargo test --bin svault --features store` | 28 passed | 28 passed |
+| `cargo test --test cli_scan_baseline_it --features store,acceptance-fixtures` | 5 passed | 5 passed |
+| `cli_union_it` / `cli_read_only_it`（`store,acceptance-fixtures`） | 各 2 passed | 各 2 passed |
+| 默认 / `store` 的 `cargo check --bins` | 通过 | 通过 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 通过 | 通过 |
+| 归一化与真实总库原型矩阵 | 25 项通过 | 25 项通过 |
+| 正式 provider 跨版本矩阵 | 61 项支持契约检查通过，`rc=2` 有限兼容 | 61 项支持契约检查通过，`rc=2` 有限兼容 |
+
+最终矩阵 `supported_contracts_passed=true`、`failure=null`；`rc=2` 对应表中旧读者遗漏与旧整代重写损失，不是完整向后保真。Windows 日志为 `target/final-win-compat.log`，Linux 日志为 `target/final-linux-compat.log`，完整 JSON 报告另存于各轮运行目录；这些本机运行物不入库。
+
+Linux 基线集成测试最初因夹具固定落在 Windows 挂载盘、合成钥匙无法满足 `0600` 被权限门拒绝；现夹具跟随 `CARGO_TARGET_DIR`，相对值先按项目根解析为绝对路径，避免 DSH 根因路径非绝对而跳过扫描。最终在 Linux 文件系统及 Windows 相对构建目录分别重验五项通过，没有放松生产权限检查。真实 Rust 消费方另跑 `cargo check --locked --lib`（只以 Cargo `paths` 覆盖依赖，不改消费方文件），仍因上述 `Cursor.dsh_state` 报 `E0063`，因此没有把消费方编译记为通过。
+
+复跑入口（路径由运行环境显式提供）：
+
+```sh
+node scripts/verify-dsh-provider-compat.mjs \
+  --binary '<new-svault>' --old-binary '<released-svault>' \
+  --dsh-package '<absolute-package.json>' --example-binary '<dsh_snapshot>'
+```
+
+退出码 `0` 表示支持契约通过且未观察到未知字段损失；`1` 表示验收契约失败；`2` 表示 `supported_contracts_passed` 但观察到旧读者 / 旧重写器丢失新证据，报告 `limited_compatibility`。`2` 必须保留为升级限制，不能改成全绿结论。Linux 可通过 `SVAULT_DSH_NODE='<linux-node>' bash scripts/verify-dsh-provider-linux.sh '<package.json>' '<released-svault>'` 复跑全套测试与矩阵；第二个位置参数可省略，脚本将各命令自己的退出码单独存为 `target/final-linux-*.rc`，并明确报告有限兼容。报告与运行物保存在 `${CARGO_TARGET_DIR:-target}/dsh-provider-compat/run-*`，每轮复制并记录所用新旧二进制的 SHA-256。WSL 应指定 Linux 文件系统上的 `CARGO_TARGET_DIR`，以便合成钥匙满足真实的 `0600` 权限；只读操作比较整库逻辑摘要，重复扫描比较事件密文与投影语义，允许正常来源刷新 `updated_at`。

@@ -1,7 +1,7 @@
-//! 实验性 DSH v4 字节核验与原生记录位置；不注册 provider、不产生 RawEvent。
+//! DSH v4 核验、原生记录位置、归一化与保守提交门。
 //!
-//! 物理完整不包含 DSH codec / restore admission、来源选代或生命周期稳定性。
-//! 即使成功也不能转换成 AppendLogObservation 或生产推进凭据。
+//! 单独的物理完整不包含原生 admission、来源选代或生命周期稳定性。
+//! 常规来源接线由 `dsh_provider` 复用完整验证路径，物理摘要本身不是推进凭据。
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -20,9 +20,9 @@ mod source;
 pub use native::{AdmittedSnapshot, NativeRuntime};
 #[cfg(feature = "store")]
 pub use normalize::{
-    commit_dsh_source_step, commit_dsh_source_step_with_bindings, plan_dsh_source_step,
-    plan_dsh_source_step_with_bindings, scan_dsh_sessions_root_to_store, DshPlannedStep,
-    DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
+    apply_dsh_planned_projection, commit_dsh_source_step, commit_dsh_source_step_with_bindings,
+    plan_dsh_source_step, plan_dsh_source_step_with_bindings, scan_dsh_sessions_root_to_store,
+    DshPlannedStep, DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
 };
 pub use normalize::{
     epoch_ms_to_iso8601_utc, evaluate_dsh_usage_sample, normalize_admitted_snapshot,

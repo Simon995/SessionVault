@@ -436,7 +436,7 @@ pub enum UsageExecutionBindingStatus {
 ///   随 `EventType::Usage`（同时填 `usage: Some(TokenUsage)`）落库；
 /// - 当属于 `ExactTotalWithUnknownCache`、`PartialInsufficientForTotal`、`InvalidOrContradictory`、
 ///   `MissingUsageReport`、`IncompleteTurnLifecycle` 或 `SupersededBySameStep` 时，
-///   随 `EventType::Meta`（`usage: None`）落库——既保证 `TotalStore` 加密存储与 `open_read_only`
+///   随已有 `Message` / `Thinking` 或独立 `Meta`（`usage: None`）落库——既保证 `TotalStore` 加密存储与 `open_read_only`
 ///   完整保留计量证据与诊断原因，又保证只认四段 `TokenUsage` 的消费方（如 QuotaBar）绝不把未知桶当 `0` 误计。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageEvidence {
