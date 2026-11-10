@@ -319,6 +319,3 @@ node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.jso
    - `summarize_session_usage_evidence(&[RawEvent]) -> SessionUsageSummary` 从任意已归一化或从 `TotalStore` 读回的事件切片中聚合会话级用量账本与精确计数器。
 
 Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 25 项检查全部通过；Windows `store,dsh-experimental` 库测试 456 passed，WSL Linux `store,dsh-experimental` 库测试 442 passed，两平台零警告 clippy 通过。
-
-
-
