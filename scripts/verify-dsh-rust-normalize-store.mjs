@@ -9,7 +9,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { constants, zstdCompressSync } from "node:zlib";
-import { seedWithTurn, withRetry } from "../tests/fixtures/dsh-v4/scenarios.mjs";
+import {
+  seedWithTurn,
+  unseededSubagentChild,
+  withCompactionAndSubagentCatalog,
+  withRetry,
+} from "../tests/fixtures/dsh-v4/scenarios.mjs";
 import { loadDshInstallation, SUPPORTED_DSH_VERSION } from "./dsh-installed.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -410,6 +415,354 @@ async function main() {
         stepIFutureGen.json.store_head.source_revision === 2 &&
         stepIFutureGen.json.store_current_events === 3,
       stepIFutureGen.json,
+    );
+
+    // Step J: 真实 @deepseek-ai/dsh v4 runtime 下的 Compaction + surfaceOp:"replace" 表面折叠 + SubagentCatalog + 控制面绑定 InputOrigin 保真
+    const complexDir = path.join(tmpRoot, "complex-compact-session");
+    const complexDoc = withCompactionAndSubagentCatalog(baseFixture, "session-compact-v4");
+    writeZstdSession(complexDir, complexDoc.header, complexDoc.events);
+    const complexStoreDb = path.join(tmpRoot, "complex_store.db");
+    const complexStateFile = path.join(tmpRoot, "complex_state.json");
+    const complexBindingsFile = path.join(tmpRoot, "complex_bindings.json");
+    fs.writeFileSync(
+      complexBindingsFile,
+      JSON.stringify({
+        schemaVersion: 1,
+        bindings: [
+          {
+            schemaVersion: 1,
+            owner: { namespace: "tumechat.user", id: "u_main" },
+            host: { namespace: "tumechat.host", id: "h_win" },
+            session: { namespace: "tumechat.session", id: "s_compact" },
+            assignment: { namespace: "tumechat.assignment", id: "a_compact" },
+            controller: "product-adapter",
+            nativeSource: {
+              backend: "dsh-native",
+              sourceLocation: "local",
+              sourcePath: complexDir,
+              nativeSessionId: complexDoc.header.id,
+            },
+            temporary: false,
+            readMemory: false,
+            verifiedHumanInput: true,
+            recordedAt: "2026-11-09T09:00:00Z",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    const stepJComplex = runSnapshotCli(binary, [
+      "--session-dir",
+      complexDir,
+      "--source-instance",
+      "live-complex-instance",
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--store-db",
+      complexStoreDb,
+      "--state-file",
+      complexStateFile,
+      "--bindings-file",
+      complexBindingsFile,
+      "--positions",
+    ]);
+    const jJson = stepJComplex.json;
+    const jSpans = jJson?.normalized_event_spans || [];
+    const jOrigins = jJson?.observed_user_input_origins || [];
+    // 在 baseFixture 中，表面节点为 seq 2 (system), 3 (developer), 4 (user), 5 (assistant), 7 (tool/result)。
+    // checkpoint 位于 seq 13（surfaceOp: { op: "replace", startSeq: 3, endSeq: 7 }），
+    // seq 2 是 system/message 受保护，被折叠替换的是 [3, 4, 5, 7]，保留 seq 2！
+    const spanSeq2 = jSpans.find((s) => s.native_seq === 2);
+    const spanSeq4 = jSpans.find((s) => s.native_seq === 4);
+    const spanSeq13 = jSpans.find((s) => s.native_seq === 13);
+    check(
+      "stepJ_compaction_surface_fold_and_input_origins",
+      stepJComplex.status === 0 &&
+        jJson.admission_status === "persistent_bound" &&
+        jJson.subagent_catalog.length === 1 &&
+        jJson.subagent_catalog[0].child_id === "session-compact-v4-sub-1" &&
+        jJson.compaction_records.length === 3 &&
+        jJson.surface_replacements.length === 1 &&
+        JSON.stringify(jJson.surface_replacements[0].replaced_surface_seqs) ===
+          JSON.stringify([3, 4, 5, 7]) &&
+        spanSeq2?.active_on_surface === true &&
+        spanSeq4?.active_on_surface === false &&
+        spanSeq4?.shadowed_by_native_seq === 13 &&
+        spanSeq13?.active_on_surface === true &&
+        spanSeq13?.surface_op === "replace" &&
+        jOrigins.length === 5 &&
+        // 第 1 条 user/message（seq 4，source.kind="user"）在受控会话中升级为 human_verified
+        jOrigins[0].sender_kind === "human_verified" &&
+        jOrigins[0].trust_level === "human_verified" &&
+        // 第 2 条（compact-checkpoint）、第 3 条（subagent-settled）、第 4 条（goal）、第 5 条（team-message）绝不升级为 human_verified
+        jOrigins[1].sender_kind === "subagent_or_runtime" &&
+        jOrigins[1].basis === "dsh_compaction_checkpoint" &&
+        jOrigins[2].sender_kind === "subagent_or_runtime" &&
+        jOrigins[2].basis === "dsh_subagent_settlement" &&
+        jOrigins[2].sender_session === "session-compact-v4-sub-1" &&
+        jOrigins[3].sender_kind === "coordinator_dispatch" &&
+        jOrigins[3].basis === "dsh_source_coordinator" &&
+        jOrigins[4].sender_kind === "peer_session" &&
+        jOrigins[4].basis === "dsh_source_peer",
+      jJson,
+    );
+
+    // Step K: 无 seed 独立子代理（isSeeded: false, origin: "subagent", subagent/descriptor）、多层 seed fork（s0 -> s1 -> s2）及父临时会话血缘继承排除
+    const unseededSubDir = path.join(tmpRoot, "unseeded-subagent-dir");
+    const unseededSubDoc = unseededSubagentChild(
+      baseFixture.header,
+      "session-compact-v4",
+      "session-compact-v4-sub-1",
+    );
+    writeZstdSession(unseededSubDir, unseededSubDoc.header, unseededSubDoc.events);
+    const stepKUnseeded = runSnapshotCli(binary, [
+      "--session-dir",
+      unseededSubDir,
+      "--source-instance",
+      "subagent-instance-1",
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--normalize",
+      "--positions",
+    ]);
+    const kNorm = stepKUnseeded.json?.normalization;
+    check(
+      "stepK_unseeded_subagent_descriptor_and_origin",
+      stepKUnseeded.status === 0 &&
+        kNorm?.is_seeded === false &&
+        kNorm?.session_origin === "subagent" &&
+        kNorm?.parent_session_id === "session-compact-v4" &&
+        kNorm?.inherited_event_count === 0 &&
+        kNorm?.subagent_descriptor_count === 1 &&
+        stepKUnseeded.json.subagent_descriptors[0].mode === "continuable" &&
+        stepKUnseeded.json.subagent_descriptors[0].label === "audit",
+      stepKUnseeded.json,
+    );
+
+    // 多层 seed fork（s0 -> mid1 -> grandchild2）
+    const mid1Doc = seedWithTurn(baseFixture, "session-mid-1");
+    const grandchild2Doc = seedWithTurn(mid1Doc, "session-grandchild-2");
+    const grandchildDir = path.join(tmpRoot, "grandchild-fork-dir");
+    writeZstdSession(grandchildDir, grandchild2Doc.header, grandchild2Doc.events);
+    const stepKGrandchild = runSnapshotCli(binary, [
+      "--session-dir",
+      grandchildDir,
+      "--source-instance",
+      "grandchild-instance",
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--normalize",
+      "--positions",
+    ]);
+    check(
+      "stepK_multilevel_seed_fork_suppresses_all_ancestors",
+      stepKGrandchild.status === 0 &&
+        stepKGrandchild.json.normalization.is_seeded === true &&
+        stepKGrandchild.json.normalization.parent_session_id === "session-mid-1" &&
+        stepKGrandchild.json.normalization.inherited_event_count === mid1Doc.events.length &&
+        stepKGrandchild.json.normalization.suppressed_inherited_records === mid1Doc.events.length &&
+        stepKGrandchild.json.normalization.emitted_raw_events === 3 &&
+        stepKGrandchild.json.normalized_event_spans.every(
+          (s) => s.native_seq >= mid1Doc.events.length,
+        ),
+      stepKGrandchild.json,
+    );
+
+    // 父会话标为 temporary: true 时，子代理会话通过 parentSession 自动继承 temporary_excluded，不写库、不推进状态
+    const tempBindingsFile = path.join(tmpRoot, "temp_parent_bindings.json");
+    fs.writeFileSync(
+      tempBindingsFile,
+      JSON.stringify({
+        schemaVersion: 1,
+        bindings: [
+          {
+            schemaVersion: 1,
+            owner: { namespace: "tumechat.user", id: "u_main" },
+            host: { namespace: "tumechat.host", id: "h_win" },
+            session: { namespace: "tumechat.session", id: "s_temp_parent" },
+            controller: "product-adapter",
+            nativeSource: {
+              backend: "dsh-native",
+              sourceLocation: "local",
+              nativeSessionId: "session-compact-v4",
+            },
+            temporary: true,
+            readMemory: true,
+            recordedAt: "2026-11-09T09:05:00Z",
+          },
+        ],
+      }),
+      "utf8",
+    );
+    const tempSubStoreDb = path.join(tmpRoot, "temp_sub_store.db");
+    const tempSubStateFile = path.join(tmpRoot, "temp_sub_state.json");
+    const stepKTempInherited = runSnapshotCli(binary, [
+      "--session-dir",
+      unseededSubDir,
+      "--source-instance",
+      "subagent-instance-1",
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--store-db",
+      tempSubStoreDb,
+      "--state-file",
+      tempSubStateFile,
+      "--bindings-file",
+      tempBindingsFile,
+    ]);
+    check(
+      "stepK_subagent_inherits_parent_temporary_exclusion",
+      stepKTempInherited.status === 0 &&
+        stepKTempInherited.json.admission_status === "temporary_excluded" &&
+        stepKTempInherited.json.events_excluded_temporary === 4 &&
+        stepKTempInherited.json.advanced_saved_state === false &&
+        stepKTempInherited.json.store_current_events === 0,
+      stepKTempInherited.json,
+    );
+
+    // Step L: DSH 会话根目录批量发现（--sessions-root）：v4 Ready、v0..v3 拒绝、v5+ 拒绝不回退、编码冲突拒绝
+    const discRoot = path.join(tmpRoot, "dsh-sessions-root");
+    writeZstdSession(path.join(discRoot, "01-ready-zstd"), baseFixture.header, baseFixture.events);
+    writePlainSession(
+      path.join(discRoot, "02-ready-plain"),
+      baseFixture.header,
+      baseFixture.events,
+    );
+    const legacyDir = path.join(discRoot, "03-legacy-v3");
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, "session.v3.jsonl.zstd"), "legacy-v3");
+    const futureDir = path.join(discRoot, "04-future-v5");
+    writeZstdSession(futureDir, baseFixture.header, baseFixture.events);
+    fs.writeFileSync(path.join(futureDir, "session.v5.jsonl.zstd"), "future-v5");
+    const conflictDir = path.join(discRoot, "05-encoding-conflict");
+    writeZstdSession(conflictDir, baseFixture.header, baseFixture.events);
+    writePlainSession(conflictDir, baseFixture.header, baseFixture.events);
+
+    const stepLDiscover = runSnapshotCli(binary, [
+      "--sessions-root",
+      discRoot,
+      "--compression",
+      "zstd",
+    ]);
+    const lEntries = stepLDiscover.json?.entries || [];
+    check(
+      "stepL_sessions_root_discovery_v4_only_contract",
+      stepLDiscover.status === 0 &&
+        stepLDiscover.json.kind === "dsh_sessions_root_discovered" &&
+        stepLDiscover.json.ready_v4_count === 2 &&
+        stepLDiscover.json.blocked_count === 3 &&
+        lEntries[0]?.outcome?.status === "ready_v4" &&
+        lEntries[0]?.outcome?.compression === "zstd" &&
+        lEntries[1]?.outcome?.status === "ready_v4" &&
+        lEntries[1]?.outcome?.compression === "none" &&
+        lEntries[2]?.outcome?.status === "blocked" &&
+        lEntries[2]?.outcome?.blocked?.reason === "physical_generation" &&
+        lEntries[3]?.outcome?.status === "blocked" &&
+        lEntries[3]?.outcome?.blocked?.reason === "physical_generation" &&
+        lEntries[4]?.outcome?.status === "blocked" &&
+        lEntries[4]?.outcome?.blocked?.reason === "encoding_conflict",
+      stepLDiscover.json,
+    );
+
+    // Step M: DSH 会话根目录批量扫描与入库（scan_dsh_sessions_root_to_store）：首轮入库 2 个 v4 会话（16 条事件），第 2 轮幂等 no-op，第 3 轮出现 v5 时 hold_prior_projection
+    const rootStoreDb = path.join(tmpRoot, "root_scan_store.db");
+    const rootStateFile = path.join(tmpRoot, "root_scan_states.json");
+    const stepM1 = runSnapshotCli(binary, [
+      "--sessions-root",
+      discRoot,
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--store-db",
+      rootStoreDb,
+      "--state-file",
+      rootStateFile,
+    ]);
+    check(
+      "stepM1_sessions_root_batch_scan_initial_commit",
+      stepM1.status === 0 &&
+        stepM1.json.kind === "dsh_sessions_root_scanned_and_committed" &&
+        stepM1.json.ready_v4_count === 2 &&
+        stepM1.json.blocked_count === 3 &&
+        stepM1.json.projected_sessions === 2 &&
+        stepM1.json.preserved_sessions === 3 &&
+        stepM1.json.total_events_appended === 16 &&
+        stepM1.json.store_current_events === 16,
+      stepM1.json,
+    );
+
+    // 第 2 轮：无变化，2 个 v4 会话均 no_op_unchanged，0 条新增
+    const stepM2 = runSnapshotCli(binary, [
+      "--sessions-root",
+      discRoot,
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--store-db",
+      rootStoreDb,
+      "--state-file",
+      rootStateFile,
+    ]);
+    check(
+      "stepM2_sessions_root_batch_scan_noop_idempotent",
+      stepM2.status === 0 &&
+        stepM2.json.entries[0]?.commit_gate?.decision === "no_op_unchanged" &&
+        stepM2.json.entries[1]?.commit_gate?.decision === "no_op_unchanged" &&
+        stepM2.json.total_events_appended === 0 &&
+        stepM2.json.store_current_events === 16,
+      stepM2.json,
+    );
+
+    // 第 3 轮：在已入库的 01-ready-zstd 下出现未来代 session.v5.jsonl.zstd -> 触发 hold_prior_projection，保持库内 16 条事件不丢
+    fs.writeFileSync(
+      path.join(discRoot, "01-ready-zstd", "session.v5.jsonl.zstd"),
+      "future-v5",
+    );
+    const stepM3 = runSnapshotCli(binary, [
+      "--sessions-root",
+      discRoot,
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--store-db",
+      rootStoreDb,
+      "--state-file",
+      rootStateFile,
+      "--force",
+    ]);
+    check(
+      "stepM3_sessions_root_future_v5_holds_prior_v4_projection",
+      stepM3.status === 0 &&
+        stepM3.json.ready_v4_count === 1 &&
+        stepM3.json.blocked_count === 4 &&
+        stepM3.json.entries[0]?.commit_gate?.decision === "hold_prior_projection" &&
+        stepM3.json.store_current_events === 16,
+      stepM3.json,
     );
 
     console.log(

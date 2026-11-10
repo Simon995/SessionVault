@@ -75,6 +75,60 @@ pub struct NormalizedEventSpan {
     pub jsonl_end: usize,
     pub frame_index: Option<usize>,
     pub record_fingerprint: String,
+    /// 原生表面操作（`"append"` | `"replace"` | 非表面事件为 `None`）。
+    pub surface_op: Option<String>,
+    /// 该记录是否仍在折叠后的当前活跃对话表面（surface）上。
+    pub active_on_surface: bool,
+    /// 若该表面记录已被后续 `surfaceOp: { op: "replace" }` 折叠替换，记录替换它的 `native_seq`。
+    pub shadowed_by_native_seq: Option<u64>,
+}
+
+/// DSH v4 `subagent/descriptor` 元数据记录（子会话自身的委托描述符）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DshSubagentDescriptor {
+    pub native_seq: u64,
+    pub version: u64,
+    pub provider: String,
+    pub mode: String,
+    pub label: Option<String>,
+    pub ownership: NativeEventOwnership,
+}
+
+/// DSH v4 `subagent/catalog` 元数据记录（父会话登记的子代理目录项）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DshSubagentCatalogEntry {
+    pub native_seq: u64,
+    pub version: u64,
+    pub child_id: String,
+    pub child_created_at: Option<String>,
+    pub mode: String,
+    pub label: Option<String>,
+    pub ownership: NativeEventOwnership,
+}
+
+/// DSH v4 `compaction/*` 生命周期与摘要事件记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DshCompactionRecord {
+    pub native_seq: u64,
+    pub native_type: String,
+    pub compaction_id: Option<String>,
+    pub turn: Option<u64>,
+    pub shadowed_start_seq: Option<u64>,
+    pub shadowed_end_seq: Option<u64>,
+    pub shadowed_seqs: Vec<u64>,
+    pub ownership: NativeEventOwnership,
+}
+
+/// DSH v4 `surfaceOp: { op: "replace", startSeq, endSeq }` 表面替换记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DshSurfaceReplacement {
+    pub replacement_native_seq: u64,
+    pub native_type: String,
+    pub start_seq: u64,
+    pub end_seq: u64,
+    pub source_event_seqs: Vec<u64>,
+    pub replaced_surface_seqs: Vec<u64>,
+    pub ownership: NativeEventOwnership,
 }
 
 /// 一条 DSH 原生 usage 记录的归一化处置状态。
@@ -113,11 +167,20 @@ pub struct NormalizedDshSnapshot {
     pub cwd: Option<String>,
     pub parent_session_id: Option<String>,
     pub forked_from_seq: Option<u64>,
+    pub is_seeded: bool,
+    pub session_origin: Option<String>,
+    pub delegation_depth: Option<u64>,
+    pub agent_preset: Option<String>,
     pub inherited_event_count: usize,
     pub suppressed_inherited_records: usize,
     pub events: Vec<RawEvent>,
     pub spans: Vec<NormalizedEventSpan>,
     pub usage_ledger: Vec<DshUsageEntry>,
+    pub subagent_descriptors: Vec<DshSubagentDescriptor>,
+    pub subagent_catalog: Vec<DshSubagentCatalogEntry>,
+    pub compaction_records: Vec<DshCompactionRecord>,
+    pub surface_replacements: Vec<DshSurfaceReplacement>,
+    pub active_surface_native_seqs: Vec<u64>,
 }
 
 impl NormalizedDshSnapshot {
@@ -168,10 +231,20 @@ impl NormalizedDshSnapshot {
             "has_cwd": self.cwd.is_some(),
             "parent_session_id": self.parent_session_id,
             "forked_from_seq": self.forked_from_seq,
+            "is_seeded": self.is_seeded,
+            "session_origin": self.session_origin,
+            "delegation_depth": self.delegation_depth,
+            "agent_preset": self.agent_preset,
             "inherited_event_count": self.inherited_event_count,
             "suppressed_inherited_records": self.suppressed_inherited_records,
             "emitted_raw_events": self.events.len(),
             "next_seq": self.next_seq(),
+            "subagent_descriptor_count": self.subagent_descriptors.len(),
+            "subagent_catalog_count": self.subagent_catalog.len(),
+            "compaction_record_count": self.compaction_records.len(),
+            "surface_replacement_count": self.surface_replacements.len(),
+            "active_surface_event_count": self.active_surface_native_seqs.len(),
+            "active_surface_native_seqs": self.active_surface_native_seqs,
             "usage_summary": {
                 "total_native_usage_records": self.usage_ledger.len(),
                 "emitted_exact_four_bucket": exact_usages,
@@ -182,6 +255,10 @@ impl NormalizedDshSnapshot {
         if include_positions {
             report["normalized_event_spans"] = json!(self.spans);
             report["usage_ledger"] = json!(self.usage_ledger);
+            report["subagent_descriptors"] = json!(self.subagent_descriptors);
+            report["subagent_catalog"] = json!(self.subagent_catalog);
+            report["compaction_records"] = json!(self.compaction_records);
+            report["surface_replacements"] = json!(self.surface_replacements);
         }
         report
     }
@@ -332,6 +409,23 @@ fn normalize_verified(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let forked_from_seq = header_obj.get("forkedFromSeq").and_then(Value::as_u64);
+    let is_seeded = header_obj
+        .get("isSeeded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let session_origin = header_obj
+        .get("origin")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let delegation_depth = header_obj.get("delegationDepth").and_then(Value::as_u64);
+    let agent_preset = header_obj
+        .get("agentPreset")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let default_distro = scan_default_distro(&cfg.source_location);
     let attribution = attribution_from_cwd(
@@ -359,6 +453,108 @@ fn normalize_verified(
             value,
         });
     }
+
+    // 预演完整事件流（含继承前缀）的 DSH v4 对话表面折叠（surface fold），并收集复杂语义台账：
+    // - 表面事件类型：`system/message`、`developer/message`、`user/message`、`assistant/message`、`tool/result`
+    // - `surfaceOp: "append"`（或未指定）追加到表面尾部；
+    // - `surfaceOp: { op: "replace", startSeq, endSeq }` 将当前表面上 `[startSeq..=endSeq]` 的闭区间节点
+    //   替换为当前事件（遵循 DSH `session.js`：若区间起点为索引 0 的 `system/message`，且替换者不是仅替换索引 0
+    //   的 `system/message`，则保护索引 0 的 `system/message` 不被覆盖，仅替换 `1..=end_idx`）。
+    let mut surface_nodes: Vec<(u64, String)> = Vec::new();
+    let mut shadowed_by_map: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut surface_op_by_seq: BTreeMap<u64, String> = BTreeMap::new();
+    let mut subagent_descriptors: Vec<DshSubagentDescriptor> = Vec::new();
+    let mut subagent_catalog: Vec<DshSubagentCatalogEntry> = Vec::new();
+    let mut compaction_records: Vec<DshCompactionRecord> = Vec::new();
+    let mut surface_replacements: Vec<DshSurfaceReplacement> = Vec::new();
+
+    for (idx, rec) in parsed_records.iter().enumerate() {
+        let native_seq = rec.position.native_seq();
+        let ownership = if idx < inherited_event_count {
+            NativeEventOwnership::InheritedPrefix
+        } else {
+            NativeEventOwnership::OwnEvent
+        };
+        let event_type_str = rec
+            .value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if is_surface_event_type(event_type_str) {
+            if let Some((start_seq, end_seq, source_event_seqs)) =
+                extract_surface_replace_spec(&rec.value)
+            {
+                surface_op_by_seq.insert(native_seq, "replace".to_string());
+                let start_idx = surface_nodes.iter().position(|(s, _)| *s == start_seq);
+                let end_idx = surface_nodes.iter().position(|(s, _)| *s == end_seq);
+                let mut replaced_surface_seqs = Vec::new();
+                if let (Some(s_idx), Some(e_idx)) = (start_idx, end_idx) {
+                    if s_idx <= e_idx {
+                        let protect_leading_system = event_type_str != "tool/result"
+                            && s_idx == 0
+                            && surface_nodes
+                                .first()
+                                .is_some_and(|(_, ty)| ty == "system/message")
+                            && !(e_idx == 0 && event_type_str == "system/message");
+                        let replace_from = if protect_leading_system { 1 } else { s_idx };
+                        if replace_from <= e_idx {
+                            for (old_seq, _) in &surface_nodes[replace_from..=e_idx] {
+                                shadowed_by_map.insert(*old_seq, native_seq);
+                                replaced_surface_seqs.push(*old_seq);
+                            }
+                            surface_nodes.splice(
+                                replace_from..=e_idx,
+                                std::iter::once((native_seq, event_type_str.to_string())),
+                            );
+                        } else {
+                            // 仅索引 0 被保护且 e_idx == 0 时，新节点直接插入索引 1
+                            surface_nodes.insert(1, (native_seq, event_type_str.to_string()));
+                        }
+                    }
+                }
+                surface_replacements.push(DshSurfaceReplacement {
+                    replacement_native_seq: native_seq,
+                    native_type: event_type_str.to_string(),
+                    start_seq,
+                    end_seq,
+                    source_event_seqs,
+                    replaced_surface_seqs,
+                    ownership,
+                });
+            } else {
+                surface_op_by_seq.insert(native_seq, "append".to_string());
+                surface_nodes.push((native_seq, event_type_str.to_string()));
+            }
+        }
+
+        match event_type_str {
+            "subagent/descriptor" => {
+                if let Some(desc) = extract_subagent_descriptor(native_seq, &rec.value, ownership) {
+                    subagent_descriptors.push(desc);
+                }
+            }
+            "subagent/catalog" => {
+                if let Some(entry) =
+                    extract_subagent_catalog_entry(native_seq, &rec.value, ownership)
+                {
+                    subagent_catalog.push(entry);
+                }
+            }
+            "compaction/start" | "compaction/summary" | "compaction/end" | "compaction/prune" => {
+                compaction_records.push(extract_compaction_record(
+                    native_seq,
+                    event_type_str,
+                    &rec.value,
+                    ownership,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let active_surface_native_seqs: Vec<u64> = surface_nodes.iter().map(|(seq, _)| *seq).collect();
+    let active_surface_set: BTreeSet<u64> = active_surface_native_seqs.iter().copied().collect();
 
     // 第一遍扫描本会话自有记录（native_seq >= inherited_event_count），决议同 (turn, step) 的 usage 槽位。
     // 规则（docs/dsh-ingest-survey.md §9–§11）：
@@ -431,6 +627,10 @@ fn normalize_verified(
             .and_then(Value::as_str)
             .unwrap_or_default();
 
+        let rec_surface_op = surface_op_by_seq.get(&pos.native_seq()).cloned();
+        let rec_active_on_surface = active_surface_set.contains(&pos.native_seq());
+        let rec_shadowed_by = shadowed_by_map.get(&pos.native_seq()).copied();
+
         let mut push_event = |event_type: EventType,
                               actor: Option<Actor>,
                               content: Option<String>,
@@ -441,10 +641,12 @@ fn normalize_verified(
             let event_key = slots.next(event_type);
             let has_time = occurred_at.is_some();
             let input_origin = if event_type == EventType::Message && actor == Some(Actor::User) {
-                Some(crate::session_binding::classify_user_input_origin(
+                Some(crate::session_binding::classify_dsh_user_input_origin(
                     Some(&rec.value),
                     content.as_deref().unwrap_or(""),
                     &cfg.source_path,
+                    session_origin.as_deref(),
+                    parent_session_id.as_deref(),
                 ))
             } else {
                 None
@@ -495,6 +697,9 @@ fn normalize_verified(
                 jsonl_end: pos.jsonl_end(),
                 frame_index: pos.frame_index(),
                 record_fingerprint: pos.record_fingerprint().to_string(),
+                surface_op: rec_surface_op.clone(),
+                active_on_surface: rec_active_on_surface,
+                shadowed_by_native_seq: rec_shadowed_by,
             });
             raw_seq
         };
@@ -598,12 +803,122 @@ fn normalize_verified(
         cwd,
         parent_session_id,
         forked_from_seq,
+        is_seeded,
+        session_origin,
+        delegation_depth,
+        agent_preset,
         inherited_event_count,
         suppressed_inherited_records,
         events,
         spans,
         usage_ledger,
+        subagent_descriptors,
+        subagent_catalog,
+        compaction_records,
+        surface_replacements,
+        active_surface_native_seqs,
     })
+}
+
+fn is_surface_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "system/message"
+            | "developer/message"
+            | "user/message"
+            | "assistant/message"
+            | "tool/result"
+    )
+}
+
+fn extract_surface_replace_spec(value: &Value) -> Option<(u64, u64, Vec<u64>)> {
+    let op_obj = value.get("surfaceOp")?.as_object()?;
+    if op_obj.get("op").and_then(Value::as_str) != Some("replace") {
+        return None;
+    }
+    let start_seq = op_obj.get("startSeq").and_then(Value::as_u64)?;
+    let end_seq = op_obj.get("endSeq").and_then(Value::as_u64)?;
+    let source_event_seqs = value
+        .get("sourceEventSeqs")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    Some((start_seq, end_seq, source_event_seqs))
+}
+
+fn extract_subagent_descriptor(
+    native_seq: u64,
+    value: &Value,
+    ownership: NativeEventOwnership,
+) -> Option<DshSubagentDescriptor> {
+    let data = value.get("data").unwrap_or(value);
+    let version = data.get("version").and_then(Value::as_u64).unwrap_or(1);
+    let provider = data.get("provider").and_then(Value::as_str)?.to_string();
+    let mode = data.get("mode").and_then(Value::as_str)?.to_string();
+    let label = non_empty_str(data.get("label"));
+    Some(DshSubagentDescriptor {
+        native_seq,
+        version,
+        provider,
+        mode,
+        label,
+        ownership,
+    })
+}
+
+fn extract_subagent_catalog_entry(
+    native_seq: u64,
+    value: &Value,
+    ownership: NativeEventOwnership,
+) -> Option<DshSubagentCatalogEntry> {
+    let data = value.get("data").unwrap_or(value);
+    let version = data.get("version").and_then(Value::as_u64).unwrap_or(1);
+    let child_id = data.get("childId").and_then(Value::as_str)?.to_string();
+    let child_created_at = non_empty_str(data.get("childCreatedAt"));
+    let mode = data.get("mode").and_then(Value::as_str)?.to_string();
+    let label = non_empty_str(data.get("label"));
+    Some(DshSubagentCatalogEntry {
+        native_seq,
+        version,
+        child_id,
+        child_created_at,
+        mode,
+        label,
+        ownership,
+    })
+}
+
+fn extract_compaction_record(
+    native_seq: u64,
+    native_type: &str,
+    value: &Value,
+    ownership: NativeEventOwnership,
+) -> DshCompactionRecord {
+    let data = value.get("data").unwrap_or(value);
+    let compaction_id = non_empty_str(data.get("compactionId"));
+    let turn = data.get("turn").and_then(Value::as_u64);
+    let shadowed_range = data.get("shadowedRange");
+    let shadowed_start_seq = shadowed_range
+        .and_then(|r| r.get("start"))
+        .and_then(Value::as_u64);
+    let shadowed_end_seq = shadowed_range
+        .and_then(|r| r.get("end"))
+        .and_then(Value::as_u64);
+    let shadowed_seqs = data
+        .get("shadowedSeqs")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    DshCompactionRecord {
+        native_seq,
+        native_type: native_type.to_string(),
+        compaction_id,
+        turn,
+        shadowed_start_seq,
+        shadowed_end_seq,
+        shadowed_seqs,
+        ownership,
+    }
 }
 
 fn record_usage_resolution<F>(
@@ -799,8 +1114,11 @@ fn join_content_blocks(items: &[Value], block_type: &str) -> Option<String> {
 fn extract_dsh_message_content(value: &Value, block_type: &str) -> Option<String> {
     if let Some(items) = value
         .get("data")
-        .and_then(|d| d.get("message"))
-        .and_then(|m| m.get("content"))
+        .and_then(|d| {
+            d.get("message")
+                .and_then(|m| m.get("content"))
+                .or_else(|| d.get("content"))
+        })
         .and_then(Value::as_array)
     {
         if let Some(text) = join_content_blocks(items, block_type) {
@@ -808,6 +1126,14 @@ fn extract_dsh_message_content(value: &Value, block_type: &str) -> Option<String
         }
     }
     if block_type == "text" {
+        if let Some(s) = value
+            .get("data")
+            .and_then(|d| d.get("content"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Some(s.to_string());
+        }
         return non_empty_str(value.get("text"));
     }
     None
@@ -850,7 +1176,11 @@ fn extract_dsh_user_text(value: &Value) -> Option<String> {
 fn extract_dsh_tool_name(value: &Value) -> &str {
     value
         .get("data")
-        .and_then(|d| d.get("name"))
+        .and_then(|d| {
+            d.get("call")
+                .and_then(|c| c.get("name"))
+                .or_else(|| d.get("name"))
+        })
         .and_then(Value::as_str)
         .or_else(|| value.get("toolName").and_then(Value::as_str))
         .filter(|s| !s.trim().is_empty())
@@ -861,10 +1191,17 @@ fn extract_dsh_tool_result(value: &Value) -> Option<String> {
     if let Some(text) = extract_dsh_message_content(value, "text") {
         return Some(text);
     }
-    if let Some(output) = non_empty_str(value.get("output")) {
+    if let Some(output) = value
+        .get("data")
+        .and_then(|d| non_empty_str(d.get("output")))
+        .or_else(|| non_empty_str(value.get("output")))
+    {
         return Some(output);
     }
-    let err = value.get("error")?;
+    let err = value
+        .get("data")
+        .and_then(|d| d.get("error"))
+        .or_else(|| value.get("error"))?;
     if let Some(msg) = non_empty_str(err.get("message")) {
         return Some(msg);
     }
@@ -881,6 +1218,7 @@ mod store_wiring {
     use crate::scan_plan::{
         CommitPlan, CursorAction, PriorProjection, PriorState, ScanReasons, StoreAction,
     };
+    use crate::session_binding::{IngestAdmissionVerdict, SessionBindingRegistry};
     use crate::store::{
         FileProjectionBatch, ProjectionStats, SourceKey, StoreError, StoreResult, TotalStore,
     };
@@ -896,6 +1234,9 @@ mod store_wiring {
         pub plan: CommitPlan,
         pub normalized: Option<NormalizedDshSnapshot>,
         pub candidate_state: Option<DshSavedState>,
+        pub admission_status: Option<String>,
+        pub admission_detail: Option<String>,
+        pub events_excluded_temporary: u64,
     }
 
     /// 单步 DSH 来源观察 + `TotalStore::apply_projection` 提交结果。
@@ -937,13 +1278,206 @@ mod store_wiring {
         cursor
     }
 
-    /// 将持久化状态（若有）与当前来源捕获结果转换为 `CommitGateDecision`、`AppendLogObservation` 与 `CommitPlan`。
+    /// 对候选归一化产物与待提交事件列表执行控制面绑定准入与 `InputOrigin` 丰富。
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_verified_step(
+        relation: Option<SnapshotRelation>,
+        gate: CommitGateDecision,
+        effective_reasons: ScanReasons,
+        prior_state: Option<&DshSavedState>,
+        prior_projection: PriorProjection,
+        snapshot: &SourceSnapshot,
+        mut normalized: NormalizedDshSnapshot,
+        candidate_events: Vec<RawEvent>,
+        source_change: SourceChange,
+        include_fingerprint: bool,
+        cfg: &DshNormalizeConfig,
+        bindings: &SessionBindingRegistry,
+    ) -> DshPlannedStep {
+        let mut session_parents = std::collections::HashMap::new();
+        if let Some(ref p) = normalized.parent_session_id {
+            session_parents.insert(normalized.session_id.clone(), p.clone());
+        }
+        // 同时将 `normalized.events` 与 `candidate_events` 经过绑定准入与 InputOrigin 升级，
+        // 使报告与落库事件完全一致。
+        if let Ok(full_filtered) = bindings.filter_and_enrich_events(
+            SourceType::Jsonl,
+            &cfg.source_location,
+            &cfg.source_path,
+            normalized.events.clone(),
+            &session_parents,
+        ) {
+            if !full_filtered.kept_events.is_empty() {
+                normalized.events = full_filtered.kept_events;
+            }
+        }
+
+        let pre_verdict = bindings.evaluate(
+            SourceType::Jsonl,
+            &cfg.source_location,
+            &cfg.source_path,
+            Some(&normalized.session_id),
+            normalized.parent_session_id.as_deref(),
+        );
+        if let IngestAdmissionVerdict::UnknownHold { reason } = pre_verdict {
+            let detail = reason.to_string();
+            let observation = AppendLogObservation {
+                source_change,
+                quality: ParseQuality::Unavailable(ScanFailure::Read(format!(
+                    "session binding uncertain (hold): {detail}"
+                ))),
+                events: Vec::new(),
+                cursor: cursor_from_saved(prior_state),
+                source_fingerprint: None,
+            };
+            let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
+            return DshPlannedStep {
+                relation,
+                gate,
+                effective_reasons,
+                observation,
+                plan,
+                normalized: Some(normalized),
+                candidate_state: None,
+                admission_status: Some("unknown_hold".to_string()),
+                admission_detail: Some(detail),
+                events_excluded_temporary: 0,
+            };
+        }
+
+        match bindings.filter_and_enrich_events(
+            SourceType::Jsonl,
+            &cfg.source_location,
+            &cfg.source_path,
+            candidate_events,
+            &session_parents,
+        ) {
+            Err(uncertainty) => {
+                let detail = uncertainty.to_string();
+                let observation = AppendLogObservation {
+                    source_change,
+                    quality: ParseQuality::Unavailable(ScanFailure::Read(format!(
+                        "session binding uncertain (hold): {detail}"
+                    ))),
+                    events: Vec::new(),
+                    cursor: cursor_from_saved(prior_state),
+                    source_fingerprint: None,
+                };
+                let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
+                DshPlannedStep {
+                    relation,
+                    gate,
+                    effective_reasons,
+                    observation,
+                    plan,
+                    normalized: Some(normalized),
+                    candidate_state: None,
+                    admission_status: Some("unknown_hold".to_string()),
+                    admission_detail: Some(detail),
+                    events_excluded_temporary: 0,
+                }
+            }
+            Ok(filtered) => {
+                if filtered.admission_status == "temporary_excluded"
+                    || matches!(
+                        pre_verdict,
+                        IngestAdmissionVerdict::TemporaryExcluded { .. }
+                    )
+                {
+                    let detail = filtered.admission_detail.or_else(|| match pre_verdict {
+                        IngestAdmissionVerdict::TemporaryExcluded { basis } => {
+                            Some(basis.to_string())
+                        }
+                        _ => None,
+                    });
+                    let observation = AppendLogObservation {
+                        source_change: SourceChange::Appended,
+                        quality: ParseQuality::Clean {
+                            deferred_tail_bytes: 0,
+                        },
+                        events: Vec::new(),
+                        cursor: cursor_from_saved(prior_state),
+                        source_fingerprint: None,
+                    };
+                    // 临时会话不落库、不推进 DshSavedState，确保后续追加或绑定变更可完整重检。
+                    let plan = CommitPlan::plan(
+                        &observation,
+                        ScanReasons::NONE,
+                        PriorProjection::no_store(),
+                    );
+                    return DshPlannedStep {
+                        relation,
+                        gate,
+                        effective_reasons,
+                        observation,
+                        plan,
+                        normalized: Some(normalized),
+                        candidate_state: None,
+                        admission_status: Some("temporary_excluded".to_string()),
+                        admission_detail: detail,
+                        events_excluded_temporary: filtered.excluded_events,
+                    };
+                }
+
+                let next_state = DshSavedState::from_verified(
+                    snapshot,
+                    normalized.next_seq(),
+                    PARSER_REVISION,
+                    cfg.attribution_revision,
+                );
+                let observation = AppendLogObservation {
+                    source_change,
+                    quality: ParseQuality::Clean {
+                        deferred_tail_bytes: 0,
+                    },
+                    events: filtered.kept_events,
+                    cursor: cursor_from_verified(snapshot, normalized.next_seq()),
+                    source_fingerprint: include_fingerprint
+                        .then(|| SourceFingerprint::of(&semantic_stream_bytes(snapshot))),
+                };
+                let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
+                DshPlannedStep {
+                    relation,
+                    gate,
+                    effective_reasons,
+                    observation,
+                    plan,
+                    normalized: Some(normalized),
+                    candidate_state: Some(next_state),
+                    admission_status: Some(filtered.admission_status.to_string()),
+                    admission_detail: filtered.admission_detail,
+                    events_excluded_temporary: filtered.excluded_events,
+                }
+            }
+        }
+    }
+
+    /// 将持久化状态（若有）与当前来源捕获结果转换为 `CommitGateDecision`、`AppendLogObservation` 与 `CommitPlan`（无额外控制面绑定）。
     pub fn plan_dsh_source_step(
         prior_state: Option<&DshSavedState>,
         current: Result<&SourceSnapshot, &Blocked>,
         reasons: ScanReasons,
         prior_projection: PriorProjection,
         cfg: &DshNormalizeConfig,
+    ) -> Result<DshPlannedStep, Blocked> {
+        plan_dsh_source_step_with_bindings(
+            prior_state,
+            current,
+            reasons,
+            prior_projection,
+            cfg,
+            &SessionBindingRegistry::empty(),
+        )
+    }
+
+    /// 携带控制面会话绑定（`SessionBindingRegistry`）规划单步 DSH 来源观察与提交。
+    pub fn plan_dsh_source_step_with_bindings(
+        prior_state: Option<&DshSavedState>,
+        current: Result<&SourceSnapshot, &Blocked>,
+        reasons: ScanReasons,
+        prior_projection: PriorProjection,
+        cfg: &DshNormalizeConfig,
+        bindings: &SessionBindingRegistry,
     ) -> Result<DshPlannedStep, Blocked> {
         let (relation, gate) =
             super::super::source::evaluate_saved_commit_gate(prior_state, current);
@@ -979,6 +1513,9 @@ mod store_wiring {
                     plan,
                     normalized: None,
                     candidate_state: None,
+                    admission_status: None,
+                    admission_detail: None,
+                    events_excluded_temporary: 0,
                 })
             }
             CommitGateDecision::HoldPriorProjection { reason, .. } => {
@@ -1000,6 +1537,9 @@ mod store_wiring {
                     plan,
                     normalized: None,
                     candidate_state: None,
+                    admission_status: None,
+                    admission_detail: None,
+                    events_excluded_temporary: 0,
                 })
             }
             CommitGateDecision::RejectDifferentSource => {
@@ -1021,38 +1561,29 @@ mod store_wiring {
                     plan,
                     normalized: None,
                     candidate_state: None,
+                    admission_status: None,
+                    admission_detail: None,
+                    events_excluded_temporary: 0,
                 })
             }
             CommitGateDecision::InitialProjectionCandidate { .. } => {
                 let snapshot = current.expect("InitialProjectionCandidate requires Ok snapshot");
                 let normalized = normalize_source_snapshot(snapshot, cfg)?;
-                let next_state = DshSavedState::from_verified(
-                    snapshot,
-                    normalized.next_seq(),
-                    PARSER_REVISION,
-                    cfg.attribution_revision,
-                );
-                let observation = AppendLogObservation {
-                    source_change: SourceChange::Appended,
-                    quality: ParseQuality::Clean {
-                        deferred_tail_bytes: 0,
-                    },
-                    events: normalized.events.clone(),
-                    cursor: cursor_from_verified(snapshot, normalized.next_seq()),
-                    source_fingerprint: Some(SourceFingerprint::of(&semantic_stream_bytes(
-                        snapshot,
-                    ))),
-                };
-                let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
-                Ok(DshPlannedStep {
+                let events = normalized.events.clone();
+                Ok(finalize_verified_step(
                     relation,
                     gate,
                     effective_reasons,
-                    observation,
-                    plan,
-                    normalized: Some(normalized),
-                    candidate_state: Some(next_state),
-                })
+                    prior_state,
+                    prior_projection,
+                    snapshot,
+                    normalized,
+                    events,
+                    SourceChange::Appended,
+                    true,
+                    cfg,
+                    bindings,
+                ))
             }
             CommitGateDecision::NoOpUnchanged { .. } => {
                 let snapshot = current.expect("NoOpUnchanged requires Ok snapshot");
@@ -1069,33 +1600,20 @@ mod store_wiring {
                 } else {
                     Vec::new()
                 };
-                let next_state = DshSavedState::from_verified(
-                    snapshot,
-                    normalized.next_seq(),
-                    PARSER_REVISION,
-                    cfg.attribution_revision,
-                );
-                let observation = AppendLogObservation {
-                    source_change: SourceChange::Appended,
-                    quality: ParseQuality::Clean {
-                        deferred_tail_bytes: 0,
-                    },
-                    events,
-                    cursor: cursor_from_verified(snapshot, normalized.next_seq()),
-                    source_fingerprint: Some(SourceFingerprint::of(&semantic_stream_bytes(
-                        snapshot,
-                    ))),
-                };
-                let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
-                Ok(DshPlannedStep {
+                Ok(finalize_verified_step(
                     relation,
                     gate,
                     effective_reasons,
-                    observation,
-                    plan,
-                    normalized: Some(normalized),
-                    candidate_state: Some(next_state),
-                })
+                    prior_state,
+                    prior_projection,
+                    snapshot,
+                    normalized,
+                    events,
+                    SourceChange::Appended,
+                    true,
+                    cfg,
+                    bindings,
+                ))
             }
             CommitGateDecision::IncrementalAppendCandidate { prior_events, .. } => {
                 let snapshot = current.expect("IncrementalAppendCandidate requires Ok snapshot");
@@ -1119,68 +1637,45 @@ mod store_wiring {
                 } else {
                     normalized.events_from_native_seq(*prior_events as u64).0
                 };
-                let next_state = DshSavedState::from_verified(
-                    snapshot,
-                    normalized.next_seq(),
-                    PARSER_REVISION,
-                    cfg.attribution_revision,
-                );
-                let observation = AppendLogObservation {
-                    source_change: SourceChange::Appended,
-                    quality: ParseQuality::Clean {
-                        deferred_tail_bytes: 0,
-                    },
-                    events,
-                    cursor: cursor_from_verified(snapshot, normalized.next_seq()),
-                    source_fingerprint: need_full_events
-                        .then(|| SourceFingerprint::of(&semantic_stream_bytes(snapshot))),
-                };
-                let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
-                Ok(DshPlannedStep {
+                Ok(finalize_verified_step(
                     relation,
                     gate,
                     effective_reasons,
-                    observation,
-                    plan,
-                    normalized: Some(normalized),
-                    candidate_state: Some(next_state),
-                })
+                    prior_state,
+                    prior_projection,
+                    snapshot,
+                    normalized,
+                    events,
+                    SourceChange::Appended,
+                    need_full_events,
+                    cfg,
+                    bindings,
+                ))
             }
             CommitGateDecision::RebuildProjectionCandidate { .. } => {
                 let snapshot = current.expect("RebuildProjectionCandidate requires Ok snapshot");
                 let normalized = normalize_source_snapshot(snapshot, cfg)?;
-                let next_state = DshSavedState::from_verified(
-                    snapshot,
-                    normalized.next_seq(),
-                    PARSER_REVISION,
-                    cfg.attribution_revision,
-                );
-                let observation = AppendLogObservation {
-                    source_change: SourceChange::RollbackOrRewrite,
-                    quality: ParseQuality::Clean {
-                        deferred_tail_bytes: 0,
-                    },
-                    events: normalized.events.clone(),
-                    cursor: cursor_from_verified(snapshot, normalized.next_seq()),
-                    source_fingerprint: Some(SourceFingerprint::of(&semantic_stream_bytes(
-                        snapshot,
-                    ))),
-                };
-                let plan = CommitPlan::plan(&observation, effective_reasons, prior_projection);
-                Ok(DshPlannedStep {
+                let events = normalized.events.clone();
+                Ok(finalize_verified_step(
                     relation,
                     gate,
                     effective_reasons,
-                    observation,
-                    plan,
-                    normalized: Some(normalized),
-                    candidate_state: Some(next_state),
-                })
+                    prior_state,
+                    prior_projection,
+                    snapshot,
+                    normalized,
+                    events,
+                    SourceChange::RollbackOrRewrite,
+                    true,
+                    cfg,
+                    bindings,
+                ))
             }
         }
     }
 
-    /// 执行单步 DSH 观察、规划并写入 `TotalStore`；仅在写库成功且 `CursorAction::Advance` 时推进 `DshSavedState`。
+    /// 执行单步 DSH 观察、规划并写入 `TotalStore`（自动从 `store.load_session_bindings()` 加载控制面绑定）；
+    /// 仅在写库成功且 `CursorAction::Advance` 时推进 `DshSavedState`。
     pub fn commit_dsh_source_step(
         store: &TotalStore,
         prior_state: Option<&DshSavedState>,
@@ -1188,19 +1683,39 @@ mod store_wiring {
         reasons: ScanReasons,
         cfg: &DshNormalizeConfig,
     ) -> StoreResult<DshStoreCommitOutcome> {
+        let bindings = store.load_session_bindings();
+        commit_dsh_source_step_with_bindings(store, prior_state, current, reasons, cfg, &bindings)
+    }
+
+    /// 显式指定 `SessionBindingRegistry` 执行单步 DSH 观察、规划并写入 `TotalStore`。
+    pub fn commit_dsh_source_step_with_bindings(
+        store: &TotalStore,
+        prior_state: Option<&DshSavedState>,
+        current: Result<&SourceSnapshot, &Blocked>,
+        reasons: ScanReasons,
+        cfg: &DshNormalizeConfig,
+        bindings: &SessionBindingRegistry,
+    ) -> StoreResult<DshStoreCommitOutcome> {
         let source_key = SourceKey {
             source_type: SourceType::Jsonl,
             source_location: cfg.source_location.clone(),
             source_path: cfg.source_path.clone(),
         };
         let prior_projection = PriorProjection::ask(store, &source_key)?;
-        let planned = plan_dsh_source_step(prior_state, current, reasons, prior_projection, cfg)
-            .map_err(|blocked| {
-                StoreError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("dsh normalization blocked: {blocked:?}"),
-                ))
-            })?;
+        let planned = plan_dsh_source_step_with_bindings(
+            prior_state,
+            current,
+            reasons,
+            prior_projection,
+            cfg,
+            bindings,
+        )
+        .map_err(|blocked| {
+            StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("dsh normalization blocked: {blocked:?}"),
+            ))
+        })?;
 
         let projection_stats = match planned.plan.store() {
             StoreAction::Preserve => None,
@@ -1229,7 +1744,9 @@ mod store_wiring {
             }
         };
 
-        let advanced_saved_state = planned.plan.cursor() == CursorAction::Advance;
+        let advanced_saved_state = planned.plan.cursor() == CursorAction::Advance
+            && planned.admission_status.as_deref() != Some("temporary_excluded")
+            && planned.admission_status.as_deref() != Some("unknown_hold");
         let next_state = if advanced_saved_state {
             planned.candidate_state.clone()
         } else {
@@ -1243,11 +1760,167 @@ mod store_wiring {
             advanced_saved_state,
         })
     }
+
+    /// DSH 会话根目录批量扫描中单个会话子目录的扫描与写库结果。
+    #[derive(Debug, Clone)]
+    pub struct DshRootScanSessionOutcome {
+        pub dir_name: String,
+        pub session_dir: std::path::PathBuf,
+        pub discovery_status: crate::dsh_snapshot::source::DshDiscoveredSessionStatus,
+        pub commit_outcome: DshStoreCommitOutcome,
+    }
+
+    /// DSH 会话根目录批量扫描与总库提交汇总报告。
+    #[derive(Debug, Clone)]
+    pub struct DshRootScanOutcome {
+        pub sessions_root: std::path::PathBuf,
+        pub total_session_dirs: usize,
+        pub ready_v4_count: usize,
+        pub blocked_count: usize,
+        pub projected_sessions: usize,
+        pub preserved_sessions: usize,
+        pub temporary_excluded_sessions: usize,
+        pub total_events_appended: u64,
+        pub entries: Vec<DshRootScanSessionOutcome>,
+    }
+
+    /// 对显式给出的 DSH 会话根目录（如 `<dsh_home>/sessions`）执行批量发现、v4 捕获、归一化、控制面准入与总库提交。
+    ///
+    /// 首版正式规则：
+    /// - 仅最高规范代为 `v4` 的子目录进入 `capture_source` + `commit_dsh_source_step_with_bindings`；
+    /// - 仅存旧格式代 `v0..v3` 或出现未来格式代 `v5+` 的子目录显式按 `Err(Blocked::Unsupported("physical_generation"))`
+    ///   进入保守提交门（无前代时 `RejectInitial`，已有 v4 前代时 `HoldPriorProjection` 保守冻结），绝不回退旧代。
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_dsh_sessions_root_to_store(
+        store: &TotalStore,
+        sessions_root: &std::path::Path,
+        source_instance_prefix: &str,
+        runtime: &crate::dsh_snapshot::NativeRuntime,
+        saved_states: &mut std::collections::BTreeMap<String, DshSavedState>,
+        reasons: ScanReasons,
+        source_location: crate::rawevent::SourceLocation,
+        attribution_revision: i64,
+        deadline: crate::deadline::Deadline,
+    ) -> StoreResult<DshRootScanOutcome> {
+        let discovery =
+            crate::dsh_snapshot::source::discover_dsh_sessions_in_root(sessions_root, None)
+                .map_err(|blocked| {
+                    StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("dsh sessions root discovery blocked: {blocked:?}"),
+                    ))
+                })?;
+        let bindings = store.load_session_bindings();
+
+        let mut projected_sessions = 0usize;
+        let mut preserved_sessions = 0usize;
+        let mut temporary_excluded_sessions = 0usize;
+        let mut total_events_appended = 0u64;
+        let mut entries_out = Vec::with_capacity(discovery.entries.len());
+
+        for entry in discovery.entries {
+            let mut cfg = DshNormalizeConfig::local_full(entry.session_dir.display().to_string());
+            cfg.source_location = source_location.clone();
+            cfg.attribution_revision = attribution_revision;
+            let prior_state = saved_states.get(&entry.dir_name);
+            let commit_outcome = match &entry.outcome {
+                crate::dsh_snapshot::source::DshDiscoveredSessionStatus::ReadyV4 {
+                    compression,
+                    ..
+                } => {
+                    let src_cfg = match crate::dsh_snapshot::source::SourceConfig::new(
+                        format!("{source_instance_prefix}:{}", entry.dir_name),
+                        entry.session_dir.clone(),
+                        None,
+                        *compression,
+                    ) {
+                        Ok(c) => c,
+                        Err(blocked) => {
+                            let co = commit_dsh_source_step_with_bindings(
+                                store,
+                                prior_state,
+                                Err(&blocked),
+                                reasons,
+                                &cfg,
+                                &bindings,
+                            )?;
+                            preserved_sessions += 1;
+                            entries_out.push(DshRootScanSessionOutcome {
+                                dir_name: entry.dir_name,
+                                session_dir: entry.session_dir,
+                                discovery_status: entry.outcome,
+                                commit_outcome: co,
+                            });
+                            continue;
+                        }
+                    };
+                    let captured =
+                        crate::dsh_snapshot::source::capture_source(&src_cfg, runtime, deadline);
+                    commit_dsh_source_step_with_bindings(
+                        store,
+                        prior_state,
+                        captured.as_ref(),
+                        reasons,
+                        &cfg,
+                        &bindings,
+                    )?
+                }
+                crate::dsh_snapshot::source::DshDiscoveredSessionStatus::Blocked { blocked } => {
+                    commit_dsh_source_step_with_bindings(
+                        store,
+                        prior_state,
+                        Err(blocked),
+                        reasons,
+                        &cfg,
+                        &bindings,
+                    )?
+                }
+            };
+
+            if commit_outcome.advanced_saved_state {
+                if let Some(ref next_state) = commit_outcome.next_state {
+                    saved_states.insert(entry.dir_name.clone(), next_state.clone());
+                }
+            }
+
+            if commit_outcome.planned.admission_status.as_deref() == Some("temporary_excluded") {
+                temporary_excluded_sessions += 1;
+            }
+            match commit_outcome.planned.plan.store() {
+                StoreAction::Preserve => preserved_sessions += 1,
+                StoreAction::Project(_) => projected_sessions += 1,
+            }
+            if let Some(ref st) = commit_outcome.projection_stats {
+                total_events_appended += st.appended;
+            }
+
+            entries_out.push(DshRootScanSessionOutcome {
+                dir_name: entry.dir_name,
+                session_dir: entry.session_dir,
+                discovery_status: entry.outcome,
+                commit_outcome,
+            });
+        }
+
+        Ok(DshRootScanOutcome {
+            sessions_root: discovery.sessions_root,
+            total_session_dirs: entries_out.len(),
+            ready_v4_count: discovery.ready_v4_count,
+            blocked_count: discovery.blocked_count,
+            projected_sessions,
+            preserved_sessions,
+            temporary_excluded_sessions,
+            total_events_appended,
+            entries: entries_out,
+        })
+    }
 }
 
 #[cfg(feature = "store")]
 pub use store_wiring::{
-    commit_dsh_source_step, plan_dsh_source_step, DshPlannedStep, DshStoreCommitOutcome,
+    commit_dsh_source_step, commit_dsh_source_step_with_bindings, plan_dsh_source_step,
+    plan_dsh_source_step_with_bindings, scan_dsh_sessions_root_to_store, DshPlannedStep,
+    DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
 };
 
 #[cfg(all(test, any(windows, unix)))]
@@ -1663,11 +2336,159 @@ mod tests {
         let out =
             commit_dsh_source_step(&store, None, Ok(&snap), ScanReasons::INITIAL, &cfg).unwrap();
         assert_eq!(
-            out.projection_stats.unwrap().appended,
+            out.planned.admission_status.as_deref(),
+            Some("temporary_excluded")
+        );
+        assert_eq!(out.planned.events_excluded_temporary, 4);
+        assert!(!out.advanced_saved_state);
+        assert_eq!(
+            out.projection_stats.map_or(0, |s| s.appended),
             0,
             "临时 DSH 会话的 Message 与 Usage 均不得写进总库"
         );
         assert_eq!(store.read_since_page(0, 50).unwrap().events.len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dsh_complex_semantics_surface_fold_compaction_subagent_and_fork() {
+        use crate::rawevent::{InputTrustLevel, SenderKind};
+
+        let dir =
+            std::env::temp_dir().join(format!("sv-dsh-complex-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 构造包含继承前缀（seq 0..=2，其中 seq 2 为 session/end-seed）、
+        // 自有 subagent/descriptor、subagent/catalog、工具调用与表面重写 tool/result、
+        // 以及 compaction 事务（带 startSeq=0 的 compact-checkpoint 表面替换，测试索引 0 system/message 保护）的快照。
+        let records = [
+            r#"{"type":"session","version":4,"id":"s_complex","cwd":"/workspace/demo","parentSession":"s_parent","forkedFromSeq":1,"isSeeded":true,"origin":"subagent","delegationDepth":2,"agentPreset":"coder"}"#,
+            r#"{"seq":0,"type":"system/message","time":1700000000000,"surfaceOp":"append","data":{"id":"sys-0","role":"system","content":[{"type":"text","text":"root system prompt"}]}}"#,
+            r#"{"seq":1,"type":"user/message","time":1700000001000,"surfaceOp":"append","data":{"id":"u-1","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"inherited question"}]}}"#,
+            r#"{"seq":2,"type":"session/end-seed","time":1700000001500,"data":{"inherited":true}}"#,
+            r#"{"seq":3,"type":"subagent/descriptor","time":1700000001600,"data":{"version":3,"provider":"deepseek","mode":"foreground","label":"researcher"}}"#,
+            r#"{"seq":4,"type":"user/message","time":1700000002000,"surfaceOp":"append","data":{"id":"u-4","role":"user","source":{"kind":"user"},"content":[{"type":"text","text":"subagent delegated prompt"}]}}"#,
+            r#"{"seq":5,"type":"assistant/message","time":1700000003000,"surfaceOp":"append","data":{"turn":1,"step":0,"message":{"id":"a-5","role":"assistant","source":{"kind":"llm","provider":"deepseek","model":"deepseek-chat"},"content":[{"type":"text","text":"running tool"}]},"usage":{"inputTokens":20,"outputTokens":10,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":30}}}"#,
+            r#"{"seq":6,"type":"compaction/start","time":1700000004000,"data":{"compactionId":"cmp-1","turn":2}}"#,
+            r#"{"seq":7,"type":"compaction/summary","time":1700000004100,"data":{"compactionId":"cmp-1","turn":2,"shadowedRange":{"start":1,"end":5},"shadowedSeqs":[1,4,5],"summary":{"goal":"test"}}}"#,
+            r#"{"seq":8,"type":"user/message","time":1700000004200,"surfaceOp":{"op":"replace","startSeq":0,"endSeq":5},"sourceEventSeqs":[1,4,5,7],"data":{"id":"u-8","role":"user","source":{"kind":"compact-checkpoint","compactionId":"cmp-1"},"content":[{"type":"text","text":"checkpoint summary"}]}}"#,
+            r#"{"seq":9,"type":"compaction/end","time":1700000004300,"data":{"compactionId":"cmp-1","turn":2}}"#,
+            r#"{"seq":10,"type":"subagent/catalog","time":1700000005000,"data":{"version":2,"childId":"s_grandchild","childCreatedAt":"2026-11-09T09:00:00.000Z","mode":"background","label":"verifier"}}"#,
+            r#"{"seq":11,"type":"user/message","time":1700000005500,"surfaceOp":"append","data":{"id":"u-11","role":"user","source":{"kind":"subagent-settled","subagentSessionId":"s_grandchild"},"content":[{"type":"text","text":"grandchild settled"}]}}"#,
+            r#"{"seq":12,"type":"tool/call","time":1700000006000,"data":{"turn":2,"step":0,"call":{"id":"call-1","name":"read","input":{"path":"a.txt"}}}}"#,
+            r#"{"seq":13,"type":"tool/result","time":1700000006500,"surfaceOp":"append","data":{"id":"tr-13","role":"tool","toolCallId":"call-1","content":[{"type":"text","text":"raw large tool output"}]}}"#,
+            r#"{"seq":14,"type":"tool/result","time":1700000006800,"surfaceOp":{"op":"replace","startSeq":13,"endSeq":13},"sourceEventSeqs":[13],"data":{"id":"tr-14","role":"tool","toolCallId":"call-1","content":[{"type":"text","text":"pruned tool output"}]}}"#,
+        ];
+
+        let snap = synthetic_source_snapshot(
+            &dir,
+            "s_complex",
+            Compression::None,
+            &records,
+            3,
+            "lc_complex",
+            &[
+                "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10", "e11", "e12",
+                "e13", "e14",
+            ],
+        );
+        let cfg = DshNormalizeConfig::local_full(dir.display().to_string());
+        let norm = normalize_source_snapshot(&snap, &cfg).unwrap();
+
+        assert!(norm.is_seeded);
+        assert_eq!(norm.session_origin.as_deref(), Some("subagent"));
+        assert_eq!(norm.delegation_depth, Some(2));
+        assert_eq!(norm.agent_preset.as_deref(), Some("coder"));
+        assert_eq!(norm.inherited_event_count, 3);
+        assert_eq!(norm.suppressed_inherited_records, 3);
+
+        // 核对 subagent/descriptor 与 subagent/catalog
+        assert_eq!(norm.subagent_descriptors.len(), 1);
+        assert_eq!(norm.subagent_descriptors[0].native_seq, 3);
+        assert_eq!(norm.subagent_descriptors[0].provider, "deepseek");
+        assert_eq!(norm.subagent_descriptors[0].mode, "foreground");
+        assert_eq!(
+            norm.subagent_descriptors[0].label.as_deref(),
+            Some("researcher")
+        );
+
+        assert_eq!(norm.subagent_catalog.len(), 1);
+        assert_eq!(norm.subagent_catalog[0].native_seq, 10);
+        assert_eq!(norm.subagent_catalog[0].child_id, "s_grandchild");
+        assert_eq!(norm.subagent_catalog[0].mode, "background");
+
+        // 核对 compaction_records 与 surface_replacements
+        assert_eq!(norm.compaction_records.len(), 3);
+        assert_eq!(norm.compaction_records[1].native_type, "compaction/summary");
+        assert_eq!(norm.compaction_records[1].shadowed_seqs, vec![1, 4, 5]);
+
+        assert_eq!(norm.surface_replacements.len(), 2);
+        // 第 1 次替换：startSeq=0, endSeq=5，因 seq 0 是 system/message 受保护，仅替换 [1, 4, 5]
+        assert_eq!(norm.surface_replacements[0].replacement_native_seq, 8);
+        assert_eq!(
+            norm.surface_replacements[0].replaced_surface_seqs,
+            vec![1, 4, 5]
+        );
+        // 第 2 次替换：tool/result seq 14 替换 seq 13
+        assert_eq!(norm.surface_replacements[1].replacement_native_seq, 14);
+        assert_eq!(norm.surface_replacements[1].replaced_surface_seqs, vec![13]);
+
+        // 最终活跃表面应为：[0 (system), 8 (checkpoint), 11 (subagent-settled), 14 (replaced tool/result)]
+        assert_eq!(norm.active_surface_native_seqs, vec![0, 8, 11, 14]);
+
+        // 核对自有 spans 的 active_on_surface 与 shadowed_by_native_seq
+        let span_by_seq = |nseq: u64, ty: EventType| -> &NormalizedEventSpan {
+            norm.spans
+                .iter()
+                .find(|s| s.native_seq == nseq && s.event_type == ty)
+                .unwrap()
+        };
+        let sp4 = span_by_seq(4, EventType::Message);
+        assert!(!sp4.active_on_surface);
+        assert_eq!(sp4.shadowed_by_native_seq, Some(8));
+
+        let sp8 = span_by_seq(8, EventType::Message);
+        assert!(sp8.active_on_surface);
+        assert_eq!(sp8.surface_op.as_deref(), Some("replace"));
+        assert_eq!(sp8.shadowed_by_native_seq, None);
+
+        let sp13 = span_by_seq(13, EventType::ToolResult);
+        assert!(!sp13.active_on_surface);
+        assert_eq!(sp13.shadowed_by_native_seq, Some(14));
+
+        let sp14 = span_by_seq(14, EventType::ToolResult);
+        assert!(sp14.active_on_surface);
+        assert_eq!(sp14.surface_op.as_deref(), Some("replace"));
+
+        // 核对各条 user/message 的 InputOrigin：
+        // - seq 4：位于 origin="subagent" 会话中的 source.kind="user" -> dsh_subagent_origin (SubagentOrRuntime)
+        // - seq 8：source.kind="compact-checkpoint" -> dsh_compaction_checkpoint (SubagentOrRuntime)
+        // - seq 11：source.kind="subagent-settled" -> dsh_subagent_settlement (SubagentOrRuntime, sender_session=s_grandchild)
+        let ev4 = &norm.events[sp4.raw_seq as usize];
+        let o4 = ev4.input_origin.as_ref().unwrap();
+        assert_eq!(o4.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o4.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(o4.basis, "dsh_subagent_origin");
+        assert_eq!(o4.sender_session.as_deref(), Some("s_parent"));
+
+        let ev8 = &norm.events[sp8.raw_seq as usize];
+        let o8 = ev8.input_origin.as_ref().unwrap();
+        assert_eq!(o8.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o8.basis, "dsh_compaction_checkpoint");
+
+        let sp11 = span_by_seq(11, EventType::Message);
+        let ev11 = &norm.events[sp11.raw_seq as usize];
+        let o11 = ev11.input_origin.as_ref().unwrap();
+        assert_eq!(o11.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o11.basis, "dsh_subagent_settlement");
+        assert_eq!(o11.sender_session.as_deref(), Some("s_grandchild"));
+
+        // 核对 tool/call 提取到了 data.call.name == "read"
+        let sp12 = span_by_seq(12, EventType::ToolUse);
+        let ev12 = &norm.events[sp12.raw_seq as usize];
+        assert_eq!(ev12.content.as_deref(), Some("[Tool: read]"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

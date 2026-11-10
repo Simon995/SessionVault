@@ -1640,6 +1640,12 @@ impl TotalStore {
         Ok(())
     }
 
+    /// 读取当前总库生效的控制面会话绑定清单（合并 `store_meta['session_bindings_json']` 与同目录 `session_bindings.json`）。
+    pub fn load_session_bindings(&self) -> crate::session_binding::SessionBindingRegistry {
+        let conn = self.conn.lock().unwrap();
+        self.load_session_bindings_with_conn(&conn)
+    }
+
     fn load_session_bindings_with_conn(
         &self,
         conn: &Connection,

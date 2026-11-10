@@ -281,3 +281,25 @@ Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/ve
 node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.json>' --binary '<absolute-example-binary>'
 ```
 
+## 12. 复杂语义（表面折叠 / 压缩 / 子代理 / 多层 fork）与会话根目录批量扫描提交
+
+2026-11-10，按用户 2026-11-09 拍板的首版格式代范围（仅支持 `v4` 日志格式 `session.v4.jsonl[.zstd]`，旧格式代 `v0..v3` 或未来格式代 `v5+` 显式拒绝且不回退），在 [normalize.rs](../src/dsh_snapshot/normalize.rs)、[source.rs](../src/dsh_snapshot/source.rs)、[session_binding.rs](../src/session_binding.rs)、[dsh-installed.mjs](../scripts/dsh-installed.mjs) 与 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 中补齐 DSH v4 复杂语义、真实发送方分类与会话根目录批量发现/扫描提交：
+
+1. **表面折叠（surface fold）与压缩（compaction）记录提取**：
+   - `NormalizedDshSnapshot` 在本会话区间（`native_seq >= inherited_event_count`）追踪表面事件（`"system/message" | "developer/message" | "user/message" | "assistant/message" | "tool/result"`）的 `surfaceOp`：`"append"` 追加至活跃表面，`{ op: "replace", startSeq, endSeq }` 将当前活跃表面上 `[startSeq..=endSeq]` 闭区间替换为当前事件（保留首个 `system/message` 受保护头节点不被非单节点 `system/message` 替换）；
+   - `NormalizedEventSpan` 新增 `surface_op: Option<String>`、`active_on_surface: bool` 与 `shadowed_by_native_seq: Option<u64>`，保留完整底层事件日志的同时显式区分当前有效上下文窗口与被压缩检查点遮蔽的历史节点，并输出 `surface_replacements: Vec<DshSurfaceReplacement>` 与 `active_surface_native_seqs: Vec<u64>`；
+   - 提取 `compaction/start`、`compaction/summary`、`compaction/end`、`compaction/prune` 至 `compaction_records: Vec<DshCompactionRecord>`（含 `compaction_id`、`turn`、`shadowed_start_seq`、`shadowed_end_seq`、`shadowed_seqs`）。
+2. **子代理元数据与多层 fork 血缘**：
+   - 提取子代理会话内的 `subagent/descriptor`（`DshSubagentDescriptor`：`version`、`provider`、`mode`、`label`、`agent_provider`、`agent_model`、`persona`）与父会话内的 `subagent/catalog`（`DshSubagentCatalogEntry`：`version`、`child_id`、`child_created_at`、`mode`、`label`）；
+   - `NormalizedDshSnapshot` 保留 `is_seeded`、`session_origin` 与 `parent_session_id`：无 seed 独立子代理（`isSeeded: false, origin: "subagent"`）保持 `inherited_event_count = 0` 且携带 `parent_session_id`；多层 seed fork（`s0 -> mid1 -> grandchild2`）按 `inherited_event_count` 精确抑制全部祖先历史前缀。
+3. **DSH v4 `source.kind` 真实发送方分类与控制面准入（`classify_dsh_user_input_origin`）**：
+   - 识别 DSH v4 producer-owned `data.source.kind`：`"compact-checkpoint" | "compact-basic"` 归为 `SenderKind::SubagentOrRuntime`（`dsh_compaction_checkpoint`），`"subagent-settled" | "subagent-report"` 归为 `SenderKind::SubagentOrRuntime`（`dsh_subagent_settlement`，提取 `senderSessionId`），`"coordinator" | "goal" | "tool-goal" | "schedule"` 归为 `SenderKind::CoordinatorDispatch`（`dsh_source_coordinator`），`"team-message" | "agent-message" | "session-reference" | "webhook"` 归为 `SenderKind::PeerSession`（`dsh_source_peer`，提取 `senderId` / `senderName`），以及 `header.origin == "subagent"` 会话中的初始委托 `user/message`（`dsh_subagent_origin`）；
+   - 在控制面绑定 `verified_human_input == true` 的主会话中，仅真实 `source.kind == "user"` 的消息升级为 `SenderKind::HumanVerified`；压缩检查点、子代理结算、目标驱动与团队同侪消息绝不被误升级为人类亲手输入；
+   - 父会话标为 `temporary: true` 时，子代理会话通过 `parentSession` 血缘在 `plan_dsh_source_step_with_bindings` / `commit_dsh_source_step_with_bindings` 中自动继承 `temporary_excluded`，0 条事件入库且不推进 `DshSavedState`。
+4. **会话根目录批量发现与总库扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`）**：
+   - `select_generation_auto_compression` 与 `discover_dsh_sessions_in_root` 在显式会话根目录（或环境变量 `SVAULT_DSH_SESSIONS_DIR` / `SVAULT_DSH_HOME` 解析出的 `dsh_sessions_root_from_env`，未配置时为 `None`）下按子目录执行最高规范代选代：仅最高规范代为 `v4` 的子目录标为 `ReadyV4`（自动识别 `.jsonl` 或 `.jsonl.zstd`），仅存 `v0..v3` 或出现 `v5+` 的子目录显式标为 `Blocked(Unsupported("physical_generation"))`，混存两种编码标为 `Blocked(Unsupported("encoding_conflict"))`；
+   - `scan_dsh_sessions_root_to_store` 对整根下的所有会话子目录执行批量捕获、归一化、控制面准入与 `TotalStore` 提交，并维护 `BTreeMap<String, DshSavedState>`：已入库 `v4` 的会话子目录若后续出现 `session.v5.jsonl.zstd`，自动进入 `HoldPriorProjection` 保守冻结，保留库内既有 `v4` 事件不丢失。
+
+本机 `@deepseek-ai/dsh` 升级至 `0.2.2-rc.1`（`dsh-installed.mjs` 兼容 `0.2.1-rc.5` 与 `0.2.2-rc.1`）后，Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 24 项检查全部通过，19 组 `verify-dsh-native-admission.mjs`、35 组 `verify-dsh-rust-source-capture.mjs` 与 140 份快照 + 5 组对照的 `verify-dsh-rust-snapshot.mjs` 回归全部通过；Windows `store,dsh-experimental` 库测试 452 passed，WSL Linux `store,dsh-experimental` 库测试 438 passed，两平台零警告 clippy 通过。
+
+

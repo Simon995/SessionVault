@@ -937,6 +937,44 @@ pub fn classify_user_input_origin(
     }
 }
 
+/// 结合 DSH 会话级元数据（如 `header.origin == "subagent"` 与 `header.parentSession`）
+/// 对 `user/message` 的输入来源进行分类。
+///
+/// 在 DSH v4 中，子代理会话（`origin: "subagent"`）的首轮任务提示常以 `user/message`
+/// （`data.source.kind == "user"`）写入子会话日志；若不结合会话级 `origin`，该提示会被误留为
+/// `"log_role_only"`。本函数在未命中更高优先级的同侪/派单信封时，将其归类为
+/// `SenderKind::SubagentOrRuntime` + `InputTrustLevel::PeerUntrusted`。
+pub fn classify_dsh_user_input_origin(
+    raw_record: Option<&Value>,
+    text: &str,
+    source_path: &str,
+    session_origin: Option<&str>,
+    parent_session_id: Option<&str>,
+) -> InputOrigin {
+    let origin = classify_user_input_origin(raw_record, text, source_path);
+    if origin.sender_kind == SenderKind::Unknown
+        && origin.basis == "log_role_only"
+        && session_origin
+            .map(|o| o.trim().eq_ignore_ascii_case("subagent"))
+            .unwrap_or(false)
+    {
+        return InputOrigin {
+            sender_kind: SenderKind::SubagentOrRuntime,
+            trust_level: InputTrustLevel::PeerUntrusted,
+            basis: "dsh_subagent_origin".to_string(),
+            sender_session: parent_session_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            sender_address: None,
+            xs_message_id: None,
+            assignment_id: None,
+            handoff_id: None,
+        };
+    }
+    origin
+}
+
 /// 将控制面执行绑定叠加到日志级 `InputOrigin` 上。
 ///
 /// - 若日志级已识别出 `PeerSession` / `SubagentOrRuntime`，**保持原判（绝不被会话级人类绑定洗白）**，
@@ -1201,18 +1239,136 @@ fn inspect_native_non_human_markers(
         });
     }
 
-    // DSH v4 `data.message.source.principal` 或顶层 `source.principal`
-    let principal = val
+    // DSH v4 `data.source`、`data.message.source` 或顶层 `source`
+    let source_obj = val
         .get("data")
-        .and_then(|d| d.get("message"))
-        .and_then(|m| m.get("source"))
-        .and_then(|s| s.get("principal"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            val.get("source")
-                .and_then(|s| s.get("principal"))
+        .and_then(|d| {
+            d.get("source")
+                .or_else(|| d.get("message").and_then(|m| m.get("source")))
+        })
+        .or_else(|| val.get("source"));
+
+    if let Some(src) = source_obj {
+        if let Some(kind_raw) = src.get("kind").and_then(Value::as_str) {
+            let k = kind_raw.trim().to_ascii_lowercase();
+            let sender_session = src
+                .get("senderSessionId")
+                .or_else(|| src.get("subagentSessionId"))
+                .or_else(|| src.get("childId"))
+                .or_else(|| src.get("fromSession"))
+                .or_else(|| src.get("senderSession"))
+                .or_else(|| src.get("sessionId"))
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| is_safe_part(v, 160))
+                .map(str::to_string);
+            let sender_address = src
+                .get("from")
+                .or_else(|| src.get("sender"))
+                .or_else(|| src.get("senderId"))
+                .or_else(|| src.get("senderName"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && v.len() <= 256 && !v.contains('\0'))
+                .map(str::to_string);
+            let assignment_id = src
+                .get("assignmentId")
+                .or_else(|| src.get("goalId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| is_safe_part(v, 160))
+                .map(str::to_string);
+
+            match k.as_str() {
+                "user" | "human" => {}
+                "team-message" | "agent-message" | "session-reference" | "webhook" => {
+                    return Some(InputOrigin {
+                        sender_kind: SenderKind::PeerSession,
+                        trust_level: InputTrustLevel::PeerUntrusted,
+                        basis: "dsh_source_peer".to_string(),
+                        sender_session,
+                        sender_address,
+                        xs_message_id: None,
+                        assignment_id,
+                        handoff_id: None,
+                    });
+                }
+                "coordinator" | "goal" | "tool-goal" | "schedule" => {
+                    return Some(InputOrigin {
+                        sender_kind: SenderKind::CoordinatorDispatch,
+                        trust_level: InputTrustLevel::Unverified,
+                        basis: "dsh_source_coordinator".to_string(),
+                        sender_session,
+                        sender_address,
+                        xs_message_id: None,
+                        assignment_id,
+                        handoff_id: None,
+                    });
+                }
+                "subagent-settled" | "subagent-report" => {
+                    return Some(InputOrigin {
+                        sender_kind: SenderKind::SubagentOrRuntime,
+                        trust_level: InputTrustLevel::PeerUntrusted,
+                        basis: "dsh_subagent_settlement".to_string(),
+                        sender_session,
+                        sender_address,
+                        xs_message_id: None,
+                        assignment_id,
+                        handoff_id: None,
+                    });
+                }
+                "compact-checkpoint" | "compact-basic" => {
+                    return Some(InputOrigin {
+                        sender_kind: SenderKind::SubagentOrRuntime,
+                        trust_level: InputTrustLevel::PeerUntrusted,
+                        basis: "dsh_compaction_checkpoint".to_string(),
+                        sender_session,
+                        sender_address,
+                        xs_message_id: None,
+                        assignment_id,
+                        handoff_id: None,
+                    });
+                }
+                other if !other.is_empty() => {
+                    return Some(InputOrigin {
+                        sender_kind: SenderKind::SubagentOrRuntime,
+                        trust_level: InputTrustLevel::PeerUntrusted,
+                        basis: "dsh_source_non_user".to_string(),
+                        sender_session,
+                        sender_address,
+                        xs_message_id: None,
+                        assignment_id,
+                        handoff_id: None,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // DSH v4 顶层 `surfaceOp: { op: "replace", ... }` 的表面重写 user/message 属于非人类压缩检查点。
+    if val
+        .get("surfaceOp")
+        .and_then(|op| op.get("op"))
+        .and_then(Value::as_str)
+        == Some("replace")
+    {
+        return Some(InputOrigin {
+            sender_kind: SenderKind::SubagentOrRuntime,
+            trust_level: InputTrustLevel::PeerUntrusted,
+            basis: "dsh_surface_replace".to_string(),
+            sender_session: None,
+            sender_address: None,
+            xs_message_id: None,
+            assignment_id: None,
+            handoff_id: None,
         });
+    }
+
+    // DSH v4 `data.message.source.principal`、`data.source.principal` 或顶层 `source.principal`
+    let principal = source_obj
+        .and_then(|s| s.get("principal"))
+        .and_then(Value::as_str);
 
     if let Some(p) = principal {
         match p.trim().to_ascii_lowercase().as_str() {
@@ -1801,6 +1957,162 @@ mod tests {
         assert_eq!(o4.sender_kind, SenderKind::Unknown);
         assert_eq!(o4.trust_level, InputTrustLevel::Unverified);
         assert_eq!(o4.basis, "log_role_only");
+    }
+
+    #[test]
+    fn h4_dsh_v4_source_kind_and_subagent_origin_classification() {
+        // 1. DSH v4 人类直接输入 `data.source.kind == "user"`（主会话）⇒ 日志层 Unknown("log_role_only")，
+        //    叠加受控绑定后升级为 HumanVerified
+        let dsh_user = serde_json::json!({
+            "seq": 2,
+            "type": "user/message",
+            "surfaceOp": "append",
+            "data": {
+                "id": "m-user-1",
+                "role": "user",
+                "source": { "kind": "user" },
+                "content": [{ "type": "text", "text": "ship h4" }]
+            }
+        });
+        let o_user = classify_dsh_user_input_origin(
+            Some(&dsh_user),
+            "ship h4",
+            "/dsh/sessions/s-root",
+            Some("interactive"),
+            None,
+        );
+        assert_eq!(o_user.sender_kind, SenderKind::Unknown);
+        assert_eq!(o_user.basis, "log_role_only");
+        let o_user_bound = apply_control_plane_to_input_origin(o_user, true, Some("assign:dsh-1"));
+        assert_eq!(o_user_bound.sender_kind, SenderKind::HumanVerified);
+        assert_eq!(o_user_bound.trust_level, InputTrustLevel::HumanVerified);
+
+        // 2. DSH v4 子代理结算 `data.source.kind == "subagent-settled"` ⇒ SubagentOrRuntime + PeerUntrusted，
+        //    即使主会话绑定 verified_human_input=true 也绝不升级为 HumanVerified！
+        let dsh_settled = serde_json::json!({
+            "seq": 6,
+            "type": "user/message",
+            "surfaceOp": "append",
+            "data": {
+                "id": "m-settled-1",
+                "role": "user",
+                "source": {
+                    "kind": "subagent-settled",
+                    "subagentSessionId": "sub-sess-42",
+                    "toolCallId": "call-sub-1"
+                },
+                "content": [{ "type": "text", "text": "<subagent-result>done</subagent-result>" }]
+            }
+        });
+        let o_settled = classify_dsh_user_input_origin(
+            Some(&dsh_settled),
+            "<subagent-result>done</subagent-result>",
+            "/dsh/sessions/s-root",
+            Some("interactive"),
+            None,
+        );
+        assert_eq!(o_settled.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o_settled.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(o_settled.basis, "dsh_subagent_settlement");
+        assert_eq!(o_settled.sender_session.as_deref(), Some("sub-sess-42"));
+        let o_settled_bound =
+            apply_control_plane_to_input_origin(o_settled, true, Some("assign:dsh-1"));
+        assert_eq!(o_settled_bound.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o_settled_bound.trust_level, InputTrustLevel::PeerUntrusted);
+
+        // 3. DSH v4 压缩检查点 `data.source.kind == "compact-checkpoint"` + `surfaceOp.op == "replace"`
+        let dsh_compact = serde_json::json!({
+            "seq": 10,
+            "type": "user/message",
+            "surfaceOp": { "op": "replace", "startSeq": 2, "endSeq": 8 },
+            "sourceEventSeqs": [2, 3, 4, 8],
+            "data": {
+                "id": "m-compact-1",
+                "role": "user",
+                "source": {
+                    "kind": "compact-checkpoint",
+                    "compactionId": "cmp-1"
+                },
+                "content": [{ "type": "text", "text": "Compacted checkpoint summary" }]
+            }
+        });
+        let o_compact = classify_dsh_user_input_origin(
+            Some(&dsh_compact),
+            "Compacted checkpoint summary",
+            "/dsh/sessions/s-root",
+            None,
+            None,
+        );
+        assert_eq!(o_compact.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o_compact.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(o_compact.basis, "dsh_compaction_checkpoint");
+
+        // 4. DSH v4 协调器目标注入 `data.source.kind == "goal"` ⇒ CoordinatorDispatch + Unverified
+        let dsh_goal = serde_json::json!({
+            "seq": 12,
+            "type": "user/message",
+            "surfaceOp": "append",
+            "data": {
+                "id": "m-goal-1",
+                "role": "user",
+                "source": { "kind": "goal", "goalId": "goal-99" },
+                "content": [{ "type": "text", "text": "Continue autonomous goal" }]
+            }
+        });
+        let o_goal = classify_dsh_user_input_origin(
+            Some(&dsh_goal),
+            "Continue autonomous goal",
+            "/dsh/sessions/s-root",
+            None,
+            None,
+        );
+        assert_eq!(o_goal.sender_kind, SenderKind::CoordinatorDispatch);
+        assert_eq!(o_goal.trust_level, InputTrustLevel::Unverified);
+        assert_eq!(o_goal.basis, "dsh_source_coordinator");
+        assert_eq!(o_goal.assignment_id.as_deref(), Some("goal-99"));
+
+        // 5. DSH v4 同侪团队消息 `data.source.kind == "team-message"` ⇒ PeerSession + PeerUntrusted
+        let dsh_team = serde_json::json!({
+            "seq": 14,
+            "type": "user/message",
+            "surfaceOp": "append",
+            "data": {
+                "id": "m-team-1",
+                "role": "user",
+                "source": {
+                    "kind": "team-message",
+                    "from": "worker-alpha",
+                    "fromSession": "sess-worker-1"
+                },
+                "content": [{ "type": "text", "text": "Team update" }]
+            }
+        });
+        let o_team = classify_dsh_user_input_origin(
+            Some(&dsh_team),
+            "Team update",
+            "/dsh/sessions/s-root",
+            None,
+            None,
+        );
+        assert_eq!(o_team.sender_kind, SenderKind::PeerSession);
+        assert_eq!(o_team.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(o_team.basis, "dsh_source_peer");
+        assert_eq!(o_team.sender_session.as_deref(), Some("sess-worker-1"));
+        assert_eq!(o_team.sender_address.as_deref(), Some("worker-alpha"));
+
+        // 6. DSH v4 子代理会话（`header.origin == "subagent"`）中带 `source.kind == "user"` 的初始委托提示
+        //    ⇒ 结合会话级 `origin: "subagent"` 归为 SubagentOrRuntime + PeerUntrusted，且记录父会话 ID！
+        let o_sub_init = classify_dsh_user_input_origin(
+            Some(&dsh_user),
+            "ship h4",
+            "/dsh/sessions/sub-sess-42",
+            Some("subagent"),
+            Some("s-root"),
+        );
+        assert_eq!(o_sub_init.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(o_sub_init.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(o_sub_init.basis, "dsh_subagent_origin");
+        assert_eq!(o_sub_init.sender_session.as_deref(), Some("s-root"));
     }
 
     #[cfg(feature = "store")]

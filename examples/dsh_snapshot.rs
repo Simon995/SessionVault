@@ -9,9 +9,9 @@ use clap::{ArgGroup, Parser, ValueEnum};
 use serde_json::{json, Value};
 use session_vault::deadline::Deadline;
 use session_vault::dsh_snapshot::{
-    capture, capture_source, evaluate_commit_gate, normalize_admitted_snapshot,
-    normalize_source_snapshot, Blocked, Compression, DshNormalizeConfig, NativeRuntime,
-    SourceConfig, SourceSnapshot,
+    capture, capture_source, discover_dsh_sessions_in_root, evaluate_commit_gate,
+    normalize_admitted_snapshot, normalize_source_snapshot, Blocked, Compression,
+    DshNormalizeConfig, NativeRuntime, SourceConfig, SourceSnapshot,
 };
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -24,7 +24,7 @@ enum Encoding {
 #[command(group(
     ArgGroup::new("target")
         .required(true)
-        .args(["path", "session_dir"]),
+        .args(["path", "session_dir", "sessions_root"]),
 ))]
 struct Args {
     #[arg(long)]
@@ -32,9 +32,11 @@ struct Args {
     #[arg(
         long,
         requires_all = ["source_instance", "node", "dsh_package"],
-        conflicts_with = "path"
+        conflicts_with_all = ["path", "sessions_root"]
     )]
     session_dir: Option<PathBuf>,
+    #[arg(long, conflicts_with_all = ["path", "session_dir"])]
+    sessions_root: Option<PathBuf>,
     #[arg(long, requires = "session_dir")]
     source_instance: Option<String>,
     #[arg(long, requires = "session_dir")]
@@ -61,11 +63,14 @@ struct Args {
     #[arg(long, requires = "node")]
     native_timeout_ms: Option<u64>,
     #[cfg(feature = "store")]
-    #[arg(long, requires_all = ["session_dir", "state_file"])]
+    #[arg(long, requires = "state_file")]
     store_db: Option<PathBuf>,
     #[cfg(feature = "store")]
     #[arg(long, requires = "store_db")]
     state_file: Option<PathBuf>,
+    #[cfg(feature = "store")]
+    #[arg(long, requires = "store_db")]
+    bindings_file: Option<PathBuf>,
     #[cfg(feature = "store")]
     #[arg(long, requires = "store_db")]
     force: bool,
@@ -184,6 +189,21 @@ fn run_store_mode(
         }
     };
 
+    if let Some(ref bpath) = args.bindings_file {
+        let raw = match std::fs::read_to_string(bpath) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to read bindings_file: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let reg = session_vault::SessionBindingRegistry::from_json_str(&raw);
+        if let Err(e) = store.set_session_bindings(&reg) {
+            eprintln!("failed to set session bindings: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let prior_state: Option<DshSavedState> = if state_path.exists() {
         match std::fs::read_to_string(state_path)
             .ok()
@@ -275,6 +295,9 @@ fn run_store_mode(
         "relation": outcome.planned.relation.as_ref().map(|r| r.kind_str()),
         "relation_detail": outcome.planned.relation,
         "commit_gate": outcome.planned.gate,
+        "admission_status": outcome.planned.admission_status,
+        "admission_detail": outcome.planned.admission_detail,
+        "events_excluded_temporary": outcome.planned.events_excluded_temporary,
         "plan": {
             "index": index_str,
             "store": store_str,
@@ -297,9 +320,163 @@ fn run_store_mode(
         if let Some(ref norm) = outcome.planned.normalized {
             report["normalized_event_spans"] = json!(norm.spans);
             report["usage_ledger"] = json!(norm.usage_ledger);
+            report["subagent_descriptors"] = json!(norm.subagent_descriptors);
+            report["subagent_catalog"] = json!(norm.subagent_catalog);
+            report["compaction_records"] = json!(norm.compaction_records);
+            report["surface_replacements"] = json!(norm.surface_replacements);
+            report["active_surface_native_seqs"] = json!(norm.active_surface_native_seqs);
+            let user_origins: Vec<Value> = norm
+                .events
+                .iter()
+                .filter_map(|ev| {
+                    ev.input_origin.as_ref().map(|orig| {
+                        json!({
+                            "raw_seq": ev.seq,
+                            "sender_kind": orig.sender_kind,
+                            "trust_level": orig.trust_level,
+                            "basis": orig.basis,
+                            "sender_session": orig.sender_session,
+                            "assignment_id": orig.assignment_id,
+                        })
+                    })
+                })
+                .collect();
+            report["observed_user_input_origins"] = json!(user_origins);
         }
     }
 
+    if write_json_line(&report) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+#[cfg(feature = "store")]
+#[allow(clippy::disallowed_methods)]
+fn run_root_store_mode(args: &Args, sessions_root: &std::path::Path) -> ExitCode {
+    use session_vault::dsh_snapshot::{scan_dsh_sessions_root_to_store, DshSavedState};
+    use session_vault::scan_plan::ScanReasons;
+    use session_vault::{SourceLocation, StoreKey, TotalStore};
+    use std::collections::BTreeMap;
+
+    let (Some(ref node), Some(ref dsh_pkg)) = (&args.node, &args.dsh_package) else {
+        eprintln!("--sessions-root with --store-db requires --node and --dsh-package");
+        return ExitCode::FAILURE;
+    };
+    let runtime = match NativeRuntime::new(node.clone(), dsh_pkg.clone()) {
+        Ok(rt) => rt,
+        Err(reason) => {
+            let _ = write_json_line(&serde_json::to_value(reason).unwrap());
+            return ExitCode::from(2);
+        }
+    };
+
+    let store_path = args.store_db.as_ref().expect("store_db required");
+    let state_path = args.state_file.as_ref().expect("state_file required");
+    let key = StoreKey::from_bytes([0x5a_u8; 32]);
+    let store = match TotalStore::open_with_key(store_path, key) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to open store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(ref bpath) = args.bindings_file {
+        let raw = match std::fs::read_to_string(bpath) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("failed to read bindings_file: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let reg = session_vault::SessionBindingRegistry::from_json_str(&raw);
+        if let Err(e) = store.set_session_bindings(&reg) {
+            eprintln!("failed to set session bindings: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let mut saved_states: BTreeMap<String, DshSavedState> = if state_path.exists() {
+        match std::fs::read_to_string(state_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, DshSavedState>>(&raw).ok())
+        {
+            Some(map) => map,
+            None => {
+                eprintln!("failed to parse root state_file");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        BTreeMap::new()
+    };
+
+    let mut reasons = ScanReasons::NONE;
+    if args.force {
+        reasons |= ScanReasons::FORCE;
+    }
+    let inst_prefix = args
+        .source_instance
+        .as_deref()
+        .unwrap_or("dsh-root-instance");
+    let outcome = match scan_dsh_sessions_root_to_store(
+        &store,
+        sessions_root,
+        inst_prefix,
+        &runtime,
+        &mut saved_states,
+        reasons,
+        SourceLocation::Local,
+        0,
+        make_deadline(args.native_timeout_ms),
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("scan_dsh_sessions_root_to_store error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if !args.simulate_crash_before_save_state {
+        let serialized = serde_json::to_string_pretty(&saved_states).unwrap();
+        if std::fs::write(state_path, serialized).is_err() {
+            eprintln!("failed to write root state_file");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let current_page = store.read_current_since_page(0, 10_000).unwrap();
+    let entries_json: Vec<Value> = outcome
+        .entries
+        .iter()
+        .map(|e| {
+            json!({
+                "dir_name": e.dir_name,
+                "discovery_status": e.discovery_status,
+                "commit_gate": e.commit_outcome.planned.gate,
+                "admission_status": e.commit_outcome.planned.admission_status,
+                "events_excluded_temporary": e.commit_outcome.planned.events_excluded_temporary,
+                "observed_events_in_batch": e.commit_outcome.planned.observation.events.len(),
+                "advanced_saved_state": e.commit_outcome.advanced_saved_state,
+            })
+        })
+        .collect();
+
+    let report = json!({
+        "kind": "dsh_sessions_root_scanned_and_committed",
+        "sessions_root": outcome.sessions_root,
+        "total_session_dirs": outcome.total_session_dirs,
+        "ready_v4_count": outcome.ready_v4_count,
+        "blocked_count": outcome.blocked_count,
+        "projected_sessions": outcome.projected_sessions,
+        "preserved_sessions": outcome.preserved_sessions,
+        "temporary_excluded_sessions": outcome.temporary_excluded_sessions,
+        "total_events_appended": outcome.total_events_appended,
+        "store_current_events": current_page.events.len(),
+        "entries": entries_json,
+    });
     if write_json_line(&report) {
         ExitCode::SUCCESS
     } else {
@@ -313,6 +490,33 @@ fn main() -> ExitCode {
         Encoding::None => Compression::None,
         Encoding::Zstd => Compression::Zstd,
     };
+    if let Some(ref sessions_root) = args.sessions_root {
+        #[cfg(feature = "store")]
+        if args.store_db.is_some() {
+            return run_root_store_mode(&args, sessions_root);
+        }
+        let (report, code) = match discover_dsh_sessions_in_root(sessions_root, None) {
+            Ok(disc) => (
+                json!({
+                    "kind": "dsh_sessions_root_discovered",
+                    "sessions_root": disc.sessions_root,
+                    "ready_v4_count": disc.ready_v4_count,
+                    "blocked_count": disc.blocked_count,
+                    "entries": disc.entries,
+                }),
+                ExitCode::SUCCESS,
+            ),
+            Err(reason) => (
+                serde_json::to_value(reason).expect("serializable blocked result"),
+                ExitCode::from(2),
+            ),
+        };
+        return if write_json_line(&report) {
+            code
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     if let Some(ref path) = args.path {
         if !path.is_absolute() {
             eprintln!("path must be absolute");

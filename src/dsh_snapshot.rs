@@ -20,17 +20,22 @@ mod source;
 pub use native::{AdmittedSnapshot, NativeRuntime};
 #[cfg(feature = "store")]
 pub use normalize::{
-    commit_dsh_source_step, plan_dsh_source_step, DshPlannedStep, DshStoreCommitOutcome,
+    commit_dsh_source_step, commit_dsh_source_step_with_bindings, plan_dsh_source_step,
+    plan_dsh_source_step_with_bindings, scan_dsh_sessions_root_to_store, DshPlannedStep,
+    DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
 };
 pub use normalize::{
     epoch_ms_to_iso8601_utc, normalize_admitted_snapshot, normalize_source_snapshot,
-    DshNormalizeConfig, DshUsageEntry, DshUsageStatus, NativeEventOwnership, NormalizedDshSnapshot,
-    NormalizedEventSpan,
+    DshCompactionRecord, DshNormalizeConfig, DshSubagentCatalogEntry, DshSubagentDescriptor,
+    DshSurfaceReplacement, DshUsageEntry, DshUsageStatus, NativeEventOwnership,
+    NormalizedDshSnapshot, NormalizedEventSpan,
 };
 pub use source::{
-    capture_source, evaluate_commit_gate, evaluate_saved_commit_gate, parse_canonical_log_filename,
-    select_generation, CommitGateDecision, DshSavedState, HoldReason, RebuildReason,
-    SelectedGeneration, SnapshotRelation, SourceConfig, SourceSnapshot,
+    capture_source, discover_dsh_sessions_in_root, dsh_sessions_root_from_env,
+    evaluate_commit_gate, evaluate_saved_commit_gate, parse_canonical_log_filename,
+    select_generation, select_generation_auto_compression, CommitGateDecision,
+    DshDiscoveredSessionEntry, DshDiscoveredSessionStatus, DshRootDiscoveryReport, DshSavedState,
+    HoldReason, RebuildReason, SelectedGeneration, SnapshotRelation, SourceConfig, SourceSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, Deserialize)]

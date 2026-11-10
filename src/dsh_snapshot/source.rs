@@ -62,6 +62,22 @@ pub fn select_generation(
     session_dir: &Path,
     expected_compression: Compression,
 ) -> Result<SelectedGeneration, Blocked> {
+    select_generation_internal(session_dir, Some(expected_compression)).map(|(sel, _)| sel)
+}
+
+/// 在显式会话目录上自动检测单一一致编码并按最高规范代选择物理日志；
+/// 混存 `.jsonl` 与 `.jsonl.zstd` 报 `encoding_conflict`，最高规范代非 `v4`（`v0..v3` 或 `v5+`）
+/// 报 `physical_generation` 且不回退旧代。
+pub fn select_generation_auto_compression(
+    session_dir: &Path,
+) -> Result<(SelectedGeneration, Compression), Blocked> {
+    select_generation_internal(session_dir, None)
+}
+
+fn select_generation_internal(
+    session_dir: &Path,
+    expected_compression: Option<Compression>,
+) -> Result<(SelectedGeneration, Compression), Blocked> {
     if !session_dir.is_absolute() {
         return Err(Blocked::Unavailable("session_directory_not_absolute"));
     }
@@ -78,7 +94,8 @@ pub fn select_generation(
         Probed::Absent => return Err(Blocked::Changed("selection_lost")),
         Probed::Unknown(_) => return Err(Blocked::Unavailable("directory_entries_unverified")),
     };
-    let mut best: Option<SelectedGeneration> = None;
+    let mut best: Option<(SelectedGeneration, Compression)> = None;
+    let mut observed_compression: Option<Compression> = expected_compression;
     for item in entries {
         let entry = item.map_err(|_| Blocked::Unavailable("directory_entry_unverified"))?;
         let Some(name) = entry.file_name.to_str() else {
@@ -87,8 +104,14 @@ pub fn select_generation(
         let Some((generation, compression)) = parse_canonical_log_filename(name) else {
             continue;
         };
-        if compression != expected_compression {
-            return Err(Blocked::Unsupported("encoding_conflict"));
+        match observed_compression {
+            Some(expected) if compression != expected => {
+                return Err(Blocked::Unsupported("encoding_conflict"));
+            }
+            None => {
+                observed_compression = Some(compression);
+            }
+            Some(_) => {}
         }
         match entry.kind {
             Probed::Found(FileKind::File) => {}
@@ -100,20 +123,155 @@ pub fn select_generation(
         }
         if best
             .as_ref()
-            .is_none_or(|current| generation > current.generation)
+            .is_none_or(|(current, _)| generation > current.generation)
         {
-            best = Some(SelectedGeneration {
-                generation,
-                file_name: name.to_string(),
-                path: entry.path,
-            });
+            best = Some((
+                SelectedGeneration {
+                    generation,
+                    file_name: name.to_string(),
+                    path: entry.path,
+                },
+                compression,
+            ));
         }
     }
-    let chosen = best.ok_or(Blocked::Changed("selection_lost"))?;
+    let (chosen, chosen_compression) = best.ok_or(Blocked::Changed("selection_lost"))?;
     if chosen.generation != SUPPORTED_PHYSICAL_GENERATION {
         return Err(Blocked::Unsupported("physical_generation"));
     }
-    Ok(chosen)
+    Ok((chosen, chosen_compression))
+}
+
+/// DSH 会话根目录下单个会话子目录的发现与规范代判定状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DshDiscoveredSessionStatus {
+    ReadyV4 {
+        generation: u32,
+        compression: Compression,
+        file_name: String,
+        artifact_path: PathBuf,
+    },
+    Blocked {
+        blocked: Blocked,
+    },
+}
+
+/// DSH 会话根目录下发现的单个会话子目录条目。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DshDiscoveredSessionEntry {
+    pub dir_name: String,
+    pub session_dir: PathBuf,
+    pub outcome: DshDiscoveredSessionStatus,
+}
+
+/// DSH 会话根目录（如 `<dsh_home>/sessions`）的批量发现与规范代核查报告。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DshRootDiscoveryReport {
+    pub sessions_root: PathBuf,
+    pub entries: Vec<DshDiscoveredSessionEntry>,
+    pub ready_v4_count: usize,
+    pub blocked_count: usize,
+}
+
+/// 从显式环境变量解析 DSH 会话根目录（优先 `SVAULT_DSH_SESSIONS_DIR`，其次 `SVAULT_DSH_HOME` 下的 `sessions`）。
+///
+/// 未配置环境变量时返回 `None`，绝不默认扫描未显式授权的目录，保证既有消费者行为零变化。
+pub fn dsh_sessions_root_from_env() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SVAULT_DSH_SESSIONS_DIR") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(home) = std::env::var("SVAULT_DSH_HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed).join("sessions"));
+        }
+    }
+    None
+}
+
+/// 在显式给出的 DSH 会话根目录（如 `<dsh_home>/sessions`）下枚举所有会话子目录并执行最高规范代选择。
+///
+/// 首版正式规则（2026-11-09 决定）：
+/// - 仅最高规范代为 `v4`（`session.v4.jsonl[.zstd]`）的子目录记为 `ReadyV4`；
+/// - 仅存旧格式代 `v0..v3` 或出现未来格式代 `v5+` 的子目录显式记为 `Blocked(Unsupported("physical_generation"))`，绝不回退旧代；
+/// - 混存 `.jsonl` 与 `.jsonl.zstd` 显式记为 `Blocked(Unsupported("encoding_conflict"))`。
+pub fn discover_dsh_sessions_in_root(
+    sessions_root: &Path,
+    expected_compression: Option<Compression>,
+) -> Result<DshRootDiscoveryReport, Blocked> {
+    if !sessions_root.is_absolute() {
+        return Err(Blocked::Unavailable("sessions_root_not_absolute"));
+    }
+    match probe::lstat_entry(sessions_root, Some(sessions_root)) {
+        Probed::Found(RealEntryKind::Directory) => {}
+        Probed::Found(RealEntryKind::RegularFile(_) | RealEntryKind::Other) => {
+            return Err(Blocked::Unsupported("sessions_root_kind"));
+        }
+        Probed::Absent => return Err(Blocked::Unavailable("sessions_root_absent")),
+        Probed::Unknown(_) => return Err(Blocked::Unavailable("sessions_root_unverified")),
+    }
+    let raw_entries = match probe::read_dir_entries(sessions_root, Some(sessions_root)) {
+        Probed::Found(entries) => entries,
+        Probed::Absent => return Err(Blocked::Unavailable("sessions_root_absent")),
+        Probed::Unknown(_) => return Err(Blocked::Unavailable("sessions_root_entries_unverified")),
+    };
+
+    let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
+    for item in raw_entries {
+        let entry = item.map_err(|_| Blocked::Unavailable("sessions_root_entry_unverified"))?;
+        let Some(name) = entry.file_name.to_str() else {
+            continue;
+        };
+        match entry.kind {
+            Probed::Found(FileKind::Dir) => {
+                subdirs.push((name.to_string(), entry.path));
+            }
+            Probed::Found(FileKind::File | FileKind::Other) => continue,
+            Probed::Absent => continue,
+            Probed::Unknown(_) => {
+                return Err(Blocked::Unavailable("sessions_root_entry_unverified"))
+            }
+        }
+    }
+    subdirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut entries = Vec::with_capacity(subdirs.len());
+    let mut ready_v4_count = 0usize;
+    let mut blocked_count = 0usize;
+
+    for (dir_name, session_dir) in subdirs {
+        let outcome = match select_generation_internal(&session_dir, expected_compression) {
+            Ok((selected, compression)) => {
+                ready_v4_count += 1;
+                DshDiscoveredSessionStatus::ReadyV4 {
+                    generation: selected.generation,
+                    compression,
+                    file_name: selected.file_name,
+                    artifact_path: selected.path,
+                }
+            }
+            Err(blocked) => {
+                blocked_count += 1;
+                DshDiscoveredSessionStatus::Blocked { blocked }
+            }
+        };
+        entries.push(DshDiscoveredSessionEntry {
+            dir_name,
+            session_dir,
+            outcome,
+        });
+    }
+
+    Ok(DshRootDiscoveryReport {
+        sessions_root: sessions_root.to_path_buf(),
+        entries,
+        ready_v4_count,
+        blocked_count,
+    })
 }
 
 /// 显式配置的会话目录捕获目标。
@@ -955,5 +1113,90 @@ pub(super) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discover_dsh_sessions_in_root_enumerates_v4_and_reports_legacy_future_or_conflict() {
+        let root = std::env::temp_dir().join(format!(
+            "sv-dsh-root-disc-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 1. s_a_v4_zstd：含 v2、v3、v4（zstd）-> 选最高代 v4 ReadyV4
+        let s_a = root.join("s_a_v4_zstd");
+        std::fs::create_dir_all(&s_a).unwrap();
+        std::fs::write(s_a.join("session.v2.jsonl.zstd"), b"v2").unwrap();
+        std::fs::write(s_a.join("session.v3.jsonl.zstd"), b"v3").unwrap();
+        std::fs::write(s_a.join("session.v4.jsonl.zstd"), b"v4").unwrap();
+
+        // 2. s_b_v4_plain：仅 v4（plain）-> ReadyV4
+        let s_b = root.join("s_b_v4_plain");
+        std::fs::create_dir_all(&s_b).unwrap();
+        std::fs::write(s_b.join("session.v4.jsonl"), b"v4_plain").unwrap();
+
+        // 3. s_c_legacy_v3：仅 v0..v3 -> Blocked(Unsupported("physical_generation"))
+        let s_c = root.join("s_c_legacy_v3");
+        std::fs::create_dir_all(&s_c).unwrap();
+        std::fs::write(s_c.join("session.jsonl.zstd"), b"v0").unwrap();
+        std::fs::write(s_c.join("session.v3.jsonl.zstd"), b"v3").unwrap();
+
+        // 4. s_d_future_v5：v4 与 v5 并存 -> 绝不回退 v4，Blocked(Unsupported("physical_generation"))
+        let s_d = root.join("s_d_future_v5");
+        std::fs::create_dir_all(&s_d).unwrap();
+        std::fs::write(s_d.join("session.v4.jsonl.zstd"), b"v4").unwrap();
+        std::fs::write(s_d.join("session.v5.jsonl.zstd"), b"v5").unwrap();
+
+        // 5. s_e_conflict：同目录混存 plain 与 zstd -> Blocked(Unsupported("encoding_conflict"))
+        let s_e = root.join("s_e_conflict");
+        std::fs::create_dir_all(&s_e).unwrap();
+        std::fs::write(s_e.join("session.v4.jsonl"), b"plain").unwrap();
+        std::fs::write(s_e.join("session.v4.jsonl.zstd"), b"zstd").unwrap();
+
+        let report = discover_dsh_sessions_in_root(&root, None).unwrap();
+        assert_eq!(report.ready_v4_count, 2);
+        assert_eq!(report.blocked_count, 3);
+        assert_eq!(report.entries.len(), 5);
+
+        assert_eq!(
+            report.entries[0].outcome,
+            DshDiscoveredSessionStatus::ReadyV4 {
+                generation: 4,
+                compression: Compression::Zstd,
+                file_name: "session.v4.jsonl.zstd".to_string(),
+                artifact_path: s_a.join("session.v4.jsonl.zstd"),
+            }
+        );
+        assert_eq!(
+            report.entries[1].outcome,
+            DshDiscoveredSessionStatus::ReadyV4 {
+                generation: 4,
+                compression: Compression::None,
+                file_name: "session.v4.jsonl".to_string(),
+                artifact_path: s_b.join("session.v4.jsonl"),
+            }
+        );
+        assert_eq!(
+            report.entries[2].outcome,
+            DshDiscoveredSessionStatus::Blocked {
+                blocked: Blocked::Unsupported("physical_generation"),
+            }
+        );
+        assert_eq!(
+            report.entries[3].outcome,
+            DshDiscoveredSessionStatus::Blocked {
+                blocked: Blocked::Unsupported("physical_generation"),
+            }
+        );
+        assert_eq!(
+            report.entries[4].outcome,
+            DshDiscoveredSessionStatus::Blocked {
+                blocked: Blocked::Unsupported("encoding_conflict"),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
