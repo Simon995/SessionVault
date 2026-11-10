@@ -7,13 +7,15 @@ if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
     exit 1
 fi
 package=$1
-old_binary=${2:-$HOME/svault-dist-target/release/svault}
 export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/svault-probe-target}"
 node_binary=${SVAULT_DSH_NODE:-node}
 set -eu
 root=$(git rev-parse --show-toplevel)
 cd "$root"
+# 发布构建会覆盖构建缓存；旧读者必须取固定发布产物，不能指回同一个构建出口。
+legacy_tag=v2026.11.09.1
+old_binary=${2:-$root/target/dist/$legacy_tag/svault-$legacy_tag-x86_64-linux}
 if [ ! -f "$package" ] || [ ! -f "$old_binary" ]; then
     printf '%s\n' 'DSH package or released binary is not a file; use Linux absolute paths' >&2
     exit 1
