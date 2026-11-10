@@ -380,12 +380,113 @@ pub fn decode_all<R: Read>(r: R) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 从任意字节流 `R` 按块切分 UTF-8 行并依次调用 `on_line`（不含行尾 `\n` / `\r\n`）；
+/// `on_line` 返回 `false` 时立即停止读取。
+fn feed_lines(
+    mut stream: impl FnMut(&mut dyn FnMut(&[u8]) -> bool) -> io::Result<()>,
+    mut on_line: impl FnMut(&str) -> bool,
+) -> io::Result<()> {
+    let mut pending = Vec::new();
+    let mut stopped = false;
+    let mut utf8_err: Option<io::Error> = None;
+
+    stream(&mut |chunk| {
+        pending.extend_from_slice(chunk);
+        let mut start = 0usize;
+        while let Some(rel) = pending[start..].iter().position(|&b| b == b'\n') {
+            let end = start + rel;
+            let mut line_bytes = &pending[start..end];
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes = &line_bytes[..line_bytes.len() - 1];
+            }
+            match std::str::from_utf8(line_bytes) {
+                Ok(line) => {
+                    if !on_line(line) {
+                        stopped = true;
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    utf8_err = Some(invalid(format!("invalid utf-8 in line: {e}")));
+                    return false;
+                }
+            }
+            start = end + 1;
+        }
+        if start > 0 {
+            pending.drain(..start);
+        }
+        true
+    })?;
+
+    if let Some(err) = utf8_err {
+        return Err(err);
+    }
+    if !stopped && !pending.is_empty() {
+        if pending.last() == Some(&b'\r') {
+            pending.pop();
+        }
+        let line = std::str::from_utf8(&pending)
+            .map_err(|e| invalid(format!("invalid utf-8 in trailing line: {e}")))?;
+        let _ = on_line(line);
+    }
+    Ok(())
+}
+
+/// 流式解压并逐行交给 `on_line`（不含行尾 `\n` / `\r\n`）；`on_line` 返回 `false` 即刻停止解压。
+///
+/// 早停时不继续解压当前帧剩余块或后续帧（专为 `session-origin` 在大文件首行命中 `session_meta`
+/// 即停设计，G.3）。若在停止前遇到流损坏或非 UTF-8 字节，则返回 `Err`。
+pub fn decode_lines<R: Read>(r: R, on_line: impl FnMut(&str) -> bool) -> io::Result<()> {
+    let mut r = r;
+    feed_lines(|sink| decode_stream(&mut r, |b| sink(b)), on_line)
+}
+
+/// 流式读取未压缩 UTF-8 文本流并逐行交给 `on_line`；`on_line` 返回 `false` 即刻停止读取。
+fn read_plain_lines<R: Read + ?Sized>(
+    r: &mut R,
+    on_line: impl FnMut(&str) -> bool,
+) -> io::Result<()> {
+    feed_lines(
+        |sink| {
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = match r.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                if n == 0 || !sink(&buf[..n]) {
+                    return Ok(());
+                }
+            }
+        },
+        on_line,
+    )
+}
+
 /// 读一个**本机**逻辑来源的全文：`path` 在就读它，不在才读压缩形态。
 /// 三态与 [`crate::probe::read_bytes`] 相同：两种形态都不在才是 `Absent`。
 pub fn read_local(path: &Path) -> crate::probe::Probed<Vec<u8>> {
     use crate::probe::Probed;
     match crate::probe::read_bytes(path, None) {
         Probed::Absent => crate::probe::with_reader(&compressed_path(path), |r| decode_all(r)),
+        other => other,
+    }
+}
+
+/// 流式逐行读一个**本机**逻辑来源：`path` 在就按普通文件流式逐行读，不在才流式解压 `<path>.zst` 逐行读。
+/// `on_line` 返回 `false` 时立即停止读取 / 解压（G.3）。
+/// 三态与 [`read_local`] 相同：两种形态都不在才是 `Absent`。
+pub fn scan_lines_local(
+    path: &Path,
+    mut on_line: impl FnMut(&str) -> bool,
+) -> crate::probe::Probed<()> {
+    use crate::probe::Probed;
+    match crate::probe::with_reader(path, |r| read_plain_lines(r, &mut on_line)) {
+        Probed::Absent => {
+            crate::probe::with_reader(&compressed_path(path), |r| decode_lines(r, &mut on_line))
+        }
         other => other,
     }
 }
@@ -406,6 +507,35 @@ pub fn read_wsl(
                     .map(Some)
                     .map_err(|e| format!("{distro}:{zst}: {e}")),
                 None => Ok(None),
+            }
+        }
+    }
+}
+
+/// 流式逐行读一个 **WSL** 逻辑来源（G.3），语义同 [`scan_lines_local`]：
+/// `Ok(false)` = 两种形态都不在；`Ok(true)` = 存在且已完成逐行扫描（含 `on_line` 早停）。
+pub fn scan_lines_wsl(
+    distro: &str,
+    path: &str,
+    deadline: crate::deadline::Deadline,
+    mut on_line: impl FnMut(&str) -> bool,
+) -> Result<bool, String> {
+    match crate::wsl::read_file_at(distro, path, deadline)? {
+        Some(text) => {
+            for line in text.lines() {
+                if !on_line(line) {
+                    break;
+                }
+            }
+            Ok(true)
+        }
+        None => {
+            let zst = format!("{path}{SUFFIX}");
+            match crate::wsl::read_whole(distro, &zst, deadline)? {
+                Some(read) => decode_lines(read.bytes.as_slice(), &mut on_line)
+                    .map(|()| true)
+                    .map_err(|e| format!("{distro}:{zst}: {e}")),
+                None => Ok(false),
             }
         }
     }

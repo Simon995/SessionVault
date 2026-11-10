@@ -66,8 +66,9 @@ pub use discover::{
 pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
-    Actor, EventAttribution, EventType, InputOrigin, InputTrustLevel, RawEvent, SenderKind,
-    SourceLocation, SourceMode, SourceType, TimeConfidence,
+    effective_view_slice, effective_view_start_index, Actor, EventAttribution, EventType,
+    InputOrigin, InputTrustLevel, RawEvent, SenderKind, SourceLocation, SourceMode, SourceType,
+    TimeConfidence,
 };
 pub use report::ScanReport;
 pub use session_binding::{

@@ -901,6 +901,15 @@ pub fn classify_user_input_origin(
     content: &str,
     source_path: &str,
 ) -> InputOrigin {
+    // 0. 优先检查原生 JSON 记录中的上下文自动压缩摘要 / 压缩边界标记（G.1）。
+    //    🔴 必须在文本信封嗅探（`<cross-session-message>` / `[xs ...]`）之前执行：
+    //    自动生成的压缩摘要经常在正文里复述历史对话中出现过的 `<cross-session-message>`
+    //    或 `[xs id=...]` 片段；若先做文本嗅探，压缩摘要会被误判为一条新的同侪投递而丢失
+    //    压缩边界标记。
+    if let Some(origin) = inspect_compaction_markers(raw_record) {
+        return origin;
+    }
+
     let trimmed = content.trim_start();
 
     // 1. 检查 `<cross-session-message ...>` 同侪信封（Claude Code / 桌面跨会话投递）。
@@ -1203,6 +1212,105 @@ fn inspect_handoff_or_dispatch(raw_record: Option<&Value>, text: &str) -> Option
                 handoff_id: None,
             });
         }
+    }
+
+    None
+}
+
+fn inspect_compaction_markers(raw_record: Option<&Value>) -> Option<InputOrigin> {
+    let val = raw_record?;
+
+    // 1. Claude Code 合成压缩摘要：顶层 `"isCompactSummary": true`。
+    if val.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        return Some(InputOrigin {
+            sender_kind: SenderKind::SubagentOrRuntime,
+            trust_level: InputTrustLevel::PeerUntrusted,
+            basis: "claude_compact_summary".to_string(),
+            sender_session: None,
+            sender_address: None,
+            xs_message_id: None,
+            assignment_id: None,
+            handoff_id: None,
+        });
+    }
+
+    // 2. Claude Code 压缩边界记录：`type == "system" && subtype == "compact_boundary"` 或 `type == "summary"`。
+    let entry_type = val.get("type").and_then(Value::as_str);
+    let subtype = val.get("subtype").and_then(Value::as_str);
+    if subtype == Some("compact_boundary") || entry_type == Some("summary") {
+        return Some(InputOrigin {
+            sender_kind: SenderKind::SubagentOrRuntime,
+            trust_level: InputTrustLevel::PeerUntrusted,
+            basis: "claude_compact_boundary".to_string(),
+            sender_session: None,
+            sender_address: None,
+            xs_message_id: None,
+            assignment_id: None,
+            handoff_id: None,
+        });
+    }
+
+    // 3. Codex 压缩记录：`type == "compacted"`、`payload.type == "compacted"` 或含 `payload.replacement_history`。
+    let payload = val.get("payload");
+    if entry_type == Some("compacted")
+        || payload.and_then(|p| p.get("type")).and_then(Value::as_str) == Some("compacted")
+        || payload.and_then(|p| p.get("replacement_history")).is_some()
+    {
+        return Some(InputOrigin {
+            sender_kind: SenderKind::SubagentOrRuntime,
+            trust_level: InputTrustLevel::PeerUntrusted,
+            basis: "codex_compacted".to_string(),
+            sender_session: None,
+            sender_address: None,
+            xs_message_id: None,
+            assignment_id: None,
+            handoff_id: None,
+        });
+    }
+
+    // 4. DSH v4 压缩检查点：`source.kind` 为 `compact-checkpoint` / `compact-basic` 或 `surfaceOp.op == "replace"`。
+    let source_obj = val
+        .get("data")
+        .and_then(|d| {
+            d.get("source")
+                .or_else(|| d.get("message").and_then(|m| m.get("source")))
+        })
+        .or_else(|| val.get("source"));
+    if let Some(src) = source_obj {
+        if let Some(kind_raw) = src.get("kind").and_then(Value::as_str) {
+            if matches!(
+                kind_raw.trim().to_ascii_lowercase().as_str(),
+                "compact-checkpoint" | "compact-basic"
+            ) {
+                return Some(InputOrigin {
+                    sender_kind: SenderKind::SubagentOrRuntime,
+                    trust_level: InputTrustLevel::PeerUntrusted,
+                    basis: "dsh_compaction_checkpoint".to_string(),
+                    sender_session: None,
+                    sender_address: None,
+                    xs_message_id: None,
+                    assignment_id: None,
+                    handoff_id: None,
+                });
+            }
+        }
+    }
+    if val
+        .get("surfaceOp")
+        .and_then(|op| op.get("op"))
+        .and_then(Value::as_str)
+        == Some("replace")
+    {
+        return Some(InputOrigin {
+            sender_kind: SenderKind::SubagentOrRuntime,
+            trust_level: InputTrustLevel::PeerUntrusted,
+            basis: "dsh_surface_replace".to_string(),
+            sender_session: None,
+            sender_address: None,
+            xs_message_id: None,
+            assignment_id: None,
+            handoff_id: None,
+        });
     }
 
     None
@@ -2606,5 +2714,194 @@ mod tests {
         assert_eq!(u5.basis, "log_role_only");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn g1_compaction_summary_is_distinguished_from_human_input_and_cuts_effective_view() {
+        use crate::attribution::RootRegistry;
+        use crate::catalog::Profile;
+        use crate::parser::{parse_lines, ParseCtx};
+        use crate::pathnorm::HostPlatform;
+        use crate::rawevent::{effective_view_slice, effective_view_start_index};
+        use std::sync::Arc;
+
+        // 1. 构造含两轮上下文压缩的 Claude Code 会话：
+        //    - turn 0: 真实用户输入 "first human prompt"
+        //    - compact 1: isCompactSummary=true（且正文里复述了历史 `<cross-session-message>` 与 `[xs id=1]`）
+        //    - turn 1: 真实用户输入 "second human prompt"
+        //    - compact 2: 第二次压缩摘要 isCompactSummary=true
+        //    - turn 2: 最新真实用户输入 "current active window prompt"
+        let lines_owned = [
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "claude_compact_sess",
+                "timestamp": "2026-11-10T01:00:00Z",
+                "message": {"role": "user", "content": "first human prompt"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "sessionId": "claude_compact_sess",
+                "timestamp": "2026-11-10T01:05:00Z",
+                "content": "Conversation compacted"
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "claude_compact_sess",
+                "isCompactSummary": true,
+                "isVisibleInTranscriptOnly": true,
+                "timestamp": "2026-11-10T01:05:01Z",
+                "message": {
+                    "role": "user",
+                    "content": "This session is being continued from a previous conversation.\nQuoted history: <cross-session-message from=\"peer\" from-session=\"s_peer\">quoted</cross-session-message>\n[xs id=99 from=win/claude/peer] quoted"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "claude_compact_sess",
+                "timestamp": "2026-11-10T01:10:00Z",
+                "message": {"role": "user", "content": "second human prompt"}
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "claude_compact_sess",
+                "isCompactSummary": true,
+                "isVisibleInTranscriptOnly": true,
+                "timestamp": "2026-11-10T01:20:00Z",
+                "message": {
+                    "role": "user",
+                    "content": "Second compaction summary of earlier turns."
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "sessionId": "claude_compact_sess",
+                "timestamp": "2026-11-10T01:21:00Z",
+                "message": {"role": "user", "content": "current active window prompt"}
+            })
+            .to_string(),
+        ];
+        let line_refs: Vec<&str> = lines_owned.iter().map(String::as_str).collect();
+        let ctx = ParseCtx {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: "/home/dev/.claude/projects/p/claude_compact_sess.jsonl".to_string(),
+            profile: Profile::Full,
+            host: HostPlatform::current(),
+            default_distro: None,
+            roots: Arc::new(RootRegistry::new()),
+        };
+        let parsed = parse_lines(&ctx, &line_refs, 0, None);
+        assert_eq!(parsed.events.len(), 5);
+
+        // 2. 即使该会话在控制面绑定了 verifiedHumanInput = true，两条 isCompactSummary
+        //    也绝不能升级为 HumanVerified，且必须保持 `claude_compact_summary`（不被正文复述的信封误导）。
+        let reg = SessionBindingRegistry::from_json_str(
+            r#"{
+                "schemaVersion": 1,
+                "bindings": [
+                    {
+                        "schemaVersion": 1,
+                        "session": {"namespace": "tumechat.session", "id": "s_cmp"},
+                        "owner": {"namespace": "tumechat.principal", "id": "u_me"},
+                        "host": {"namespace": "tumechat.host", "id": "h_local"},
+                        "assignment": {"namespace": "tumechat.assignment", "id": "a_cmp"},
+                        "temporary": false,
+                        "readMemory": true,
+                        "verifiedHumanInput": true,
+                        "state": "bound",
+                        "recordedAt": "2026-11-10T01:00:00Z",
+                        "nativeSource": {
+                            "backend": "claude_code",
+                            "sourceLocation": "local",
+                            "nativeSessionId": "claude_compact_sess"
+                        }
+                    }
+                ]
+            }"#,
+        );
+        let enriched = reg
+            .filter_and_enrich_events(
+                SourceType::ClaudeCode,
+                &SourceLocation::Local,
+                &ctx.source_path,
+                parsed.events,
+                &parsed.session_parents,
+            )
+            .unwrap()
+            .kept_events;
+
+        assert_eq!(enriched.len(), 5);
+        // turn 0: HumanVerified
+        assert!(!enriched[0].is_compaction_summary());
+        assert_eq!(
+            enriched[0].input_origin.as_ref().unwrap().sender_kind,
+            SenderKind::HumanVerified
+        );
+        // compact 1: SubagentOrRuntime + PeerUntrusted + claude_compact_summary
+        assert!(enriched[1].is_compaction_summary());
+        let c1 = enriched[1].input_origin.as_ref().unwrap();
+        assert_eq!(c1.sender_kind, SenderKind::SubagentOrRuntime);
+        assert_eq!(c1.trust_level, InputTrustLevel::PeerUntrusted);
+        assert_eq!(c1.basis, "claude_compact_summary");
+        // turn 1: HumanVerified
+        assert!(!enriched[2].is_compaction_summary());
+        assert_eq!(
+            enriched[2].input_origin.as_ref().unwrap().sender_kind,
+            SenderKind::HumanVerified
+        );
+        // compact 2: SubagentOrRuntime + PeerUntrusted + claude_compact_summary
+        assert!(enriched[3].is_compaction_summary());
+        assert_eq!(
+            enriched[3].input_origin.as_ref().unwrap().basis,
+            "claude_compact_summary"
+        );
+        // turn 2: HumanVerified
+        assert!(!enriched[4].is_compaction_summary());
+        assert_eq!(
+            enriched[4].input_origin.as_ref().unwrap().sender_kind,
+            SenderKind::HumanVerified
+        );
+
+        // 3. 验证有效上下文窗口（VIEW）切点：取最后一次压缩摘要（index 3）起算的窗口。
+        assert_eq!(effective_view_start_index(&enriched), 3);
+        let view = effective_view_slice(&enriched);
+        assert_eq!(view.len(), 2);
+        assert!(view[0].is_compaction_summary());
+        assert_eq!(
+            view[1].content.as_deref(),
+            Some("current active window prompt")
+        );
+
+        // 4. 验证 Codex `compacted` 与 Claude `compact_boundary` 的直接分类。
+        let codex_compacted = serde_json::json!({
+            "type": "compacted",
+            "payload": {
+                "message": "",
+                "replacement_history": [{"type": "compaction", "encrypted_content": "enc"}]
+            }
+        });
+        let origin_codex = classify_user_input_origin(Some(&codex_compacted), "", "/p/r.jsonl");
+        assert!(origin_codex.is_compaction_summary());
+        assert_eq!(origin_codex.basis, "codex_compacted");
+        assert_eq!(origin_codex.sender_kind, SenderKind::SubagentOrRuntime);
+
+        let claude_boundary = serde_json::json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "content": "Conversation compacted"
+        });
+        let origin_boundary = classify_user_input_origin(
+            Some(&claude_boundary),
+            "Conversation compacted",
+            "/p/c.jsonl",
+        );
+        assert!(origin_boundary.is_compaction_summary());
+        assert_eq!(origin_boundary.basis, "claude_compact_boundary");
     }
 }

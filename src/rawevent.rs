@@ -219,6 +219,26 @@ pub struct InputOrigin {
     pub handoff_id: Option<String>,
 }
 
+impl InputOrigin {
+    /// 该输入是否由上下文自动压缩产生（如 Claude `isCompactSummary: true`、
+    /// Codex `compacted` 或 DSH `compact-checkpoint` / `surfaceOp: "replace"`）。
+    ///
+    /// 用途（G.1）：
+    /// 1. 供下游切出「最近一次压缩后的当前有效上下文窗口（`VIEW`）」；
+    /// 2. 防止记忆层把模型生成的二手摘要当作用户原话重复提炼；
+    /// 3. 防止会话标题/首条意图预览被压缩长文占据。
+    pub fn is_compaction_summary(&self) -> bool {
+        matches!(
+            self.basis.as_str(),
+            "claude_compact_summary"
+                | "claude_compact_boundary"
+                | "codex_compacted"
+                | "dsh_compaction_checkpoint"
+                | "dsh_surface_replace"
+        )
+    }
+}
+
 /// 事件类型。`Usage` 是 QuotaBar 当前唯一持久化的类别；其余多为 TumeFlow 增量需求。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -482,6 +502,30 @@ impl RawEvent {
         self.project_root_source = a.project_root_source;
         self.workspace_location = a.workspace_location;
     }
+
+    /// 该事件是否为上下文自动压缩产生的合成摘要或压缩边界检查点（G.1）。
+    pub fn is_compaction_summary(&self) -> bool {
+        self.input_origin
+            .as_ref()
+            .is_some_and(InputOrigin::is_compaction_summary)
+    }
+}
+
+/// 返回事件序列中最近一次上下文压缩摘要/检查点的起始下标（G.1 有效上下文 `VIEW` 切点）。
+///
+/// 若序列中存在一处或多处 `ev.is_compaction_summary() == true`，返回**最后一条**的下标；
+/// 若从未发生过压缩，返回 `0`（完整序列即为当前有效窗口）。
+pub fn effective_view_start_index(events: &[RawEvent]) -> usize {
+    events
+        .iter()
+        .rposition(RawEvent::is_compaction_summary)
+        .unwrap_or(0)
+}
+
+/// 切出最近一次上下文压缩起算的当前有效事件窗口（G.1 `VIEW`）。
+pub fn effective_view_slice(events: &[RawEvent]) -> &[RawEvent] {
+    let start = effective_view_start_index(events);
+    &events[start..]
 }
 
 /// 一条事件的归属三项：解析器按 `cwd` 一起写下（`parser::attribution_from_cwd`），
