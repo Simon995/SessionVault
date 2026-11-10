@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-10 更新。§1–§13 保留各阶段的安装源码核查与运行证据（`0.2.1-rc.5`，后于 §12 升级为 `0.2.2-rc.1`）。控制面绑定与临时排除已随 `v2026.11.09.1` 发布；复杂语义与细粒度用量已合入 `main`（`dc682ff` / `498b7a3`）。当前开发分支 `feat/dsh-source-integration` 的正式 `catalog` / `discover` / `scan-all` 接线与兼容边界见 §14–§15，尚未合并或发布。任务顺序只在 [backlog.md](backlog.md) 维护。
+> 2026-11-10 更新。§1–§13 保留各阶段的安装源码核查与运行证据（`0.2.1-rc.5`，后于 §12 升级为 `0.2.2-rc.1`）。控制面绑定与临时排除已随 `v2026.11.09.1` 发布；复杂语义与细粒度用量已合入 `main`（`dc682ff` / `498b7a3`）。正式 `catalog` / `discover` / `scan-all` 接线已合入 `main`（`29beb8d`），配置与有限兼容边界见 §14–§15，尚未发新 Release。任务顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -322,7 +322,7 @@ Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/ve
 
 ## 14. 常规来源接线与持久化凭据
 
-2026-11-10，开发分支 `feat/dsh-source-integration` 将上述核验链接入常规扫描。本节描述本分支，尚未合并或发布；`v2026.11.09.1` 不包含本节能力。
+2026-11-10，上述核验链已接入常规扫描并合入 `main`（`29beb8d`）。本节能力尚未发新 Release；`v2026.11.09.1` 不包含本节能力。
 
 - **目录与身份**：`catalog::builtin_descriptors()` 增加 `DeepSeek Harness` 描述符，沿用 `SourceType::Jsonl` / `SourceMode::AppendLog` / `SourceLocation::Local`。逻辑 `source_path` 为会话目录，选中的物理文件由专用选代器决定；`.jsonl` / `.zstd` 或格式代变化不产生第二份逻辑来源。`discover_transcripts()` 包含该来源，`discover_snapshots()` 不包含；显式 DSH 根内的物理日志从通用 JSONL 发现中排除，避免绕过核验或重复摄取。
 - **显式配置**：优先 `SVAULT_DSH_SESSIONS_DIR`，其次 `SVAULT_DSH_HOME/sessions`；必须是当前进程的本机绝对路径，未配置时不猜默认根。扫描另需可信本机运行时 `SVAULT_DSH_NODE` 与 `SVAULT_DSH_PACKAGE`（分别为 Node 可执行文件与 DSH `package.json` 的绝对路径）。这些配置由启动方传入，来源日志不能指定可执行代码。Windows 宿主直接捕获 WSL 来源尚未接入；在 Linux 进程中可用对应本机路径扫描。
