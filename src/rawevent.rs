@@ -5,6 +5,7 @@
 //! （正文 `content`、`parent_ref`、`time_confidence` 标为 greenfield，默认空/低置信）。
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// schema 版本。破坏性变更即 +1，并写入 TumeFlow 分库的复现戳。
 ///
@@ -280,6 +281,302 @@ pub struct TokenUsage {
     pub cache_read: u64,
 }
 
+// ===========================================================================
+// H.4 / H.7 细粒度用量保真证据（`docs/dsh-ingest-survey.md` §11）
+// ===========================================================================
+
+/// JavaScript `Number.MAX_SAFE_INTEGER`（$2^{53} - 1$），用于校验来自 JS runtime 的非负安全整数计量值。
+pub const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// 原生计量样本在单条源记录中的采集位置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageSampleOrigin {
+    /// 来自外层消息/尝试记录的 `data.usage`（或顶层 `usage`）。
+    OuterMessage,
+    /// 来自内嵌流数组 `data.stream[stream_index].chunk.usage`。
+    StreamChunk { stream_index: usize },
+}
+
+/// 单条原生计量样本记录（保留原始 JSON 载荷与采集位置）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSampleRecord {
+    pub origin: UsageSampleOrigin,
+    pub raw_usage: Value,
+}
+
+/// 精确 `total_tokens` 的产生方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TotalTokenProvenance {
+    /// 来源显式报告了合法 `totalTokens`，且与已知分桶不矛盾。
+    Reported,
+    /// 来源未显式报告 `totalTokens`，但四桶（`input`、`output`、`cache_read`、`cache_write`）
+    /// 全部显式报告且合法，由四桶之和精确推导（`reasoning_tokens` 已含在 `output` 内，不重复加）。
+    DerivedFromCompleteBuckets,
+}
+
+/// 单条计量尝试的可用状态（三态/多态区分：四桶精确 vs 仅 total 精确但 cache 未知 vs 残缺/矛盾/被覆盖）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageAvailability {
+    /// 四桶（`input`、`output`、`cache_read`、`cache_write`）与精确 `total` 全部齐全且自洽；
+    /// 仅此状态允许投影为 `EventType::Usage`（`TokenUsage` 四段）。
+    ExactFourBucket,
+    /// `input`、`output` 与显式报告的 `totalTokens` 合法且 `total >= known_sum`，
+    /// 但至少一个 cache 桶未报告（`None`）：精确 total 与未知 cache **同时成立**，
+    /// 绝不填 `0` 冒充已知，也不自行把差额猜入某个 cache 桶。
+    ExactTotalWithUnknownCache,
+    /// `input` 与 `output` 合法，但缺失至少一个 cache 桶且未报告 `totalTokens`，无法得出精确 total。
+    PartialInsufficientForTotal,
+    /// 出现负数、非整数、超过 `MAX_SAFE_INTEGER`、缺失必填 `input`/`output`、加和溢出、
+    /// `total < known_sum`、四桶齐全但 `total != sum`、或 `reasoning > output` 等矛盾。
+    InvalidOrContradictory,
+    /// 尝试记录上缺失 `usage` 对象且无可采信的 `stream` usage chunk。
+    MissingUsageReport,
+    /// 所在 turn 缺失闭合（如无 `turn/end`）或存在未配对 `llm/retry`，生命周期不完整。
+    IncompleteTurnLifecycle,
+    /// 同一 `(turn, step)` 内未经配对 `llm/retry-started` 确认即被后一条尝试覆盖。
+    SupersededBySameStep,
+}
+
+impl UsageAvailability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactFourBucket => "exact_four_bucket",
+            Self::ExactTotalWithUnknownCache => "exact_total_with_unknown_cache",
+            Self::PartialInsufficientForTotal => "partial_insufficient_for_total",
+            Self::InvalidOrContradictory => "invalid_or_contradictory",
+            Self::MissingUsageReport => "missing_usage_report",
+            Self::IncompleteTurnLifecycle => "incomplete_turn_lifecycle",
+            Self::SupersededBySameStep => "superseded_by_same_step",
+        }
+    }
+}
+
+/// 计量不可直接作四桶精确结算或存在生命周期异常的具体诊断原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageDiagnosticReason {
+    MissingUsageObject,
+    MissingRequiredInputOrOutput,
+    NegativeCount,
+    UnsafeInteger,
+    NonIntegerOrMalformedField,
+    DerivedSumOverflow,
+    TotalBelowKnownBuckets,
+    TotalMismatchCompleteBuckets,
+    ReasoningExceedsOutput,
+    UnknownCacheWithoutTotal,
+    MissingTurnEnd,
+    UnpairedRetry,
+    SupersededInSameStep,
+}
+
+/// 该计量样本在 `(turn, step)` 结算中的角色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSettlementRole {
+    /// 被选为当前尝试（含经 `llm/retry-started` 确认的独立失败尝试，或最终 `assistant/message`）的结算样本。
+    SelectedForSettlement,
+    /// 同 `(turn, step)` 内被后一条尝试覆盖，不计入结算总额。
+    SupersededSameStep,
+    /// 因缺失、矛盾或未闭合仅作诊断保留，不计入精确结算总额。
+    DiagnosticOnly,
+}
+
+/// 计量样本自身的模型路由归属状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum UsageRouteStatus {
+    /// 该条尝试记录自身显式携带了 `provider` 和/或 `model`。
+    Known {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    /// 该条尝试（如失败的 `assistant/attempt`）自身未携带模型信息；
+    /// **严禁借用同 step 后续成功消息的 provider/model**。
+    UnknownNotReported,
+}
+
+/// 计量样本所属会话的血缘状态（区分根会话、抑制继承前缀后的自有事件与未知父血缘）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum UsageLineageStatus {
+    RootSession,
+    SeededChildOwnEvent {
+        parent_session_id: String,
+        inherited_event_count: usize,
+    },
+    UnseededChildOwnEvent {
+        parent_session_id: String,
+    },
+    ParentLineageUnknown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<String>,
+    },
+}
+
+/// 计量样本所属会话的控制面执行绑定状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageExecutionBindingStatus {
+    /// 命中持久控制面会话绑定（`SessionBindingRegistry`）。
+    ControlPlaneBound,
+    /// 未绑定控制面的普通持久会话。
+    Unbound,
+}
+
+/// 单条计量尝试的细粒度保真证据（`docs/dsh-ingest-survey.md` §11 五项事实）。
+///
+/// 挂载在 [`RawEvent::usage_evidence`] 上：
+/// - 当 `settlement_role == SelectedForSettlement` 且 `availability == ExactFourBucket` 时，
+///   随 `EventType::Usage`（同时填 `usage: Some(TokenUsage)`）落库；
+/// - 当属于 `ExactTotalWithUnknownCache`、`PartialInsufficientForTotal`、`InvalidOrContradictory`、
+///   `MissingUsageReport`、`IncompleteTurnLifecycle` 或 `SupersededBySameStep` 时，
+///   随 `EventType::Meta`（`usage: None`）落库——既保证 `TotalStore` 加密存储与 `open_read_only`
+///   完整保留计量证据与诊断原因，又保证只认四段 `TokenUsage` 的消费方（如 QuotaBar）绝不把未知桶当 `0` 误计。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageEvidence {
+    // --- (5) 计量归属 ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_instance: Option<String>,
+    pub physical_generation: u32,
+    pub native_seq: u64,
+    /// `"assistant/message"` 或 `"assistant/attempt"`。
+    pub source_event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<u64>,
+    /// 同一 `(turn, step)` 内的尝试序号（从 `0` 起算；每次经配对 `llm/retry-started` 后递增）。
+    pub attempt_index: u32,
+    pub settlement_role: UsageSettlementRole,
+    pub route_status: UsageRouteStatus,
+    pub lineage_status: UsageLineageStatus,
+    pub execution_binding_status: UsageExecutionBindingStatus,
+
+    // --- (1) 原生计量样本 ---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_sample: Option<UsageSampleRecord>,
+    /// 同一源记录内被外层 `data.usage` 或更晚 `stream` chunk 覆盖的流式 usage 样本。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overridden_samples: Vec<UsageSampleRecord>,
+
+    // --- (2) 逐字段值（`Some(0)` = 显式报告 0；`None` = 未报告/未知）---
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+
+    // --- (3) 精确 total ---
+    /// 来源原始报告的 `totalTokens`（若为非负安全整数则保留，即使与分桶矛盾也留作诊断证据）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_total_tokens: Option<u64>,
+    /// 经过自洽校验后可采信的精确总 token 数（矛盾或无法推导时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_provenance: Option<TotalTokenProvenance>,
+
+    // --- (4) 可用状态与诊断 ---
+    pub availability: UsageAvailability,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostic_reasons: Vec<UsageDiagnosticReason>,
+}
+
+/// 会话级细粒度用量保真汇总（区分四桶精确合计、含未知 cache 的精确 total 合计与各类异常计数）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageSummary {
+    pub total_evidence_records: usize,
+    pub selected_for_settlement_count: usize,
+    pub exact_four_bucket_count: usize,
+    pub exact_total_with_unknown_cache_count: usize,
+    pub partial_insufficient_for_total_count: usize,
+    pub invalid_or_contradictory_count: usize,
+    pub missing_usage_report_count: usize,
+    pub incomplete_turn_lifecycle_count: usize,
+    pub superseded_by_same_step_count: usize,
+    pub unknown_route_settled_count: usize,
+    /// 仅对 `SelectedForSettlement` 且 `ExactFourBucket` 的记录求和。
+    pub exact_four_bucket_totals: TokenUsage,
+    /// 对所有 `SelectedForSettlement` 且具备 `exact_total_tokens`（含 `ExactFourBucket` 与
+    /// `ExactTotalWithUnknownCache`）的记录求和。
+    pub settled_exact_total_tokens: u64,
+    /// `SelectedForSettlement` 中是否存在任何 `cache_read_tokens.is_none()` 或 `cache_write_tokens.is_none()` 的记录。
+    pub has_unknown_cache_buckets_in_settlement: bool,
+}
+
+/// 从一组 [`RawEvent`]（如 `TotalStore::open_read_only` 读出的会话事件）汇总细粒度用量证据。
+pub fn summarize_session_usage_evidence(events: &[RawEvent]) -> SessionUsageSummary {
+    let mut summary = SessionUsageSummary::default();
+    for ev in events {
+        let Some(ref u) = ev.usage_evidence else {
+            continue;
+        };
+        summary.total_evidence_records += 1;
+        match u.availability {
+            UsageAvailability::ExactFourBucket => summary.exact_four_bucket_count += 1,
+            UsageAvailability::ExactTotalWithUnknownCache => {
+                summary.exact_total_with_unknown_cache_count += 1;
+            }
+            UsageAvailability::PartialInsufficientForTotal => {
+                summary.partial_insufficient_for_total_count += 1;
+            }
+            UsageAvailability::InvalidOrContradictory => {
+                summary.invalid_or_contradictory_count += 1;
+            }
+            UsageAvailability::MissingUsageReport => summary.missing_usage_report_count += 1,
+            UsageAvailability::IncompleteTurnLifecycle => {
+                summary.incomplete_turn_lifecycle_count += 1;
+            }
+            UsageAvailability::SupersededBySameStep => {
+                summary.superseded_by_same_step_count += 1;
+            }
+        }
+        if u.settlement_role == UsageSettlementRole::SelectedForSettlement {
+            summary.selected_for_settlement_count += 1;
+            if u.route_status == UsageRouteStatus::UnknownNotReported {
+                summary.unknown_route_settled_count += 1;
+            }
+            if u.cache_read_tokens.is_none() || u.cache_write_tokens.is_none() {
+                summary.has_unknown_cache_buckets_in_settlement = true;
+            }
+            if let Some(total) = u.exact_total_tokens {
+                summary.settled_exact_total_tokens =
+                    summary.settled_exact_total_tokens.saturating_add(total);
+            }
+            if u.availability == UsageAvailability::ExactFourBucket {
+                summary.exact_four_bucket_totals.input = summary
+                    .exact_four_bucket_totals
+                    .input
+                    .saturating_add(u.input_tokens.unwrap_or(0));
+                summary.exact_four_bucket_totals.output = summary
+                    .exact_four_bucket_totals
+                    .output
+                    .saturating_add(u.output_tokens.unwrap_or(0));
+                summary.exact_four_bucket_totals.cache_read = summary
+                    .exact_four_bucket_totals
+                    .cache_read
+                    .saturating_add(u.cache_read_tokens.unwrap_or(0));
+                summary.exact_four_bucket_totals.cache_creation = summary
+                    .exact_four_bucket_totals
+                    .cache_creation
+                    .saturating_add(u.cache_write_tokens.unwrap_or(0));
+            }
+        }
+    }
+    summary
+}
+
 /// 把 `occurred_at` 的原始串归一成 **UTC 毫秒**。无法解析 → `None`。
 ///
 /// 🔴 为什么必须归一，而不是直接给原始串建索引排序：
@@ -473,6 +770,16 @@ pub struct RawEvent {
     /// 下游判断「是否人类亲自发出/授权」必须看此字段而非 `actor`。
     #[serde(default)]
     pub input_origin: Option<InputOrigin>,
+
+    // --- 细粒度用量保真证据（H.4 / H.7）---
+    /// 单次模型调用/尝试的细粒度 token 计量证据（五项事实：原生样本、逐字段 `Option<u64>`、
+    /// 精确 total 及其来源、可用性三态/多态与诊断原因、计量归属）。
+    ///
+    /// - 四桶齐全且已结算（`ExactFourBucket`）时随 `EventType::Usage` 落库；
+    /// - 仅 total 精确但 cache 未知（`ExactTotalWithUnknownCache`）或残缺/矛盾/被同 step 覆盖时
+    ///   随 `EventType::Meta`（`usage: None`）落库，防止下游把未知桶静默当 `0` 计入四桶账本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_evidence: Option<UsageEvidence>,
 }
 
 impl RawEvent {

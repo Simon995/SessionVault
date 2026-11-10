@@ -66,9 +66,12 @@ pub use discover::{
 pub use parser::PARSER_REVISION;
 pub use pathnorm::HostPlatform;
 pub use rawevent::{
-    effective_view_slice, effective_view_start_index, Actor, EventAttribution, EventType,
-    InputOrigin, InputTrustLevel, RawEvent, SenderKind, SourceLocation, SourceMode, SourceType,
-    TimeConfidence,
+    effective_view_slice, effective_view_start_index, summarize_session_usage_evidence, Actor,
+    EventAttribution, EventType, InputOrigin, InputTrustLevel, RawEvent, SenderKind,
+    SessionUsageSummary, SourceLocation, SourceMode, SourceType, TimeConfidence,
+    TotalTokenProvenance, UsageAvailability, UsageDiagnosticReason, UsageEvidence,
+    UsageExecutionBindingStatus, UsageLineageStatus, UsageRouteStatus, UsageSampleOrigin,
+    UsageSampleRecord, UsageSettlementRole, JS_MAX_SAFE_INTEGER,
 };
 pub use report::ScanReport;
 pub use session_binding::{

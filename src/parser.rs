@@ -151,6 +151,7 @@ impl ParseCtx {
             message_id: None,
             request_id: None,
             input_origin: None,
+            usage_evidence: None,
         }
     }
 }

@@ -302,4 +302,23 @@ node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.jso
 
 本机 `@deepseek-ai/dsh` 升级至 `0.2.2-rc.1`（`dsh-installed.mjs` 兼容 `0.2.1-rc.5` 与 `0.2.2-rc.1`）后，Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 24 项检查全部通过，19 组 `verify-dsh-native-admission.mjs`、35 组 `verify-dsh-rust-source-capture.mjs` 与 140 份快照 + 5 组对照的 `verify-dsh-rust-snapshot.mjs` 回归全部通过；Windows `store,dsh-experimental` 库测试 452 passed，WSL Linux `store,dsh-experimental` 库测试 438 passed，两平台零警告 clippy 通过。
 
+## 13. 细粒度用量保真（五项事实）与总库持久化
+
+2026-11-10，在 [rawevent.rs](../src/rawevent.rs)、[normalize.rs](../src/dsh_snapshot/normalize.rs)、[session_binding.rs](../src/session_binding.rs) 与 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 中落地 [dsh-ingest-survey.md §11](dsh-ingest-survey.md#11-usage--token-计量边界与核验) 定义的细粒度用量保真五项事实与总库持久化汇总：
+
+1. **五项事实结构（`UsageEvidence` 与 `DshUsageEntry`）**：
+   - **原生计量样本（`UsageSampleRecord` / `UsageSampleOrigin`）**：保留来自外层 `OuterMessage`（`data.usage`）或内嵌流 `StreamChunk { stream_index }`（`data.stream[i].chunk.usage`）的原始 `raw_usage: Value`，并将同记录内被外层或更晚流式 chunk 覆盖的样本完整保存在 `overridden_samples: Vec<UsageSampleRecord>` 中；
+   - **逐字段值**：`input_tokens`、`output_tokens`、`cache_read_tokens`、`cache_write_tokens`、`reasoning_tokens` 均为 `Option<u64>`（`Some(0)` 表显式报告 `0`，`None` 表未报告 / 未知，绝不填 `0` 冒充已知，也不把差额猜入未知 cache 桶）；
+   - **精确 total（`TotalTokenProvenance`）**：保留原始 `reported_total_tokens: Option<u64>` 与校验通过的 `exact_total_tokens: Option<u64>`，区分 `Reported` 与 `DerivedFromCompleteBuckets`（四桶齐全且未报 `totalTokens` 时推导；`reasoning_tokens` 已含在 `output_tokens` 内，不重复加）；
+   - **可用状态与诊断（`UsageAvailability` / `UsageDiagnosticReason`）**：完整覆盖 `tests/fixtures/dsh-v4/usage-cases.json` 全部 13 个向量及 turn / retry 生命周期（`ExactFourBucket`、`ExactTotalWithUnknownCache`、`PartialInsufficientForTotal`、`InvalidOrContradictory`、`MissingUsageReport`、`IncompleteTurnLifecycle`、`SupersededBySameStep`）；
+   - **计量归属（`UsageSettlementRole` / `UsageRouteStatus` / `UsageLineageStatus` / `UsageExecutionBindingStatus`）**：绑定 `source_instance`、`physical_generation`、`native_seq`、`source_event_type`、`turn`、`step`、`attempt_index`、`settlement_role`、`route_status`（失败 attempt 无 `model` 时标 `UnknownNotReported`，绝不借用同 step 成功消息的 `model`）、`lineage_status`、`execution_binding_status`。
+2. **跨版本与消费方兼容持久化机制（`RawEvent::usage_evidence` 与 `summarize_session_usage_evidence`）**：
+   - `RawEvent` 新增 `#[serde(default, skip_serializing_if = "Option::is_none")] pub usage_evidence: Option<UsageEvidence>`，且不在 `strip_content()` 中抹除，使 `StorageProfile::Full` 与 `StorageProfile::MetadataOnly` 写入总库后均可完整还原；
+   - 仅当 `settlement_role == SelectedForSettlement && availability == ExactFourBucket` 时发射 `EventType::Usage`（同时填 `usage = Some(TokenUsage)` 与 `usage_evidence = Some(UsageEvidence)`），确保既有只读 `EventType::Usage` 四桶的消费方零破坏、不会把 `None` 读成 `0`；
+   - 非四桶状态（如 `ExactTotalWithUnknownCache`、`PartialInsufficientForTotal`、`InvalidOrContradictory`、`IncompleteTurnLifecycle`）在已有宿主 `EventType::Message` / `Thinking` 时直接挂在宿主事件的 `RawEvent::usage_evidence` 上（不改变 `RawEvent` 条数与槽位序号），无宿主事件时（如 `assistant/attempt`）发射 `EventType::Meta`（`usage: None, usage_evidence: Some(UsageEvidence)`）；
+   - `summarize_session_usage_evidence(&[RawEvent]) -> SessionUsageSummary` 从任意已归一化或从 `TotalStore` 读回的事件切片中聚合会话级用量账本与精确计数器。
+
+Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 各 25 项检查全部通过；Windows `store,dsh-experimental` 库测试 456 passed，WSL Linux `store,dsh-experimental` 库测试 442 passed，两平台零警告 clippy 通过。
+
+
 

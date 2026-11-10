@@ -20,8 +20,11 @@ use crate::catalog::Profile;
 use crate::parser::{attribution_from_cwd, scan_default_distro, PARSER_REVISION};
 use crate::pathnorm::HostPlatform;
 use crate::rawevent::{
-    Actor, EventKey, EventType, RawEvent, SourceLocation, SourceMode, SourceType, TimeConfidence,
-    TokenUsage, EVENT_KEY_VERSION, SCHEMA_VERSION,
+    summarize_session_usage_evidence, Actor, EventKey, EventType, RawEvent, SessionUsageSummary,
+    SourceLocation, SourceMode, SourceType, TimeConfidence, TokenUsage, TotalTokenProvenance,
+    UsageAvailability, UsageDiagnosticReason, UsageEvidence, UsageExecutionBindingStatus,
+    UsageLineageStatus, UsageRouteStatus, UsageSampleOrigin, UsageSampleRecord,
+    UsageSettlementRole, EVENT_KEY_VERSION, JS_MAX_SAFE_INTEGER, SCHEMA_VERSION,
 };
 
 /// DSH 归一化配置：注入来源位置、路径、Profile、宿主平台与项目根注册表。
@@ -29,6 +32,7 @@ use crate::rawevent::{
 pub struct DshNormalizeConfig {
     pub source_location: SourceLocation,
     pub source_path: String,
+    pub source_instance: Option<String>,
     pub profile: Profile,
     pub host: HostPlatform,
     pub roots: Arc<RootRegistry>,
@@ -40,6 +44,7 @@ impl DshNormalizeConfig {
         Self {
             source_location: SourceLocation::Local,
             source_path: source_path.into(),
+            source_instance: None,
             profile: Profile::Full,
             host: HostPlatform::current(),
             roots: Arc::new(RootRegistry::new()),
@@ -131,13 +136,29 @@ pub struct DshSurfaceReplacement {
     pub ownership: NativeEventOwnership,
 }
 
-/// 一条 DSH 原生 usage 记录的归一化处置状态。
+/// 单条原生 usage 样本的纯函数校验与分类结果（覆盖 `tests/fixtures/dsh-v4/usage-cases.json` 全部 13 个向量）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DshSampleEvaluation {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub reported_total_tokens: Option<u64>,
+    pub exact_total_tokens: Option<u64>,
+    pub total_provenance: Option<TotalTokenProvenance>,
+    pub exact_four_bucket_usage: Option<TokenUsage>,
+    pub availability: UsageAvailability,
+    pub diagnostic_reasons: Vec<UsageDiagnosticReason>,
+}
+
+/// 一条 DSH 原生 usage 记录的归一化处置状态（保留与三态汇总的向后兼容，细粒度状态见 [`DshUsageEntry::availability`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DshUsageStatus {
     /// 显式给齐四桶且与 `totalTokens` 一致，已作为 `EventType::Usage` 发射。
     ExactFourBucket,
-    /// 缺失 `cacheReadTokens` 或 `cacheWriteTokens`，或四桶之和不等于 `totalTokens`；不填 0 冒充已知四桶。
+    /// 缺失 `cacheReadTokens` 或 `cacheWriteTokens`（含精确 total 但 cache 未知）、或残缺/矛盾/未闭合；不填 0 冒充已知四桶。
     PartialOrUnreconciled,
     /// 同 `(turn, step)` 内无确认重试，被同 step 后一条 usage 覆盖。
     SupersededBySameStep,
@@ -150,14 +171,30 @@ pub struct DshUsageEntry {
     pub source_kind: String,
     pub turn: Option<u64>,
     pub step: Option<u64>,
+    pub attempt_index: u32,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub status: DshUsageStatus,
+    pub availability: UsageAvailability,
+    pub settlement_role: UsageSettlementRole,
+    pub route_status: UsageRouteStatus,
+    pub lineage_status: UsageLineageStatus,
+    pub execution_binding_status: UsageExecutionBindingStatus,
     pub emitted_raw_seq: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    /// 若存在已校验的 `exact_total_tokens` 则为该精确值，否则为 `reported_total_tokens`。
     pub total_tokens: Option<u64>,
+    pub reported_total_tokens: Option<u64>,
+    pub exact_total_tokens: Option<u64>,
+    pub total_provenance: Option<TotalTokenProvenance>,
+    pub diagnostic_reasons: Vec<UsageDiagnosticReason>,
+    pub selected_sample_origin: Option<UsageSampleOrigin>,
+    pub overridden_sample_count: usize,
+    pub evidence: UsageEvidence,
 }
 
 /// 已完成原生记录位置到 `RawEvent` 映射的 DSH 快照结果。
@@ -186,6 +223,11 @@ pub struct NormalizedDshSnapshot {
 impl NormalizedDshSnapshot {
     pub fn next_seq(&self) -> u64 {
         self.events.len() as u64
+    }
+
+    /// 汇总当前已发射 `events` 上挂载的细粒度用量证据（与 `TotalStore::open_read_only` 读回后调用结果一致）。
+    pub fn session_usage_summary(&self) -> SessionUsageSummary {
+        summarize_session_usage_evidence(&self.events)
     }
 
     /// 取出 `native_seq >= start_native_seq` 的增量事件及其对应位置跨度。
@@ -226,6 +268,25 @@ impl NormalizedDshSnapshot {
             .iter()
             .filter(|u| u.status == DshUsageStatus::SupersededBySameStep)
             .count();
+        let exact_total_unknown_cache = self
+            .usage_ledger
+            .iter()
+            .filter(|u| {
+                u.settlement_role == UsageSettlementRole::SelectedForSettlement
+                    && u.availability == UsageAvailability::ExactTotalWithUnknownCache
+            })
+            .count();
+        let invalid_or_contradictory = self
+            .usage_ledger
+            .iter()
+            .filter(|u| u.availability == UsageAvailability::InvalidOrContradictory)
+            .count();
+        let incomplete_lifecycle = self
+            .usage_ledger
+            .iter()
+            .filter(|u| u.availability == UsageAvailability::IncompleteTurnLifecycle)
+            .count();
+        let session_usage = self.session_usage_summary();
         report["normalization"] = json!({
             "session_id": self.session_id,
             "has_cwd": self.cwd.is_some(),
@@ -250,6 +311,13 @@ impl NormalizedDshSnapshot {
                 "emitted_exact_four_bucket": exact_usages,
                 "partial_or_unreconciled": partial_usages,
                 "superseded_by_same_step": superseded_usages,
+                "exact_total_with_unknown_cache": exact_total_unknown_cache,
+                "invalid_or_contradictory": invalid_or_contradictory,
+                "incomplete_turn_lifecycle": incomplete_lifecycle,
+                "settled_exact_total_tokens": session_usage.settled_exact_total_tokens,
+                "exact_four_bucket_totals": session_usage.exact_four_bucket_totals,
+                "has_unknown_cache_buckets_in_settlement": session_usage.has_unknown_cache_buckets_in_settlement,
+                "unknown_route_settled_count": session_usage.unknown_route_settled_count,
             },
         });
         if include_positions {
@@ -314,7 +382,11 @@ pub fn normalize_source_snapshot(
     snapshot: &SourceSnapshot,
     cfg: &DshNormalizeConfig,
 ) -> Result<NormalizedDshSnapshot, Blocked> {
-    normalize_admitted_snapshot(snapshot.admitted(), cfg)
+    let mut cfg_with_inst = cfg.clone();
+    if cfg_with_inst.source_instance.is_none() {
+        cfg_with_inst.source_instance = Some(snapshot.source_binding().to_string());
+    }
+    normalize_admitted_snapshot(snapshot.admitted(), &cfg_with_inst)
 }
 
 struct ParsedRecord<'a> {
@@ -328,13 +400,21 @@ struct RawUsageCandidate {
     source_kind: String,
     turn: Option<u64>,
     step: Option<u64>,
+    attempt_index: u32,
+    provider: Option<String>,
     model: Option<String>,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    cache_read_tokens: Option<u64>,
-    cache_write_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    exact_usage: Option<TokenUsage>,
+    selected_sample: Option<UsageSampleRecord>,
+    overridden_samples: Vec<UsageSampleRecord>,
+    eval: DshSampleEvaluation,
+    include_in_ledger: bool,
+}
+
+#[derive(Default)]
+struct StepRetryTracker {
+    current_attempt_index: u32,
+    pending_retry: bool,
+    unpaired_retry_seen: bool,
+    latest_seq_per_attempt: BTreeMap<u32, u64>,
 }
 
 struct RecordSlotCounter {
@@ -556,15 +636,24 @@ fn normalize_verified(
     let active_surface_native_seqs: Vec<u64> = surface_nodes.iter().map(|(seq, _)| *seq).collect();
     let active_surface_set: BTreeSet<u64> = active_surface_native_seqs.iter().copied().collect();
 
-    // 第一遍扫描本会话自有记录（native_seq >= inherited_event_count），决议同 (turn, step) 的 usage 槽位。
+    let lineage_status = derive_session_lineage_status(
+        parent_session_id.as_deref(),
+        is_seeded,
+        inherited_event_count,
+        session_origin.as_deref(),
+    );
+
+    // 第一遍扫描本会话自有记录（native_seq >= inherited_event_count），决议同 (turn, step) 的 usage 槽位与 turn/retry 生命周期。
     // 规则（docs/dsh-ingest-survey.md §9–§11）：
-    // - 同一 (turn, step) 内若出现成对的 `llm/retry` -> `llm/retry-started`，则保留重试前的失败 attempt usage；
-    // - 否则同一 (turn, step) 内的后一条 usage（如成功的 `assistant/message`）覆盖前一条槽位；
-    // - 失败 attempt 不借用后续成功 `assistant/message` 的 `model`。
-    let mut pending_retry_steps: BTreeSet<(u64, u64)> = BTreeSet::new();
-    let mut confirmed_retry_steps: BTreeSet<(u64, u64)> = BTreeSet::new();
+    // - 同一 (turn, step) 内每次成对的 `llm/retry` -> `llm/retry-started` 推进 `current_attempt_index`，
+    //   保留重试前的失败 attempt usage 为独立已结算尝试；
+    // - 同一 `attempt_index` 内若未出现成对 `llm/retry-started` 而直接出现后一条尝试，则后一条覆盖前一条（`SupersededBySameStep`）；
+    // - 失败 attempt 不借用后续成功 `assistant/message` 的 `provider` / `model`；
+    // - 显式出现过 `turn/start` 但未出现 `turn/end` 的 turn 标记 `MissingTurnEnd`；出现过 `llm/retry` 但未配对 `llm/retry-started` 的 step 标记 `UnpairedRetry`。
+    let mut turns_with_start: BTreeSet<u64> = BTreeSet::new();
+    let mut turns_with_end: BTreeSet<u64> = BTreeSet::new();
+    let mut step_trackers: BTreeMap<(u64, u64), StepRetryTracker> = BTreeMap::new();
     let mut usage_candidates: BTreeMap<u64, RawUsageCandidate> = BTreeMap::new();
-    let mut latest_slot_winner: BTreeMap<(u64, u64), u64> = BTreeMap::new();
 
     for rec in parsed_records.iter().skip(inherited_event_count) {
         let event_type_str = rec
@@ -574,39 +663,78 @@ fn normalize_verified(
             .unwrap_or_default();
         let (turn, step) = extract_turn_step(&rec.value);
         match event_type_str {
+            "turn/start" => {
+                if let Some(t) = turn {
+                    turns_with_start.insert(t);
+                }
+            }
+            "turn/end" => {
+                if let Some(t) = turn {
+                    turns_with_end.insert(t);
+                }
+            }
             "llm/retry" => {
                 if let (Some(t), Some(s)) = (turn, step) {
-                    pending_retry_steps.insert((t, s));
+                    let tracker = step_trackers.entry((t, s)).or_default();
+                    if tracker.pending_retry {
+                        tracker.unpaired_retry_seen = true;
+                    }
+                    tracker.pending_retry = true;
                 }
             }
             "llm/retry-started" => {
                 if let (Some(t), Some(s)) = (turn, step) {
-                    if pending_retry_steps.remove(&(t, s)) {
-                        confirmed_retry_steps.insert((t, s));
+                    let tracker = step_trackers.entry((t, s)).or_default();
+                    if tracker.pending_retry {
+                        tracker.pending_retry = false;
+                        tracker.current_attempt_index += 1;
+                    } else {
+                        tracker.unpaired_retry_seen = true;
                     }
                 }
             }
             "assistant/attempt" | "assistant/message" => {
-                if let Some(usage_val) = extract_dsh_usage_object(&rec.value) {
-                    let candidate = parse_usage_candidate(
-                        rec.position.native_seq(),
-                        event_type_str,
+                let attempt_index = if let (Some(t), Some(s)) = (turn, step) {
+                    let tracker = step_trackers.entry((t, s)).or_default();
+                    let idx = tracker.current_attempt_index;
+                    tracker
+                        .latest_seq_per_attempt
+                        .insert(idx, rec.position.native_seq());
+                    idx
+                } else {
+                    0
+                };
+                let (selected_sample, overridden_samples, has_explicit_usage_key) =
+                    collect_dsh_usage_samples(&rec.value);
+                let eval =
+                    evaluate_dsh_usage_sample(selected_sample.as_ref().map(|s| &s.raw_usage));
+                let (provider, model) = extract_dsh_route(&rec.value);
+                let include_in_ledger = selected_sample.is_some()
+                    || has_explicit_usage_key
+                    || event_type_str == "assistant/attempt"
+                    || turn.is_some_and(|t| turns_with_start.contains(&t));
+                usage_candidates.insert(
+                    rec.position.native_seq(),
+                    RawUsageCandidate {
+                        native_seq: rec.position.native_seq(),
+                        source_kind: event_type_str.to_string(),
                         turn,
                         step,
-                        extract_dsh_model(&rec.value).as_deref(),
-                        usage_val,
-                    );
-                    if let (Some(t), Some(s)) = (turn, step) {
-                        latest_slot_winner.insert((t, s), rec.position.native_seq());
-                    }
-                    usage_candidates.insert(rec.position.native_seq(), candidate);
-                }
+                        attempt_index,
+                        provider,
+                        model,
+                        selected_sample,
+                        overridden_samples,
+                        eval,
+                        include_in_ledger,
+                    },
+                );
             }
             _ => {}
         }
     }
 
-    let mut events = Vec::new();
+    let mut events: Vec<RawEvent> = Vec::new();
     let mut spans = Vec::new();
     let mut usage_ledger = Vec::new();
     let mut suppressed_inherited_records = 0usize;
@@ -631,13 +759,15 @@ fn normalize_verified(
         let rec_active_on_surface = active_surface_set.contains(&pos.native_seq());
         let rec_shadowed_by = shadowed_by_map.get(&pos.native_seq()).copied();
 
-        let mut push_event = |event_type: EventType,
+        let mut push_event = |events_buf: &mut Vec<RawEvent>,
+                              event_type: EventType,
                               actor: Option<Actor>,
                               content: Option<String>,
                               ev_model: Option<String>,
-                              usage: Option<TokenUsage>|
+                              usage: Option<TokenUsage>,
+                              usage_evidence: Option<UsageEvidence>|
          -> u64 {
-            let raw_seq = events.len() as u64;
+            let raw_seq = events_buf.len() as u64;
             let event_key = slots.next(event_type);
             let has_time = occurred_at.is_some();
             let input_origin = if event_type == EventType::Message && actor == Some(Actor::User) {
@@ -684,8 +814,9 @@ fn normalize_verified(
                 message_id: None,
                 request_id: None,
                 input_origin,
+                usage_evidence,
             };
-            events.push(ev);
+            events_buf.push(ev);
             spans.push(NormalizedEventSpan {
                 raw_seq,
                 event_type,
@@ -708,9 +839,11 @@ fn normalize_verified(
             "system/message" => {
                 if let Some(text) = extract_dsh_message_content(&rec.value, "text") {
                     push_event(
+                        &mut events,
                         EventType::Message,
                         Some(Actor::System),
                         Some(text),
+                        None,
                         None,
                         None,
                     );
@@ -719,15 +852,25 @@ fn normalize_verified(
             "developer/message" => {
                 if let Some(text) = extract_dsh_message_content(&rec.value, "text") {
                     // developer/message 与 system/message 在 DSH 恢复语义中角色不同，actor 置 None 不冒充 System。
-                    push_event(EventType::Message, None, Some(text), None, None);
+                    push_event(
+                        &mut events,
+                        EventType::Message,
+                        None,
+                        Some(text),
+                        None,
+                        None,
+                        None,
+                    );
                 }
             }
             "user/message" => {
                 if let Some(text) = extract_dsh_user_text(&rec.value) {
                     push_event(
+                        &mut events,
                         EventType::Message,
                         Some(Actor::User),
                         Some(text),
+                        None,
                         None,
                         None,
                     );
@@ -737,38 +880,55 @@ fn normalize_verified(
                 if let Some(candidate) = usage_candidates.get(&pos.native_seq()) {
                     record_usage_resolution(
                         candidate,
-                        &confirmed_retry_steps,
-                        &latest_slot_winner,
+                        &turns_with_start,
+                        &turns_with_end,
+                        &step_trackers,
+                        &lineage_status,
+                        cfg.source_instance.as_deref(),
+                        None,
                         &mut usage_ledger,
+                        &mut events,
                         &mut push_event,
                     );
                 }
             }
             "assistant/message" => {
+                let mut host_event_seq: Option<u64> = None;
                 if let Some(thinking) = extract_dsh_assistant_reasoning(&rec.value) {
-                    push_event(
+                    let seq = push_event(
+                        &mut events,
                         EventType::Thinking,
                         Some(Actor::Assistant),
                         Some(thinking),
                         model.clone(),
                         None,
+                        None,
                     );
+                    host_event_seq = Some(seq);
                 }
                 if let Some(text) = extract_dsh_message_content(&rec.value, "text") {
-                    push_event(
+                    let seq = push_event(
+                        &mut events,
                         EventType::Message,
                         Some(Actor::Assistant),
                         Some(text),
                         model.clone(),
                         None,
+                        None,
                     );
+                    host_event_seq = Some(seq);
                 }
                 if let Some(candidate) = usage_candidates.get(&pos.native_seq()) {
                     record_usage_resolution(
                         candidate,
-                        &confirmed_retry_steps,
-                        &latest_slot_winner,
+                        &turns_with_start,
+                        &turns_with_end,
+                        &step_trackers,
+                        &lineage_status,
+                        cfg.source_instance.as_deref(),
+                        host_event_seq,
                         &mut usage_ledger,
+                        &mut events,
                         &mut push_event,
                     );
                 }
@@ -776,9 +936,11 @@ fn normalize_verified(
             "tool/call" => {
                 let tool_name = extract_dsh_tool_name(&rec.value);
                 push_event(
+                    &mut events,
                     EventType::ToolUse,
                     Some(Actor::Assistant),
                     Some(format!("[Tool: {tool_name}]")),
+                    None,
                     None,
                     None,
                 );
@@ -786,9 +948,11 @@ fn normalize_verified(
             "tool/result" => {
                 if let Some(output) = extract_dsh_tool_result(&rec.value) {
                     push_event(
+                        &mut events,
                         EventType::ToolResult,
                         Some(Actor::Tool),
                         Some(output),
+                        None,
                         None,
                         None,
                     );
@@ -921,112 +1085,580 @@ fn extract_compaction_record(
     }
 }
 
-fn record_usage_resolution<F>(
-    candidate: &RawUsageCandidate,
-    confirmed_retry_steps: &BTreeSet<(u64, u64)>,
-    latest_slot_winner: &BTreeMap<(u64, u64), u64>,
-    usage_ledger: &mut Vec<DshUsageEntry>,
-    push_event: &mut F,
-) where
-    F: FnMut(EventType, Option<Actor>, Option<String>, Option<String>, Option<TokenUsage>) -> u64,
-{
-    let is_superseded = match (candidate.turn, candidate.step) {
-        (Some(t), Some(s)) if !confirmed_retry_steps.contains(&(t, s)) => latest_slot_winner
-            .get(&(t, s))
-            .is_some_and(|&winner_seq| winner_seq != candidate.native_seq),
-        _ => false,
+fn derive_session_lineage_status(
+    parent_session_id: Option<&str>,
+    is_seeded: bool,
+    inherited_event_count: usize,
+    session_origin: Option<&str>,
+) -> UsageLineageStatus {
+    if is_seeded || inherited_event_count > 0 {
+        match parent_session_id {
+            Some(p) => UsageLineageStatus::SeededChildOwnEvent {
+                parent_session_id: p.to_string(),
+                inherited_event_count,
+            },
+            None => UsageLineageStatus::ParentLineageUnknown {
+                parent_session_id: None,
+            },
+        }
+    } else if let Some(p) = parent_session_id {
+        UsageLineageStatus::UnseededChildOwnEvent {
+            parent_session_id: p.to_string(),
+        }
+    } else if session_origin == Some("subagent") {
+        UsageLineageStatus::ParentLineageUnknown {
+            parent_session_id: None,
+        }
+    } else {
+        UsageLineageStatus::RootSession
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ParsedUsageField {
+    Absent,
+    Valid(u64),
+    Invalid(UsageDiagnosticReason),
+}
+
+fn parse_usage_field(obj: &serde_json::Map<String, Value>, key: &str) -> ParsedUsageField {
+    let Some(val) = obj.get(key) else {
+        return ParsedUsageField::Absent;
+    };
+    if val.is_null() {
+        return ParsedUsageField::Absent;
+    }
+    if let Some(i) = val.as_i64() {
+        if i < 0 {
+            return ParsedUsageField::Invalid(UsageDiagnosticReason::NegativeCount);
+        }
+        let u = i as u64;
+        if u > JS_MAX_SAFE_INTEGER {
+            return ParsedUsageField::Invalid(UsageDiagnosticReason::UnsafeInteger);
+        }
+        return ParsedUsageField::Valid(u);
+    }
+    if let Some(u) = val.as_u64() {
+        if u > JS_MAX_SAFE_INTEGER {
+            return ParsedUsageField::Invalid(UsageDiagnosticReason::UnsafeInteger);
+        }
+        return ParsedUsageField::Valid(u);
+    }
+    if let Some(f) = val.as_f64() {
+        if f.is_finite() && f.fract() == 0.0 {
+            if f < 0.0 {
+                return ParsedUsageField::Invalid(UsageDiagnosticReason::NegativeCount);
+            }
+            if f > (JS_MAX_SAFE_INTEGER as f64) {
+                return ParsedUsageField::Invalid(UsageDiagnosticReason::UnsafeInteger);
+            }
+        }
+    }
+    ParsedUsageField::Invalid(UsageDiagnosticReason::NonIntegerOrMalformedField)
+}
+
+fn push_unique_reason(reasons: &mut Vec<UsageDiagnosticReason>, r: UsageDiagnosticReason) {
+    if !reasons.contains(&r) {
+        reasons.push(r);
+    }
+}
+
+/// 评估单条 DSH 原生 usage 样本（覆盖 `tests/fixtures/dsh-v4/usage-cases.json` 全部 13 个向量）。
+///
+/// 核心不变量（`docs/dsh-ingest-survey.md` §11）：
+/// - 显式报告的 `0` 计为 `Some(0)`，未报告计为 `None`，绝不填 `0` 冒充已知；
+/// - 四桶齐全且未显式报告 `totalTokens` 时，由四桶之和推导 `exact_total_tokens`（`DerivedFromCompleteBuckets`；`reasoningTokens` 已含在 `outputTokens` 内，不重复加）；
+/// - 缺失任一 cache 桶但显式报告了合法 `totalTokens >= known_sum` 时，判为 `ExactTotalWithUnknownCache`（精确 total 与未知 cache 同时成立，绝不把差额猜入某个 cache 桶）；
+/// - 负数、超 `JS_MAX_SAFE_INTEGER`、推导和超 `JS_MAX_SAFE_INTEGER`、`total < known_sum`、四桶齐全但 `total != sum`、`reasoning > output` 全部判为 `InvalidOrContradictory`。
+pub fn evaluate_dsh_usage_sample(raw_usage: Option<&Value>) -> DshSampleEvaluation {
+    let Some(val) = raw_usage.filter(|v| !v.is_null()) else {
+        return DshSampleEvaluation {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            reported_total_tokens: None,
+            exact_total_tokens: None,
+            total_provenance: None,
+            exact_four_bucket_usage: None,
+            availability: UsageAvailability::MissingUsageReport,
+            diagnostic_reasons: vec![UsageDiagnosticReason::MissingUsageObject],
+        };
     };
 
-    let (status, emitted_raw_seq) = if is_superseded {
+    let Some(obj) = val.as_object() else {
+        return DshSampleEvaluation {
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            reported_total_tokens: None,
+            exact_total_tokens: None,
+            total_provenance: None,
+            exact_four_bucket_usage: None,
+            availability: UsageAvailability::InvalidOrContradictory,
+            diagnostic_reasons: vec![UsageDiagnosticReason::NonIntegerOrMalformedField],
+        };
+    };
+
+    let mut reasons = Vec::new();
+    let extract_opt = |f: ParsedUsageField, reasons: &mut Vec<UsageDiagnosticReason>| match f {
+        ParsedUsageField::Absent => None,
+        ParsedUsageField::Valid(v) => Some(v),
+        ParsedUsageField::Invalid(r) => {
+            push_unique_reason(reasons, r);
+            None
+        }
+    };
+
+    let f_in = parse_usage_field(obj, "inputTokens");
+    let f_out = parse_usage_field(obj, "outputTokens");
+    let f_cr = parse_usage_field(obj, "cacheReadTokens");
+    let f_cw = parse_usage_field(obj, "cacheWriteTokens");
+    let f_tot = parse_usage_field(obj, "totalTokens");
+    let f_reas = parse_usage_field(obj, "reasoningTokens");
+
+    let input_tokens = extract_opt(f_in, &mut reasons);
+    let output_tokens = extract_opt(f_out, &mut reasons);
+    let cache_read_tokens = extract_opt(f_cr, &mut reasons);
+    let cache_write_tokens = extract_opt(f_cw, &mut reasons);
+    let reported_total_tokens = extract_opt(f_tot, &mut reasons);
+    let reasoning_tokens = extract_opt(f_reas, &mut reasons);
+
+    if matches!(f_in, ParsedUsageField::Absent) || matches!(f_out, ParsedUsageField::Absent) {
+        push_unique_reason(
+            &mut reasons,
+            UsageDiagnosticReason::MissingRequiredInputOrOutput,
+        );
+    }
+
+    if !reasons.is_empty() {
+        return DshSampleEvaluation {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            reported_total_tokens,
+            exact_total_tokens: None,
+            total_provenance: None,
+            exact_four_bucket_usage: None,
+            availability: UsageAvailability::InvalidOrContradictory,
+            diagnostic_reasons: reasons,
+        };
+    }
+
+    let input = input_tokens.expect("checked Present & Valid");
+    let output = output_tokens.expect("checked Present & Valid");
+
+    if let Some(reas) = reasoning_tokens {
+        if reas > output {
+            push_unique_reason(&mut reasons, UsageDiagnosticReason::ReasoningExceedsOutput);
+        }
+    }
+
+    let known_sum = input
+        .checked_add(output)
+        .and_then(|v| v.checked_add(cache_read_tokens.unwrap_or(0)))
+        .and_then(|v| v.checked_add(cache_write_tokens.unwrap_or(0)))
+        .filter(|&sum| sum <= JS_MAX_SAFE_INTEGER);
+
+    if known_sum.is_none() {
+        push_unique_reason(&mut reasons, UsageDiagnosticReason::DerivedSumOverflow);
+    }
+
+    let complete_four_buckets = cache_read_tokens.is_some() && cache_write_tokens.is_some();
+
+    if complete_four_buckets {
+        if let (Some(rep_total), Some(sum)) = (reported_total_tokens, known_sum) {
+            if rep_total < sum {
+                push_unique_reason(&mut reasons, UsageDiagnosticReason::TotalBelowKnownBuckets);
+            } else if rep_total > sum {
+                push_unique_reason(
+                    &mut reasons,
+                    UsageDiagnosticReason::TotalMismatchCompleteBuckets,
+                );
+            }
+        }
+        if reasons.is_empty() {
+            let sum = known_sum.expect("checked known_sum is_some");
+            let (exact_total, prov) = match reported_total_tokens {
+                Some(rep) => (rep, TotalTokenProvenance::Reported),
+                None => (sum, TotalTokenProvenance::DerivedFromCompleteBuckets),
+            };
+            let exact_usage = TokenUsage {
+                input,
+                output,
+                cache_creation: cache_write_tokens.unwrap(),
+                cache_read: cache_read_tokens.unwrap(),
+            };
+            return DshSampleEvaluation {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                reported_total_tokens,
+                exact_total_tokens: Some(exact_total),
+                total_provenance: Some(prov),
+                exact_four_bucket_usage: Some(exact_usage),
+                availability: UsageAvailability::ExactFourBucket,
+                diagnostic_reasons: Vec::new(),
+            };
+        }
+        return DshSampleEvaluation {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            reported_total_tokens,
+            exact_total_tokens: None,
+            total_provenance: None,
+            exact_four_bucket_usage: None,
+            availability: UsageAvailability::InvalidOrContradictory,
+            diagnostic_reasons: reasons,
+        };
+    }
+
+    // 缺失至少一个 cache 桶
+    match reported_total_tokens {
+        Some(rep_total) => {
+            if let Some(sum) = known_sum {
+                if rep_total < sum {
+                    push_unique_reason(&mut reasons, UsageDiagnosticReason::TotalBelowKnownBuckets);
+                }
+            }
+            if reasons.is_empty() {
+                DshSampleEvaluation {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    reported_total_tokens,
+                    exact_total_tokens: Some(rep_total),
+                    total_provenance: Some(TotalTokenProvenance::Reported),
+                    exact_four_bucket_usage: None,
+                    availability: UsageAvailability::ExactTotalWithUnknownCache,
+                    diagnostic_reasons: Vec::new(),
+                }
+            } else {
+                DshSampleEvaluation {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    reported_total_tokens,
+                    exact_total_tokens: None,
+                    total_provenance: None,
+                    exact_four_bucket_usage: None,
+                    availability: UsageAvailability::InvalidOrContradictory,
+                    diagnostic_reasons: reasons,
+                }
+            }
+        }
+        None => {
+            let had_contradiction = !reasons.is_empty();
+            push_unique_reason(
+                &mut reasons,
+                UsageDiagnosticReason::UnknownCacheWithoutTotal,
+            );
+            DshSampleEvaluation {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                reported_total_tokens: None,
+                exact_total_tokens: None,
+                total_provenance: None,
+                exact_four_bucket_usage: None,
+                availability: if had_contradiction {
+                    UsageAvailability::InvalidOrContradictory
+                } else {
+                    UsageAvailability::PartialInsufficientForTotal
+                },
+                diagnostic_reasons: reasons,
+            }
+        }
+    }
+}
+
+/// 采集单条 DSH 尝试记录中的所有 usage 样本（区分 `OuterMessage` 与 `StreamChunk { stream_index }`）。
+fn collect_dsh_usage_samples(
+    value: &Value,
+) -> (Option<UsageSampleRecord>, Vec<UsageSampleRecord>, bool) {
+    let mut stream_samples = Vec::new();
+    let stream_arr = value
+        .get("data")
+        .and_then(|d| d.get("stream"))
+        .or_else(|| value.get("stream"))
+        .and_then(Value::as_array);
+    if let Some(arr) = stream_arr {
+        for (idx, item) in arr.iter().enumerate() {
+            if let Some(chunk) = item.get("chunk") {
+                if chunk.get("type").and_then(Value::as_str) == Some("usage") {
+                    if let Some(u) = chunk.get("usage").filter(|v| !v.is_null()) {
+                        stream_samples.push(UsageSampleRecord {
+                            origin: UsageSampleOrigin::StreamChunk { stream_index: idx },
+                            raw_usage: u.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let data_has_usage_key = value
+        .get("data")
+        .and_then(Value::as_object)
+        .is_some_and(|o| o.contains_key("usage"));
+    let root_has_usage_key = value.as_object().is_some_and(|o| o.contains_key("usage"));
+    let has_explicit_usage_key = data_has_usage_key || root_has_usage_key;
+
+    let outer_val = value
+        .get("data")
+        .and_then(|d| d.get("usage"))
+        .filter(|v| !v.is_null())
+        .or_else(|| value.get("usage").filter(|v| !v.is_null()));
+
+    if let Some(u) = outer_val {
+        let selected = UsageSampleRecord {
+            origin: UsageSampleOrigin::OuterMessage,
+            raw_usage: u.clone(),
+        };
+        (Some(selected), stream_samples, has_explicit_usage_key)
+    } else if let Some(last_stream) = stream_samples.pop() {
+        (Some(last_stream), stream_samples, has_explicit_usage_key)
+    } else {
+        (None, Vec::new(), has_explicit_usage_key)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_usage_resolution<F>(
+    candidate: &RawUsageCandidate,
+    turns_with_start: &BTreeSet<u64>,
+    turns_with_end: &BTreeSet<u64>,
+    step_trackers: &BTreeMap<(u64, u64), StepRetryTracker>,
+    lineage_status: &UsageLineageStatus,
+    source_instance: Option<&str>,
+    host_event_seq: Option<u64>,
+    usage_ledger: &mut Vec<DshUsageEntry>,
+    events: &mut Vec<RawEvent>,
+    push_event: &mut F,
+) where
+    F: FnMut(
+        &mut Vec<RawEvent>,
+        EventType,
+        Option<Actor>,
+        Option<String>,
+        Option<String>,
+        Option<TokenUsage>,
+        Option<UsageEvidence>,
+    ) -> u64,
+{
+    let mut is_superseded = false;
+    let mut unpaired_retry = false;
+    if let (Some(t), Some(s)) = (candidate.turn, candidate.step) {
+        if let Some(tracker) = step_trackers.get(&(t, s)) {
+            if tracker
+                .latest_seq_per_attempt
+                .get(&candidate.attempt_index)
+                .is_some_and(|&winner_seq| winner_seq != candidate.native_seq)
+            {
+                is_superseded = true;
+            }
+            if tracker.pending_retry || tracker.unpaired_retry_seen {
+                unpaired_retry = true;
+            }
+        }
+    }
+
+    let missing_turn_end = candidate
+        .turn
+        .is_some_and(|t| turns_with_start.contains(&t) && !turns_with_end.contains(&t));
+
+    let mut diagnostic_reasons = candidate.eval.diagnostic_reasons.clone();
+    if is_superseded {
+        push_unique_reason(
+            &mut diagnostic_reasons,
+            UsageDiagnosticReason::SupersededInSameStep,
+        );
+    }
+    if missing_turn_end {
+        push_unique_reason(
+            &mut diagnostic_reasons,
+            UsageDiagnosticReason::MissingTurnEnd,
+        );
+    }
+    if unpaired_retry {
+        push_unique_reason(
+            &mut diagnostic_reasons,
+            UsageDiagnosticReason::UnpairedRetry,
+        );
+    }
+
+    let (availability, settlement_role) = if is_superseded {
+        (
+            UsageAvailability::SupersededBySameStep,
+            UsageSettlementRole::SupersededSameStep,
+        )
+    } else if (missing_turn_end
+        && (candidate.source_kind == "assistant/attempt"
+            || candidate.eval.availability == UsageAvailability::MissingUsageReport))
+        || (unpaired_retry && candidate.source_kind == "assistant/attempt")
+    {
+        (
+            UsageAvailability::IncompleteTurnLifecycle,
+            UsageSettlementRole::DiagnosticOnly,
+        )
+    } else {
+        match candidate.eval.availability {
+            UsageAvailability::ExactFourBucket | UsageAvailability::ExactTotalWithUnknownCache => (
+                candidate.eval.availability,
+                UsageSettlementRole::SelectedForSettlement,
+            ),
+            UsageAvailability::PartialInsufficientForTotal
+            | UsageAvailability::InvalidOrContradictory
+            | UsageAvailability::MissingUsageReport
+            | UsageAvailability::IncompleteTurnLifecycle => (
+                candidate.eval.availability,
+                UsageSettlementRole::DiagnosticOnly,
+            ),
+            UsageAvailability::SupersededBySameStep => (
+                UsageAvailability::SupersededBySameStep,
+                UsageSettlementRole::SupersededSameStep,
+            ),
+        }
+    };
+
+    let route_status = if candidate.provider.is_some() || candidate.model.is_some() {
+        UsageRouteStatus::Known {
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+        }
+    } else {
+        UsageRouteStatus::UnknownNotReported
+    };
+
+    let exact_total_tokens =
+        if matches!(settlement_role, UsageSettlementRole::SelectedForSettlement) {
+            candidate.eval.exact_total_tokens
+        } else {
+            None
+        };
+    let total_provenance = if exact_total_tokens.is_some() {
+        candidate.eval.total_provenance
+    } else {
+        None
+    };
+
+    let evidence = UsageEvidence {
+        source_instance: source_instance.map(str::to_string),
+        physical_generation: 4,
+        native_seq: candidate.native_seq,
+        source_event_type: candidate.source_kind.clone(),
+        turn: candidate.turn,
+        step: candidate.step,
+        attempt_index: candidate.attempt_index,
+        settlement_role,
+        route_status: route_status.clone(),
+        lineage_status: lineage_status.clone(),
+        execution_binding_status: UsageExecutionBindingStatus::Unbound,
+        selected_sample: candidate.selected_sample.clone(),
+        overridden_samples: candidate.overridden_samples.clone(),
+        input_tokens: candidate.eval.input_tokens,
+        output_tokens: candidate.eval.output_tokens,
+        cache_read_tokens: candidate.eval.cache_read_tokens,
+        cache_write_tokens: candidate.eval.cache_write_tokens,
+        reasoning_tokens: candidate.eval.reasoning_tokens,
+        reported_total_tokens: candidate.eval.reported_total_tokens,
+        exact_total_tokens,
+        total_provenance,
+        availability,
+        diagnostic_reasons: diagnostic_reasons.clone(),
+    };
+
+    let (status, emitted_raw_seq) = if availability == UsageAvailability::SupersededBySameStep {
         (DshUsageStatus::SupersededBySameStep, None)
-    } else if let Some(exact) = candidate.exact_usage {
+    } else if availability == UsageAvailability::ExactFourBucket
+        && settlement_role == UsageSettlementRole::SelectedForSettlement
+    {
+        let exact = candidate
+            .eval
+            .exact_four_bucket_usage
+            .expect("ExactFourBucket requires exact_four_bucket_usage");
         let seq = push_event(
+            events,
             EventType::Usage,
             Some(Actor::Assistant),
             None,
             candidate.model.clone(),
             Some(exact),
+            Some(evidence.clone()),
         );
         (DshUsageStatus::ExactFourBucket, Some(seq))
+    } else if let Some(h_seq) = host_event_seq {
+        // 将非四桶计量证据挂载到同一原生记录已发射的 Assistant Message / Thinking 事件上：
+        // - 不改变 RawEvent 条数或槽位序号，保持既有投影兼容；
+        // - TotalStore 在 Profile::Full 与 Profile::Metadata 下均完整加密持久化该证据；
+        // - 旧消费方只读 EventType::Usage 时绝不会把未知 cache 桶当 0 累加。
+        if let Some(ev) = events.get_mut(h_seq as usize) {
+            ev.usage_evidence = Some(evidence.clone());
+        }
+        (DshUsageStatus::PartialOrUnreconciled, None)
+    } else if candidate.include_in_ledger {
+        // 对于没有发射 Message/Thinking 的记录（如携带非四桶 usage 或未闭合生命周期的 assistant/attempt），
+        // 发射一条 EventType::Meta（usage: None）承载 usage_evidence，确保 TotalStore 持久化不丢证据。
+        let seq = push_event(
+            events,
+            EventType::Meta,
+            Some(Actor::Assistant),
+            None,
+            candidate.model.clone(),
+            None,
+            Some(evidence.clone()),
+        );
+        (DshUsageStatus::PartialOrUnreconciled, Some(seq))
     } else {
         (DshUsageStatus::PartialOrUnreconciled, None)
     };
 
-    usage_ledger.push(DshUsageEntry {
-        native_seq: candidate.native_seq,
-        source_kind: candidate.source_kind.clone(),
-        turn: candidate.turn,
-        step: candidate.step,
-        model: candidate.model.clone(),
-        status,
-        emitted_raw_seq,
-        input_tokens: candidate.input_tokens,
-        output_tokens: candidate.output_tokens,
-        cache_read_tokens: candidate.cache_read_tokens,
-        cache_write_tokens: candidate.cache_write_tokens,
-        total_tokens: candidate.total_tokens,
-    });
-}
-
-fn parse_usage_candidate(
-    native_seq: u64,
-    source_kind: &str,
-    turn: Option<u64>,
-    step: Option<u64>,
-    model: Option<&str>,
-    usage_val: &Value,
-) -> RawUsageCandidate {
-    let input_tokens = usage_val.get("inputTokens").and_then(Value::as_u64);
-    let output_tokens = usage_val.get("outputTokens").and_then(Value::as_u64);
-    let cache_read_tokens = usage_val.get("cacheReadTokens").and_then(Value::as_u64);
-    let cache_write_tokens = usage_val.get("cacheWriteTokens").and_then(Value::as_u64);
-    let total_tokens = usage_val.get("totalTokens").and_then(Value::as_u64);
-
-    let exact_usage = match (
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-    ) {
-        (Some(input), Some(output), Some(cache_read), Some(cache_write)) => {
-            let sum = input
-                .checked_add(output)
-                .and_then(|v| v.checked_add(cache_read))
-                .and_then(|v| v.checked_add(cache_write));
-            let total_matches = match (sum, total_tokens) {
-                (Some(s), Some(total)) => s == total,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if total_matches {
-                Some(TokenUsage {
-                    input,
-                    output,
-                    cache_creation: cache_write,
-                    cache_read,
-                })
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    RawUsageCandidate {
-        native_seq,
-        source_kind: source_kind.to_string(),
-        turn,
-        step,
-        model: model
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        input_tokens,
-        output_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-        total_tokens,
-        exact_usage,
+    if candidate.include_in_ledger || missing_turn_end || unpaired_retry {
+        usage_ledger.push(DshUsageEntry {
+            native_seq: candidate.native_seq,
+            source_kind: candidate.source_kind.clone(),
+            turn: candidate.turn,
+            step: candidate.step,
+            attempt_index: candidate.attempt_index,
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+            status,
+            availability,
+            settlement_role,
+            route_status,
+            lineage_status: lineage_status.clone(),
+            execution_binding_status: UsageExecutionBindingStatus::Unbound,
+            emitted_raw_seq,
+            input_tokens: candidate.eval.input_tokens,
+            output_tokens: candidate.eval.output_tokens,
+            cache_read_tokens: candidate.eval.cache_read_tokens,
+            cache_write_tokens: candidate.eval.cache_write_tokens,
+            reasoning_tokens: candidate.eval.reasoning_tokens,
+            total_tokens: exact_total_tokens.or(candidate.eval.reported_total_tokens),
+            reported_total_tokens: candidate.eval.reported_total_tokens,
+            exact_total_tokens,
+            total_provenance,
+            diagnostic_reasons,
+            selected_sample_origin: candidate.selected_sample.as_ref().map(|s| s.origin.clone()),
+            overridden_sample_count: candidate.overridden_samples.len(),
+            evidence,
+        });
     }
 }
 
@@ -1056,6 +1688,25 @@ fn extract_dsh_time_ms(value: &Value) -> Option<i64> {
         .or_else(|| value.get("ts").and_then(Value::as_i64))
 }
 
+fn extract_dsh_route(value: &Value) -> (Option<String>, Option<String>) {
+    let msg_source = value
+        .get("data")
+        .and_then(|d| d.get("message"))
+        .and_then(|m| m.get("source"));
+    let data_source = value.get("data").and_then(|d| d.get("source"));
+    let provider = msg_source
+        .and_then(|s| non_empty_str(s.get("provider")))
+        .or_else(|| data_source.and_then(|s| non_empty_str(s.get("provider"))))
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|d| non_empty_str(d.get("provider")))
+        })
+        .or_else(|| non_empty_str(value.get("provider")));
+    let model = extract_dsh_model(value);
+    (provider, model)
+}
+
 fn extract_dsh_model(value: &Value) -> Option<String> {
     value
         .get("data")
@@ -1066,38 +1717,19 @@ fn extract_dsh_model(value: &Value) -> Option<String> {
         .or_else(|| {
             value
                 .get("data")
+                .and_then(|d| d.get("source"))
+                .and_then(|s| s.get("model"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("data")
                 .and_then(|d| d.get("model"))
                 .and_then(Value::as_str)
         })
         .or_else(|| value.get("model").and_then(Value::as_str))
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
-}
-
-fn extract_dsh_usage_object(value: &Value) -> Option<&Value> {
-    if let Some(u) = value
-        .get("data")
-        .and_then(|d| d.get("usage"))
-        .filter(|v| v.is_object())
-    {
-        return Some(u);
-    }
-    if let Some(stream) = value
-        .get("data")
-        .and_then(|d| d.get("stream"))
-        .and_then(Value::as_array)
-    {
-        if let Some(u) = stream.iter().rev().find_map(|item| {
-            let chunk = item.get("chunk")?;
-            (chunk.get("type").and_then(Value::as_str) == Some("usage"))
-                .then(|| chunk.get("usage"))
-                .flatten()
-                .filter(|v| v.is_object())
-        }) {
-            return Some(u);
-        }
-    }
-    value.get("usage").filter(|v| v.is_object())
 }
 
 fn join_content_blocks(items: &[Value], block_type: &str) -> Option<String> {
@@ -1309,6 +1941,13 @@ mod store_wiring {
         ) {
             if !full_filtered.kept_events.is_empty() {
                 normalized.events = full_filtered.kept_events;
+            }
+            if full_filtered.admission_status == "persistent_bound" {
+                for entry in &mut normalized.usage_ledger {
+                    entry.execution_binding_status = UsageExecutionBindingStatus::ControlPlaneBound;
+                    entry.evidence.execution_binding_status =
+                        UsageExecutionBindingStatus::ControlPlaneBound;
+                }
             }
         }
 
@@ -2488,6 +3127,358 @@ mod tests {
         let sp12 = span_by_seq(12, EventType::ToolUse);
         let ev12 = &norm.events[sp12.raw_seq as usize];
         assert_eq!(ev12.content.as_deref(), Some("[Tool: read]"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evaluate_dsh_usage_sample_covers_all_13_checked_in_fixture_vectors() {
+        let raw_json = include_str!("../../tests/fixtures/dsh-v4/usage-cases.json");
+        let cases: Vec<Value> = serde_json::from_str(raw_json).unwrap();
+        assert_eq!(cases.len(), 13);
+
+        for case in &cases {
+            let name = case["name"].as_str().unwrap();
+            let eval = evaluate_dsh_usage_sample(case.get("usage"));
+            match name {
+                "exact_all_buckets" => {
+                    assert_eq!(eval.availability, UsageAvailability::ExactFourBucket);
+                    assert_eq!(eval.input_tokens, Some(10));
+                    assert_eq!(eval.output_tokens, Some(5));
+                    assert_eq!(eval.cache_read_tokens, Some(2));
+                    assert_eq!(eval.cache_write_tokens, Some(3));
+                    assert_eq!(eval.reasoning_tokens, Some(2));
+                    assert_eq!(eval.exact_total_tokens, Some(20));
+                    assert_eq!(eval.total_provenance, Some(TotalTokenProvenance::Reported));
+                    assert!(eval.diagnostic_reasons.is_empty());
+                }
+                "derive_total_from_known_buckets" => {
+                    assert_eq!(eval.availability, UsageAvailability::ExactFourBucket);
+                    assert_eq!(eval.reported_total_tokens, None);
+                    assert_eq!(eval.exact_total_tokens, Some(20));
+                    assert_eq!(
+                        eval.total_provenance,
+                        Some(TotalTokenProvenance::DerivedFromCompleteBuckets)
+                    );
+                    assert!(eval.diagnostic_reasons.is_empty());
+                }
+                "exact_total_unknown_cache" => {
+                    assert_eq!(
+                        eval.availability,
+                        UsageAvailability::ExactTotalWithUnknownCache
+                    );
+                    assert_eq!(eval.input_tokens, Some(10));
+                    assert_eq!(eval.output_tokens, Some(5));
+                    assert_eq!(eval.cache_read_tokens, None);
+                    assert_eq!(eval.cache_write_tokens, None);
+                    assert_eq!(eval.exact_total_tokens, Some(20));
+                    assert_eq!(eval.total_provenance, Some(TotalTokenProvenance::Reported));
+                    assert_eq!(eval.exact_four_bucket_usage, None);
+                }
+                "exact_total_one_unknown_bucket" => {
+                    assert_eq!(
+                        eval.availability,
+                        UsageAvailability::ExactTotalWithUnknownCache
+                    );
+                    assert_eq!(eval.cache_read_tokens, Some(2));
+                    assert_eq!(eval.cache_write_tokens, None);
+                    assert_eq!(eval.exact_total_tokens, Some(20));
+                    assert_eq!(eval.exact_four_bucket_usage, None);
+                }
+                "explicit_zero_cache" => {
+                    assert_eq!(eval.availability, UsageAvailability::ExactFourBucket);
+                    assert_eq!(eval.cache_read_tokens, Some(0));
+                    assert_eq!(eval.cache_write_tokens, Some(0));
+                    assert_eq!(eval.exact_total_tokens, Some(15));
+                    assert!(eval.exact_four_bucket_usage.is_some());
+                }
+                "missing_usage" => {
+                    assert_eq!(eval.availability, UsageAvailability::MissingUsageReport);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::MissingUsageObject]
+                    );
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "unknown_cache_without_total" => {
+                    assert_eq!(
+                        eval.availability,
+                        UsageAvailability::PartialInsufficientForTotal
+                    );
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::UnknownCacheWithoutTotal]
+                    );
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "total_below_known_buckets" => {
+                    assert_eq!(eval.availability, UsageAvailability::InvalidOrContradictory);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::TotalBelowKnownBuckets]
+                    );
+                    assert_eq!(eval.reported_total_tokens, Some(14));
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "total_above_complete_buckets" => {
+                    assert_eq!(eval.availability, UsageAvailability::InvalidOrContradictory);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::TotalMismatchCompleteBuckets]
+                    );
+                    assert_eq!(eval.reported_total_tokens, Some(21));
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "reasoning_above_output" => {
+                    assert_eq!(eval.availability, UsageAvailability::InvalidOrContradictory);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::ReasoningExceedsOutput]
+                    );
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "negative_count" => {
+                    assert_eq!(eval.availability, UsageAvailability::InvalidOrContradictory);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::NegativeCount]
+                    );
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "unsafe_integer" => {
+                    assert_eq!(eval.availability, UsageAvailability::InvalidOrContradictory);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::UnsafeInteger]
+                    );
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                "safe_inputs_overflow_derived_sum" => {
+                    assert_eq!(eval.availability, UsageAvailability::InvalidOrContradictory);
+                    assert_eq!(
+                        eval.diagnostic_reasons,
+                        vec![UsageDiagnosticReason::DerivedSumOverflow]
+                    );
+                    assert_eq!(eval.exact_total_tokens, None);
+                }
+                other => panic!("unexpected usage-cases.json vector: {other}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "store")]
+    #[test]
+    fn dsh_usage_fidelity_five_facts_and_store_roundtrip_under_full_and_metadata_profiles() {
+        use crate::catalog::Profile;
+        use crate::scan_plan::ScanReasons;
+        use crate::session_binding::SessionBindingRegistry;
+        use crate::store::TotalStore;
+        use crate::StoreKey;
+
+        let dir = std::env::temp_dir().join(format!(
+            "sv-dsh-usage-fidelity-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let records = [
+            r#"{"type":"session","version":4,"id":"s_uf","cwd":"/workspace/demo","parentSession":"s_root","isSeeded":true}"#,
+            // 继承前缀 seq 0：绝不重复计入子会话
+            r#"{"seq":0,"type":"assistant/message","time":1700000000000,"data":{"turn":0,"step":1,"message":{"id":"a0","role":"assistant","content":[{"type":"text","text":"inherited"}]},"usage":{"inputTokens":999,"outputTokens":999,"cacheReadTokens":0,"cacheWriteTokens":0,"totalTokens":1998}}}"#,
+            // Turn 1: 闭合 turn，含配对重试（attempt 0 无 model，stream usage 17）+ 成功消息（attempt 1，外层 usage 覆盖流式 chunk，且由四桶推导 total=20）
+            r#"{"seq":1,"type":"turn/start","time":1700000001000,"data":{"turn":1}}"#,
+            r#"{"seq":2,"type":"assistant/attempt","time":1700000001100,"data":{"turn":1,"step":1,"stream":[{"type":"chunk","time":1700000001110,"chunk":{"type":"usage","usage":{"inputTokens":7,"outputTokens":5,"cacheReadTokens":2,"cacheWriteTokens":3,"totalTokens":17}}}]}}"#,
+            r#"{"seq":3,"type":"llm/retry","time":1700000001200,"data":{"turn":1,"step":1,"retry":1}}"#,
+            r#"{"seq":4,"type":"llm/retry-started","time":1700000001300,"data":{"turn":1,"step":1,"retry":1}}"#,
+            r#"{"seq":5,"type":"assistant/message","time":1700000001400,"data":{"turn":1,"step":1,"message":{"id":"a5","role":"assistant","source":{"kind":"model","provider":"deepseek","model":"deepseek-chat"},"content":[{"type":"text","text":"turn1 answer"}]},"stream":[{"type":"chunk","time":1700000001410,"chunk":{"type":"usage","usage":{"inputTokens":1,"outputTokens":1,"cacheReadTokens":0,"cacheWriteTokens":0}}}],"usage":{"inputTokens":10,"outputTokens":5,"cacheReadTokens":2,"cacheWriteTokens":3}}}"#,
+            r#"{"seq":6,"type":"turn/end","time":1700000001500,"data":{"turn":1}}"#,
+            // Turn 2: 闭合 turn，第一条消息为 ExactTotalWithUnknownCache（精确 total=25，cache 未知），第二条消息为矛盾账（total=14 < 10+5）
+            r#"{"seq":7,"type":"turn/start","time":1700000002000,"data":{"turn":2}}"#,
+            r#"{"seq":8,"type":"assistant/message","time":1700000002100,"data":{"turn":2,"step":1,"message":{"id":"a8","role":"assistant","source":{"kind":"model","provider":"deepseek","model":"deepseek-reasoner"},"content":[{"type":"text","text":"unknown cache reply"}]},"usage":{"inputTokens":15,"outputTokens":5,"totalTokens":25}}}"#,
+            r#"{"seq":9,"type":"assistant/message","time":1700000002200,"data":{"turn":2,"step":2,"message":{"id":"a9","role":"assistant","source":{"kind":"model","provider":"deepseek","model":"deepseek-chat"},"content":[{"type":"text","text":"contradictory reply"}]},"usage":{"inputTokens":10,"outputTokens":5,"totalTokens":14}}}"#,
+            r#"{"seq":10,"type":"turn/end","time":1700000002300,"data":{"turn":2}}"#,
+            // Turn 3: 未闭合 turn（有 turn/start 无 turn/end）且 attempt 缺失 usage -> IncompleteTurnLifecycle
+            r#"{"seq":11,"type":"turn/start","time":1700000003000,"data":{"turn":3}}"#,
+            r#"{"seq":12,"type":"assistant/attempt","time":1700000003100,"data":{"turn":3,"step":1}}"#,
+        ];
+
+        let snap = synthetic_source_snapshot(
+            &dir,
+            "s_uf",
+            Compression::Zstd,
+            &records,
+            1,
+            "lc_uf",
+            &[
+                "h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8", "h9", "h10", "h11", "h12",
+            ],
+        );
+
+        let reg = SessionBindingRegistry::from_json_str(
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "bindings": [{
+                    "schemaVersion": 1,
+                    "owner": { "namespace": "tumechat.user", "id": "u_uf" },
+                    "host": { "namespace": "tumechat.host", "id": "h_uf" },
+                    "session": { "namespace": "tumechat.session", "id": "s_uf_bound" },
+                    "nativeSource": {
+                        "backend": "dsh-native",
+                        "sourceLocation": "local",
+                        "nativeSessionId": "s_uf"
+                    },
+                    "temporary": false,
+                    "readMemory": true,
+                    "recordedAt": "2026-11-10T01:00:00Z"
+                }]
+            })
+            .to_string(),
+        );
+
+        for profile in [Profile::Full, Profile::Metadata] {
+            let db_path = dir.join(format!("store_{profile:?}.db"));
+            let key = StoreKey::from_bytes([0x42_u8; 32]);
+            let store = TotalStore::open_with_key(&db_path, key).unwrap();
+            store.set_session_bindings(&reg).unwrap();
+
+            let mut cfg =
+                DshNormalizeConfig::local_full(dir.join("session-uf").display().to_string());
+            cfg.profile = profile;
+
+            let out = commit_dsh_source_step(&store, None, Ok(&snap), ScanReasons::INITIAL, &cfg)
+                .unwrap();
+            assert!(out.advanced_saved_state);
+            let norm = out.planned.normalized.as_ref().unwrap();
+            assert_eq!(norm.usage_ledger.len(), 5);
+
+            // 1. 核对 seq 2 (failed attempt): StreamChunk, UnknownNotReported, attempt_index=0, ExactFourBucket (17)
+            let u_seq2 = &norm.usage_ledger[0];
+            assert_eq!(u_seq2.native_seq, 2);
+            assert_eq!(u_seq2.attempt_index, 0);
+            assert_eq!(u_seq2.availability, UsageAvailability::ExactFourBucket);
+            assert_eq!(u_seq2.route_status, UsageRouteStatus::UnknownNotReported);
+            assert_eq!(
+                u_seq2.selected_sample_origin,
+                Some(UsageSampleOrigin::StreamChunk { stream_index: 0 })
+            );
+            assert_eq!(
+                u_seq2.execution_binding_status,
+                UsageExecutionBindingStatus::ControlPlaneBound
+            );
+            assert_eq!(
+                u_seq2.lineage_status,
+                UsageLineageStatus::SeededChildOwnEvent {
+                    parent_session_id: "s_root".to_string(),
+                    inherited_event_count: 1,
+                }
+            );
+
+            // 2. 核对 seq 5 (succeeded message after retry): OuterMessage 覆盖 1 条 StreamChunk, attempt_index=1, DerivedFromCompleteBuckets (20)
+            let u_seq5 = &norm.usage_ledger[1];
+            assert_eq!(u_seq5.native_seq, 5);
+            assert_eq!(u_seq5.attempt_index, 1);
+            assert_eq!(u_seq5.availability, UsageAvailability::ExactFourBucket);
+            assert_eq!(u_seq5.exact_total_tokens, Some(20));
+            assert_eq!(
+                u_seq5.total_provenance,
+                Some(TotalTokenProvenance::DerivedFromCompleteBuckets)
+            );
+            assert_eq!(
+                u_seq5.selected_sample_origin,
+                Some(UsageSampleOrigin::OuterMessage)
+            );
+            assert_eq!(u_seq5.overridden_sample_count, 1);
+            assert_eq!(
+                u_seq5.route_status,
+                UsageRouteStatus::Known {
+                    provider: Some("deepseek".to_string()),
+                    model: Some("deepseek-chat".to_string()),
+                }
+            );
+
+            // 3. 核对 seq 8: ExactTotalWithUnknownCache (exact_total=25, cache_read=None, cache_write=None)
+            let u_seq8 = &norm.usage_ledger[2];
+            assert_eq!(
+                u_seq8.availability,
+                UsageAvailability::ExactTotalWithUnknownCache
+            );
+            assert_eq!(
+                u_seq8.settlement_role,
+                UsageSettlementRole::SelectedForSettlement
+            );
+            assert_eq!(u_seq8.exact_total_tokens, Some(25));
+            assert_eq!(u_seq8.cache_read_tokens, None);
+            assert_eq!(u_seq8.cache_write_tokens, None);
+
+            // 4. 核对 seq 9: InvalidOrContradictory (TotalBelowKnownBuckets, reported_total=14, exact_total=None)
+            let u_seq9 = &norm.usage_ledger[3];
+            assert_eq!(
+                u_seq9.availability,
+                UsageAvailability::InvalidOrContradictory
+            );
+            assert_eq!(u_seq9.settlement_role, UsageSettlementRole::DiagnosticOnly);
+            assert_eq!(u_seq9.reported_total_tokens, Some(14));
+            assert_eq!(u_seq9.exact_total_tokens, None);
+            assert_eq!(
+                u_seq9.diagnostic_reasons,
+                vec![UsageDiagnosticReason::TotalBelowKnownBuckets]
+            );
+
+            // 5. 核对 seq 12: 未闭合 turn 3 -> IncompleteTurnLifecycle (MissingUsageObject + MissingTurnEnd)
+            let u_seq12 = &norm.usage_ledger[4];
+            assert_eq!(
+                u_seq12.availability,
+                UsageAvailability::IncompleteTurnLifecycle
+            );
+            assert_eq!(u_seq12.settlement_role, UsageSettlementRole::DiagnosticOnly);
+            assert!(u_seq12
+                .diagnostic_reasons
+                .contains(&UsageDiagnosticReason::MissingTurnEnd));
+
+            // 6. 用 TotalStore::open_read_only_with_key 只读打开总库，验证五项事实往返与汇总完全一致
+            drop(store);
+            let ro_store =
+                TotalStore::open_read_only_with_key(&db_path, StoreKey::from_bytes([0x42_u8; 32]))
+                    .unwrap();
+            let stored_events: Vec<RawEvent> = ro_store
+                .read_current_since_page(0, 100)
+                .unwrap()
+                .events
+                .into_iter()
+                .map(|(_, ev)| ev)
+                .collect();
+
+            // 只有 seq 2 与 seq 5 两条 ExactFourBucket 允许发射 EventType::Usage！
+            let usage_events: Vec<&RawEvent> = stored_events
+                .iter()
+                .filter(|e| e.event_type == EventType::Usage)
+                .collect();
+            assert_eq!(usage_events.len(), 2);
+
+            let summary = summarize_session_usage_evidence(&stored_events);
+            assert_eq!(summary, norm.session_usage_summary());
+            assert_eq!(summary.total_evidence_records, 5);
+            assert_eq!(summary.selected_for_settlement_count, 3);
+            assert_eq!(summary.exact_four_bucket_count, 2);
+            assert_eq!(summary.exact_total_with_unknown_cache_count, 1);
+            assert_eq!(summary.invalid_or_contradictory_count, 1);
+            assert_eq!(summary.incomplete_turn_lifecycle_count, 1);
+            assert_eq!(summary.unknown_route_settled_count, 1);
+            assert!(summary.has_unknown_cache_buckets_in_settlement);
+            assert_eq!(
+                summary.exact_four_bucket_totals,
+                TokenUsage {
+                    input: 17,
+                    output: 10,
+                    cache_creation: 6,
+                    cache_read: 4,
+                }
+            );
+            // 17 (seq 2) + 20 (seq 5) + 25 (seq 8, ExactTotalWithUnknownCache) = 62
+            assert_eq!(summary.settled_exact_total_tokens, 62);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

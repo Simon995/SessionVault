@@ -667,6 +667,7 @@ fn scan_snapshot_file(
         message_id: None,
         request_id: None,
         input_origin: None,
+        usage_evidence: None,
     };
     cursor.content_hash = Some(hash);
     cursor.next_seq += 1;

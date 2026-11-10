@@ -843,6 +843,10 @@ impl SessionBindingRegistry {
                 } => {
                     if binding_matched {
                         any_bound = true;
+                        if let Some(ref mut ue) = ev.usage_evidence {
+                            ue.execution_binding_status =
+                                crate::rawevent::UsageExecutionBindingStatus::ControlPlaneBound;
+                        }
                     }
                     if ev.actor == Some(Actor::User)
                         && ev.event_type == EventType::Message

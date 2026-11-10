@@ -765,6 +765,93 @@ async function main() {
       stepM3.json,
     );
 
+    // Step N: 真实 @deepseek-ai/dsh v4 runtime 下的细粒度用量保真（五项事实 + TotalStore 持久化汇总）
+    // 包含：
+    // - Turn 1 (withRetry): attempt 0 (stream usage=17, UnknownNotReported) + attempt 1 (ExactFourBucket=15, Reported)
+    // - Turn 2: derive_total_from_known_buckets (10+5+2+3 -> DerivedFromCompleteBuckets, exact_total=20)
+    // - Turn 3: exact_total_unknown_cache (input=10, output=5, total=20 -> ExactTotalWithUnknownCache, exact_total=20, cache=null)
+    // - Turn 4: unknown_cache_without_total (input=10, output=5 -> PartialInsufficientForTotal, diagnostic=unknown_cache_without_total)
+    // - Turn 5: total_below_known_buckets (input=10, output=5, total=14 -> InvalidOrContradictory, diagnostic=total_below_known_buckets)
+    let fidelityDoc = withRetry(baseFixture);
+    const fidelityTurn2 = appendCompleteTurn(fidelityDoc, 2, "u2", "a2", {
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheWriteTokens: 3,
+    });
+    const fidelityTurn3 = appendCompleteTurn(fidelityTurn2, 3, "u3", "a3", {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 20,
+    });
+    const fidelityTurn4 = appendCompleteTurn(fidelityTurn3, 4, "u4", "a4", {
+      inputTokens: 10,
+      outputTokens: 5,
+    });
+    const fidelityTurn5 = appendCompleteTurn(fidelityTurn4, 5, "u5", "a5", {
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 14,
+    });
+    const fidelityDir = path.join(tmpRoot, "usage-fidelity-session");
+    const fidelityStoreDb = path.join(tmpRoot, "usage_fidelity_store.db");
+    const fidelityStateFile = path.join(tmpRoot, "usage_fidelity_state.json");
+    writeZstdSession(fidelityDir, fidelityTurn5.header, fidelityTurn5.events);
+
+    const stepNFidelity = runSnapshotCli(binary, [
+      "--session-dir",
+      fidelityDir,
+      "--source-instance",
+      "inst-fidelity",
+      "--compression",
+      "zstd",
+      "--node",
+      process.execPath,
+      "--dsh-package",
+      installation.anchor,
+      "--store-db",
+      fidelityStoreDb,
+      "--state-file",
+      fidelityStateFile,
+      "--positions",
+    ]);
+    const nJson = stepNFidelity.json;
+    const nLedger = nJson?.usage_ledger || [];
+    const nSummary = nJson?.store_usage_summary;
+    check(
+      "stepN_usage_fidelity_five_facts_and_store_summary",
+      stepNFidelity.status === 0 &&
+        nLedger.length === 6 &&
+        nLedger[0].availability === "exact_four_bucket" &&
+        nLedger[0].route_status?.status === "unknown_not_reported" &&
+        nLedger[0].selected_sample_origin?.kind === "stream_chunk" &&
+        nLedger[1].availability === "exact_four_bucket" &&
+        nLedger[1].attempt_index === 1 &&
+        nLedger[1].overridden_sample_count === 2 &&
+        nLedger[2].availability === "exact_four_bucket" &&
+        nLedger[2].total_provenance === "derived_from_complete_buckets" &&
+        nLedger[2].exact_total_tokens === 20 &&
+        nLedger[3].availability === "exact_total_with_unknown_cache" &&
+        nLedger[3].exact_total_tokens === 20 &&
+        nLedger[3].cache_read_tokens === null &&
+        nLedger[3].cache_write_tokens === null &&
+        nLedger[4].availability === "partial_insufficient_for_total" &&
+        nLedger[4].diagnostic_reasons.includes("unknown_cache_without_total") &&
+        nLedger[5].availability === "invalid_or_contradictory" &&
+        nLedger[5].diagnostic_reasons.includes("total_below_known_buckets") &&
+        nSummary?.total_evidence_records === 6 &&
+        nSummary?.selected_for_settlement_count === 4 &&
+        nSummary?.exact_four_bucket_count === 3 &&
+        nSummary?.exact_total_with_unknown_cache_count === 1 &&
+        nSummary?.partial_insufficient_for_total_count === 1 &&
+        nSummary?.invalid_or_contradictory_count === 1 &&
+        nSummary?.unknown_route_settled_count === 1 &&
+        nSummary?.has_unknown_cache_buckets_in_settlement === true &&
+        // 17 (attempt 0) + 20 (turn 1 msg) + 20 (turn 2 derived) + 20 (turn 3 unknown cache) = 77
+        nSummary?.settled_exact_total_tokens === 77,
+      nJson,
+    );
+
     console.log(
       JSON.stringify({
         ok: true,

@@ -320,6 +320,14 @@ fn run_store_mode(
         if let Some(ref norm) = outcome.planned.normalized {
             report["normalized_event_spans"] = json!(norm.spans);
             report["usage_ledger"] = json!(norm.usage_ledger);
+            let current_raw_events: Vec<session_vault::RawEvent> = current_page
+                .events
+                .iter()
+                .map(|(_, ev)| ev.clone())
+                .collect();
+            report["store_usage_summary"] = json!(session_vault::summarize_session_usage_evidence(
+                &current_raw_events
+            ));
             report["subagent_descriptors"] = json!(norm.subagent_descriptors);
             report["subagent_catalog"] = json!(norm.subagent_catalog);
             report["compaction_records"] = json!(norm.compaction_records);

@@ -25,10 +25,10 @@ pub use normalize::{
     DshRootScanOutcome, DshRootScanSessionOutcome, DshStoreCommitOutcome,
 };
 pub use normalize::{
-    epoch_ms_to_iso8601_utc, normalize_admitted_snapshot, normalize_source_snapshot,
-    DshCompactionRecord, DshNormalizeConfig, DshSubagentCatalogEntry, DshSubagentDescriptor,
-    DshSurfaceReplacement, DshUsageEntry, DshUsageStatus, NativeEventOwnership,
-    NormalizedDshSnapshot, NormalizedEventSpan,
+    epoch_ms_to_iso8601_utc, evaluate_dsh_usage_sample, normalize_admitted_snapshot,
+    normalize_source_snapshot, DshCompactionRecord, DshNormalizeConfig, DshSampleEvaluation,
+    DshSubagentCatalogEntry, DshSubagentDescriptor, DshSurfaceReplacement, DshUsageEntry,
+    DshUsageStatus, NativeEventOwnership, NormalizedDshSnapshot, NormalizedEventSpan,
 };
 pub use source::{
     capture_source, discover_dsh_sessions_in_root, dsh_sessions_root_from_env,

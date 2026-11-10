@@ -6862,6 +6862,7 @@ mod tests {
             message_id: None,
             request_id: None,
             input_origin: None,
+            usage_evidence: None,
         }
     }
 
@@ -10246,6 +10247,7 @@ mod project_identity_tests {
             message_id: None,
             request_id: None,
             input_origin: None,
+            usage_evidence: None,
         }
     }
 
