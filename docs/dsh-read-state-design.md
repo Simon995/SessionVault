@@ -56,7 +56,7 @@ CARGO_TARGET_DIR=target/dsh-read-state cargo test --features store --test cli_sc
 
 2026-11-05，Windows 实跑：修复前的三组测试中，缩短反例报 `reparse` 而非 `rollback`，其余两组对照通过；修复后补入 mtime 倒退，共四组全部通过，第一组同时验证写库后恢复旧状态的重放。随后 429 个库测试、28 个 CLI 单元测试、默认 / store 两种 bin 构建及零警告 clippy 均通过。真实 CLI 进程只摄取合成正文、读写项目内测试库，并把 Claude / Codex 本机配置根指向本次沙箱路径；未摄取真实日志或写真实总库。发布 CLI 的 `--only` 在发现之后过滤，仍可能执行宿主 / WSL 发现与挂载探测；本测试不证明发现阶段完全隔离。
 
-2026-11-06 重跑上述提交门全部通过，修复已提交为 `368b730`，尚未合并发布。这项修复只补当前 CLI 的基线接线，不使 DSH 读取完整性自动成立，也不改变既有一次性坏行策略。
+2026-11-06 重跑上述提交门全部通过，修复已提交为 `368b730`（已随 `v2026.11.09.1` 发布）。这项修复只补当前 CLI 的基线接线，不使 DSH 读取完整性自动成立，也不改变既有一次性坏行策略。
 
 ## 4. DSH 首次接入采用保守提交条件
 
@@ -112,7 +112,7 @@ node scripts/verify-dsh-snapshot.mjs --dsh-package '<dsh-package.json>'
 
 该工具不启动 Host / LLM，不写真实日志或总库，运行物保留。报告明确 `frozen_fixture_snapshots_validated=true`、`live_source_capture_validated=false`、`production_advance_gate_integrated=false` 与 `provider_registered=false`。这是独立诊断路线的运行证据，不是已发布能力，也不是可直接持久化的生产推进凭据。
 
-本节冻结副本核验已提交为 `6b2a0b3`，尚未合并发布；活跃来源捕获原型另见 §7。生产接线仍需已验证字节到原生事件位置的映射、持久化旧前缀证据和阻断状态到扫描 / 提交门的接合。当前未改公开 Cursor、schema 或 SourceType，未把试验性状态塞进 Clean / Degraded。
+本节冻结副本核验已提交为 `6b2a0b3`（已随 `v2026.11.09.1` 发布）；活跃来源捕获原型另见 §7，已验证字节到原生事件位置的映射、持久化旧前缀证据和阻断状态到扫描 / 提交门的接合见 §10–§12。当前未改公开 Cursor、schema 或 SourceType，未把试验性状态塞进 Clean / Degraded。
 
 ## 7. 活跃来源的实际捕获原型
 
@@ -153,7 +153,7 @@ node scripts/read-dsh-snapshot.mjs --dsh-package '<dsh-package.json>' --root '<a
 
 审计取消另做了真实 `uv → Python` 进程链对照：Windows 只 kill uv 时，合成 Python 仍运行到三秒后的自然结束；因此不再使用 spawn 的 `signal` 自动先杀 wrapper。取消、审计超时和输出超限均走统一终止路径，Windows 对本次子进程 PID 用 `taskkill /T /F`，POSIX 启动独立进程组后终止该组；不会按进程名处理其他运行物。清理另有共享配置中的截止时间，未确认结束时返回 `unavailable/auditor_cleanup_unconfirmed`，不被取消状态掩盖。新增两编码反例从 Python 的 ready 屏障触发取消，并断言它未走到自然结束标记，随后重新捕获成功。WSL 的 Node `v12.22.9` 只验证了进程组终止原语；该环境没有 uv，未运行完整 reader，不将其算作 WSL 捕获验收。
 
-报告明确 `controlled_capture_windows_validated=true` 与 `same_buffer_validation_and_decode=true`，同时保留 `general_stress_validated=false`、`arbitrary_aba_excluded=false`、`production_advance_gate_integrated=false`、`provider_registered=false`。每份成功摘要也明确 `atomic_source_snapshot_proven=false` 与 `production_advance_permit=false`：前后多次观察不能保证期间没有任意 ABA，`matches_observation` 更不能证明未来提交时来源仍稳定。本节捕获与进程树取消修复已提交为 `86c34aa`，尚未合并发布；不把 reader 内存 receipt 序列化为生产游标。后续 Rust 字节与原生位置核验见 §8，生产提交与持久化重放仍待接线。
+报告明确 `controlled_capture_windows_validated=true` 与 `same_buffer_validation_and_decode=true`，同时保留 `general_stress_validated=false`、`arbitrary_aba_excluded=false`、`production_advance_gate_integrated=false`、`provider_registered=false`。每份成功摘要也明确 `atomic_source_snapshot_proven=false` 与 `production_advance_permit=false`：前后多次观察不能保证期间没有任意 ABA，`matches_observation` 更不能证明未来提交时来源仍稳定。本节捕获与进程树取消修复已提交为 `86c34aa`（已随 `v2026.11.09.1` 发布）；不把 reader 内存 receipt 序列化为生产游标。后续 Rust 字节与原生位置核验见 §8，生产提交、持久化重放与复杂语义/会话根批量扫描见 §10–§12。
 
 ## 8. Rust 同缓冲区物理核验与原生记录位置
 

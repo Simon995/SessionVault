@@ -6,17 +6,18 @@
 
 ## 当前状态与下一步
 
-截至 2026-11-10，最新正式发布与本机安装为 `v2026.11.09.1`（`ccfbdca`；核对 GitHub Release、标签及 `svault --version`），包含 `reclaim-rollbacks`（`ab72363`）、CLI 全读旧来源基线保留修复（`368b730`）以及 **H.1 / H.2 / H.3** 的控制面绑定输入契约（`SessionBindingRegistry`、三态 `IngestAdmissionVerdict`）、扫描与 `TotalStore::apply_projection_if` 双层统一临时会话排除（含 `<parent>/subagents/agent-*.jsonl` 与 `parentSession` 血缘继承、未知/未决/冲突 fail-closed `UnknownHold`）和真实发送方与同侪来源保真（`RawEvent::input_origin`、`SenderKind`、`InputTrustLevel`，`a151997`）。**H.4** 已在 `feat/dsh-provider-v4` 分支完成复杂语义（`surfaceOp: "replace"` 表面折叠、`compaction/*` 记录、`subagent/descriptor` 与 `subagent/catalog`、无 seed 子代理与多层 seed fork 继承前缀抑制、DSH v4 `source.kind` 到 `InputOrigin` 分类）以及会话根目录批量发现（`discover_dsh_sessions_in_root` / `dsh_sessions_root_from_env`）与总库批量扫描提交（`scan_dsh_sessions_root_to_store`），Windows 与 WSL Linux 实跑 24 项端到端验证全部通过，证据见 [DSH 核查记录](dsh-ingest-survey.md) §8–§19 与 [读取状态设计](dsh-read-state-design.md) §6–§12。本轮只写项目内合成日志与测试临时库，未操作真库。
+截至 2026-11-10，最新正式发布与本机安装为 `v2026.11.09.1`（`ccfbdca`；核对 GitHub Release、标签及 `svault --version`），包含 `reclaim-rollbacks`（`ab72363`）、CLI 全读旧来源基线保留修复（`368b730`）以及 **H.1 / H.2 / H.3** 的控制面绑定输入契约（`SessionBindingRegistry`、三态 `IngestAdmissionVerdict`）、扫描与 `TotalStore::apply_projection_if` 双层统一临时会话排除（含 `<parent>/subagents/agent-*.jsonl` 与 `parentSession` 血缘继承、未知/未决/冲突 fail-closed `UnknownHold`）和真实发送方与同侪来源保真（`RawEvent::input_origin`、`SenderKind`、`InputTrustLevel`，`a151997`）。此外，**H.4**（DSH v4 复杂语义、真实来源分类与会话根目录批量发现/扫描提交，`dc682ff`）以及 **G.1 / G.2 / G.3**（上下文压缩边界识别与有效上下文 `VIEW` 切点、Codex `paginated` / `history_base` 分段核查、`session-origin` 压缩件流式早停，`d7d3315`）已于 2026-11-10 合入 `main`（尚未打包发新 Release）。证据见 [DSH 核查记录](dsh-ingest-survey.md) §8–§19 与 [读取状态设计](dsh-read-state-design.md) §6–§12。本轮只写项目内合成日志与测试临时库，未操作真库。
 
 | 顺序 / 条件                    | 对应任务                            | 下一步具体产物与完成判据                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | ~~H.1 / H.2 / H.3 源码与发版~~ | ✅ 已发布 `v2026.11.09.1`（`a151997` / `ccfbdca`） | 已在 [`src/session_binding.rs`](../src/session_binding.rs)、[`src/rawevent.rs`](../src/rawevent.rs)、[`src/scan.rs`](../src/scan.rs) 与 [`src/store.rs`](../src/store.rs) 落地并随 `v2026.11.09.1` 正式发布；TumeChat 可直接用已发布 CLI，QuotaBar / TumeFlow 可按需升级子模块指针                                                                                                                                                                                                                                |
-| 已完成代码，待 review 合并     | H.4：复杂语义与会话根批量扫描提交   | 已在 `feat/dsh-provider-v4` 分支落地表面折叠、压缩记录、子代理 descriptor/catalog、多层 fork、DSH v4 `source.kind` 真实来源分类，以及 `discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`（仅支持 `v4`，`v0..v3` / `v5+` 显式报 `Unsupported("physical_generation")` 且不回退；复用 `SourceType::Jsonl` 保持旧读者 100% 兼容）；Windows 与 WSL 24 项端到端验证全绿，待人 review 后合并 |
+| ~~G.1 / G.2 / G.3 核查与实现~~ | ✅ 已合并 `main`（`d7d3315`）        | 已完成 Claude `isCompactSummary` / `compact_boundary` 与 Codex `compacted` / `paginated` / `history_base` 的本机与 WSL 实测；在 `classify_user_input_origin` 最前端识别压缩摘要并导出 `is_compaction_summary` / `effective_view_slice`；`read_codex_origin` 改为流式逐行早停                                                                                                                                                                                                                                            |
+| 已合并 `main`，待宿主配置根定型 | H.4：DSH v4 复杂语义与会话根批量扫描 | 已合入 `main`（`dc682ff`）：落地表面折叠、压缩记录、子代理 descriptor/catalog、多层 fork、DSH v4 `source.kind` 真实来源分类，以及 `discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`（仅支持 `v4`，`v0..v3` / `v5+` 显式报 `Unsupported("physical_generation")` 且不回退；复用 `SourceType::Jsonl` 保持旧读者兼容）；待宿主固定线上会话根后开启默认发现或发布新版本                                                                                                                                     |
 | 可并行设计，改公开类型前核兼容 | H.4 / H.7：用量保真实现             | 按核查记录 §11 保留原生报告、逐字段未知、精确 total、诊断及 attempt / 继承归属；metadata / full 与加密存储往返不丢事实。旧四桶不填零冒充已知，核旧 reader / 多 writer 和四类消费者                                                                                                                                                                                        |
 | 相关功能接入时                 | H.5 / H.6、G.4：血缘与跨主机证据    | 父子会话控制面与日志血缘已在 H.1/H.2（`a151997`）接入临时排除；后续按任务追溯、原生转写或远程回源的实际需求补齐重放防重和跨机证据 / 删除状态；本地只读与墓碑出口已可复用，远程认证与编排归上层                                                                                                                                                                            |
-| 外部条件或专项开工后           | A / D、E、F、G.1–G.3、C 的其余项    | 副本传输等组网条件；有效视图 / 分页核查、统一项目检索标识、长空格字面量排查及性能优化按各节推进。回收命令须单独发布，真库执行仍按人定“先不删”                                                                                                                                                                                                                             |
+| 外部条件或专项开工后           | A / D、E、F、C 的其余项             | 副本传输等组网条件；统一项目检索标识、旧事件归属复核、长空格字面量排查及存储体积优化按各节推进。真库回退旧代回收仍按人定“先不删”                                                                                                                                                                                                                                             |
 
-DSH v4 复杂语义与会话根目录批量发现/扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`）已在 `feat/dsh-provider-v4` 分支完成并在 Windows / WSL 双平台通过 24 项端到端检查。一般高并发压力、租约争夺和完整 WSL DSH 捕获仍未验，不能把指定受控窗口通过视为一般并发验收。
+DSH v4 复杂语义与会话根目录批量发现/扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`）已合入 `main`（`dc682ff`）并在 Windows / WSL 双平台通过 24 项端到端检查。一般高并发压力、租约争夺和完整 WSL DSH 捕获仍未验，不能把指定受控窗口通过视为一般并发验收。
 
 ## 哪些影响消费方使用
 
@@ -24,10 +25,10 @@ DSH v4 复杂语义与会话根目录批量发现/扫描提交（`discover_dsh_s
 | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | H.1 / H.2 临时契约与排除     | 已随 `v2026.11.09.1`（`a151997` / `ccfbdca`）正式发布，覆盖 CLI 与 `TotalStore::apply_projection_if` 多写者及子会话血缘；QuotaBar / TumeFlow 需各自 bump 子模块指针 |
 | H.1 / H.3 真实来源与 peer    | 已随 `v2026.11.09.1`（`a151997` / `ccfbdca`）正式发布，`RawEvent::input_origin` 区分 `HumanVerified` / `PeerSession` / `CoordinatorDispatch` / `Unknown`          |
-| H.4 正式宿主来源             | `feat/dsh-provider-v4` 已完成复杂语义与会话根目录批量扫描入库（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`），待 review 合并与发版         |
+| H.4 正式宿主来源             | 已合入 `main`（`dc682ff`），支持 DSH v4 复杂语义与会话根目录批量扫描入库（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`）；尚未随 CLI 正式发布 |
+| G.1 / G.2 / G.3 有效视图与分页 | 已合入 `main`（`d7d3315`）：压缩摘要识别为 `SubagentOrRuntime`（`is_compaction_summary` / `effective_view_slice`），Codex `paginated` 分段已核不重计 token，`read_codex_origin` 已流式早停；尚未随 CLI 正式发布 |
 | H.5 / G.4 血缘与重放         | 父子会话血缘已接入临时会话继承（`a151997`）；跨工具原生转写重放防重与完整任务树追溯待消费方接入时补齐，普通历史读取不以之为前置                                   |
 | H.6 来源主机证据 / 删除状态  | 跨设备回源、离线状态及下游删除闭环需上层接合；本仓已有本地只读与墓碑出口，不等于删除能力整体未实现                                                                |
-| G.1 / G.2 有效视图与分页核查 | 前者影响自动压缩摘要与用户输入区分，后者是待核格式风险；本轮未测，不能直接断言已有数据丢失                                                                        |
 
 已发布的 `sessions-recent` / `sessions-read`、`stores`、`pull` / `changes`（逐库）、`roots` / `attribute` 和 `erasures` 可供消费方先做合成接入准备；本轮已向消费方核对版本、源码与边界，没有新增读取接口需求。`current` 是当前解析投影，不是 G.1 的有效上下文窗口；`pull`、`changes` 和会话续读各有自己的游标，`erasures` 没有增量游标；`store_id` 是库标识，不是可信主机身份。`session-origin` 仅查 Codex 记录的仓库远端。
 
@@ -126,14 +127,14 @@ DSH v4 复杂语义与会话根目录批量发现/扫描提交（`discover_dsh_s
 - ~~`svault gc` 会删回退留下的旧代~~ ✅ 10-29 合并（`6413981`）：候选少了「与当前头同一个源版本」，真库 279 份、
   237,541 条唯一副本全在候选里；修后候选 0。修复已在 `v2026.10.29.1` 发布，见 B 节；旧版 v2026.10.10.2 仍带旧条件，换到已含修复的版本前别拿它跑 `gc --apply`。
 - **[人]** 回收被当前代完整覆盖的回退旧代（storage-growth 第 5 项，人 10-29 定三步）：第 1 步「量」✅（`6413981`，
-  `TotalStore::rollback_coverage`；按内容完整覆盖 521 份、667.8 MiB）；第 2 步「手动回收」✅ 代码（`ab72363`）：
-  `svault reclaim-rollbacks`（源码已有、尚未正式发布；默认预览，`--apply` 才删），真库只读预览与第 1 步一致。真库人 10-29 定**先不删**；
+  `TotalStore::rollback_coverage`；按内容完整覆盖 521 份、667.8 MiB）；第 2 步「手动回收」✅ 代码与发布（`ab72363` / `v2026.11.09.1`）：
+  `svault reclaim-rollbacks`（默认预览，`--apply` 才删），真库只读预览与第 1 步一致。真库人 10-29 定**先不删**；
   要删时先备份、先跟 QuotaBar 说好（它退出、重启都要人同意，并先备份凭据与索引），删完 `VACUUM`。第 3 步以后再说。
 
 ## F. 测试与工具
 
-- ~~`open_existing_returns_the_store_when_it_is_there` 曾在无桌面 Linux 上失败于准备步骤。~~
-  2026-11-06 在 [store.rs](../src/store.rs) 改为显式测试文件钥匙（`open_with_source` / `open_existing_from`），不改生产钥匙来源默认值；WSL Linux 实跑 `--features store`（415 passed, 0 failed）与 `--features store,dsh-experimental`（421 passed, 0 failed）全绿（已提交 `495bd46`，尚未合并发布）。
+- ~~`open_existing_returns_the_store_when_it_is_there` 曾在无桌面 Linux 上失败于准备步骤。~~ ✅
+  2026-11-06 在 [store.rs](../src/store.rs) 改为显式测试文件钥匙（`open_with_source` / `open_existing_from`），不改生产钥匙来源默认值；WSL Linux 实跑 `--features store` 与 `--features store,dsh-experimental` 全绿（`495bd46`，已随 `v2026.11.09.1` 发布）。
 - **[本仓，小，非交付前置]** 清理字符串字面量里误折叠留下的长空格：先查候选、逐条确认，只改确属意外的日志 / 断言 / SQL 文本，不把正常缩进算作缺陷。候选数量不固化；`grep -rnE '"[^"]*[^ ] {8,}[^ ][^"]*"' src/` 可列出。
 - 本仓没有 CI：Linux 专属分支（非 Windows 的桩、Unix 文件权限）只能在 WSL 里用 Linux 工具链手动跑。
 
