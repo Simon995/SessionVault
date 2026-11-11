@@ -101,13 +101,13 @@ pub enum ParseQuality {
 
 ### 控制面过滤与游标连续性（2026-11-10）
 
-强制全读或欠账重试可以丢弃旧游标，但仍必须利用可信旧指纹的覆盖长度判断截断：当前大小短于 `SourceFingerprint::covered_len()` 即为 `RollbackOrRewrite`，包括文件被清空的早退路径。append-log 新指纹只覆盖原始字节中的完整行，不覆盖尚未消费的半行尾巴；删除半行不应触发回退。指纹和游标共用原始字节边界，在有损 UTF-8 解码前确定，避免坏字节扩展后误算偏移。旧版已存指纹若包含半行，首次遇到该范围被截短时仍可能保守保留旧代，成功全读后更新基线。只靠游标偏移会把重试误报成追加，进而保留已不在源中的旧尾部事件。
+强制全读或欠账重试可以重置解析起点，但不能丢弃旧游标的已消费范围与 mtime 基线；原生前缀验证仍需同时使用旧 `safe_offset` 和可信旧指纹的覆盖长度。增量追加可能已消费到旧全读指纹之外，当前大小短于该已消费范围或 `SourceFingerprint::covered_len()` 均须识别为 `RollbackOrRewrite`，包括文件被清空的早退路径。append-log 新指纹只覆盖原始字节中的完整行，不覆盖尚未消费的半行尾巴；删除半行不应触发回退。指纹和游标共用原始字节边界，在有损 UTF-8 解码前确定，避免坏字节扩展后误算偏移。旧版已存指纹若包含半行，首次遇到该范围被截短时仍可能保守保留旧代，成功全读后更新基线。只靠游标偏移会把重试误报成追加，进而保留已不在源中的旧尾部事件。
 
 过滤前的原生事件序号与过滤后保留条数是两个维度。混合临时与持久会话的文件逐事件判断准入，不能用首条事件代表整份文件；`next_seq` 按过滤前的解析事件数推进，保留被排除事件留下的序号空档。整批临时排除时，保留本批起点、序号与旧解析状态；不能回到文件头却沿用增量序号，否则会重发之前已保存的事件。
 
 Codex 的 `session_meta` 可以单独占一批且不产事件。已知父关系保存于 `CodexState.session_parents`，随游标序列化，下一批按会话 ID 恢复；同一批或跨批切走、切回同一会话时仍保留其已知父关系，不能只存最后一个会话的父 ID。`PARSER_REVISION = 5` 使旧投影重新提取来源与父血缘。旧状态缺少该默认空映射仍可读取；Rust 字面量构造与手写状态映射需要消费方适配。
 
-总库的绑定读取、三态判断与投影保存处于同一个 `BEGIN IMMEDIATE` 事务中。读取 `store_meta` 失败返回带 `RegistryUnreadable` 的注册表，不能压成空规则。消费方若另存本地索引，也须把 `TotalStore::load_session_bindings()` 的有效规则显式传入扫描；总库末端拒绝写入不能撤销消费方提前保存的正文或用量。
+总库的绑定读取、三态判断与投影保存处于同一个 `BEGIN IMMEDIATE` 事务中。读取 `store_meta` 失败返回带 `RegistryUnreadable` 的注册表，不能压成空规则。消费方若另存本地索引，也须把 `TotalStore::load_session_bindings()` 的有效规则显式传入扫描；总库未就绪时无法确认只存在于元数据中的规则，应明确报告未就绪并冻结整轮持久化，不能把仅有文件规则当成完整快照。总库末端拒绝写入不能撤销消费方提前保存的正文或用量。
 
 `SessionBindingRegistry::fingerprint()` 标识合并后的全部有效规则与故障，忽略 JSON 排版；`to_canonical_json()` 是回写原文，不能代替它。调用方逐来源持久化绑定身份，变化时使用 `ScanReasons::BINDINGS_CHANGED` 驱动完整重解析，并经 `ProjectionToken::with_bindings` 将绑定作为独立身份分量。规则 A→B→A 会恢复同一语义身份，完整目标提交仍须核对当前内容，不能把旧 token 当作这次已完成；缺少可信旧目标哈希时保守保留旧代。
 
@@ -117,7 +117,7 @@ Codex 的 `session_meta` 可以单独占一批且不产事件。已知父关系�
 
 `TotalStore::apply_projection` 保留操作重放契约：相同 token 返回那次操作的历史头，不能因当前头变化就重建旧目标。新增公开的 `apply_full_projection_target` 复用已有完整目标逻辑，只有当前目标、头与逐事件内容均一致时才短路；完整回退可正确处理已提交前缀 → 追加尾部 → 再回到该前缀及空目标。调用方只在成功观察且已确认从头读取完整事件时选择它，不能传入增量尾部；`Reparse` 缺少可核旧目标哈希时会保守转为保留旧代的 `Rollback`。
 
-完整读取不一定观察为回退：增量追加不会刷新旧全读指纹，欠账重试又可丢弃游标；来源回到指纹覆盖的历史前缀时，观察仍可能为 `Appended`，而总库还留有未撤销的尾部。调用方在成功观察、`ReplaceFile` 且需恢复完整目标时，仍须显式选择完整目标 API；不能只以 `Rollback` 模式作为入口。完整目标为空也须提交，不能被空 `Append` 的 no-op 分支提前确认。API 选择与空批旁路共用同一个完整目标判据，普通增量尾仍走原操作 API。
+完整读取不一定观察为回退：增量追加不会刷新旧全读指纹，欠账重试又可丢弃游标；来源回到指纹覆盖的历史前缀时，观察仍可能为 `Appended`，而总库还留有未撤销的尾部。调用方在成功观察、`ReplaceFile` 且需恢复完整目标时，仍须显式选择完整目标 API；不能只以 `Rollback` 模式作为入口。完整目标为空也须提交，不能被空 `Append` 的 no-op 分支提前确认。整个来源改为临时排除时，已有当前投影的显式完整空目标同样切换当前头并保留旧代；首次临时空来源不建空代，重复提交不反复开代。API 选择与空批旁路共用同一个完整目标判据，普通增量尾仍走原操作 API。
 
 以上回归均使用合成来源、隔离 SQLite 与显式测试钥匙，不证明运行中旧写者已完成升级，也不代替旧写者重写证据的兼容验收。
 
@@ -131,6 +131,8 @@ bitflags! {
         const FORCE             = 1 << 1; // 用户显式刷新
         const PARSER_STALE      = 1 << 2; // PARSER_REVISION 提升
         const ATTRIBUTION_STALE = 1 << 3; // 注册表长出覆盖它的新根
+        const SYNC_DEBT         = 1 << 4; // 某个物化层尚未确认目标
+        const BINDINGS_CHANGED  = 1 << 5; // 有效绑定规则变化
     }
 }
 ```
@@ -139,8 +141,8 @@ bitflags! {
 
 ```
 观测到源变化(RollbackOrRewrite)
-  > ReparseRequired | PARSER_STALE | ATTRIBUTION_STALE
-  > INITIAL | FORCE
+  > ReparseRequired | PARSER_STALE | ATTRIBUTION_STALE | BINDINGS_CHANGED
+  > INITIAL | FORCE | SYNC_DEBT
   > 增量（无 reason）
 ```
 

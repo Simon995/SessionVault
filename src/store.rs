@@ -3371,7 +3371,8 @@ impl TotalStore {
         //
         // 在任何 token 记账、`projections` 创建与 `raw_events` 入库之前执行同一套判据：
         // - `UnknownHold` ⇒ 返回 `Err(StoreError::BindingUncertain)` 拒绝入库；
-        // - `TemporaryExcluded`（且过滤后无保留事件）⇒ 不建空代、不写事件，返回 `appended: 0`；
+        // - `TemporaryExcluded`（且过滤后无保留事件）⇒ 普通增量或尚无当前投影时跳过；
+        //   已有当前投影的完整目标继续核对并提交空目标，沿用切头、幂等与旧代保留策略；
         // - `PersistentAllowed` ⇒ 写入过滤并补齐 `input_origin` 后的事件。
         // 在同一个 IMMEDIATE 事务里读取规则并写入，另一个写者不能在准入与保存之间改判决。
         let filtered = bindings
@@ -3383,7 +3384,16 @@ impl TotalStore {
                 &std::collections::HashMap::new(),
             )
             .map_err(|u| StoreError::BindingUncertain(u.to_string()))?;
-        if filtered.admission_status == "temporary_excluded" && filtered.kept_events.is_empty() {
+        if filtered.admission_status == "temporary_excluded"
+            && filtered.kept_events.is_empty()
+            && (!revisit_target
+                || !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM current_head WHERE source_type = ?1 \
+                     AND source_location = ?2 AND source_path = ?3)",
+                    params![source_type, source_location, source_path],
+                    |r| r.get::<_, bool>(0),
+                )?)
+        {
             let head = head_of(tx, &source_type, &source_location, &source_path)?;
             let max_offset: i64 =
                 tx.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
@@ -9157,6 +9167,258 @@ mod tests {
             .unwrap()
             .events
             .is_empty());
+    }
+
+    #[test]
+    fn binding_full_temporary_empty_target_clears_current_and_retains_history() {
+        use sha2::{Digest, Sha256};
+
+        for source_binding in [true, false] {
+            for mode in [
+                Projection::Append,
+                Projection::Rollback,
+                Projection::Reparse,
+            ] {
+                let (_dir, db, key_file) = key_file_store("binding-empty-target");
+                let store = TotalStore::open_with_source(&db, &KeySource::File(key_file)).unwrap();
+                let path = db.with_file_name("file.jsonl");
+                std::fs::write(
+                    &path,
+                    concat!(
+                        "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"saved body\"}}\n",
+                        "{\"type\":\"assistant\",\"sessionId\":\"s\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"answer\"}],\"usage\":{\"input_tokens\":120,\"output_tokens\":40}}}\n",
+                    ),
+                )
+                .unwrap();
+                let source = SourceRef {
+                    source_type: SourceType::ClaudeCode,
+                    source_location: SourceLocation::Local,
+                    source_mode: SourceMode::AppendLog,
+                    path,
+                    project_root: None,
+                    artifact_kind: None,
+                };
+                let scan = |rules: &crate::SessionBindingRegistry| {
+                    crate::scan::scan_append_log_with_bindings(
+                        &source,
+                        None,
+                        None,
+                        crate::catalog::Profile::Full,
+                        std::sync::Arc::new(crate::attribution::RootRegistry::new()),
+                        crate::deadline::Deadline::unbounded(),
+                        &crate::scan::StatPrefetch::default(),
+                        rules,
+                    )
+                };
+                let source_key = SourceKey {
+                    source_type: source.source_type,
+                    source_location: source.source_location.clone(),
+                    source_path: source.path.display().to_string(),
+                };
+                let (persistent, _) = scan(&store.load_session_bindings());
+                assert_eq!(persistent.events.len(), 3, "fixture must include usage");
+                assert!(persistent
+                    .events
+                    .iter()
+                    .any(|e| e.event_type == EventType::Usage));
+                store
+                    .apply_projection(FileProjectionBatch {
+                        source: source_key.clone(),
+                        parser_revision: Some(crate::PARSER_REVISION),
+                        mode: Projection::Append,
+                        events: persistent.events,
+                        token: None,
+                    })
+                    .unwrap();
+                let saved = store
+                    .read_session(
+                        source.source_type,
+                        &source.source_location,
+                        &source_key.source_path,
+                        "s",
+                    )
+                    .unwrap()
+                    .events;
+                assert_eq!(saved.len(), 3);
+                let prior_hash =
+                    format!("{:x}", Sha256::digest(serde_json::to_vec(&saved).unwrap()));
+                let rules = if source_binding {
+                    serde_json::json!({
+                        "schemaVersion": 1,
+                        "bindings": [{
+                            "schemaVersion": 1,
+                            "owner": {"namespace": "test.user", "id": "u"},
+                            "host": {"namespace": "test.host", "id": "h"},
+                            "session": {"namespace": "test.session", "id": "s"},
+                            "controller": "product-adapter",
+                            "nativeSource": {
+                                "backend": "claude-cli",
+                                "sourceLocation": "local",
+                                "sourcePath": source_key.source_path,
+                                "nativeSessionId": "s"
+                            },
+                            "temporary": true,
+                            "readMemory": false,
+                            "recordedAt": "2026-11-09T08:00:00Z"
+                        }]
+                    })
+                } else {
+                    serde_json::json!({
+                        "schemaVersion": 1,
+                        "temporaryRoots": [source.path.parent().unwrap().display().to_string()]
+                    })
+                };
+                let rules = crate::SessionBindingRegistry::from_json_str(&rules.to_string());
+                store.set_session_bindings(&rules).unwrap();
+                let (excluded, report) = scan(&rules);
+                assert_eq!(
+                    report.admission_status.as_deref(),
+                    Some("temporary_excluded")
+                );
+                assert!(excluded.events.is_empty());
+                let token = crate::token::ProjectionToken::new(
+                    &source_key,
+                    Some("temporary-empty"),
+                    4,
+                    1,
+                    (0, 100),
+                );
+                let target = || FileProjectionBatch {
+                    source: source_key.clone(),
+                    parser_revision: Some(crate::PARSER_REVISION),
+                    mode,
+                    events: excluded.events.clone(),
+                    token: Some(token.clone()),
+                };
+                let incremental = store.apply_projection(target()).unwrap();
+                assert!(
+                    !incremental.head_moved,
+                    "ordinary exclusion must remain a no-op"
+                );
+                let current = || {
+                    store
+                        .read_session(
+                            source.source_type,
+                            &source.source_location,
+                            &source_key.source_path,
+                            "s",
+                        )
+                        .unwrap()
+                        .events
+                };
+                assert_eq!(current().len(), 3);
+                let applied = store
+                    .with_session_bindings(&rules, |guard| {
+                        guard.apply_full_projection_target(target(), Some(&prior_hash))
+                    })
+                    .unwrap();
+                assert!(
+                    applied.head_moved,
+                    "full empty target must replace saved events: {source_binding}/{mode:?}"
+                );
+                assert_eq!(applied.appended, 0);
+                assert_eq!(applied.superseded_removed, 0);
+                assert_eq!(
+                    applied.loses_events,
+                    (mode == Projection::Reparse).then_some((3, 0))
+                );
+                assert!(
+                    current().is_empty(),
+                    "current body and usage must both disappear"
+                );
+                let retained: Vec<_> = store
+                    .read_since_page(0, 100)
+                    .unwrap()
+                    .events
+                    .into_iter()
+                    .filter(|(_, e)| e.source_path == source_key.source_path)
+                    .map(|(_, e)| e)
+                    .collect();
+                assert_eq!(
+                    serde_json::to_value(&retained).unwrap(),
+                    serde_json::to_value(&saved).unwrap(),
+                    "old generation must remain decryptable"
+                );
+                let counts = || {
+                    let conn = store.conn.lock().unwrap();
+                    ["projections", "applied_projections", "projection_log"]
+                        .into_iter()
+                        .map(|table| {
+                            conn.query_row(
+                                &format!("SELECT COUNT(*) FROM {table} WHERE source_path = ?1"),
+                                [&source_key.source_path],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let committed = counts();
+                assert_eq!(committed, vec![2, 1, 1]);
+                let replay = store
+                    .with_session_bindings(&rules, |guard| {
+                        guard.apply_full_projection_target(target(), Some(&prior_hash))
+                    })
+                    .unwrap();
+                assert!(
+                    !replay.head_moved,
+                    "repeated full target must not open another generation"
+                );
+                assert_eq!(
+                    (replay.source_revision, replay.projection_revision),
+                    (applied.source_revision, applied.projection_revision)
+                );
+                assert_eq!(counts(), committed);
+                assert!(current().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn binding_full_temporary_empty_target_without_current_does_not_create_a_generation() {
+        let (_dir, db, key_file) = key_file_store("binding-first-empty");
+        let store = TotalStore::open_with_source(&db, &KeySource::File(key_file)).unwrap();
+        let rules = crate::SessionBindingRegistry::from_json_str(
+            r#"{"schemaVersion":1,"temporaryRoots":["/p"]}"#,
+        );
+        store.set_session_bindings(&rules).unwrap();
+        for mode in [
+            Projection::Append,
+            Projection::Rollback,
+            Projection::Reparse,
+        ] {
+            for full in [false, true] {
+                let mut target = batch(mode, 0, "", Some(token_for("first-empty")));
+                target.events.clear();
+                let stats = store
+                    .with_session_bindings(&rules, |guard| {
+                        if full {
+                            guard.apply_full_projection_target(target, None)
+                        } else {
+                            guard.apply_projection(target)
+                        }
+                    })
+                    .unwrap();
+                assert!(!stats.head_moved);
+                assert_eq!(stats.appended, 0);
+            }
+        }
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "current_head",
+            "projections",
+            "applied_projections",
+            "projection_log",
+        ] {
+            let rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE source_path = ?1"),
+                    [key().source_path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "first temporary source must not create {table}");
+        }
     }
 
     #[test]
