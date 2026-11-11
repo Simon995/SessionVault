@@ -581,13 +581,18 @@ impl SessionBindingRegistry {
         }
 
         let norm_path = source_path
-            .map(normalize_path_key)
+            .map(|path| normalize_source_path_key(path, source_location))
             .filter(|s| !s.is_empty());
 
         // 2. 独立临时会话根检查（路径前缀按目录段边界匹配）。
         if let Some(ref np) = norm_path {
             for root in &self.temporary_roots {
-                if path_is_under_root(np, root) {
+                let root_key = normalize_source_path_key(root, source_location);
+                let matches = match compare_binding_paths(np, &root_key, true) {
+                    Ok(matches) => matches,
+                    Err(reason) => return IngestAdmissionVerdict::UnknownHold { reason },
+                };
+                if matches {
                     return IngestAdmissionVerdict::TemporaryExcluded {
                         basis: TemporaryExclusionBasis::TemporaryRoot { root: root.clone() },
                     };
@@ -603,8 +608,18 @@ impl SessionBindingRegistry {
                     .source_location
                     .as_ref()
                     .is_none_or(|l| l == source_location);
-                let pending_norm = normalize_path_key(&pending.source_path);
-                if type_ok && loc_ok && path_is_under_root(np, &pending_norm) {
+                let pending_norm = normalize_source_path_key(
+                    &pending.source_path,
+                    pending.source_location.as_ref().unwrap_or(source_location),
+                );
+                if !type_ok || !loc_ok {
+                    continue;
+                }
+                let matches = match compare_binding_paths(np, &pending_norm, true) {
+                    Ok(matches) => matches,
+                    Err(reason) => return IngestAdmissionVerdict::UnknownHold { reason },
+                };
+                if matches {
                     return IngestAdmissionVerdict::UnknownHold {
                         reason: BindingUncertainty::PendingBinding {
                             detail: format!(
@@ -618,25 +633,30 @@ impl SessionBindingRegistry {
         }
 
         // 4. 查找匹配的绑定记录（按路径匹配或按 `(source_type, source_location, native_session_id)` 匹配）。
-        let matched: Vec<&SessionBindingRecord> = self
-            .records
-            .iter()
-            .filter(|rec| {
-                if rec.native_source.source_type != source_type
-                    || &rec.native_source.source_location != source_location
-                {
-                    return false;
+        let mut matched = Vec::new();
+        for rec in &self.records {
+            if rec.native_source.source_type != source_type
+                || &rec.native_source.source_location != source_location
+            {
+                continue;
+            }
+            let sid_match = session_id
+                .filter(|s| !s.is_empty())
+                .is_some_and(|sid| sid == rec.native_source.native_session_id);
+            let path_match = match (&norm_path, &rec.native_source.source_path) {
+                (Some(np), Some(rp)) if !sid_match => {
+                    let rule_key = normalize_source_path_key(rp, source_location);
+                    match compare_binding_paths(np, &rule_key, false) {
+                        Ok(matches) => matches,
+                        Err(reason) => return IngestAdmissionVerdict::UnknownHold { reason },
+                    }
                 }
-                let path_match = match (&norm_path, &rec.native_source.source_path) {
-                    (Some(np), Some(rp)) => np == &normalize_path_key(rp),
-                    _ => false,
-                };
-                let sid_match = session_id
-                    .filter(|s| !s.is_empty())
-                    .is_some_and(|sid| sid == rec.native_source.native_session_id);
-                path_match || sid_match
-            })
-            .collect();
+                _ => false,
+            };
+            if path_match || sid_match {
+                matched.push(rec);
+            }
+        }
 
         // 5. 若存在多条绑定记录，检查是否冲突（H.1 冲突检测）。
         if matched.len() > 1 {
@@ -768,27 +788,8 @@ impl SessionBindingRegistry {
         events: Vec<RawEvent>,
         line_parent_sessions: &HashMap<String, String>,
     ) -> Result<FilteredEvents, BindingUncertainty> {
-        let inferred_sid = events
-            .first()
-            .map(|e| e.source_session_id.as_str())
-            .filter(|s| !s.is_empty());
-        let inferred_parent = inferred_sid
-            .and_then(|sid| line_parent_sessions.get(sid).map(String::as_str))
-            .or_else(|| {
-                events
-                    .iter()
-                    .find_map(|e| e.parent_ref.as_deref())
-                    .filter(|s| !s.is_empty())
-            });
-
-        // 先做一次来源级评估（即使 `events` 为空也能识别出 `TemporaryRoot`、`PendingBinding` 或路径级绑定）。
-        let source_verdict = self.evaluate(
-            source_type,
-            source_location,
-            source_path,
-            inferred_sid,
-            inferred_parent,
-        );
+        // 来源级只按路径判定；一个文件可能包含多个会话，首条事件不能代表后续会话。
+        let source_verdict = self.evaluate(source_type, source_location, source_path, None, None);
         if let IngestAdmissionVerdict::UnknownHold { reason } = source_verdict {
             return Err(reason);
         }
@@ -1747,9 +1748,10 @@ fn parse_binding_record(value: &Value) -> Result<SessionBindingRecord, String> {
         .and_then(Value::as_bool)
         .ok_or_else(|| "missing or non-boolean `readMemory` switch".to_string())?;
 
-    let state = match obj.get("state").and_then(Value::as_str) {
-        None | Some("bound") => BindingRecordState::Bound,
-        Some("pending") => BindingRecordState::Pending,
+    let state = match obj.get("state") {
+        None => BindingRecordState::Bound,
+        Some(Value::String(value)) if value == "bound" => BindingRecordState::Bound,
+        Some(Value::String(value)) if value == "pending" => BindingRecordState::Pending,
         Some(other) => return Err(format!("invalid binding state: {other:?}")),
     };
 
@@ -1793,15 +1795,41 @@ fn parse_binding_record(value: &Value) -> Result<SessionBindingRecord, String> {
 }
 
 fn normalize_path_key(raw: &str) -> String {
-    let mut s = raw.trim().replace('\\', "/");
-    while s.len() > 1 && s.ends_with('/') {
-        s.pop();
+    crate::attribution::registry_key(raw, &crate::pathnorm::DriveMounts::default())
+}
+
+fn normalize_source_path_key(raw: &str, location: &SourceLocation) -> String {
+    let raw = raw.trim();
+    match location {
+        SourceLocation::Wsl(distro) if raw.starts_with('/') && !raw.starts_with("//") => {
+            normalize_path_key(&format!("wsl:{distro}:{raw}"))
+        }
+        _ => normalize_path_key(raw),
     }
-    // Windows 盘符路径（`C:/...`）统一小写比较，Linux 路径保持原样（但盘符前缀规范化）。
-    if s.len() >= 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':' {
-        s.make_ascii_lowercase();
+}
+
+fn compare_binding_paths(path: &str, rule: &str, prefix: bool) -> Result<bool, BindingUncertainty> {
+    // 注册表没有运行期挂载事实；无法核对盘符与发行版写法时必须保留未知态，不能猜映射。
+    let linux_namespace = |value: &str| {
+        value.starts_with('/') || crate::pathnorm::split_canonical_wsl(value).is_some()
+    };
+    let cross_namespace = (crate::pathnorm::is_windows_drive_path(path) && linux_namespace(rule))
+        || (crate::pathnorm::is_windows_drive_path(rule) && linux_namespace(path));
+    if cross_namespace
+        || crate::pathnorm::is_windows_drive_mount(path)
+        || crate::pathnorm::is_windows_drive_mount(rule)
+    {
+        return Err(BindingUncertainty::RegistryUnreadable {
+            detail:
+                "binding path comparison requires drive mount facts; use a shared source namespace"
+                    .to_string(),
+        });
     }
-    s
+    Ok(if prefix {
+        path_is_under_root(path, rule)
+    } else {
+        path == rule
+    })
 }
 
 fn path_is_under_root(norm_path: &str, norm_root: &str) -> bool {
@@ -1845,10 +1873,8 @@ mod tests {
     fn sample_binding_json(temporary: bool, read_memory: bool) -> String {
         serde_json::json!({
             "schemaVersion": 1,
-            "temporaryRoots": [
-                "C:/Users/dev/AppData/Local/Temp/tumechat-ephemeral",
-                "/tmp/tumechat-ephemeral"
-            ],
+            // 与下面的绑定使用同一命名空间；跨命名空间的未知挂载另有专项回归。
+            "temporaryRoots": ["/tmp/tumechat-ephemeral"],
             "pendingSources": [
                 {
                     "backend": "claude-cli",
@@ -1878,6 +1904,108 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    #[test]
+    fn ingest_binding_wsl_aliases_share_temporary_and_pending_verdicts() {
+        let location = SourceLocation::Wsl("Test".to_string());
+        for root in [
+            r"\\wsl.localhost\Test\home\dev\Secret",
+            r"\\wsl$\Test\home\dev\Secret",
+            "wsl:Test:/home/dev/Secret",
+            "/home/dev/Secret",
+        ] {
+            let registry = SessionBindingRegistry::from_json_str(
+                &serde_json::json!({
+                    "schemaVersion": 1, "temporaryRoots": [root]
+                })
+                .to_string(),
+            );
+            assert!(
+                matches!(
+                    registry.evaluate(
+                        SourceType::Codex,
+                        &location,
+                        "/home/dev/Secret/log.jsonl",
+                        None,
+                        None
+                    ),
+                    IngestAdmissionVerdict::TemporaryExcluded { .. }
+                ),
+                "root={root}"
+            );
+            assert!(matches!(
+                registry.evaluate(
+                    SourceType::Codex,
+                    &location,
+                    "/home/dev/secret/log.jsonl",
+                    None,
+                    None
+                ),
+                IngestAdmissionVerdict::PersistentAllowed { .. }
+            ));
+        }
+        let registry = SessionBindingRegistry::from_json_str(&serde_json::json!({
+            "schemaVersion": 1,
+            "pendingSources": [{"backend": "codex-cli", "sourceLocation": "wsl:Test", "sourcePath": r"\\wsl.localhost\Test\home\dev\pending", "reason": "binding"}]
+        }).to_string());
+        assert!(matches!(
+            registry.evaluate(
+                SourceType::Codex,
+                &location,
+                "/home/dev/pending/log.jsonl",
+                None,
+                None
+            ),
+            IngestAdmissionVerdict::UnknownHold { .. }
+        ));
+    }
+
+    #[test]
+    fn ingest_binding_missing_drive_mount_mapping_holds() {
+        for value in [
+            serde_json::json!({"schemaVersion": 1, "temporaryRoots": ["C:/ephemeral"]}),
+            serde_json::json!({"schemaVersion": 1, "pendingSources": [{"backend": "codex-cli", "sourceLocation": "wsl:Test", "sourcePath": "C:/ephemeral", "reason": "binding"}]}),
+        ] {
+            let registry = SessionBindingRegistry::from_json_str(&value.to_string());
+            assert!(matches!(
+                registry.evaluate(
+                    SourceType::Codex,
+                    &SourceLocation::Wsl("Test".to_string()),
+                    "/mnt/c/ephemeral/log.jsonl",
+                    None,
+                    None
+                ),
+                IngestAdmissionVerdict::UnknownHold { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn ingest_binding_rejects_non_string_state() {
+        for state in [
+            serde_json::json!(0),
+            serde_json::json!(false),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::Value::Null,
+        ] {
+            let mut value: Value = serde_json::from_str(&sample_binding_json(false, true)).unwrap();
+            value["bindings"][0]["state"] = state;
+            let registry = SessionBindingRegistry::from_json_str(&value.to_string());
+            assert!(matches!(
+                registry.evaluate(
+                    SourceType::ClaudeCode,
+                    &SourceLocation::Local,
+                    "/log.jsonl",
+                    None,
+                    None
+                ),
+                IngestAdmissionVerdict::UnknownHold {
+                    reason: BindingUncertainty::InvalidRecord { .. }
+                }
+            ));
+        }
     }
 
     #[test]

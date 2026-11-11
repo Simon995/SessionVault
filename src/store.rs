@@ -1664,15 +1664,23 @@ impl TotalStore {
         &self,
         conn: &Connection,
     ) -> crate::session_binding::SessionBindingRegistry {
-        let meta_json: Option<String> = conn
+        let meta_json: Option<String> = match conn
             .query_row(
                 "SELECT v FROM store_meta WHERE k = 'session_bindings_json'",
                 [],
                 |r| r.get(0),
             )
             .optional()
-            .ok()
-            .flatten();
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return crate::session_binding::SessionBindingRegistry::faulted(
+                    crate::session_binding::BindingUncertainty::RegistryUnreadable {
+                        detail: format!("read store_meta session bindings: {error}"),
+                    },
+                );
+            }
+        };
         let from_meta = meta_json
             .as_deref()
             .map(crate::session_binding::SessionBindingRegistry::from_json_str)
@@ -3194,9 +3202,13 @@ impl TotalStore {
         }
     }
 
-    /// 完整来源目标的幂等提交：只有目标仍为当前最后一次提交时才短路。
-    /// 历史目标再次出现时保留旧源版本并重新提交；调用方必须提供完整归一化事件。
-    pub(crate) fn apply_full_projection_target(
+    /// 完整来源目标的幂等提交：只有目标仍为当前最后一次提交且事件内容一致时才短路。
+    /// 历史目标再次出现时保留旧源版本并重新提交；调用方必须提供完整归一化事件，不能传增量尾部。
+    ///
+    /// 与 [`Self::apply_projection`] 的操作重放不同：完整 `Rollback` 目标可覆盖同 token
+    /// 对应的旧前缀之后新增的尾部。不能由调度前的 force 标记判断完整性，源回退也会触发从头读取。
+    /// `Reparse` 需提供旧目标事件 JSON 的 SHA-256；缺失或与当前代不符时保守转为 `Rollback`。
+    pub fn apply_full_projection_target(
         &self,
         batch: FileProjectionBatch,
         prior_projected_hash: Option<&str>,
@@ -3246,6 +3258,7 @@ impl TotalStore {
 
         let mut projection = batch.mode;
         let mut conn = self.conn.lock().unwrap();
+        let tx = Self::write_tx(&mut conn)?;
 
         // ── H.1 / H.2 / H.3 控制面绑定与临时会话排除守卫 ─────────────────────
         //
@@ -3253,7 +3266,8 @@ impl TotalStore {
         // - `UnknownHold` ⇒ 返回 `Err(StoreError::BindingUncertain)` 拒绝入库；
         // - `TemporaryExcluded`（且过滤后无保留事件）⇒ 不建空代、不写事件，返回 `appended: 0`；
         // - `PersistentAllowed` ⇒ 写入过滤并补齐 `input_origin` 后的事件。
-        let bindings = self.load_session_bindings_with_conn(&conn);
+        // 在同一个 IMMEDIATE 事务里读取规则并写入，另一个写者不能在准入与保存之间改判决。
+        let bindings = self.load_session_bindings_with_conn(&tx);
         let filtered = bindings
             .filter_and_enrich_events(
                 batch.source.source_type,
@@ -3264,9 +3278,9 @@ impl TotalStore {
             )
             .map_err(|u| StoreError::BindingUncertain(u.to_string()))?;
         if filtered.admission_status == "temporary_excluded" && filtered.kept_events.is_empty() {
-            let head = head_of(&conn, &source_type, &source_location, &source_path)?;
+            let head = head_of(&tx, &source_type, &source_location, &source_path)?;
             let max_offset: i64 =
-                conn.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
+                tx.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
                     r.get(0)
                 })?;
             return Ok(Some(ProjectionStats {
@@ -3282,7 +3296,6 @@ impl TotalStore {
             }));
         }
         let mut events = filtered.kept_events;
-        let tx = Self::write_tx(&mut conn)?;
         let head = head_of(&tx, &source_type, &source_location, &source_path)?;
         let mut skipped_erased = 0u64;
         // 完整目标与已保存投影比较前，先应用同一事务中的墓碑；擦除留下的 seq 间隙不是源回退。
@@ -8779,6 +8792,187 @@ mod tests {
     fn head_of_store(s: &TotalStore) -> (i64, i64) {
         let conn = s.conn.lock().unwrap();
         head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap()
+    }
+
+    #[test]
+    fn ingest_binding_metadata_read_errors_hold_instead_of_allowing() {
+        for broken_meta in [
+            "DROP TABLE store_meta",
+            "INSERT INTO store_meta (k, v) VALUES ('session_bindings_json', x'00')",
+        ] {
+            let store = TotalStore::open_in_memory().unwrap();
+            assert!(matches!(
+                store.load_session_bindings().evaluate(
+                    SourceType::ClaudeCode,
+                    &SourceLocation::Local,
+                    "/p/file.jsonl",
+                    Some("s"),
+                    None
+                ),
+                crate::session_binding::IngestAdmissionVerdict::PersistentAllowed { .. }
+            ));
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute_batch(broken_meta)
+                .unwrap();
+            let registry = store.load_session_bindings();
+            assert!(
+                matches!(
+                    registry.evaluate(
+                        SourceType::ClaudeCode,
+                        &SourceLocation::Local,
+                        "/p/file.jsonl",
+                        Some("s"),
+                        None
+                    ),
+                    crate::session_binding::IngestAdmissionVerdict::UnknownHold {
+                        reason: crate::session_binding::BindingUncertainty::RegistryUnreadable { .. }
+                    }
+                ),
+                "broken metadata must not become an empty registry: {broken_meta}"
+            );
+            assert!(matches!(
+                store.apply_projection(batch(Projection::Append, 0, "synthetic", None)),
+                Err(StoreError::BindingUncertain(_))
+            ));
+            assert!(store
+                .read_current_since_page(0, 10)
+                .unwrap()
+                .events
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn ingest_binding_transaction_observes_the_latest_committed_rules() {
+        use std::cell::RefCell;
+        use std::sync::mpsc::{sync_channel, SyncSender};
+        use std::time::Duration;
+
+        thread_local! {
+            static WAITING: RefCell<Option<SyncSender<()>>> = const { RefCell::new(None) };
+        }
+        fn on_busy(attempt: i32) -> bool {
+            WAITING.with(|sender| {
+                if let Some(sender) = sender.borrow().as_ref() {
+                    let _ = sender.try_send(());
+                }
+            });
+            std::thread::sleep(Duration::from_millis(1));
+            attempt < 10_000
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sv-binding-transaction-{unique}"));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("store.db");
+        let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([8; 32])).unwrap();
+        let mut controller = Connection::open(&path).unwrap();
+        let control = controller
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        control
+            .execute(
+                "INSERT INTO store_meta (k, v) VALUES ('session_bindings_json', ?1)",
+                [r#"{"schemaVersion":1,"temporaryRoots":["/p"]}"#],
+            )
+            .unwrap();
+        let (ready, waiting) = sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            WAITING.with(|sender| *sender.borrow_mut() = Some(ready));
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .busy_handler(Some(on_busy))
+                .unwrap();
+            let stats = store
+                .apply_projection(batch(Projection::Append, 0, "synthetic", None))
+                .unwrap();
+            (store, stats)
+        });
+        // BEGIN IMMEDIATE 已真正遇到另一连接的写锁，再提交控制面更新；不用时间猜测先后顺序。
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        control.commit().unwrap();
+        let (store, stats) = writer.join().unwrap();
+        assert_eq!(stats.appended, 0);
+        assert!(store
+            .read_current_since_page(0, 10)
+            .unwrap()
+            .events
+            .is_empty());
+    }
+
+    #[test]
+    fn full_rollback_target_replaces_an_appended_tail_when_the_prefix_token_reappears() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let token = token_for("prefix");
+        store
+            .apply_projection(batch(Projection::Append, 0, "prefix", Some(token.clone())))
+            .unwrap();
+        store
+            .apply_projection(batch(Projection::Append, 1, "tail", None))
+            .unwrap();
+        // 操作重放维持原有契约；完整目标必须显式选择另一种提交方式。
+        let replay = store
+            .apply_projection(batch(
+                Projection::Rollback,
+                0,
+                "prefix",
+                Some(token.clone()),
+            ))
+            .unwrap();
+        assert!(!replay.head_moved);
+        assert_eq!(
+            store.read_current_since_page(0, 10).unwrap().events.len(),
+            2
+        );
+        for expected_revision in 1..=2 {
+            let target = || batch(Projection::Rollback, 0, "prefix", Some(token.clone()));
+            let applied = store.apply_full_projection_target(target(), None).unwrap();
+            assert_eq!(applied.source_revision, expected_revision);
+            let current = store.read_current_since_page(0, 10).unwrap().events;
+            assert_eq!(current.len(), 1);
+            assert_eq!(current[0].1.content.as_deref(), Some("prefix"));
+            assert!(
+                !store
+                    .apply_full_projection_target(target(), None)
+                    .unwrap()
+                    .head_moved
+            );
+            if expected_revision == 1 {
+                store
+                    .apply_projection(batch(Projection::Append, 1, "another tail", None))
+                    .unwrap();
+            }
+        }
+        let empty_target = || {
+            let mut target = batch(Projection::Rollback, 0, "", Some(token_for("empty")));
+            target.events.clear();
+            target
+        };
+        assert!(
+            store
+                .apply_full_projection_target(empty_target(), None)
+                .unwrap()
+                .head_moved
+        );
+        assert!(store
+            .read_current_since_page(0, 10)
+            .unwrap()
+            .events
+            .is_empty());
+        assert!(
+            !store
+                .apply_full_projection_target(empty_target(), None)
+                .unwrap()
+                .head_moved
+        );
     }
 
     #[test]

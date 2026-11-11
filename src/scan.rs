@@ -1,7 +1,7 @@
 //! 单来源增量扫描（§8）。按 `source_mode` 分派；已实现 append_log 与 snapshot_file。
 //!
 //! append_log 流程：stat 文件 → 比对 `(mtime, size)` 检测回退/截断 → 从 `safe_offset`
-//! 读尾部 → `split_complete_jsonl` 切出完整行（半行留下轮）→ 解析 → 推进游标。
+//! 读尾部 → 按原始字节切出完整行（半行留下轮）→ 解码解析 → 推进游标。
 //! 移植自 QuotaBar `session_index.rs::split_complete_jsonl`（纯函数，带单测）。
 
 use crate::cursor::{Cursor, CursorKind, ScanResult, ScanStatus};
@@ -987,8 +987,11 @@ fn scan_append_log<S: ByteSource>(
         }
     };
 
-    // 回退/截断检测：size 变小，或 mtime 倒退 → 从头重读。
+    // 强制全读可丢弃 cursor，但旧指纹的覆盖长度仍能证明截断（含清空）。
     let rollback = size < cursor.safe_offset
+        || prior_fingerprint
+            .as_ref()
+            .is_some_and(|fp| size < fp.covered_len())
         || matches!((mtime, cursor.mtime), (Some(now), Some(prev)) if now < prev);
     let mut start = cursor.safe_offset;
     if rollback {
@@ -1048,6 +1051,11 @@ fn scan_append_log<S: ByteSource>(
         }
         cursor.size = size;
         cursor.mtime = mtime;
+        // 空文件也是完整目标；返回零长度基线，不能让调用方继续沿用清空前的指纹。
+        let fingerprint = (size == 0).then(|| SourceFingerprint::of(&[]));
+        if let Some(fp) = &fingerprint {
+            cursor.content_hash = Some(fp.as_str().to_string());
+        }
         return (
             observe(
                 change,
@@ -1055,7 +1063,7 @@ fn scan_append_log<S: ByteSource>(
                     deferred_tail_bytes: 0,
                 },
                 cursor,
-                None,
+                fingerprint,
             ),
             report,
         );
@@ -1081,10 +1089,13 @@ fn scan_append_log<S: ByteSource>(
     };
     report.bytes_read = tail.len() as u64;
 
-    // 全读（`start == 0`）才算得出整份内容的指纹；增量手上只有尾巴，**算不出**。
+    // 全读（`start == 0`）才算得出从头开始的指纹；增量手上只有尾巴，**算不出**。
+    // 只覆盖完整行：尚未消费的半行被删除，不是既有投影的回退。
+    // 按原始字节找边界，不能用有损 UTF-8 解码后的字符串长度切原始字节。
     // `None` 因此表示「这一轮没读全文」，不是「内容没变」。
+    let complete_len = complete_jsonl_len(&tail);
     let fingerprint = if start == 0 {
-        let fp = SourceFingerprint::of(&tail);
+        let fp = SourceFingerprint::of(&tail[..complete_len]);
         // 🔴 同尺寸原地重写：size 与 mtime 都可能一字不变，只有内容变了。
         // 不在这里认出来，UI 索引会 `ReplaceFile` 而总库走 `Append` 把新 seq 当重复
         // 丢弃 —— 两层从此不一致，且没有任何东西会说出来。
@@ -1117,11 +1128,12 @@ fn scan_append_log<S: ByteSource>(
         None
     };
 
-    let text = String::from_utf8_lossy(&tail);
-    let (complete, pending) = split_complete_jsonl(&text);
+    // 有损解码可能把一个坏字节扩成多个 UTF-8 字节，偏移必须先在原始字节上确定。
+    let pending = tail.len() - complete_len;
+    let text = String::from_utf8_lossy(&tail[..complete_len]);
     report.pending_tail_bytes = pending as u64;
 
-    let lines: Vec<&str> = complete.lines().collect();
+    let lines: Vec<&str> = text.lines().collect();
     // default_distro：WSL 来源用其自身发行版（权威），把 distro 未知的裸 Linux cwd 打成
     // 精确 wsl:<distro>（见 parser）；本地来源为 None（裸 Linux cwd 记在 local transcript
     // 下的边角由 host/CLI 决定是否注入 wsl::default_distro）。按库重算归属用同一个函数。
@@ -1137,6 +1149,7 @@ fn scan_append_log<S: ByteSource>(
     let base_seq = cursor.next_seq;
     let codex_state_before = cursor.codex_state.clone();
     let parsed = parse_lines(&ctx, &lines, base_seq, cursor.codex_state.take());
+    let parsed_next_seq = base_seq + parsed.events.len() as u64;
 
     cursor.kind = CursorKind::ByteOffset;
     cursor.size = size;
@@ -1178,9 +1191,9 @@ fn scan_append_log<S: ByteSource>(
     report.admission_detail = filtered.admission_detail;
 
     // 若整批事件因临时会话策略被排除（无保留事件且有排除计数），直接作为 Clean 空批返回，
-    // 并将 safe_offset 保持在 0，确保后续增量追加时第 1 行的会话/父血缘元信息始终在场。
+    // 保持本批起点与旧状态；回到文件头却保留增量 seq 会重复发出此前已保存的事件。
     if filtered.kept_events.is_empty() && filtered.excluded_events > 0 {
-        cursor.safe_offset = 0;
+        cursor.safe_offset = start;
         cursor.next_seq = base_seq;
         cursor.codex_state = codex_state_before;
         report.events_emitted = 0;
@@ -1214,7 +1227,7 @@ fn scan_append_log<S: ByteSource>(
     if parsed.skipped > 0 {
         if one_shot {
             cursor.safe_offset = size - pending as u64;
-            cursor.next_seq = base_seq + kept_events.len() as u64;
+            cursor.next_seq = parsed_next_seq;
             cursor.codex_state = parsed.codex_state;
             report.events_emitted = kept_events.len() as u64;
             log::warn!(
@@ -1262,7 +1275,7 @@ fn scan_append_log<S: ByteSource>(
 
     // 全部好行：推进 safe_offset 到「完整行」边界（size - pending），半行留下轮。
     cursor.safe_offset = size - pending as u64;
-    cursor.next_seq = base_seq + kept_events.len() as u64;
+    cursor.next_seq = parsed_next_seq;
     cursor.codex_state = parsed.codex_state;
     report.events_emitted = kept_events.len() as u64;
 
@@ -1326,15 +1339,15 @@ fn read_range(path: &std::path::Path, start: u64, end: u64) -> std::io::Result<V
 /// 其字节数作为 pending 留待下一轮（保证 `safe_offset` 永远落在完整行边界）。
 /// 返回 `(完整行文本含尾随\n, pending_bytes)`。
 pub fn split_complete_jsonl(text: &str) -> (&str, usize) {
-    match text.rfind('\n') {
-        Some(idx) => {
-            let boundary = idx + 1; // 含换行
-            let complete = &text[..boundary];
-            let pending = text.len() - boundary;
-            (complete, pending)
-        }
-        None => ("", text.len()),
-    }
+    let boundary = complete_jsonl_len(text.as_bytes());
+    (&text[..boundary], text.len() - boundary)
+}
+
+fn complete_jsonl_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |i| i + 1)
 }
 
 #[cfg(test)]
@@ -1418,6 +1431,158 @@ mod tests {
         let (path, mut src) = temp_source(name, body);
         src.source_type = SourceType::Codex;
         (path, src)
+    }
+
+    fn temporary_session_binding(
+        backend: &str,
+        session: &str,
+    ) -> crate::session_binding::SessionBindingRegistry {
+        crate::session_binding::SessionBindingRegistry::from_json_str(&serde_json::json!({
+            "schemaVersion": 1,
+            "bindings": [{
+                "schemaVersion": 1,
+                "owner": {"namespace": "test.owner", "id": "u"},
+                "host": {"namespace": "test.host", "id": "local"},
+                "session": {"namespace": "test.session", "id": session},
+                "nativeSource": {"backend": backend, "sourceLocation": "local", "nativeSessionId": session},
+                "temporary": true,
+                "readMemory": true,
+                "recordedAt": "2026-11-10T00:00:00Z"
+            }]
+        }).to_string())
+    }
+
+    #[test]
+    fn ingest_binding_mixed_sessions_keep_persistent_events_and_monotonic_seq() {
+        for sessions in [
+            ["temporary", "persistent", "persistent"],
+            ["persistent", "temporary", "persistent"],
+        ] {
+            let body = sessions
+                .iter()
+                .map(|sid| claude_line(sid, "synthetic") + "\n")
+                .collect::<String>();
+            let (path, source) = temp_source("mixed-binding", &body);
+            let bindings = temporary_session_binding("claude-cli", "temporary");
+            let scan = |cursor, fingerprint| {
+                super::scan_append_log_with_bindings(
+                    &source,
+                    cursor,
+                    fingerprint,
+                    Profile::Full,
+                    no_roots(),
+                    crate::deadline::Deadline::unbounded(),
+                    &super::StatPrefetch::default(),
+                    &bindings,
+                )
+            };
+            let (first, report) = scan(None, None);
+            assert_eq!(report.events_excluded_temporary, 1);
+            assert_eq!(first.events.len(), 2);
+            assert!(first
+                .events
+                .iter()
+                .all(|event| event.source_session_id == "persistent"));
+            assert_eq!(first.cursor.next_seq, 3);
+            append(&path, &(claude_line("persistent", "next") + "\n"));
+            let (next, _) = scan(Some(first.cursor), first.source_fingerprint);
+            assert_eq!(next.events.len(), 1);
+            assert_eq!(next.events[0].seq, 3);
+            assert_eq!(next.cursor.next_seq, 4);
+            let saved_offset = next.cursor.safe_offset;
+            append(&path, &(claude_line("temporary", "excluded") + "\n"));
+            let (excluded, _) = scan(Some(next.cursor), next.source_fingerprint);
+            assert!(excluded.events.is_empty());
+            assert_eq!(excluded.cursor.safe_offset, saved_offset);
+            assert_eq!(excluded.cursor.next_seq, 4);
+            append(&path, &(claude_line("persistent", "after excluded") + "\n"));
+            let (resumed, _) = scan(Some(excluded.cursor), excluded.source_fingerprint);
+            assert_eq!(resumed.events.len(), 1);
+            assert_eq!(resumed.events[0].seq, 5);
+            assert_eq!(resumed.cursor.next_seq, 6);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn ingest_binding_codex_metadata_parent_survives_empty_batch_and_reopen() {
+        let metadata = serde_json::json!({"type": "session_meta", "payload": {
+            "id": "child", "parent_session_id": "temporary"
+        }})
+        .to_string()
+            + "\n";
+        let (path, source) = temp_source_codex("parent-binding", &metadata);
+        let bindings = temporary_session_binding("codex-cli", "temporary");
+        let scan = |cursor, fingerprint| {
+            super::scan_append_log_with_bindings(
+                &source,
+                cursor,
+                fingerprint,
+                Profile::Full,
+                no_roots(),
+                crate::deadline::Deadline::unbounded(),
+                &super::StatPrefetch::default(),
+                &bindings,
+            )
+        };
+        let (first, _) = scan(None, None);
+        assert!(first.events.is_empty());
+        assert_eq!(first.cursor.safe_offset, metadata.len() as u64);
+        let saved = serde_json::to_vec(&first.cursor).unwrap();
+        let reopened = serde_json::from_slice(&saved).unwrap();
+        append(&path, &(codex_token(100, 0, 20) + "\n"));
+        let (next, report) = scan(Some(reopened), first.source_fingerprint);
+        assert!(next.events.is_empty());
+        assert_eq!(report.events_excluded_temporary, 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ingest_binding_codex_parent_survives_switching_sessions_between_empty_batches() {
+        let metadata = [
+            serde_json::json!({"type": "session_meta", "payload": {"id": "child", "parent_session_id": "temporary"}}).to_string(),
+            serde_json::json!({"type": "session_meta", "payload": {"id": "other"}}).to_string(),
+            serde_json::json!({"type": "session_meta", "payload": {"id": "child"}}).to_string(),
+        ];
+        for cut in 1..=metadata.len() {
+            let body = metadata[..cut].join("\n") + "\n";
+            let (path, source) = temp_source_codex("switched-parent-binding", &body);
+            let bindings = temporary_session_binding("codex-cli", "temporary");
+            let scan = |cursor, fingerprint| {
+                super::scan_append_log_with_bindings(
+                    &source,
+                    cursor,
+                    fingerprint,
+                    Profile::Full,
+                    no_roots(),
+                    crate::deadline::Deadline::unbounded(),
+                    &super::StatPrefetch::default(),
+                    &bindings,
+                )
+            };
+            let (mut observed, _) = scan(None, None);
+            if cut < metadata.len() {
+                append(&path, &(metadata[cut..].join("\n") + "\n"));
+                let saved = serde_json::to_vec(&observed.cursor).unwrap();
+                (observed, _) = scan(
+                    Some(serde_json::from_slice(&saved).unwrap()),
+                    observed.source_fingerprint,
+                );
+            }
+            assert!(observed.events.is_empty());
+            let saved = serde_json::to_vec(&observed.cursor).unwrap();
+            append(&path, &(codex_token(100, 0, 20) + "\n"));
+            let (next, report) = scan(
+                Some(serde_json::from_slice(&saved).unwrap()),
+                observed.source_fingerprint,
+            );
+            assert!(
+                next.events.is_empty(),
+                "known parent lost at metadata split {cut}"
+            );
+            assert_eq!(report.events_excluded_temporary, 1);
+            std::fs::remove_file(path).unwrap();
+        }
     }
 
     fn temp_snapshot(name: &str, body: &str) -> (PathBuf, SourceRef) {
@@ -1851,6 +2016,61 @@ mod tests {
                 "同尺寸重写要被认出来 —— size/mtime 都指望不上"
             );
             let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        fn removing_an_unconsumed_tail_keeps_the_committed_prefix_baseline() {
+            let complete = format!("{}\n", claude_line("s1", "first"));
+            for unfinished in [b"{\"role\":".as_slice(), &[0xff, 0xfe]] {
+                for full_read in [false, true] {
+                    let (path, src) = temp_source("unconsumed-tail", "");
+                    let body = [complete.as_bytes(), unfinished].concat();
+                    std::fs::write(&path, body).unwrap();
+                    let (first, _) = scan_obs(&src, None);
+                    assert_eq!(first.events.len(), 1);
+                    assert_eq!(first.cursor.safe_offset, complete.len() as u64);
+                    let prior = first.source_fingerprint.unwrap();
+                    assert_eq!(prior.covered_len(), first.cursor.safe_offset);
+                    std::fs::write(&path, &complete).unwrap();
+                    let cursor = (!full_read).then_some(first.cursor);
+                    let (next, report) = scan_obs_with(&src, cursor, Some(prior.clone()));
+                    assert_eq!(next.source_change, SourceChange::Appended);
+                    assert!(!report.rollback_detected);
+                    assert_eq!(next.events.len(), usize::from(full_read));
+                    // 已消费的行真正被删除时，即使强制全读没有 cursor 也必须认出回退。
+                    std::fs::write(&path, "").unwrap();
+                    let (cleared, _) = scan_obs_with(&src, None, Some(prior));
+                    assert_eq!(cleared.source_change, SourceChange::RollbackOrRewrite);
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn a_full_rescan_detects_truncation_from_prior_fingerprint() {
+            let first_line = format!("{}\n", claude_line("s1", "first"));
+            let body = format!("{first_line}{}\n", claude_line("s1", "second"));
+            for retained in ["", first_line.as_str()] {
+                let (path, src) = temp_source("truncated-retry", &body);
+                let (first, _) = scan_obs(&src, None);
+                let prior = first
+                    .source_fingerprint
+                    .expect("full scan has a fingerprint");
+                std::fs::write(&path, retained).unwrap();
+                // 欠账重试强制全读时没有旧 cursor，只有上次成功同步的指纹。
+                let (retried, report) = scan_obs_with(&src, None, Some(prior));
+                assert_eq!(retried.source_change, SourceChange::RollbackOrRewrite);
+                assert!(report.rollback_detected);
+                assert_eq!(retried.events.len(), usize::from(!retained.is_empty()));
+                assert_eq!(retried.cursor.safe_offset, retained.len() as u64);
+                let fingerprint = retried
+                    .source_fingerprint
+                    .expect("successful full read has a baseline, including empty files");
+                assert_eq!(fingerprint.covered_len(), retained.len() as u64);
+                let (unchanged, _) = scan_obs_with(&src, Some(retried.cursor), Some(fingerprint));
+                assert_eq!(unchanged.source_change, SourceChange::Appended);
+                std::fs::remove_file(path).unwrap();
+            }
         }
 
         /// 增量读**算不出**整份指纹 —— `None` 是「没读全文」，不是「内容没变」。

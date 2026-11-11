@@ -36,7 +36,7 @@ pub struct AppendLogObservation {
     pub quality: ParseQuality,
     pub events: Vec<RawEvent>,
     pub cursor: Cursor,
-    /// 全读时算出的源内容指纹。
+    /// 全读时算出的源内容指纹；append-log 只覆盖完整行，不含未消费的半行尾巴。
     ///
     /// 🔴 **它存在是为了识别「同尺寸原地重写」。** 回退检测只看 `size` 与 `mtime`，
     /// 一次保留大小与时间戳的原地重写**检不出来**：UI 索引若因别的原因走了全读，

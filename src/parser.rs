@@ -50,6 +50,7 @@ use crate::session_binding::{
 /// | 1   | 基线 |
 /// | 2   | Claude assistant 行的顶层 `effort` 开始被提取（此前整条链路丢弃） |
 /// | 3   | 每条事件带上 [`EventKey`]（记录指纹 + 记录内槽位），ADR-044 决定 4 |
+/// | 5   | 输入来源与父血缘保真；Codex 元信息父关系跨批延续，存量事件需重投影 |
 ///
 /// 🔴 rev 3 是必须的，不是形式（评审 [P1]）：加 `EventKey` 时若不提版本，从 rev 2
 /// 升上来的安装会认为既有文件**没过期**，只扫增量尾巴 —— 于是绝大多数历史事件永远
@@ -58,7 +59,7 @@ use crate::session_binding::{
 ///
 /// 判据就是本常量文档第一句：**从同一份字节里能提取出什么发生了变化** —— 加一个新
 /// 字段正是这种变化。
-pub const PARSER_REVISION: u32 = 4;
+pub const PARSER_REVISION: u32 = 5;
 
 /// 解析产物：本批事件 + 更新后的 Codex 状态 + 跳过计数 + 告警。
 #[derive(Debug, Clone, Default)]
@@ -616,7 +617,10 @@ fn parse_codex(
         state.current_session_id = Some(session_id_from_path(&ctx.source_path));
     }
     let path_parent = extract_subagent_parent_session_id(&ctx.source_path);
-    let mut out = ParseOut::default();
+    let mut out = ParseOut {
+        session_parents: std::mem::take(&mut state.session_parents),
+        ..Default::default()
+    };
     let mut seq = base_seq;
     let mut cache: Option<(String, ProjectRoot)> = None;
     let null = Value::Null;
@@ -791,6 +795,7 @@ fn parse_codex(
         }
     }
 
+    state.session_parents = out.session_parents.clone();
     out.codex_state = Some(state);
     out
 }

@@ -34,6 +34,9 @@ pub struct CodexState {
     pub current_effort: Option<String>,
     pub current_cwd: Option<String>,
     pub current_session_id: Option<String>,
+    /// 已知原生父会话；切换会话、空批与重开后仍须保留临时属性的继承依据。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub session_parents: std::collections::HashMap<String, String>,
     /// 上一条累计用量；下一条减它得增量。
     pub previous_total: CodexUsage,
 }
