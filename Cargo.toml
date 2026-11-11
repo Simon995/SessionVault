@@ -33,6 +33,14 @@ name = "identity_probe"
 required-features = ["store"]
 
 [[example]]
+name = "measure_compressed_len"
+required-features = ["store"]
+
+[[example]]
+name = "measure_binding_guard"
+required-features = ["store"]
+
+[[example]]
 name = "dsh_snapshot"
 required-features = ["dsh-experimental"]
 
