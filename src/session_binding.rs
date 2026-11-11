@@ -304,6 +304,59 @@ impl SessionBindingRegistry {
         self.raw_json.clone()
     }
 
+    /// 生效规则的稳定身份；包含合并后的全部规则与故障，不依赖原始 JSON 的空白或字段顺序。
+    ///
+    /// 调用方可持久化它来识别同一来源字节上的准入变化；它不是单调递增的版本号。
+    pub fn fingerprint(&self) -> Result<String, serde_json::Error> {
+        use sha2::{Digest, Sha256};
+
+        // 穷举字段：新增判据时必须明确是否进入身份。raw_json 只用于回写，不代表合并后的全集。
+        let Self {
+            fault,
+            temporary_roots,
+            pending_sources,
+            records,
+            raw_json: _,
+        } = self;
+        let rules: Vec<_> = records
+            .iter()
+            .map(|record| {
+                // 记录时间不影响准入或事件；穷举字段，新增产物维度不能被静默漏掉。
+                let SessionBindingRecord {
+                    schema_version,
+                    owner,
+                    host,
+                    session,
+                    assignment,
+                    actor,
+                    controller,
+                    native_source,
+                    temporary,
+                    read_memory,
+                    verified_human_input,
+                    state,
+                    recorded_at: _,
+                } = record;
+                (
+                    schema_version,
+                    owner,
+                    host,
+                    session,
+                    assignment,
+                    actor,
+                    controller,
+                    native_source,
+                    temporary,
+                    read_memory,
+                    verified_human_input,
+                    state,
+                )
+            })
+            .collect();
+        let bytes = serde_json::to_vec(&(fault, temporary_roots, pending_sources, rules))?;
+        Ok(format!("binding1:{:x}", Sha256::digest(bytes)))
+    }
+
     /// 按优先级加载默认绑定注册表：
     /// 1. 显式传入的 `explicit_path`（若给且不存在 ⇒ `RegistryUnreadable` fail-closed！）；
     /// 2. 环境变量 `SVAULT_SESSION_BINDINGS`（若设且不存在 ⇒ `RegistryUnreadable` fail-closed！）；
@@ -1904,6 +1957,63 @@ mod tests {
             ]
         })
         .to_string()
+    }
+
+    #[test]
+    fn binding_fingerprint_covers_merged_rules_and_faults_not_json_formatting() {
+        let left = SessionBindingRegistry::from_json_str(
+            r#"{"schemaVersion":1,"temporaryRoots":["/tmp/a"]}"#,
+        );
+        let formatted = SessionBindingRegistry::from_json_str(
+            r#"{ "temporaryRoots": ["/tmp/a"], "schemaVersion": 1 }"#,
+        );
+        assert_eq!(
+            left.fingerprint().unwrap(),
+            formatted.fingerprint().unwrap()
+        );
+        let right = SessionBindingRegistry::from_json_str(
+            r#"{"schemaVersion":1,"temporaryRoots":["/tmp/b"]}"#,
+        );
+        let merged = left.merged_with(&right);
+        assert_eq!(merged.to_canonical_json(), left.to_canonical_json());
+        assert_ne!(merged.fingerprint().unwrap(), left.fingerprint().unwrap());
+        assert_ne!(merged.fingerprint().unwrap(), right.fingerprint().unwrap());
+        assert_ne!(
+            SessionBindingRegistry::empty().fingerprint().unwrap(),
+            SessionBindingRegistry::from_json_str("invalid")
+                .fingerprint()
+                .unwrap()
+        );
+        let bound = SessionBindingRegistry::from_json_str(&sample_binding_json(false, true));
+        let excluded = SessionBindingRegistry::from_json_str(&sample_binding_json(true, true));
+        assert_ne!(
+            bound.fingerprint().unwrap(),
+            excluded.fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn binding_fingerprint_ignores_recording_time_but_keeps_projection_rules() {
+        let raw = sample_binding_json(false, true);
+        let original = SessionBindingRegistry::from_json_str(&raw)
+            .fingerprint()
+            .unwrap();
+        let mut value: Value = serde_json::from_str(&raw).unwrap();
+        value["bindings"][0]["recordedAt"] = serde_json::json!("2026-11-11T08:00:00Z");
+        assert_eq!(
+            original,
+            SessionBindingRegistry::from_json_str(&value.to_string())
+                .fingerprint()
+                .unwrap()
+        );
+        // sample_binding_json 的 product-adapter 默认已经核实人类输入。
+        value["bindings"][0]["verifiedHumanInput"] = serde_json::json!(false);
+        assert_ne!(
+            original,
+            SessionBindingRegistry::from_json_str(&value.to_string())
+                .fingerprint()
+                .unwrap()
+        );
     }
 
     #[test]

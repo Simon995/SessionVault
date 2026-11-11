@@ -88,6 +88,15 @@ impl ProjectionToken {
         ))
     }
 
+    /// 把生效绑定规则作为独立的投影身份分量；不改变原生字节指纹或项目归属版本。
+    pub fn with_bindings(self, fingerprint: &str) -> Self {
+        Self(format!(
+            "{}|bindings:{}:{fingerprint}",
+            self.0,
+            fingerprint.len()
+        ))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -117,6 +126,20 @@ mod tests {
             source_location: SourceLocation::Local,
             source_path: path.to_string(),
         }
+    }
+
+    #[test]
+    fn binding_rules_are_an_independent_token_component() {
+        let base = ProjectionToken::new(&key("/a.jsonl"), Some("fp1"), 4, 7, (0, 100));
+        assert_eq!(
+            base.clone().with_bindings("a"),
+            base.clone().with_bindings("a")
+        );
+        assert_ne!(
+            base.clone().with_bindings("a"),
+            base.clone().with_bindings("b")
+        );
+        assert_ne!(base.clone().with_bindings("a"), base);
     }
 
     #[test]

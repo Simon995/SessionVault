@@ -1280,6 +1280,49 @@ pub struct TotalStore {
     identity_seen: Mutex<std::collections::HashSet<String>>,
 }
 
+/// 仅在 [`TotalStore::with_session_bindings`] 回调期间有效的投影句柄。
+/// 构造字段私有，持有者不能提交事务或绕过该事务的准入快照。
+pub struct BindingProjection<'a> {
+    store: &'a TotalStore,
+    tx: &'a rusqlite::Transaction<'a>,
+    bindings: &'a crate::session_binding::SessionBindingRegistry,
+    failed: std::cell::Cell<bool>,
+}
+
+impl BindingProjection<'_> {
+    pub fn apply_projection(&self, batch: FileProjectionBatch) -> StoreResult<ProjectionStats> {
+        self.apply(batch, false, None)
+    }
+
+    pub fn apply_full_projection_target(
+        &self,
+        batch: FileProjectionBatch,
+        prior_projected_hash: Option<&str>,
+    ) -> StoreResult<ProjectionStats> {
+        self.apply(batch, true, prior_projected_hash)
+    }
+
+    fn apply(
+        &self,
+        batch: FileProjectionBatch,
+        full_target: bool,
+        prior_projected_hash: Option<&str>,
+    ) -> StoreResult<ProjectionStats> {
+        let result = self.store.apply_projection_on(
+            self.tx,
+            batch,
+            None,
+            full_target,
+            prior_projected_hash,
+            self.bindings,
+        );
+        if result.is_err() {
+            self.failed.set(true);
+        }
+        Ok(result?.expect("no expected head was supplied"))
+    }
+}
+
 /// 递增注册表修订号。**只在真的插入了新根时调用**（见 `register_project_root`）。
 ///
 /// 失败静默：修订号停在原地只会让 token 少区分一个维度（偏保守），
@@ -3219,6 +3262,48 @@ impl TotalStore {
         }
     }
 
+    /// 在同一份生效绑定快照下提交总库与调用方的物化索引。
+    ///
+    /// `BEGIN IMMEDIATE` 后重新读取并校验规则，再执行 `action`。回调期间数据库中的绑定
+    /// 写者被串行化；文件规则采用事务入口读到的快照，不锁住外部文件写者。
+    /// 回调只能通过给定句柄投影，不得重入本 `TotalStore` 的加锁方法。
+    ///
+    /// 回调报错会回滚总库。外部索引不是本事务的一部分：它应先落 desired，分别记 ack，
+    /// 且总库 ack 必须等本方法成功返回，保证提交失败仍可恢复。
+    pub fn with_session_bindings<T>(
+        &self,
+        expected: &crate::session_binding::SessionBindingRegistry,
+        action: impl FnOnce(&BindingProjection<'_>) -> StoreResult<T>,
+    ) -> StoreResult<T> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = Self::write_tx(&mut conn)?;
+        let bindings = self.load_session_bindings_with_conn(&tx);
+        if let crate::IngestAdmissionVerdict::UnknownHold { reason } =
+            bindings.evaluate(SourceType::Jsonl, &SourceLocation::Local, "", None, None)
+        {
+            return Err(StoreError::BindingUncertain(reason.to_string()));
+        }
+        if bindings.fingerprint()? != expected.fingerprint()? {
+            return Err(StoreError::BindingUncertain(
+                "effective binding rules changed since scanning".to_string(),
+            ));
+        }
+        let projection = BindingProjection {
+            store: self,
+            tx: &tx,
+            bindings: &bindings,
+            failed: std::cell::Cell::new(false),
+        };
+        let result = action(&projection)?;
+        if projection.failed.get() {
+            return Err(StoreError::Io(std::io::Error::other(
+                "a failed projection was caught inside the binding callback",
+            )));
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// 同 [`Self::apply_projection`]，另带一个前提：当前头仍是 `expect.0`、那一代仍有 `expect.1` 行，
     /// 否则一个字都不写、返回 `None`。整代重写用：读与写之间有人追加或换了代时，拿旧读数开的新一代
     /// 会盖掉别人的写入。前提与切头在同一事务里核。
@@ -3236,6 +3321,30 @@ impl TotalStore {
         expect: Option<(HeadRevisions, u64)>,
         revisit_target: bool,
         prior_projected_hash: Option<&str>,
+    ) -> StoreResult<Option<ProjectionStats>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = Self::write_tx(&mut conn)?;
+        let bindings = self.load_session_bindings_with_conn(&tx);
+        let result = self.apply_projection_on(
+            &tx,
+            batch,
+            expect,
+            revisit_target,
+            prior_projected_hash,
+            &bindings,
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn apply_projection_on(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        batch: FileProjectionBatch,
+        expect: Option<(HeadRevisions, u64)>,
+        revisit_target: bool,
+        prior_projected_hash: Option<&str>,
+        bindings: &crate::session_binding::SessionBindingRegistry,
     ) -> StoreResult<Option<ProjectionStats>> {
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();
@@ -3257,8 +3366,6 @@ impl TotalStore {
         }
 
         let mut projection = batch.mode;
-        let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_tx(&mut conn)?;
 
         // ── H.1 / H.2 / H.3 控制面绑定与临时会话排除守卫 ─────────────────────
         //
@@ -3267,7 +3374,6 @@ impl TotalStore {
         // - `TemporaryExcluded`（且过滤后无保留事件）⇒ 不建空代、不写事件，返回 `appended: 0`；
         // - `PersistentAllowed` ⇒ 写入过滤并补齐 `input_origin` 后的事件。
         // 在同一个 IMMEDIATE 事务里读取规则并写入，另一个写者不能在准入与保存之间改判决。
-        let bindings = self.load_session_bindings_with_conn(&tx);
         let filtered = bindings
             .filter_and_enrich_events(
                 batch.source.source_type,
@@ -3278,7 +3384,7 @@ impl TotalStore {
             )
             .map_err(|u| StoreError::BindingUncertain(u.to_string()))?;
         if filtered.admission_status == "temporary_excluded" && filtered.kept_events.is_empty() {
-            let head = head_of(&tx, &source_type, &source_location, &source_path)?;
+            let head = head_of(tx, &source_type, &source_location, &source_path)?;
             let max_offset: i64 =
                 tx.query_row("SELECT COALESCE(MAX(offset), 0) FROM raw_events", [], |r| {
                     r.get(0)
@@ -3296,7 +3402,7 @@ impl TotalStore {
             }));
         }
         let mut events = filtered.kept_events;
-        let head = head_of(&tx, &source_type, &source_location, &source_path)?;
+        let head = head_of(tx, &source_type, &source_location, &source_path)?;
         let mut skipped_erased = 0u64;
         // 完整目标与已保存投影比较前，先应用同一事务中的墓碑；擦除留下的 seq 间隙不是源回退。
         if revisit_target {
@@ -3326,7 +3432,7 @@ impl TotalStore {
         }
         let current = if revisit_target {
             let (current, undecodable) =
-                self.decode_generation_on(&tx, &source_type, &source_location, &source_path, head)?;
+                self.decode_generation_on(tx, &source_type, &source_location, &source_path, head)?;
             if undecodable != 0 {
                 return Err(StoreError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -3439,7 +3545,7 @@ impl TotalStore {
                 ],
                 |r| r.get(0),
             )?;
-            let head_now = head_of(&tx, &source_type, &source_location, &source_path)?;
+            let head_now = head_of(tx, &source_type, &source_location, &source_path)?;
             if head != want_head || head_now != want_head || rows as u64 != want_rows {
                 return Ok(None);
             }
@@ -3527,7 +3633,7 @@ impl TotalStore {
                     projection_revision,
                 );
                 let group = DataKeyGroup::from_event(ev);
-                let (key_id, data_cipher) = self.data_cipher_for_group(&tx, &group)?;
+                let (key_id, data_cipher) = self.data_cipher_for_group(tx, &group)?;
                 let envelope = data_cipher.encrypt_data(&key_id, json.as_bytes(), &aad)?;
                 let changed = stmt.execute(params![
                     now,
@@ -3678,8 +3784,7 @@ impl TotalStore {
                 now,
             ],
         )?;
-        tx.commit()?;
-        let max_offset = max_offset_on(&conn)?;
+        let max_offset = max_offset_on(tx)?;
         Ok(Some(ProjectionStats {
             appended,
             skipped_dup,
@@ -8792,6 +8897,152 @@ mod tests {
     fn head_of_store(s: &TotalStore) -> (i64, i64) {
         let conn = s.conn.lock().unwrap();
         head_of(&conn, "claude_code", "local", "/p/file.jsonl").unwrap()
+    }
+
+    #[test]
+    fn binding_guard_rejects_changes_before_any_projection_or_callback() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let scanned = store.load_session_bindings();
+        let updated = crate::SessionBindingRegistry::from_json_str(
+            r#"{"schemaVersion":1,"temporaryRoots":["/p"]}"#,
+        );
+        store.set_session_bindings(&updated).unwrap();
+        let mut called = false;
+        let result = store.with_session_bindings(&scanned, |guard| {
+            called = true;
+            guard.apply_projection(batch(Projection::Append, 0, "new content", None))
+        });
+        assert!(matches!(result, Err(StoreError::BindingUncertain(_))));
+        assert!(
+            !called,
+            "stale rules must not reach the external index callback"
+        );
+        assert!(store
+            .read_current_since_page(0, 10)
+            .unwrap()
+            .events
+            .is_empty());
+    }
+
+    #[test]
+    fn binding_guard_rejects_unknown_even_when_the_fault_snapshot_matches() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE store_meta")
+            .unwrap();
+        let unknown = store.load_session_bindings();
+        let mut called = false;
+        let result = store.with_session_bindings(&unknown, |_| {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(result, Err(StoreError::BindingUncertain(_))));
+        assert!(!called);
+    }
+
+    #[test]
+    fn binding_guard_serializes_metadata_writers_through_the_external_callback() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("sv-binding-guard-{unique}"));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("store.db");
+        let store = TotalStore::open_with_key(&path, StoreKey::from_bytes([8; 32])).unwrap();
+        let controller = Connection::open(&path).unwrap();
+        controller.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let update = || {
+            controller.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('session_bindings_json', ?1)",
+                [r#"{"schemaVersion":1,"temporaryRoots":["/p"]}"#],
+            )
+        };
+        let rules = store.load_session_bindings();
+        let stats = store
+            .with_session_bindings(&rules, |guard| {
+                let stats =
+                    guard.apply_projection(batch(Projection::Append, 0, "accepted", None))?;
+                let error = update().unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                );
+                Ok(stats)
+            })
+            .unwrap();
+        assert_eq!(stats.appended, 1);
+        update().unwrap();
+        assert!(matches!(
+            store.with_session_bindings(&rules, |_| Ok(())),
+            Err(StoreError::BindingUncertain(_))
+        ));
+    }
+
+    #[test]
+    fn binding_guard_cannot_commit_a_caught_partial_projection_failure() {
+        let store = TotalStore::open_in_memory().unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_second BEFORE INSERT ON raw_events WHEN NEW.seq = 1
+             BEGIN SELECT RAISE(ABORT, 'injected second event failure'); END;",
+            )
+            .unwrap();
+        let rules = store.load_session_bindings();
+        let result = store.with_session_bindings(&rules, |guard| {
+            let mut target = batch(Projection::Append, 0, "first", Some(token_for("partial")));
+            target.events.push(mk_event(1, "s", Some("second")));
+            assert!(guard.apply_projection(target).is_err());
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "catching an apply error must not commit a partial operation"
+        );
+        assert!(store
+            .read_current_since_page(0, 10)
+            .unwrap()
+            .events
+            .is_empty());
+        let applied: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM applied_projections", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, 0);
+    }
+
+    #[test]
+    fn binding_guard_rolls_back_projection_on_external_callback_failure() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let rules = store.load_session_bindings();
+        let result: StoreResult<()> = store.with_session_bindings(&rules, |guard| {
+            let stats =
+                guard.apply_projection(batch(Projection::Append, 0, "new content", None))?;
+            assert_eq!(stats.appended, 1);
+            Err(StoreError::Io(std::io::Error::other(
+                "external index failed",
+            )))
+        });
+        assert!(result.is_err());
+        assert!(store
+            .read_current_since_page(0, 10)
+            .unwrap()
+            .events
+            .is_empty());
+        let stats = store
+            .with_session_bindings(&rules, |guard| {
+                guard.apply_projection(batch(Projection::Append, 0, "retry", None))
+            })
+            .unwrap();
+        assert_eq!(stats.appended, 1);
     }
 
     #[test]

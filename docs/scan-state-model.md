@@ -107,7 +107,11 @@ pub enum ParseQuality {
 
 Codex 的 `session_meta` 可以单独占一批且不产事件。已知父关系保存于 `CodexState.session_parents`，随游标序列化，下一批按会话 ID 恢复；同一批或跨批切走、切回同一会话时仍保留其已知父关系，不能只存最后一个会话的父 ID。`PARSER_REVISION = 5` 使旧投影重新提取来源与父血缘。旧状态缺少该默认空映射仍可读取；Rust 字面量构造与手写状态映射需要消费方适配。
 
-总库的绑定读取、三态判断与投影保存处于同一个 `BEGIN IMMEDIATE` 事务中。读取 `store_meta` 失败返回带 `RegistryUnreadable` 的注册表，不能压成空规则。消费方若另存本地索引，也须把 `TotalStore::load_session_bindings()` 的有效规则显式传入扫描；总库末端拒绝写入不能撤销消费方提前保存的正文或用量。整轮快照只保证扫描上下文一致，不保证扫描期间控制面更新与另一份数据库的写入原子化。
+总库的绑定读取、三态判断与投影保存处于同一个 `BEGIN IMMEDIATE` 事务中。读取 `store_meta` 失败返回带 `RegistryUnreadable` 的注册表，不能压成空规则。消费方若另存本地索引，也须把 `TotalStore::load_session_bindings()` 的有效规则显式传入扫描；总库末端拒绝写入不能撤销消费方提前保存的正文或用量。
+
+`SessionBindingRegistry::fingerprint()` 标识合并后的全部有效规则与故障，忽略 JSON 排版；`to_canonical_json()` 是回写原文，不能代替它。调用方逐来源持久化绑定身份，变化时使用 `ScanReasons::BINDINGS_CHANGED` 驱动完整重解析，并经 `ProjectionToken::with_bindings` 将绑定作为独立身份分量。规则 A→B→A 会恢复同一语义身份，完整目标提交仍须核对当前内容，不能把旧 token 当作这次已完成；缺少可信旧目标哈希时保守保留旧代。
+
+`TotalStore::with_session_bindings(expected, action)` 在 `BEGIN IMMEDIATE` 后重读并校验扫描快照；变化或未知在回调前拒绝。回调用私有构造的 `BindingProjection` 句柄投影和提交本地索引，数据库中的绑定写者在整段期间被串行化。文件规则以事务入口读到的快照为准，SQLite 不锁外部文件写者；整轮快照本身也不等于提交栅栏。回调不得重入 `TotalStore` 的加锁方法。跨库提交仍不是一个原子事务：先持久化 desired，各层分别确认，总库 ack 必须等方法成功返回，失败保留欠账以恢复。普通空增量的提前确认也必须处于同一栅栏内。
 
 绑定路径比较复用 `attribution::registry_key`；发行版内绝对路径先按来源声明的 `SourceLocation::Wsl` 补齐命名空间，与 UNC / `wsl:<distro>:` 写法收敛，保留 Linux 大小写。绑定注册表尚不持有运行期挂载事实；涉及 Windows 盘符与 Linux / WSL 命名空间的交叉比较，或 `/mnt/<盘>` 的别名比较时，显式返回 `UnknownHold`，不能把空挂载表当成已证明不匹配。控制面应提供可直接核对的同命名空间路径；本修复没有承诺跨盘符挂载的完整别名识别。显式非字符串 `state` 属于非法记录，只有缺失字段继续兼容默认 `Bound`。
 

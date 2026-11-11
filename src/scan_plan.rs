@@ -169,6 +169,8 @@ impl ScanReasons {
     /// 从 seq 0 重建的新 facts 合并）当场撞主键。**两个真相源，一个加了条件另一个
     /// 没有**，正是这个类型要消灭的那件事。测试立刻抓住了。
     pub const SYNC_DEBT: Self = Self(1 << 4);
+    /// 生效的控制面规则变化 ⇒ 同一份字节需重新过滤并投影。
+    pub const BINDINGS_CHANGED: Self = Self(1 << 5);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -186,7 +188,7 @@ impl ScanReasons {
     /// 否则就是「两个真相源，一个加了条件另一个没有」（见 `SYNC_DEBT` 的注释，
     /// 那正是它记下的缺陷）。
     pub fn wants_reparse(self) -> bool {
-        self.0 & (Self::PARSER_STALE.0 | Self::ATTRIBUTION_STALE.0) != 0
+        self.0 & (Self::PARSER_STALE.0 | Self::ATTRIBUTION_STALE.0 | Self::BINDINGS_CHANGED.0) != 0
     }
 
     /// 需要**整代替换索引**、但总库内容不变的理由。
@@ -534,6 +536,16 @@ mod tests {
     }
 
     // ── 决策表逐格（观察 × 原因）──────────────────────────────────────
+
+    #[test]
+    fn binding_changes_reparse_unchanged_bytes_in_both_materialized_layers() {
+        let reason = ScanReasons::BINDINGS_CHANGED;
+        assert!(reason.wants_reparse());
+        let plan = CommitPlan::plan(&obs(clean(), SourceChange::Appended), reason, prior(true));
+        assert_eq!(plan.index(), IndexAction::ReplaceFile);
+        assert_eq!(plan.store(), StoreAction::Project(Projection::Reparse));
+        assert_eq!(plan.sync(), SyncTransition::Advance);
+    }
 
     #[test]
     fn a_plain_incremental_scan_appends() {
