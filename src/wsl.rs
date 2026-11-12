@@ -1788,20 +1788,15 @@ mod tests {
             .iter()
             .all(|b| b.is_ascii_digit() || b.is_ascii_whitespace()));
 
+        let read_script = read_whole_script(&format!("{mounted}/binary ' $; 中文-256.dat"));
         // 让真实脚本的正文读取失败：set -e 必须将失败传回，而不是只留下成功的头。
-        let script = format!(
-            "head() {{ return 2; }}\n{}",
-            read_whole_script(&format!("{mounted}/binary ' $; 中文-256.dat"))
-        );
+        let script = format!("head() {{ return 2; }}\n{read_script}");
         let failed = run_bash_stdin(&distro, &script, unbounded()).unwrap();
         assert!(!failed.status.success());
         assert!(parse_read_whole(failed.stdout).is_err());
 
         // 模拟检查后的路径替换：实际打开设备，不能当作零长度普通文件返回。
-        let script = format!(
-            "exec() {{ builtin exec 3</dev/null; }}\n{}",
-            read_whole_script(&format!("{mounted}/binary ' $; 中文-256.dat"))
-        );
+        let script = format!("exec() {{ builtin exec 3</dev/null; }}\n{read_script}");
         let replaced = run_bash_stdin(&distro, &script, unbounded()).unwrap();
         assert!(!replaced.status.success());
         assert!(replaced.stdout.is_empty());

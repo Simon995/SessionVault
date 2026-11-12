@@ -59,9 +59,9 @@
 
 ### 2.2 宿主与子 CLI 来源适配：职责与控制面绑定契约
 
-> **2026-11-04 登记，2026-11-09 落地控制面绑定、临时会话排除与真实来源保真（H.1 / H.2 / H.3），2026-11-10 合入 DSH v4 复杂语义与会话根批量扫描（H.4，`dc682ff`）及有效视图切点（G.1–G.3，`d7d3315`）**。11-05 至 11-10 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获、Rust `dsh-experimental` 物理核验与原生语义 admission 接缝、会话目录选代、保守提交门、`RawEvent` 归一化位置映射、表面折叠/压缩/子代理/多层 fork 及会话根目录批量发现与扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`），并在 [`src/session_binding.rs`](../src/session_binding.rs) 与 [`src/rawevent.rs`](../src/rawevent.rs) 实现控制面准入契约、真实来源字段与压缩边界切点，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。细粒度用量证据已合入 `main`（`498b7a3`）。显式配置根下的 DSH 来源已接到 `catalog::builtin_descriptors()` / `discover` / `scan-all` 并合入 `main`（`29beb8d`，见 [读取状态设计 §14–§15](dsh-read-state-design.md#14-常规来源接线与持久化凭据)），尚未发新 Release；任务与顺序记在 [backlog.md](backlog.md) H 节，遵守 `AGENTS.md` §4 规则 2。
+> **2026-11-04 登记，2026-11-09 落地控制面绑定、临时会话排除与真实来源保真（H.1 / H.2 / H.3），2026-11-10 合入 DSH v4 复杂语义与会话根批量扫描（H.4，`dc682ff`）及有效视图切点（G.1–G.3，`d7d3315`）**。11-05 至 11-10 已完成只读格式核查、受控双进程窗口、独立快照审计、Node 同缓冲区捕获、Rust `dsh-experimental` 物理核验与原生语义 admission 接缝、会话目录选代、保守提交门、`RawEvent` 归一化位置映射、表面折叠/压缩/子代理/多层 fork 及会话根目录批量发现与扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`），并在 [`src/session_binding.rs`](../src/session_binding.rs) 与 [`src/rawevent.rs`](../src/rawevent.rs) 实现控制面准入契约、真实来源字段与压缩边界切点，详见 [dsh-ingest-survey.md](dsh-ingest-survey.md) 与 [dsh-read-state-design.md](dsh-read-state-design.md)。细粒度用量证据已合入 `main`（`498b7a3`）。显式配置根下的 DSH 来源已接到 `catalog::builtin_descriptors()` / `discover` / `scan-all` 并合入 `main`（`29beb8d`，见 [读取状态设计 §14–§15](dsh-read-state-design.md#14-常规来源接线与持久化凭据)），已随 `v2026.11.11.1`（`b9339c3`）正式发布；宿主真实来源接入仍单独验收，任务与顺序记在 [backlog.md](backlog.md) H 节，遵守 `AGENTS.md` §4 规则 2。
 
-宿主对话摄取与执行后端选型分开：宿主已选用 DSH 时，其会话来源可以独立核查，不必等 Worker 选型结束。上层若复用 DSH 原生日志，只摄取同一份事实来源；只有上层另有独立会话记录时才评估新增 provider，避免宿主导出与原始日志重复计量、重复进入记忆。当前通用 JSONL 的实验入口不等于专用接入已交付。
+宿主对话摄取与执行后端选型分开：宿主已选用 DSH 时，其会话来源可以独立核查，不必等 Worker 选型结束。上层若复用 DSH 原生日志，只摄取同一份事实来源；只有上层另有独立会话记录时才评估新增 provider，避免宿主导出与原始日志重复计量、重复进入记忆。DSH v4 显式根常规来源已发布；通用 JSONL 入口和物理快照实验均不能替代宿主真实根、可信绑定与来源接入的联合验收。
 
 | 事项                   | 本仓承接                                                                                                                                                                   | 上层编排方 / 记忆引擎承接                                                                    |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
@@ -91,7 +91,7 @@
 | Codex 全局 `AGENTS.md`、`memories/*.md`、`memories/rollout_summaries/*.md`、`memories/extensions/ad_hoc/notes/*.md`、`rules/*.rules`、`skills/**/*.md` | `snapshot_file`，`experimental`                                                                       |
 | 宿主已确认项目根内的指令文件                                                                                                                           | `discover_project_snapshots` 单独发现，不能把全部项目层候选都算作已实现                               |
 | 通用 JSONL `sessions/**/*.jsonl`                                                                                                                       | `append_log`，`experimental`；仅显式设置 `SVAULT_JSONL_DIR` 时发现                                    |
-| DSH 会话目录内最高规范代 `session.v4.jsonl[.zstd]`（当前开发分支） | `append_log`，复用 `Jsonl` 类型；仅显式 `SVAULT_DSH_SESSIONS_DIR` 或 `SVAULT_DSH_HOME` 时发现，逻辑来源为会话目录；扫描需 `store`、`SVAULT_DSH_NODE` 与 `SVAULT_DSH_PACKAGE`，核验失败冻结 |
+| DSH 会话目录内最高规范代 `session.v4.jsonl[.zstd]`（已随 `v2026.11.11.1` 发布） | `append_log`，复用 `Jsonl` 类型；仅显式 `SVAULT_DSH_SESSIONS_DIR` 或 `SVAULT_DSH_HOME` 时发现，逻辑来源为会话目录；扫描需 `store`、`SVAULT_DSH_NODE` 与 `SVAULT_DSH_PACKAGE`，核验失败冻结 |
 
 `sqlite_store` / `opaque_family`、任意派生配置根与其他 provider 仍是预留设计；当前描述符没有 Cursor / Gemini 的可扫描实现。
 
@@ -459,7 +459,7 @@ ScanReport {
 
 建议宿主界面展示已可取得的来源、读取字节 / 事件数及告警，无法探测与确认不在须分开。授权清单、任意根设置及 provider 启停仍需 §5 的控制面设计，不能承诺当前报告已经提供这些字段。
 
-> **`ScanReport`（机器结果）≠ 日志（诊断流水账）**：前者确定性、`return`/序列化给宿主渲染、可进黄金语料断言；后者走 stderr、含 `run_id`/时间等易变量、给人排错。日志规范见 `LOGGING.md`（对齐 QuotaBar `docs/LOGGING.md`：lib 用 `log` 复用宿主 sink、stdout=NDJSON/stderr=日志、正文不进日志；决策见 TumeFlow ADR-026）。
+> **`ScanReport`（机器结果）≠ 日志（诊断流水账）**：前者确定性、`return`/序列化给宿主渲染、可进黄金语料断言；后者由 sink 输出供人排错，CLI 固定 stderr、lib 复用宿主 sink，正文不进日志。逐轮 `run_id` 是尚未统一实现的规范目标；现行过滤与格式见 [LOGGING.md](LOGGING.md)，不要把目标字段或示例当作已有 CLI 参数。
 
 ## 11. 黄金 fixture 语料（一致性套件，必须覆盖）
 

@@ -5,13 +5,17 @@
 >
 > 1. **stdout/stderr 硬隔离**（CLI 特有，QuotaBar 是 GUI 无此问题）；
 > 2. **`sv-` module-tag 命名空间** + **CLI 自带 stderr sink**（lib 形态复用宿主 sink）；
-> 3. **`run_id` 关联**（一次 `scan_all` 扫多源，需要把整轮串起来）。
+> 3. **`run_id` 关联目标**（一次 `scan_all` 扫多源，需要把整轮串起来；尚未统一实现，见 §3）。
 >
 > 决策见 TumeFlow `DECISIONS.md` ADR-026。本规范**新代码必须遵守**，目标同 QuotaBar：
 > "读一份日志就能定位问题"，而不是每次诊断先加日志再复现。
 
-状态：初始规范
-最后更新：2026-06-13
+状态：现行能力与规范目标分开记录
+最后核对：2026-11-12
+
+**当前实现**：lib 通过 `log` 复用宿主 sink；CLI 使用 `env_logger`，输出到 stderr，格式为 `[target] message`。过滤优先读 `SVAULT_LOG`，再读 `RUST_LOG`，默认 `info`，依据 `src/bin/svault.rs::init_logging`；CLI 的 `emit` 单独输出 NDJSON。`src/logging.rs` 提供固定 tag。
+
+**尚未实现**：CLI 没有 `--log-level` / `--log-format json` 参数，扫描链也未统一生成和传递逐轮 `run_id`。下文的关联字段和示例是规范目标，不能当作已可调用的参数或已齐备的诊断覆盖。实施任务只在 [backlog.md](backlog.md) F 节维护。刷新计时、嵌套阶段和进程级计数的解读见 [性能记录](refresh-performance.md)。
 
 ---
 
@@ -29,10 +33,10 @@
 | 形态 | facade | sink |
 |---|---|---|
 | **lib `session-vault`**（QuotaBar 进程内调用） | **`log`**（不是 `tracing`） | **不装 sink**——复用宿主的。QuotaBar 是 `log` + `tauri-plugin-log`，SessionVault 用 `log` 即**零桥接**落进 QuotaBar 同一个滚动日志文件 |
-| **CLI `svault`**（TumeFlow 子进程 / 独立） | `log` | **自带轻量 stderr sink**（如 `env_logger`/`fern`），文本 layout 对齐 QuotaBar 行格式；另给 `--log-format json` 供机器消费 |
+| **CLI `svault`**（TumeFlow 子进程 / 独立） | `log` | `env_logger` 固定 stderr，当前格式 `[target] message`；JSON 日志参数尚未实现 |
 
 - **lib 绝不调 `init()`/装 sink**——那会抢占宿主日志系统。lib 只发 `log::{warn,info,debug}!` 事件。
-- **CLI 才装 sink**，writer 固定 **stderr**；级别由 `--log-level` / `RUST_LOG`（target `session_vault=…`）控。
+- **CLI 才装 sink**，writer 固定 **stderr**；级别由 `SVAULT_LOG` / `RUST_LOG` 过滤表达式控制（如 `sv-scan=debug,sv-wsl=debug`；启用全局诊断可用 `debug`）。固定 tag 就是实际日志 target，`session_vault=debug` 不会匹配这些 `sv-*` target。`--log-level` 尚未实现。
 - 为什么不用 `tracing`：QuotaBar 整条管线是 `log`；用 `tracing` 则 SessionVault 日志进不了 QuotaBar 的文件 sink（要桥接）。一套管线、一个日志文件、一种格式，胜过 `tracing` 的 span。`run_id` 用字段模拟即可（§3）。
 
 ## 2. 消息格式（照搬 QuotaBar）
@@ -54,7 +58,7 @@
   - 差：`roll back`、`skip line`、`do scan`
 - **`key=value`**：结构化字段，空格分隔。**永远不要把 `content`/正文/凭据当 value**。
 
-## 3. `run_id` 关联（SessionVault 特有）
+## 3. `run_id` 关联（规范目标，尚未统一实现）
 
 一次 `scan_all` 生成一个 `run_id`（短码如 `r#a1b2`），**写进每条该轮日志的 scope**，把跨多源、跨 WSL 子进程的日志串成一条线。排错动作：`grep 'r#a1b2'` 看整轮事件序列，再看是哪个来源、哪个事件码出问题。
 （这是 QuotaBar 按账号循环时不需要、而我们多源扫描必须的关联手段；不引入 `tracing` span，用字段即可。）

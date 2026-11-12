@@ -44,4 +44,4 @@ cargo test --features store,acceptance-fixtures --test cli_union_it --test cli_r
 
 库回归另直接使用 bundled SQLite 的 `StatementStatus` 比较：旧查询 `FullscanStep > 0`，新摘要 `FullscanStep == 0` 且 `VmStep` 更少；不使用不稳定的耗时阈值。语义回归覆盖空库、Rollback 后保留两代、墓碑物理删除后的计数与水位。CLI 集成回归核对输出字段与计数，并验证旧库只读查询前后未迁移。
 
-生产延迟是否满足消费方时限，须在协调升级后的实际运行中复测。本轮未替换已安装 CLI、未访问真库。
+上述 2026-11-10 测量阶段未替换已安装 CLI、未访问真库。该修复随后已随 `v2026.11.11.1`（`b9339c3`）正式发布，本机独立 CLI 已升级；是否满足消费方生产时限仍由其按实际库与调用链复测，不能用本表的 SQL 时间替代。当前发布与任务状态只维护在 [backlog.md](backlog.md)。

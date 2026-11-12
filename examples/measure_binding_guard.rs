@@ -117,16 +117,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut rounds = Vec::new();
     for with_ledger in [false, true] {
-        for round in 0..args.rounds {
+        for round in 1..=args.rounds {
             // Force changed timestamps, as in separate production rounds, despite fast replay.
-            let now = (round + 1) as i64;
+            let now = round as i64;
             let mut timing = Round {
                 mode: if with_ledger {
                     "guard_and_ledger"
                 } else {
                     "guard_only"
                 },
-                round: round + 1,
+                round,
                 sources: keys.len(),
                 ..Default::default()
             };

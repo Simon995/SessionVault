@@ -15,7 +15,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 - 体量闸：`uv run python scripts/check-agents-budget.py`（本文件 ≤200 行、≤24 KB、单行 ≤320 字符；`CLAUDE.md` 只能是 `@AGENTS.md` 导入壳）。
 - 发布 svault：`uv run python scripts/release.py <tag>` 试运行，加 `--publish` 才打标签、发 GitHub Release、装到 `%LOCALAPPDATA%\svault\bin`；二进制里嵌着本机家目录就拒绝发布。
 - 变异验证用 `scripts/mutate.py`：变异要打在生产实际走的路径上，脚本自己备份、自己还原并核字节一致。工作区里有的文件是 CRLF（检出遗留，入库仍是 LF），按字节匹配目标时按文件实际的换行写。
-- 实机测试默认不跑，单独开、`--test-threads=1`：`SVAULT_WSL_IT=1`（真 WSL，夹具建在 Windows 临时目录、经 `/mnt/<盘>` 读）、`SVAULT_KEYCHAIN_IT=1`（真钥匙链，测试专用服务名，只删自己建的条目）。
+- 实机测试默认不跑，单独开、`--test-threads=1`：`SVAULT_WSL_IT=1`（真 WSL；旧测试在 Windows 临时目录建夹具并沿用 `/mnt/<盘>`，单桥整件读取测试在本仓 `target` 下建夹具、经实际 `wslpath` 转换后读）、`SVAULT_KEYCHAIN_IT=1`（真钥匙链，测试专用服务名，只删自己建的条目）。
 - 改了非 Windows 分支（`wsl.rs` 的桩、Unix 文件权限）要在 WSL 里用 Linux 工具链编、跑一次：本仓没有 CI，开发机编不到那一支。
 - 「没问成」在 `src/` 里的规模现查，不写进文档：`grep -rc 没问成 src/ --include=*.rs | awk -F: '{s+=$2} END {print s}'`。
 
@@ -100,7 +100,7 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 - 是什么：`README.md`；设计契约：`docs/INGEST_KERNEL.md`；字段对账：`docs/rawevent-reconciliation.md`；扫描 / 投影状态模型：`docs/scan-state-model.md`。
 - 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
 - 控制面绑定、临时会话排除与真实来源契约：`docs/INGEST_KERNEL.md` §2.2、`src/session_binding.rs`；DSH 常规来源已注册、仅显式配置根时发现，物理快照核验仍以 `dsh-experimental` 门控；核查与设计见 `docs/dsh-ingest-survey.md`、`docs/dsh-read-state-design.md`。
-- 总库体积与待优化项（存了什么、哪些可回收，只记录未动手）：`docs/storage-growth.md`。
+- 总库体积、回收判据与历史测量：`docs/storage-growth.md`；刷新性能的测量边界与已验证结论：`docs/refresh-performance.md`。
 - 总库在多台机器之间同步（现状、决定、方案、实测记录）：`docs/linux-replica.md`。
 - **待做清单**（各项做到哪、谁来做，做完划掉写提交号）：`docs/backlog.md`。
 - 存档：本文件 2026-10-09 瘦身前的全文（判例、历史、细节），`docs/agents-full-2026-10-09.md`，不再维护。

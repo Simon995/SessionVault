@@ -27,6 +27,7 @@ struct Measurement {
     compressed_bytes: u64,
     decoded_bytes: u64,
     decoded_len_ms: f64,
+    // Inclusive logical-source stat time: metadata probes plus decoded_len_ms.
     source_stat_ms: f64,
 }
 
@@ -75,22 +76,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let compressed = session_vault::compressed::compressed_path(&logical);
-        let facts = match backend.stat(&compressed, deadline) {
-            Probed::Found(facts) => facts,
-            Probed::Absent | Probed::Unknown(_) => {
-                unavailable_sources += 1;
-                continue;
-            }
+        let Probed::Found(facts) = backend.stat(&compressed, deadline) else {
+            unavailable_sources += 1;
+            continue;
         };
         let len_started = Instant::now();
-        let decoded_bytes = match session_vault::probe::with_reader(&compressed, |reader| {
-            session_vault::compressed::decoded_len(reader)
-        }) {
-            Probed::Found(len) => len,
-            Probed::Absent | Probed::Unknown(_) => {
-                unavailable_sources += 1;
-                continue;
-            }
+        let Probed::Found(decoded_bytes) =
+            session_vault::probe::with_reader(&compressed, |reader| {
+                session_vault::compressed::decoded_len(reader)
+            })
+        else {
+            unavailable_sources += 1;
+            continue;
         };
         let decoded_len_ms = len_started.elapsed().as_secs_f64() * 1000.0;
         let source_stat_ms = source_started.elapsed().as_secs_f64() * 1000.0;

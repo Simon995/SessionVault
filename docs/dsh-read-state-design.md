@@ -1,6 +1,6 @@
 # DSH 读取状态与安全推进接缝
 
-> 2026-11-10 更新。§1–§13 保留各阶段的安装源码核查与运行证据（`0.2.1-rc.5`，后于 §12 升级为 `0.2.2-rc.1`）。控制面绑定与临时排除已随 `v2026.11.09.1` 发布；复杂语义与细粒度用量已合入 `main`（`dc682ff` / `498b7a3`）。正式 `catalog` / `discover` / `scan-all` 接线已合入 `main`（`29beb8d`），配置与有限兼容边界见 §14–§15，尚未发新 Release。任务顺序只在 [backlog.md](backlog.md) 维护。
+> 状态于 2026-11-12 订正。§1–§13 保留各阶段的安装源码核查与运行证据（`0.2.1-rc.5`，后于 §12 升级为 `0.2.2-rc.1`）。控制面绑定与临时排除已随 `v2026.11.09.1` 发布；复杂语义、细粒度用量与正式 `catalog` / `discover` / `scan-all` 接线（`dc682ff` / `498b7a3` / `29beb8d`）已随 `v2026.11.11.1`（`b9339c3`）发布。配置与有限兼容边界见 §14–§15；真实来源接入仍另验。任务顺序只在 [backlog.md](backlog.md) 维护。
 
 ## 1. 先保留哪几件事实
 
@@ -304,7 +304,7 @@ node scripts/verify-dsh-rust-normalize-store.mjs --dsh-package '<dsh-package.jso
 
 ## 13. 细粒度用量保真（五项事实）与总库持久化
 
-2026-11-10，在 [rawevent.rs](../src/rawevent.rs)、[normalize.rs](../src/dsh_snapshot/normalize.rs)、[session_binding.rs](../src/session_binding.rs) 与 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 中落地 [dsh-ingest-survey.md §11](dsh-ingest-survey.md#11-usage--token-计量边界与核验) 定义的细粒度用量保真五项事实与总库持久化汇总：
+2026-11-10，在 [rawevent.rs](../src/rawevent.rs)、[normalize.rs](../src/dsh_snapshot/normalize.rs)、[session_binding.rs](../src/session_binding.rs) 与 [verify-dsh-rust-normalize-store.mjs](../scripts/verify-dsh-rust-normalize-store.mjs) 中落地 [dsh-ingest-survey.md §11](dsh-ingest-survey.md#11-用量保真方案草案与存储边界) 定义的细粒度用量保真五项事实与总库持久化汇总：
 
 1. **五项事实结构（`UsageEvidence` 与 `DshUsageEntry`）**：
    - **原生计量样本（`UsageSampleRecord` / `UsageSampleOrigin`）**：保留来自外层 `OuterMessage`（`data.usage`）或内嵌流 `StreamChunk { stream_index }`（`data.stream[i].chunk.usage`）的原始 `raw_usage: Value`，并将同记录内被外层或更晚流式 chunk 覆盖的样本完整保存在 `overridden_samples: Vec<UsageSampleRecord>` 中；
@@ -322,7 +322,7 @@ Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/ve
 
 ## 14. 常规来源接线与持久化凭据
 
-2026-11-10，上述核验链已接入常规扫描并合入 `main`（`29beb8d`）。本节能力尚未发新 Release；`v2026.11.09.1` 不包含本节能力。
+2026-11-10，上述核验链已接入常规扫描并合入 `main`（`29beb8d`），随后已随 `v2026.11.11.1` 发布；旧版 `v2026.11.09.1` 不包含本节能力。发布与运行写者升级不替代宿主真实来源接入验收。
 
 - **目录与身份**：`catalog::builtin_descriptors()` 增加 `DeepSeek Harness` 描述符，沿用 `SourceType::Jsonl` / `SourceMode::AppendLog` / `SourceLocation::Local`。逻辑 `source_path` 为会话目录，选中的物理文件由专用选代器决定；`.jsonl` / `.zstd` 或格式代变化不产生第二份逻辑来源。`discover_transcripts()` 包含该来源，`discover_snapshots()` 不包含；显式 DSH 根内的物理日志从通用 JSONL 发现中排除，避免绕过核验或重复摄取。
 - **显式配置**：优先 `SVAULT_DSH_SESSIONS_DIR`，其次 `SVAULT_DSH_HOME/sessions`；必须是当前进程的本机绝对路径，未配置时不猜默认根。扫描另需可信本机运行时 `SVAULT_DSH_NODE` 与 `SVAULT_DSH_PACKAGE`（分别为 Node 可执行文件与 DSH `package.json` 的绝对路径）。这些配置由启动方传入，来源日志不能指定可执行代码。Windows 宿主直接捕获 WSL 来源尚未接入；在 Linux 进程中可用对应本机路径扫描。
@@ -354,7 +354,7 @@ Windows 与 WSL Linux 实跑 [verify-dsh-rust-normalize-store.mjs](../scripts/ve
 
 **升级顺序**：新证据进入共享总库前，先升级所有可能反序列化后重写事件的写者。已实跑的损失路径是旧 CLI `reattribute --apply`。另据消费方 2026-11-10 源码核对，QuotaBar 归档投影前自动调用 `recompute_attribution(..., false)`，其旧依赖经旧 `RawEvent` 与 `write_rewritten` 整代回写；这是已核源码风险，未实跑证明丢失，也未核真库是否含新证据。不能只提醒手动命令。消费方自行升级依赖、Cursor 存储与字段投影，本仓不替其 bump 指针。
 
-**后续状态（2026-11-11）**：上表与下方编译失败记录描述的是 11-10 的兼容样本，不代表当前消费方源码状态。后续源码已补齐解析状态持久化、完整目标接线及两类证据的投影保真；当前复审、合并和运行写者升级状态统一见 [待做清单](backlog.md#当前状态与下一步)。源码适配不改变旧版重写器的实测损失，也不等于运行写者已换；正式启用仍遵守上述升级顺序。
+**后续状态（2026-11-11）**：上表与下方编译失败记录描述的是 11-10 的兼容样本，不代表当前消费方源码状态。后续源码已补齐解析状态持久化、完整目标接线及两类证据的投影保真；当前复审、合并和运行写者升级状态统一见 [待做清单](backlog.md#当前状态与执行顺序)。源码适配不改变旧版重写器的实测损失，也不等于运行写者已换；正式启用仍遵守上述升级顺序。
 
 本轮验证记录（2026-11-10）：
 

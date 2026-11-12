@@ -4,7 +4,7 @@
 > 把"发现各 Agent 本地数据 → 增量扫描 → 归一化为 `RawEvent` → 追加保存到总库"
 > 这件最容易踩坑的事，**只实现一次**；用户主动擦除受墓碑与防复活规则保护。
 
-**现状（2026-11-11 核对）**：Claude Code / Codex 本地与 WSL 摄取、状态快照、总库正文加密、用户擦除、项目归属及多机副本读取已实现。最新正式版 `v2026.11.11.1`（`b9339c3`）包含控制面绑定与双层临时排除、DSH v4 复杂语义和细粒度用量证据、会话有效视图标记、元数据窄查询，以及准入、游标和完整投影的一致性修复。显式配置的 DSH 来源复用 `Jsonl` + `AppendLog` 接入常规 `catalog` / `discover` / `scan-all`，未配置时不扩大发现范围。Windows / Linux 发布资产已回下载核验，本机独立 CLI 已安装并核对版本与哈希。
+**现状（2026-11-12 核对）**：Claude Code / Codex 本地与 WSL 摄取、状态快照、总库正文加密、用户擦除、项目归属及多机副本读取已实现。最新正式版 `v2026.11.11.1`（`b9339c3`）包含控制面绑定与双层临时排除、DSH v4 复杂语义和细粒度用量证据、会话有效视图标记、元数据窄查询，以及准入、游标和完整投影的一致性修复。显式配置的 DSH 来源复用 `Jsonl` + `AppendLog` 接入常规 `catalog` / `discover` / `scan-all`，未配置时不扩大发现范围。Windows / Linux 发布资产已回下载核验，本机独立 CLI 已安装并核对版本与哈希。
 
 **接下来**：新版 CLI 已发布，本机登记写者已完成安装与运行身份核验；真实来源接入仍单独验收。消费方须完整持久化游标并保留证据字段，正式启用新证据前确认所有整代重写入口均使用新版。旧版 CLI 能结构读取新事件，但不会输出未知的 `usage_evidence`；旧版整代重写会丢失证据，因此接入前需升级所有可能重写事件的写者。配置方式见下文，证据与兼容边界见 [读取状态设计](docs/dsh-read-state-design.md) §14–§15；任务顺序只维护在 [待做清单](docs/backlog.md)。
 
@@ -177,6 +177,7 @@ cargo test          # 单测（WSL 实机 IT 需 SVAULT_WSL_IT=1，默认跳过�
 - [docs/parity-contract.md](docs/parity-contract.md) —— 影子并跑对账契约（P2 step 1）：QuotaBar `usage_facts` ⇄ SessionVault RawEvent(usage) 的序数对齐、must-match/advisory 等价定义、字节边界、首测结果。`parity` 工具：`cargo run --features parity --bin parity -- …`。
 - [docs/LOGGING.md](docs/LOGGING.md) —— 日志规范（对齐 QuotaBar `docs/LOGGING.md`：`log` 复用宿主 sink、stdout=NDJSON/stderr=日志、正文不进日志；TumeFlow ADR-026）。
 - [docs/scan-state-model.md](docs/scan-state-model.md) —— 扫描与投影的状态模型：`AppendLogObservation` 四态、`ScanReasons` 组合原因 × `CommitPlan` 纯函数规划、`Deadline` 作为调用链参数、`Probed` 三态探测、幂等 `ProjectionToken`。
+- [docs/refresh-performance.md](docs/refresh-performance.md) —— 压缩长度、绑定守卫与 WSL 整件读取实验；计时嵌套、缓存、预算和自然刷新验收边界。
 - [docs/project-identity.md](docs/project-identity.md) —— 项目身份从「现算」到「记下来」（`project_identity` 表）。
 - [docs/project-attribution.md](docs/project-attribution.md) —— 会话归属到项目根的判据与解析链。
 - [docs/dsh-ingest-survey.md](docs/dsh-ingest-survey.md)、[docs/dsh-read-state-design.md](docs/dsh-read-state-design.md) —— DSH v4 宿主来源核查记录、读取状态与实验核验接缝。
