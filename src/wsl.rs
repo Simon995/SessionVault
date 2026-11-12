@@ -1004,6 +1004,12 @@ stub_on_non_windows! {
         deadline: crate::deadline::Deadline,
     ) -> Result<Option<(String, String)>, String>;
 
+    pub fn read_whole(
+        distro: &str,
+        abs_path: &str,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Option<FileRead>, String>;
+
     pub fn read_range(
         distro: &str,
         abs_path: &str,
@@ -1026,25 +1032,99 @@ stub_on_non_windows! {
 
 /// 读发行版内一个文件的全部字节与 mtime。`Ok(None)` = 不是普通文件（含不存在）。
 ///
-/// 不超过 [`READ_MANY_MAX_EACH`] 的一次 `wsl.exe`（[`read_many`]，base64 传回，任意字节都不走样；
-/// [`read_file_at`] 返回 `String`，二进制会被改坏）；更大的先 `stat` 再 [`read_range`]，两次。
-/// 只由已有的桥组成，非 Windows 构建上它们是桩，这里不必另写一份。
+/// 一次 `wsl.exe` 返回短元数据头与原始字节，不受批读上限限制，也不用 base64。
+/// 元数据与内容取自同一打开的描述符；普通非零长度文件只读 stat 时的长度，追加留给下一轮。
+/// 零长度文件及 procfs/sysfs 读到 EOF：这些虚拟文件的 stat 长度可能为零或大于实际内容。
+/// 退出失败、坏头、短读均为 `Err`，不能把没读成当作不存在或推进到未读的偏移。
+#[cfg(windows)]
 pub fn read_whole(
     distro: &str,
     abs_path: &str,
     deadline: crate::deadline::Deadline,
 ) -> Result<Option<FileRead>, String> {
-    let mut answers = read_many(distro, &[abs_path.to_string()], deadline)?;
-    if let Some(Ok(answer)) = answers.remove(abs_path) {
-        return Ok(answer);
+    let out = run_bash_stdin(distro, &read_whole_script(abs_path), deadline)?;
+    if out.status.code() == Some(7) && out.stdout.is_empty() {
+        return Ok(None);
     }
-    match stat(distro, abs_path, deadline)? {
-        None => Ok(None),
-        Some((size, mtime)) => Ok(Some(FileRead {
-            bytes: read_range(distro, abs_path, 0, size, deadline)?,
-            mtime,
-        })),
+    if !out.status.success() {
+        return Err(format!(
+            "wsl read_whole {distro}:{abs_path} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
+    parse_read_whole(out.stdout).map(Some)
+}
+
+#[cfg(any(windows, test))]
+fn read_whole_script(abs_path: &str) -> String {
+    let esc = shell_escape(abs_path);
+    format!(
+        r#"set -eu
+p="{esc}"
+if [ ! -f "$p" ]; then
+    if detail=$(LC_ALL=C stat -L -- "$p" 2>&1); then
+        exit 7
+    else
+        case "$detail" in
+            *': No such file or directory'|*': Not a directory') exit 7 ;;
+            *) printf '%s\n' "$detail" >&2; exit 1 ;;
+        esac
+    fi
+fi
+exec 3<"$p"
+# 路径检查后仍可能被替换；只读取已打开描述符指向的普通文件。
+if [ ! -f /proc/self/fd/3 ]; then
+    printf 'wsl read_whole: opened file is no longer regular\n' >&2
+    exit 1
+fi
+meta=$(stat -L --printf '%s\t%Y' -- /proc/self/fd/3)
+fs=$(stat -f -L --printf '%T' -- /proc/self/fd/3)
+case "$fs:${{meta%%$'\t'*}}" in
+    proc:*|sysfs:*|*:0)
+        # 这些长度不是精确字节数；协议明确标作未知长度流。
+        printf 'Z\t0\t%s\n' "${{meta#*$'\t'}}"
+        cat <&3
+        ;;
+    *)
+        printf 'F\t%s\n' "$meta"
+        head -c "${{meta%%$'\t'*}}" <&3
+        ;;
+esac
+"#
+    )
+}
+
+/// 头与正文只按第一个换行切开，正文中的 NUL、换行和非 UTF-8 字节不参与解析。
+#[cfg(any(windows, test))]
+fn parse_read_whole(mut bytes: Vec<u8>) -> Result<FileRead, String> {
+    let end = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or("wsl read_whole: missing header")?;
+    let header =
+        std::str::from_utf8(&bytes[..end]).map_err(|_| "wsl read_whole: non-UTF-8 header")?;
+    let mut parts = header.split('\t');
+    let (Some(kind @ ("F" | "Z")), Some(size), Some(mtime), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("wsl read_whole: malformed header".into());
+    };
+    let size = size
+        .parse::<u64>()
+        .map_err(|_| "wsl read_whole: invalid size")?;
+    let mtime = mtime
+        .parse::<i64>()
+        .map_err(|_| "wsl read_whole: invalid mtime")?;
+    let got = bytes.len() - end - 1;
+    // Z 显式表示实际流长度未知（零长度或虚拟文件），协议声明必须归零。
+    if (kind == "Z" && size != 0) || (kind == "F" && got as u64 != size) {
+        return Err(format!(
+            "wsl read_whole: length mismatch: got {got} want {size} (truncated/rotated?)"
+        ));
+    }
+    bytes.drain(..=end);
+    Ok(FileRead { bytes, mtime })
 }
 
 /// 读发行版内绝对路径文件的字节区间 `[start, end)`（对应本地 `read_range`/`Seek`）。
@@ -1503,6 +1583,234 @@ mod tests {
         assert_eq!(batch[1], Ok(Vec::new()), "空目录");
         assert_eq!(batch[2], Ok(Vec::new()), "目录不在 = 问了、没有");
         assert_eq!(batch[3].as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn whole_read_script_escapes_paths_and_uses_open_descriptor() {
+        let script = read_whole_script("/a/$x`y\"z\\file");
+        assert!(script.contains(r#"p="/a/\$x\`y\"z\\file""#));
+        assert!(script.contains("exec 3<\"$p\""));
+        assert!(script.contains("-- /proc/self/fd/3"));
+        assert!(script.contains("<&3"));
+    }
+
+    #[test]
+    fn parse_whole_read_preserves_binary_and_empty_files() {
+        let payload = b"\0\n\xff\tF\t0\t1\n";
+        let mut wire = format!("F\t{}\t-1\n", payload.len()).into_bytes();
+        wire.extend_from_slice(payload);
+        assert_eq!(
+            parse_read_whole(wire),
+            Ok(FileRead {
+                bytes: payload.to_vec(),
+                mtime: -1
+            })
+        );
+        assert_eq!(
+            parse_read_whole(b"Z\t0\t0\n".to_vec()),
+            Ok(FileRead {
+                bytes: Vec::new(),
+                mtime: 0
+            })
+        );
+    }
+
+    #[test]
+    fn parse_whole_read_zero_stat_can_have_stream_content() {
+        assert_eq!(
+            parse_read_whole(b"Z\t0\t7\nproc content\0\xff".to_vec()),
+            Ok(FileRead {
+                bytes: b"proc content\0\xff".to_vec(),
+                mtime: 7
+            })
+        );
+        assert_eq!(parse_read_whole(b"F\t0\t7\n".to_vec()).unwrap().bytes, b"");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn read_whole_non_windows_is_unavailable() {
+        assert!(read_whole("dev", "/fixture", crate::deadline::Deadline::unbounded()).is_err());
+    }
+
+    #[test]
+    fn parse_whole_read_rejects_bad_metadata_and_length_mismatch() {
+        for wire in [
+            &b""[..],
+            b"F\t0\t1",
+            b"\xff\n",
+            b"M\t0\t1\n",
+            b"F\t0\t1\textra\n",
+            b"F\t-1\t1\n",
+            b"F\tx\t1\n",
+            b"F\t18446744073709551616\t1\n",
+            b"F\t0\tx\n",
+            b"F\t0\t9223372036854775808\n",
+            b"F\t2\t1\na",
+            b"F\t1\t1\nab",
+            b"F\t0\t1\na",
+            b"Z\t1\t1\na",
+        ] {
+            assert!(parse_read_whole(wire.to_vec()).is_err(), "wire={wire:?}");
+        }
+    }
+
+    /// 合成文件只建在本仓 target 下，经挂载路径只读，不碰发行版文件或真实来源。
+    #[test]
+    #[cfg(windows)]
+    fn read_whole_binary_large_missing_and_deadline_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let unbounded = crate::deadline::Deadline::unbounded;
+        let distro = list_distros(unbounded())
+            .unwrap()
+            .into_iter()
+            .find(|d| is_user_distro(d))
+            .expect("need a user distro");
+        // 只删原子创建的私有目录中自己记下的文件；remove_dir 只接受空目录。
+        struct Fixture {
+            dir: std::path::PathBuf,
+            files: Vec<std::path::PathBuf>,
+            removed: bool,
+        }
+        impl Fixture {
+            fn cleanup(&mut self) -> std::io::Result<()> {
+                while let Some(path) = self.files.last() {
+                    std::fs::remove_file(path)?;
+                    self.files.pop();
+                }
+                if !self.removed {
+                    std::fs::remove_dir(&self.dir)?;
+                    self.removed = true;
+                }
+                Ok(())
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if let Err(e) = self.cleanup() {
+                    eprintln!("whole-read fixture cleanup failed: {e}");
+                }
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dir = parent.join(format!("wsl-whole-it-{nanos}"));
+        std::fs::create_dir(&dir).unwrap();
+        let mut fixture = Fixture {
+            dir,
+            files: Vec::new(),
+            removed: false,
+        };
+        let win = fixture.dir.to_string_lossy();
+        let convert = format!("set -eu\nwslpath -a -u \"{}\"\n", shell_escape(&win));
+        let output = run_bash_stdin(&distro, &convert, unbounded()).unwrap();
+        assert!(
+            output.status.success(),
+            "wslpath failed: {:?}",
+            output.stderr
+        );
+        let mounted = String::from_utf8(output.stdout).unwrap();
+        let mounted = mounted.trim_end_matches(['\r', '\n']);
+        assert!(
+            mounted.starts_with('/'),
+            "wslpath must return an absolute path"
+        );
+        // 同一转换脚本必须接受发行版给出的自定义挂载布局，不能猜 /mnt/<盘>。
+        let custom = format!("wslpath() {{ printf '/custom/drives/project\\n'; }}\n{convert}");
+        let converted = run_bash_stdin(&distro, &custom, unbounded()).unwrap();
+        assert!(converted.status.success());
+        assert_eq!(converted.stdout, b"/custom/drives/project\n");
+        for size in [0, 256, READ_MANY_MAX_EACH as usize + 1] {
+            let name = format!("binary ' $; 中文-{size}.dat");
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            let local_path = fixture.dir.join(&name);
+            let mut file = std::fs::File::create_new(&local_path).unwrap();
+            fixture.files.push(local_path);
+            std::io::Write::write_all(&mut file, &bytes).unwrap();
+            drop(file);
+            let path = format!("{mounted}/{name}");
+            let before = spawn_count();
+            let read = read_whole(&distro, &path, unbounded()).unwrap().unwrap();
+            assert_eq!(spawn_count() - before, 1);
+            assert_eq!(read.bytes, bytes);
+            assert_eq!(
+                Some((size as u64, read.mtime)),
+                stat(&distro, &path, unbounded()).unwrap()
+            );
+        }
+        for path in [mounted.to_owned(), format!("{mounted}/missing")] {
+            let before = spawn_count();
+            assert_eq!(read_whole(&distro, &path, unbounded()), Ok(None));
+            assert_eq!(spawn_count() - before, 1);
+        }
+        let before = spawn_count();
+        assert!(read_whole(
+            &distro,
+            mounted,
+            crate::deadline::Deadline::after(std::time::Duration::ZERO)
+        )
+        .is_err());
+        assert_eq!(spawn_count(), before, "expired deadline must not spawn");
+
+        let before = spawn_count();
+        let virtual_file = read_whole(&distro, "/proc/version", unbounded())
+            .unwrap()
+            .unwrap();
+        assert_eq!(spawn_count() - before, 1);
+        assert!(
+            !virtual_file.bytes.is_empty(),
+            "procfs stat reports zero but has content"
+        );
+        assert_eq!(
+            virtual_file.bytes,
+            read_file_at(&distro, "/proc/version", unbounded())
+                .unwrap()
+                .unwrap()
+                .as_bytes()
+        );
+
+        // sysfs 会报告大于实际内容的非零长度，也必须保留原整件读取能力。
+        let path = "/sys/kernel/uevent_seqnum";
+        let declared = stat(&distro, path, unbounded()).unwrap().unwrap().0;
+        let before = spawn_count();
+        let virtual_file = read_whole(&distro, path, unbounded()).unwrap().unwrap();
+        assert_eq!(spawn_count() - before, 1);
+        assert!(!virtual_file.bytes.is_empty());
+        assert!((virtual_file.bytes.len() as u64) < declared);
+        assert!(virtual_file
+            .bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_whitespace()));
+
+        // 让真实脚本的正文读取失败：set -e 必须将失败传回，而不是只留下成功的头。
+        let script = format!(
+            "head() {{ return 2; }}\n{}",
+            read_whole_script(&format!("{mounted}/binary ' $; 中文-256.dat"))
+        );
+        let failed = run_bash_stdin(&distro, &script, unbounded()).unwrap();
+        assert!(!failed.status.success());
+        assert!(parse_read_whole(failed.stdout).is_err());
+
+        // 模拟检查后的路径替换：实际打开设备，不能当作零长度普通文件返回。
+        let script = format!(
+            "exec() {{ builtin exec 3</dev/null; }}\n{}",
+            read_whole_script(&format!("{mounted}/binary ' $; 中文-256.dat"))
+        );
+        let replaced = run_bash_stdin(&distro, &script, unbounded()).unwrap();
+        assert!(!replaced.status.success());
+        assert!(replaced.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&replaced.stderr).contains("no longer regular"));
+        fixture.cleanup().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&fixture.dir).unwrap_err().kind()
+                == std::io::ErrorKind::NotFound
+        );
     }
 
     /// 每条请求的路径都有答案：读到了 / 不是普通文件 / 超过上限 / 没读成（坏记录、输出里没有它）。
