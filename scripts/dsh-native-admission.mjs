@@ -88,7 +88,7 @@ export async function runNativeAdmission(loadInstallation, limits, args) {
     ]);
     toolkit = { format, session, codec: format.releasedV4SessionFormatCodec };
     // 版本已由 loadInstallation 核查；只输出 package 元数据，不输出安装路径。
-    installedVersion = installation.require(values["dsh-package"]).version;
+    installedVersion = installation.version;
   } catch {
     emit({ kind: "unavailable", reason: "native_runtime_unavailable" }, 1);
     return;

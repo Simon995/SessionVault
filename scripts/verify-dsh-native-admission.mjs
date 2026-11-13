@@ -18,10 +18,7 @@ import { isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
-import {
-  loadDshInstallation,
-  SUPPORTED_DSH_VERSION,
-} from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 import limits from "./dsh-snapshot-limits.json" with { type: "json" };
 
 const checks = {};
@@ -88,7 +85,7 @@ async function main() {
       ? posix.join(wslRun, relative(run, path).split(sep).join("/"))
       : path;
   };
-  const { load } = loadDshInstallation(values["dsh-package"]);
+  const { load, version: installedVersion } = loadDshInstallation(values["dsh-package"]);
   const format = await load("@deepseek-ai/dsh-session-format-v3-to-v4");
   const codec = format.releasedV4SessionFormatCodec;
   const artifact = JSON.parse(
@@ -117,13 +114,13 @@ async function main() {
     lifecycle_sha256: hash("fixture-lifecycle"),
     native_events_sha256: hash("fixture-events"),
     event_sha256s: artifact.events.map((event) => hash(JSON.stringify(event))),
-    dsh_version: SUPPORTED_DSH_VERSION,
+    dsh_version: installedVersion,
   };
   const hold = "await new Promise(() => setInterval(() => {}, 1000));";
   const drain = "for await (const chunk of process.stdin) { void chunk; }";
   const reply = (value, code = 0) =>
     `${drain}\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(value)}\n`)});\nprocess.exit(${code});`;
-  const makePackage = async (name, body, version = SUPPORTED_DSH_VERSION) => {
+  const makePackage = async (name, body, version = installedVersion) => {
     const root = join(run, name);
     await mkdir(root);
     const anchor = join(root, "package.json");
@@ -354,7 +351,7 @@ async function main() {
   console.log(
     JSON.stringify(
       {
-        version: SUPPORTED_DSH_VERSION,
+        version: installedVersion,
         node: process.version,
         rust_runtime: inWsl ? "wsl-linux" : process.platform,
         run: relative(repo, run),

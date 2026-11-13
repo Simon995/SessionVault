@@ -21,10 +21,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { constants, zstdCompressSync } from "node:zlib";
-import {
-  loadDshInstallation,
-  SUPPORTED_DSH_VERSION,
-} from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 import limits from "./dsh-snapshot-limits.json" with { type: "json" };
 import {
   bounded,
@@ -277,7 +274,7 @@ async function main() {
       anchor,
       JSON.stringify({
         name: "@deepseek-ai/dsh",
-        version: SUPPORTED_DSH_VERSION,
+        version: installation.version,
       }),
       { flag: "wx" },
     );
@@ -920,7 +917,7 @@ async function main() {
     `${JSON.stringify(
       {
         status: "ok",
-        dsh_version: SUPPORTED_DSH_VERSION,
+        dsh_version: installation.version,
         host_node_version: process.version,
         execution_target: inWsl ? "wsl_linux" : process.platform,
         checks_passed: Object.keys(checks).length,

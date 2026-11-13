@@ -17,10 +17,7 @@ import { isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { constants, zstdCompressSync, zstdDecompressSync } from "node:zlib";
-import {
-  loadDshInstallation,
-  SUPPORTED_DSH_VERSION,
-} from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 import {
   decodeDshV4Jsonl,
   nativeLifecycleHash,
@@ -90,7 +87,7 @@ async function main() {
     const executable = await lstat(reader);
     assert(executable.isFile() && !executable.isSymbolicLink());
   }
-  const { load } = loadDshInstallation(values["dsh-package"]);
+  const { load, version } = loadDshInstallation(values["dsh-package"]);
   const format = await load("@deepseek-ai/dsh-session-format-v3-to-v4");
   const session = await load("@deepseek-ai/dsh-session");
   const codec = format.releasedV4SessionFormatCodec;
@@ -522,7 +519,7 @@ async function main() {
           inherited_event_count: admitted.inheritedEventCount,
           lifecycle_sha256: nativeLifecycleHash(admitted, codec),
           native_events_sha256: digest(JSON.stringify(admitted.events)),
-          dsh_version: SUPPORTED_DSH_VERSION,
+          dsh_version: version,
         });
       }
     } else {
@@ -592,7 +589,7 @@ async function main() {
   console.log(
     JSON.stringify(
       {
-        version: SUPPORTED_DSH_VERSION,
+        version,
         node: process.version,
         rust_runtime: inWsl ? "wsl-linux" : process.platform,
         zstandard: audited.zstandard_version,

@@ -5,7 +5,7 @@
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
+import { createProtectedRun } from "../tests/fixtures/dsh-v4/io-harness.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { constants, zstdCompressSync } from "node:zlib";
@@ -15,7 +15,7 @@ import {
   withCompactionAndSubagentCatalog,
   withRetry,
 } from "../tests/fixtures/dsh-v4/scenarios.mjs";
-import { loadDshInstallation, SUPPORTED_DSH_VERSION } from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -41,20 +41,6 @@ function parseArgs(argv) {
 function defaultBinaryPath() {
   const exe = process.platform === "win32" ? "dsh_snapshot.exe" : "dsh_snapshot";
   return path.join(repoRoot, "target", "debug", "examples", exe);
-}
-
-function runSnapshotCli(binary, args) {
-  const res = spawnSync(binary, args, {
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: 30_000,
-  });
-  if (res.error) {
-    throw res.error;
-  }
-  const stdout = (res.stdout || "").trim();
-  const parsed = stdout ? JSON.parse(stdout.split(/\r?\n/)[0]) : null;
-  return { status: res.status, stdout, stderr: res.stderr, json: parsed };
 }
 
 function headerRecord(header) {
@@ -181,10 +167,31 @@ async function main() {
     throw new Error(`dsh_snapshot binary not found at ${binary}; build with --features store,dsh-experimental first`);
   }
 
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sv-dsh-norm-store-"));
+  const tmpRoot = createProtectedRun(repoRoot, "dsh-norm-store-");
+  const statusPath = path.join(tmpRoot, "status.json");
+  const status = { status: "running", dsh_version: installation.version, binary, checks: [] };
+  const saveStatus = () => fs.writeFileSync(statusPath, JSON.stringify(status, null, 2));
+  saveStatus();
+  console.error(JSON.stringify({ run: path.relative(repoRoot, tmpRoot) }));
+  let invocation = 0;
+  const runSnapshotCli = (binary, args) => {
+    const result = spawnSync(binary, args, {
+      encoding: "utf8", windowsHide: true, timeout: 30_000,
+    });
+    const stem = path.join(tmpRoot, `invocation-${++invocation}`);
+    fs.writeFileSync(`${stem}.stdout.log`, result.stdout ?? "", { flag: "wx" });
+    fs.writeFileSync(`${stem}.stderr.log`, result.stderr ?? "", { flag: "wx" });
+    fs.writeFileSync(`${stem}.json`, JSON.stringify({ args, rc: result.status, signal: result.signal, error: result.error?.code }, null, 2), { flag: "wx" });
+    if (result.error) throw result.error;
+    const stdout = (result.stdout || "").trim();
+    const parsed = stdout ? JSON.parse(stdout.split(/\r?\n/)[0]) : null;
+    return { status: result.status, stdout, stderr: result.stderr, json: parsed };
+  };
   const checks = [];
   const check = (name, cond, detail = {}) => {
     checks.push({ name, ok: Boolean(cond), detail });
+    status.checks = checks;
+    saveStatus();
     if (!cond) {
       throw new Error(`Check failed: ${name} -> ${JSON.stringify(detail)}`);
     }
@@ -856,13 +863,21 @@ async function main() {
       JSON.stringify({
         ok: true,
         platform: process.platform,
-        dsh_version: SUPPORTED_DSH_VERSION,
+        dsh_version: installation.version,
+        run: path.relative(repoRoot, tmpRoot),
         total_checks: checks.length,
         passed_checks: checks.filter((c) => c.ok).length,
       }),
     );
+    status.status = "passed";
+    status.rc = 0;
+  } catch (error) {
+    status.status = error.code === "ETIMEDOUT" ? "timed_out" : "failed";
+    status.rc = 1;
+    status.error = { code: error.code, message: error.message };
+    throw error;
   } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    saveStatus();
   }
 }
 

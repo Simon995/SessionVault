@@ -14,10 +14,7 @@ import {
   seedWithTurn,
   withRetry,
 } from "../tests/fixtures/dsh-v4/scenarios.mjs";
-import {
-  loadDshInstallation,
-  SUPPORTED_DSH_VERSION as VERSION,
-} from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 const FIXTURE = new URL(
   "../tests/fixtures/dsh-v4/complete-turn.json",
   import.meta.url,
@@ -114,7 +111,7 @@ async function main() {
     options: { "dsh-package": { type: "string" } },
   });
   assert(values["dsh-package"]);
-  const { require: req, load } = loadDshInstallation(values["dsh-package"]);
+  const { require: req, load, version } = loadDshInstallation(values["dsh-package"]);
   const format = await load("@deepseek-ai/dsh-session-format-v3-to-v4");
   const session = await load("@deepseek-ai/dsh-session");
   const llm = await load("@deepseek-ai/dsh-llm/assistant-stream");
@@ -644,7 +641,7 @@ async function main() {
   console.log(
     JSON.stringify(
       {
-        version: VERSION,
+        version,
         scope: "synthetic_fixture_and_offline_folds",
         fixture: "complete-turn",
         events: artifact.events.length,

@@ -1,9 +1,10 @@
 /** 仅用于合成核验：跨进程回执、公开 I/O 屏障与有界等待。 */
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { fork, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+import { lstatSync, mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 const DEADLINE_MS = 15_000;
 
@@ -16,6 +17,82 @@ export function inside(root, path) {
       !rel.startsWith("../") &&
       !rel.startsWith("..\\"),
   );
+}
+
+/** 仅复用父 target；每次创建独占新目录，拒绝链接且永不自动清理。 */
+export function createProtectedRun(repo, prefix) {
+  assert(/^[a-z0-9-]+-$/.test(prefix));
+  const root = realpathSync(repo);
+  const target = join(root, "target");
+  try {
+    mkdirSync(target);
+  } catch (error) {
+    assert.equal(error.code, "EEXIST");
+  }
+  const info = lstatSync(target);
+  assert(info.isDirectory() && !info.isSymbolicLink());
+  assert.equal(realpathSync(target), target);
+  inside(root, realpathSync(target));
+  const run = mkdtempSync(join(target, prefix));
+  const created = lstatSync(run);
+  assert(created.isDirectory() && !created.isSymbolicLink());
+  assert.equal(realpathSync(run), run);
+  inside(target, realpathSync(run));
+  return run;
+}
+
+/** 超时时先终止进程树，再等待直接子进程退出；适用于输出直接写入文件的核验命令。 */
+export async function runLoggedCommand(command, args, {
+  timeout,
+  cleanupTimeout = 10_000,
+  ...options
+}) {
+  const child = spawn(command, args, {
+    ...options,
+    detached: process.platform !== "win32",
+    windowsHide: true,
+  });
+  let failure;
+  child.on("error", (error) => { failure = error; });
+  const exited = new Promise((accept) => {
+    child.once("close", (status, signal) => accept({ status, signal }));
+  });
+  const expired = Symbol("expired");
+  let timer;
+  const wait = (deadline) => new Promise((accept) => {
+    timer = setTimeout(() => accept(expired), deadline);
+  });
+  try {
+    const first = await Promise.race([exited, wait(timeout)]);
+    clearTimeout(timer);
+    if (first !== expired) return { ...first, error: failure };
+
+    let treeStopped = false;
+    if (child.pid && process.platform === "win32") {
+      // 必须在父进程仍存活时按 PID 找树，不能先 child.kill()。
+      const killed = spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+        stdio: "ignore", windowsHide: true, timeout: cleanupTimeout,
+      });
+      treeStopped = !killed.error && killed.status === 0;
+    } else if (child.pid) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+        treeStopped = true;
+      } catch (error) {
+        treeStopped = error.code === "ESRCH";
+      }
+    }
+    const last = await Promise.race([exited, wait(cleanupTimeout)]);
+    if (last === expired) child.unref();
+    return {
+      status: last === expired ? null : last.status,
+      signal: last === expired ? null : last.signal,
+      error: Object.assign(new Error("command timed out"), { code: "ETIMEDOUT" }),
+      cleanup_confirmed: treeStopped && last !== expired,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function bounded(promise) {

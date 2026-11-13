@@ -78,6 +78,8 @@
 
 职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2；核查和设计分别见 [dsh-ingest-survey.md](dsh-ingest-survey.md)、[dsh-read-state-design.md](dsh-read-state-design.md)。宿主摄取独立于 Worker 选型，子 CLI 接缝随所选后端验收。
 
+`0.2.2-rc.2` 候选来源接线与 Windows 合成验证已完成审查修复，见 [隔离验证记录](dsh-rc2-source-qualification.md)；尚未发布或安装。Linux 完整矩阵、旧 SDK 完整回归与 normalize-store 超时注入仍未验，生产 Worker 的 pending dispose 阻断另验，不因来源验证通过而解除。
+
 1. ~~临时属性、真实来源与血缘输入契约~~ ✅ `a151997` / `ccfbdca`，已发布。`temporary` 与 `read_memory` 正交，未决或冲突冻结，未绑定历史会话不伪装为可信人类输入。
 2. ~~临时会话双层排除及连续性补修~~ ✅ `a151997` / `2e60192` / `42da63e` / `7441ee6`，已随 `v2026.11.11.1` 发布。调用方须保存完整游标、显式传有效绑定快照，并使用受控提交和完整目标 API；状态 / 空批 / ack 义务只在 [扫描状态模型](scan-state-model.md#控制面过滤与游标连续性2026-11-10) 维护。
 3. ~~真实发送方和 peer 来源保真~~ ✅ `a151997`，已发布；`role=user` 不能证明真人授权，同侪信封和压缩摘要不升格。

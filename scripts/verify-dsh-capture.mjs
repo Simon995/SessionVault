@@ -11,10 +11,7 @@ import { parseArgs } from "node:util";
 import { constants, zstdCompressSync } from "node:zlib";
 import { createDshSnapshotReader } from "./dsh-snapshot-reader.mjs";
 import { decodeDshV4Jsonl } from "./dsh-native-admission.mjs";
-import {
-  loadDshInstallation,
-  SUPPORTED_DSH_VERSION,
-} from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 import limits from "./dsh-snapshot-limits.json" with { type: "json" };
 import {
   bounded,
@@ -40,7 +37,7 @@ async function main() {
   });
   const packagePath = values["dsh-package"];
   assert(packagePath);
-  const { load } = loadDshInstallation(packagePath);
+  const { load, version } = loadDshInstallation(packagePath);
   const { Context } = await load("@deepseek-ai/cordis");
   const backend = await load("@deepseek-ai/dsh-session-persistence-jsonl");
   const [format, session] = await Promise.all([
@@ -695,7 +692,7 @@ async function main() {
   console.log(
     JSON.stringify(
       {
-        version: SUPPORTED_DSH_VERSION,
+        version,
         node: process.version,
         run: relative(repo, run),
         checks: counts,

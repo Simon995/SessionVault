@@ -10,10 +10,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, lstatSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import {
-  loadDshInstallation,
-  SUPPORTED_DSH_VERSION as VERSION,
-} from "./dsh-installed.mjs";
+import { loadDshInstallation } from "./dsh-installed.mjs";
 const BACKEND = "@deepseek-ai/dsh-session-persistence-jsonl";
 const BACKEND_ID = "session-persistence-jsonl";
 const HOME_SESSIONS = /^dshHomePath\(\s*(['"])sessions\1\s*\)$/;
@@ -174,11 +171,11 @@ async function main() {
     },
   });
   assert(values["dsh-package"]);
-  const { anchor, load } = loadDshInstallation(values["dsh-package"]);
+  const { anchor, load, version } = loadDshInstallation(values["dsh-package"]);
   const api = await load("@deepseek-ai/dsh-app-boot");
   selfTest(api.composeEntries);
   if (values["self-test"]) {
-    console.log(JSON.stringify({ version: VERSION, self_test: "passed" }));
+    console.log(JSON.stringify({ version, self_test: "passed" }));
     return;
   }
   assert(values.home);
@@ -299,7 +296,7 @@ async function main() {
   console.log(
     JSON.stringify(
       {
-        version: VERSION,
+        version,
         scope: "static_profile_composition",
         expression_evaluation: "not_performed",
         live_launch_environment: "not_observed",
