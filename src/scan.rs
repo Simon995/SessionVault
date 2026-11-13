@@ -303,18 +303,38 @@ impl StatPrefetch {
         if w.fetched_batches.insert(i) {
             let (batch_distro, paths) = w.batches[i].clone();
             let deadline = w.deadline?;
+            let started = std::time::Instant::now();
             match crate::wsl::read_many(&batch_distro, &paths, deadline) {
                 Ok(answers) => {
+                    let mut fetched = 0;
+                    let mut absent = 0;
+                    let mut failed = 0;
+                    let unanswered = paths
+                        .iter()
+                        .filter(|path| !answers.contains_key(*path))
+                        .count();
+                    let mut bytes = 0;
                     for (path, answer) in answers {
-                        if let Ok(Some(read)) = answer {
-                            w.contents.insert((batch_distro.clone(), path), read);
+                        match answer {
+                            Ok(Some(read)) => {
+                                fetched += 1;
+                                bytes += read.bytes.len();
+                                w.contents.insert((batch_distro.clone(), path), read);
+                            }
+                            Ok(None) => absent += 1,
+                            Err(_) => failed += 1,
                         }
                     }
+                    log::debug!(
+                        target: tag::WSL,
+                        "whole batch: requested={} fetched={fetched} absent={absent} failed={failed} unanswered={unanswered} bytes={bytes} elapsed_ms={:.3} result=ok",
+                        paths.len(), started.elapsed().as_secs_f64() * 1000.0
+                    );
                 }
                 Err(e) => log::warn!(
                     target: tag::WSL,
-                    "batch read failed for {batch_distro} ({} sources fall back to one wsl.exe each): {e}",
-                    paths.len()
+                    "batch read failed for {batch_distro} ({} sources fall back to one wsl.exe each): {e}; elapsed_ms={:.3}",
+                    paths.len(), started.elapsed().as_secs_f64() * 1000.0
                 ),
             }
         }
@@ -846,6 +866,25 @@ impl WslSource<'_> {
     /// 再读）。否则整份读回来（预取规划的批，或单独一到两次 `wsl.exe`），在本机算；读到的与预取到的
     /// 身份对得上才记进缓存。预取确认两种形态都不在 ⇒ 直接报不在，不再起进程。
     fn stat_compressed(&self) -> Result<(u64, Option<i64>), String> {
+        let started = std::time::Instant::now();
+        // Only compute the anonymous identifier when the caller enables diagnostics.
+        let source_id = log::log_enabled!(target: tag::SCAN, log::Level::Debug).then(|| {
+            use sha2::{Digest, Sha256};
+            format!(
+                "{:x}",
+                Sha256::digest(format!("{}\0{}", self.distro, self.abs))
+            )[..12]
+                .to_string()
+        });
+        let call_id = source_id
+            .as_ref()
+            .map(|_| {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
+                NEXT_CALL.fetch_add(1, Ordering::Relaxed)
+            })
+            .unwrap_or(0);
+        let source_id = source_id.as_deref().unwrap_or("");
         let zst = self.zst();
         let missing = || {
             format!(
@@ -854,7 +893,12 @@ impl WslSource<'_> {
             )
         };
         let id = match self.prefetched_compressed {
-            Some(Ok(None)) => return Err(missing()),
+            Some(Ok(None)) => {
+                log::debug!(target: tag::SCAN,
+                    "compressed length: source={source_id} compressed_call={call_id} result=absent elapsed_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0);
+                return Err(missing());
+            }
             Some(Ok(Some(id))) => Some(*id),
             Some(Err(_)) | None => None,
         };
@@ -863,17 +907,36 @@ impl WslSource<'_> {
             if let Some(len) = cached_compressed_len(&key, id) {
                 self.stored.set(Stored::Compressed);
                 self.identity.set(Some(id));
+                log::debug!(target: tag::SCAN,
+                    "compressed length: source={source_id} compressed_call={call_id} result=cache_hit logical_bytes={len} elapsed_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0);
                 return Ok((len, Some(id.mtime)));
             }
         }
-        let read = match self.whole.take_whole(self.distro, &zst) {
-            Some(read) => read,
-            None => crate::wsl::read_whole(self.distro, &zst, self.deadline)
-                .map_err(|e| format!("{}:{zst}: {e}", self.distro))?
-                .ok_or_else(missing)?,
+        log::debug!(target: tag::SCAN,
+            "compressed length: source={source_id} compressed_call={call_id} cache=not_reused identity_available={}", id.is_some());
+        let read_started = std::time::Instant::now();
+        let (read, mode) = match self.whole.take_whole(self.distro, &zst) {
+            Some(read) => (Ok(Some(read)), "batch"),
+            None => (
+                crate::wsl::read_whole(self.distro, &zst, self.deadline),
+                "single",
+            ),
         };
-        let len = crate::compressed::decoded_len(&mut std::io::Cursor::new(&read.bytes))
-            .map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
+        log::debug!(target: tag::SCAN,
+            "compressed read: source={source_id} compressed_call={call_id} mode={mode} result={} read_ms={:.3}",
+            match &read { Ok(Some(_)) => "found", Ok(None) => "absent", Err(_) => "unknown" },
+            read_started.elapsed().as_secs_f64() * 1000.0);
+        let read = read
+            .map_err(|e| format!("{}:{zst}: {e}", self.distro))?
+            .ok_or_else(missing)?;
+        let decode_started = std::time::Instant::now();
+        let len = crate::compressed::decoded_len(&mut std::io::Cursor::new(&read.bytes));
+        log::debug!(target: tag::SCAN,
+            "compressed decode: source={source_id} compressed_call={call_id} compressed_bytes={} logical_bytes={:?} result={} decode_ms={:.3} elapsed_through_decode_ms={:.3}",
+            read.bytes.len(), len.as_ref().ok(), if len.is_ok() { "ok" } else { "error" },
+            decode_started.elapsed().as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0);
+        let len = len.map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
         if let Some(id) =
             id.filter(|id| id.size == read.bytes.len() as u64 && id.mtime == read.mtime)
         {

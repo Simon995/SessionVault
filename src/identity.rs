@@ -480,6 +480,118 @@ fn wsl_repo_id_with(
     backend: &dyn ProbeBackend,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
+    if !log::log_enabled!(target: crate::logging::tag::WSL, log::Level::Debug) {
+        return wsl_repo_id_impl(linux_path, original_root, backend, deadline);
+    }
+
+    let started = std::time::Instant::now();
+    let observed = WslIdentityProbe::new(backend, original_root);
+    // 在完整判决外收拢结果，内部所有早退（包括补探起点失败）都经过摘要。
+    let result = wsl_repo_id_impl(linux_path, original_root, &observed, deadline);
+    let total = started.elapsed();
+    let (outcome, repo_root, checkout_missing) = match &result {
+        Ok(identity) => (
+            if identity.id.starts_with("git:") {
+                "git_identity"
+            } else {
+                "path_identity"
+            },
+            if identity.repo_root.is_some() {
+                "some"
+            } else {
+                "none"
+            },
+            if identity.checkout_missing {
+                "true"
+            } else {
+                "false"
+            },
+        ),
+        Err(_) => ("unknown", "unknown", "unknown"),
+    };
+    let (probe_calls, probe_elapsed) = observed.probes.get();
+    let (read_text_calls, read_text_elapsed) = observed.reads.get();
+    log::debug!(target: crate::logging::tag::WSL,
+        "identity completed: root_sha256={} identity_call={} result={} repo_root={} checkout_missing={} probe_calls={} read_text_calls={} total_inclusive_us={} probe_nested_us={} read_text_nested_us={}",
+        observed.root_id, observed.call_id, outcome, repo_root, checkout_missing,
+        probe_calls, read_text_calls, total.as_micros(),
+        probe_elapsed.as_micros(), read_text_elapsed.as_micros(),
+    );
+    result
+}
+
+/// 仅观察 WSL 身份判决使用的后端调用；不猜路径角色，也不格式化错误或正文。
+/// 两类 nested 时间都包含在入口 total_inclusive 中，不应与总时长相加。
+/// 这是 trait 调用次数，不是桥进程数（后端可在内部拒绝已耗尽的预算）。
+struct WslIdentityProbe<'a> {
+    backend: &'a dyn ProbeBackend,
+    root_id: String,
+    call_id: u64,
+    probes: std::cell::Cell<(usize, std::time::Duration)>,
+    reads: std::cell::Cell<(usize, std::time::Duration)>,
+}
+
+impl<'a> WslIdentityProbe<'a> {
+    fn new(backend: &'a dyn ProbeBackend, root: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
+        Self {
+            backend,
+            root_id: format!("{:x}", Sha256::digest(root.as_bytes()))[..12].to_string(),
+            call_id: NEXT_CALL.fetch_add(1, Ordering::Relaxed),
+            probes: std::cell::Cell::new((0, std::time::Duration::ZERO)),
+            reads: std::cell::Cell::new((0, std::time::Duration::ZERO)),
+        }
+    }
+}
+
+impl ProbeBackend for WslIdentityProbe<'_> {
+    fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind> {
+        let started = std::time::Instant::now();
+        let result = self.backend.probe(path, deadline);
+        let elapsed = started.elapsed();
+        let (calls, total) = self.probes.get();
+        self.probes.set((calls + 1, total + elapsed));
+        let outcome = match &result {
+            Probed::Found(FileKind::Dir) => "found_dir",
+            Probed::Found(FileKind::File) => "found_file",
+            Probed::Found(FileKind::Other) => "found_other",
+            Probed::Absent => "absent",
+            Probed::Unknown(_) => "unknown",
+        };
+        log::debug!(target: crate::logging::tag::WSL,
+            "identity operation completed: root_sha256={} identity_call={} operation=probe operation_call={} result={} nested_in=identity_total elapsed_us={}",
+            self.root_id, self.call_id, calls + 1, outcome, elapsed.as_micros(),
+        );
+        result
+    }
+
+    fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String> {
+        let started = std::time::Instant::now();
+        let result = self.backend.read_text(path, deadline);
+        let elapsed = started.elapsed();
+        let (calls, total) = self.reads.get();
+        self.reads.set((calls + 1, total + elapsed));
+        let outcome = match &result {
+            Probed::Found(_) => "found",
+            Probed::Absent => "absent",
+            Probed::Unknown(_) => "unknown",
+        };
+        log::debug!(target: crate::logging::tag::WSL,
+            "identity operation completed: root_sha256={} identity_call={} operation=read_text operation_call={} result={} nested_in=identity_total elapsed_us={}",
+            self.root_id, self.call_id, calls + 1, outcome, elapsed.as_micros(),
+        );
+        result
+    }
+}
+
+fn wsl_repo_id_impl(
+    linux_path: &str,
+    original_root: &str,
+    backend: &dyn ProbeBackend,
+    deadline: Deadline,
+) -> Result<RepoIdentity, crate::probe::ProbeError> {
     let base = linux_path.trim_end_matches('/');
     let root = Path::new(base);
 
@@ -865,7 +977,10 @@ mod tests {
         // 站在访问桥的位置：路径 → (类型, 内容)。
         // ⚠️ 查表前归一分隔符 —— 调用方用 `Path::join`，它在 Windows 上产出 `\`，
         // 而真实的 `WslBackend::to_linux` 也正是在这一步把它换回 `/`。
-        struct FakeDistro(std::collections::HashMap<String, (FileKind, Option<String>)>);
+        struct FakeDistro(
+            std::collections::HashMap<String, (FileKind, Option<String>)>,
+            std::cell::RefCell<Vec<(&'static str, PathBuf, Deadline)>>,
+        );
         impl FakeDistro {
             /// 归一分隔符 **并解 `..`** —— 真实的 FS 与发行版都在 OS 层做这两件事
             /// （`commondir` 几乎总是 `../..`）。不做的话这个替身就不忠实，
@@ -886,13 +1001,15 @@ mod tests {
             }
         }
         impl ProbeBackend for FakeDistro {
-            fn probe(&self, p: &Path, _d: Deadline) -> Probed<FileKind> {
+            fn probe(&self, p: &Path, d: Deadline) -> Probed<FileKind> {
+                self.1.borrow_mut().push(("probe", p.to_path_buf(), d));
                 match self.0.get(&Self::key(p)) {
                     Some((k, _)) => Probed::Found(*k),
                     None => Probed::Absent,
                 }
             }
-            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+            fn read_text(&self, p: &Path, d: Deadline) -> Probed<String> {
+                self.1.borrow_mut().push(("read_text", p.to_path_buf(), d));
                 match self.0.get(&Self::key(p)) {
                     Some((_, Some(t))) => Probed::Found(t.clone()),
                     // 存在但不是可读文本（目录）—— 与真实桥一致：不是「没有」。
@@ -928,13 +1045,26 @@ mod tests {
             ),
         );
 
-        let got = wsl_repo_id_with(
-            "/home/u/repo/.claude/worktrees/wt",
-            "wsl:D:/home/u/repo/.claude/worktrees/wt",
-            &FakeDistro(fs),
-            Deadline::unbounded(),
-        )
-        .expect("布局完整时不该报「没问成」");
+        let fixture = FakeDistro(fs, Default::default());
+        let deadline = Deadline::unbounded();
+        let linux_root = "/home/u/repo/.claude/worktrees/wt";
+        let original_root = "wsl:D:/home/u/repo/.claude/worktrees/wt";
+        let got = wsl_repo_id_with(linux_root, original_root, &fixture, deadline)
+            .expect("布局完整时不该报「没问成」");
+        let dot_git = Path::new(linux_root).join(".git");
+        let gitdir = Path::new("/home/u/repo/.git/worktrees/wt");
+        let commondir = gitdir.join("commondir");
+        let config = gitdir.join("../..").join("config");
+        let expected = [
+            ("probe", dot_git.clone()),
+            ("read_text", dot_git),
+            ("probe", commondir.clone()),
+            ("read_text", commondir),
+            ("probe", config.clone()),
+            ("read_text", config),
+        ]
+        .map(|(op, path)| (op, path, deadline));
+        assert_eq!(*fixture.1.borrow(), expected);
 
         assert_eq!(
             got.id, "git:example.com/o/r",
@@ -944,6 +1074,37 @@ mod tests {
             got.repo_root.is_some(),
             "`.git` 确实在这一层 —— 「有没有身份」和「根在哪」是两件事"
         );
+
+        // 不安装全局 logger：直接套生产 wrapper，核对成功、读取失败和早退。
+        // 比对完整结果（包括原始 ProbeError）、操作次序、路径和同一个 deadline。
+        for case in ["complete", "unreadable", "missing"] {
+            let mut fs = fixture.0.clone();
+            match case {
+                "unreadable" => fs.get_mut("/home/u/repo/.git/config").unwrap().1 = None,
+                "missing" => fs.clear(),
+                _ => {}
+            }
+            let fixture = FakeDistro(fs, Default::default());
+            let plain = wsl_repo_id_impl(linux_root, original_root, &fixture, deadline);
+            match case {
+                "unreadable" => assert!(plain.is_err()),
+                "missing" => assert!(plain.as_ref().unwrap().checkout_missing),
+                _ => assert_eq!(plain.as_ref().unwrap(), &got),
+            }
+            let calls = fixture.1.take();
+            let observed = WslIdentityProbe::new(&fixture, original_root);
+            let measured = wsl_repo_id_impl(linux_root, original_root, &observed, deadline);
+            assert_eq!(measured, plain, "{case}: 诊断不得改变身份或错误");
+            assert_eq!(*fixture.1.borrow(), calls, "{case}: 诊断不得改变调用形状");
+            assert_eq!(
+                observed.probes.get().0,
+                calls.iter().filter(|(op, _, _)| *op == "probe").count(),
+            );
+            assert_eq!(
+                observed.reads.get().0,
+                calls.iter().filter(|(op, _, _)| *op == "read_text").count(),
+            );
+        }
     }
 
     /// 反向：本机路径**不能**被误判成 WSL 规范形而走桥。

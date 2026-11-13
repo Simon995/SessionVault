@@ -1,6 +1,6 @@
 # 刷新性能：测量边界与已验证结论
 
-查证日期：2026-11-12。源码、可复跑工具和本仓实验是本文依据；消费方的安装身份、生产轮次与内部账本由消费方维护。当前任务顺序只维护在 [backlog.md](backlog.md)，本文不另开待办队列。
+查证日期：2026-11-13。源码、可复跑工具和本仓实验是本文依据；消费方的安装身份、生产轮次与内部账本由消费方维护。当前任务顺序只维护在 [backlog.md](backlog.md)，本文不另开待办队列。
 
 ## 结论与根因
 
@@ -63,3 +63,54 @@ uv run python scripts/measure-wsl-whole-read.py --help
 截至本次整理，单桥优化已在上游 main 推送，公开 API、schema 与来源值域均未改变；正式独立 CLI 仍为 `v2026.11.11.1`（`b9339c3`）。消费方部署与自然轮验收单独记录。自然样本存在积压、预算及读取失败差异，尚不能给出固定的整轮因果提速百分比，也不能把首个成功轮当作整个验收窗口通过。
 
 本次另核既有 `read_range`、`run_bash_stdin` 和 `wait_with_deadline` 与单桥优化前源码逐函数一致。`read_range` 的 `exited Some(-1)` 是直接输出子进程状态码，不是本模块把超时映射成 -1；本模块等待超时会单独返回 `wsl.exe timed out after ...`。这只定位到非零进程退出，底层失败原因仍未核；“该函数没改”也不能排除共享资源等间接影响。后续先收失败调用的阶段、耗时、退出及重试恢复证据，不以猜测调大 timeout 或跳过确认。
+
+## 调用级诊断与合成 EOF 复核
+
+源码诊断使用既有 `log` facade，默认不输出 debug 日志。CLI 可用 `SVAULT_LOG=sv-scan=debug,sv-wsl=debug`；库形态由宿主设置同名 target 的过滤。新诊断随库消费者重新构建交付，不能把源码能力当成旧安装已经具备。
+
+- `sv-scan` 的 `compressed length/read/decode` 分开记录长度缓存命中、未复用、压缩件读取和本机解压；只记录匿名来源短哈希、大小与进程内 `compressed_call` 调用号；同一来源并发调用按调用号关联。`cache=not_reused` 不细分无缓存、身份变化和缓存锁不可用，`identity_available=false` 也不能解释成文件缺席。`read_ms` 包含 `take_whole` 的锁等待和可能的整批读取，不是纯传输耗时；从批内直接取回已读内容时可能很短。`elapsed_through_decode_ms` 包含读取及解码，不能与 `decode_ms` 相加。
+- `sv-wsl` 的 `whole batch` 输出整批 requested / fetched / absent / failed / unanswered / bytes / elapsed。`result=ok` 只指整批协议调用返回成功，须另看 fetched 是否齐全；absent 是确认缺席、failed 是逐条失败、unanswered 是协议未返回该路径，未取回的来源仍走原有回退。批时间与触发它的来源 `read_ms` 重叠，不能逐来源求和后再加整批。
+- `sv-wsl` 的 `identity operation completed` 与 `identity completed` 记录每根后端 probe / read_text 的调用形状、结果与耗时；根只以 SHA256 短标识关联，不输出配置、remote 或原始根。后端调用次数不等于进程创建尝试。`probe_nested_us` / `read_text_nested_us` 属于 `total_inclusive_us`，诊断输出开销也可能进入总时长；该入口不含上游注册表查询、锁等待和持久化写入。短哈希仅供诊断，不是项目身份。
+
+静态调用链上，WSL 普通 `.git` 目录的可读 config 路径需两次 probe 与一次 read_text（源码推导，未核实机逐根次数）；worktree / submodule 随指针和 commondir 增加操作，缺席或未知会早退。该路径不经过 `read_whole`。每个可写库句柄的身份 seen 从空开始，已存身份不替代新句柄的首次磁盘核验；不能用预填 seen 隐藏 remote 变化。具体判决仍以 `identity.rs` 与 `store.rs` 实现为准。
+
+合成复核入口为 [`measure_wsl_compressed_cache`](../examples/measure_wsl_compressed_cache.rs) 与 [`measure-wsl-compressed-cache.py`](../scripts/measure-wsl-compressed-cache.py)：新进程扫描两种大小的随机合成 `.zst`，游标预置于 EOF，连续三轮验证 `bytes_read=0`、零事件、逻辑长度与游标不变，同时要求首次解压、后两轮命中，以及批读 / 单件两条路径都被覆盖。使用显式空绑定和空项目注册表，不加载真实控制面、索引或总库；合成内容无需具备会话语义，实验不验证 parser。
+
+先在独立 target 构建 release example，再执行脚本：
+
+```bash
+CARGO_TARGET_DIR=target/refresh-cost-trace cargo build --release --example measure_wsl_compressed_cache
+uv run --with zstandard python scripts/measure-wsl-compressed-cache.py --help
+```
+
+必须显式传入二进制、发行版与本 checkout Git `agent-logs` 下尚不存在的夹具目录。脚本经真实 `wslpath` 转换，仅在 Windows 创建合成文件，不写发行版文件系统；日志、逐轮数据与夹具保留。example 同样要求 `--fixture-dir`，拒绝越界、目录链接、非普通压缩件及原文件已存在的夹具，并独立核对 Linux 路径对应的宿主夹具；路径核对发生在逐轮计时与 spawn 计数之前。驱动保存子进程超时的已有输出与失败状态，按逐轮 begin/end 标记断言首轮冷解压、后续每轮命中，不能只数整段日志。三轮是机制验证，未清 OS 缓存，也没有足够重复次数估计稳定性能分布，不能当作生产收益 A/B。
+
+以下为 2026-11-12 审查修复前的实跑记录；当时没有逐轮诊断标记，本次核对保留的 report 与 stderr，审查后的独立复核另列于后文，不替换历史样本：Windows 挂载文件系统、隔离 release 构建、`zstandard 0.25.0` 生成不声明帧内容长度的随机合成数据，每个大小独立新进程，进程内连续三轮。全部六轮保持 EOF、零事件且 `bytes_read=0`；每组首次未复用缓存、实际读取并解压，后两轮均命中。表中预取、scan 与内部读 / 解压分开列出，内层不能与 scan 相加。
+
+| 逻辑大小 / 冷读形态 | 首轮 prefetch | 首轮 read | 首轮 decode | 首轮 scan | 后两轮 scan | 各轮创建尝试 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 4 MiB / batch | 671.917 ms | 2338.756 ms | 2.759 ms | 2341.984 ms | 0.093 / 0.062 ms | 3 / 2 / 2 |
+| 12 MiB / single | 658.149 ms | 442.227 ms | 5.951 ms | 449.537 ms | 0.121 / 0.051 ms | 3 / 2 / 2 |
+
+这两条合成冷样本的主要成本位于读取窗口，不能据此断言所有真实压缩件的解压成本都低，也不能凭各一条样本比较批读与单件读取的效率。暖轮 scan 虽很短，预取仍需两次桥，实测为 604.169–1417.679 ms；缓存只省掉前置压缩件读取，没有消除元数据核验。此处每组只有一个来源，不能将该预取成本逐文件乘到真实整批。
+
+首跑在扫描前的路径换算阶段退出 1，未形成扫描样本：默认 shell 消耗了 Windows 路径的反斜杠。同路径对照中，`wsl.exe ... -- wslpath` 返回 1，`--exec wslpath` 返回 0；脚本已固定使用直接执行并保存失败状态与 stderr。原失败日志保留，修正后以新目录完成上述六轮，驱动返回 0。越界夹具负对照返回 2，在创建目录和启动 WSL 前拒绝。
+
+### 2026-11-13 审查后复核
+
+本次修复收紧了独立 example 的夹具边界与宿主 / Linux 路径核对，保存两阶段超时和启动失败的已有输出；逐轮 begin/end 验证代替整段计数。新增 `compressed_call` 分离同源并发日志，批摘要将确认缺席、逐条失败、协议未返回分别计数，生产读取与回退语义不变。
+
+相同环境类别与生成方式，在新夹具目录重新实跑。驱动返回 0、report.complete=true；两组各三轮均逐轮验证：首轮未复用缓存且恰有一次读取和一次解码，后两轮各一次命中且无读取 / 解码。两组全部保持 EOF、零新增字节与零事件。
+
+| 逻辑大小 / 冷读形态 | 首轮 prefetch | 首轮 read | 首轮 decode | 首轮 scan | 后两轮 scan | 各轮创建尝试 |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| 4 MiB / batch | 366.838 ms | 217.288 ms | 3.461 ms | 221.360 ms | 0.041 / 0.183 ms | 3 / 2 / 2 |
+| 12 MiB / single | 417.378 ms | 416.186 ms | 4.465 ms | 421.779 ms | 0.043 / 0.042 ms | 3 / 2 / 2 |
+
+暖轮预取仍为 390.975–419.276 ms。与前日样本的差异不是受控 A/B，不能归因于诊断修复或用于声称提速；本次仅证明修复后完整度断言和两条读取路径成立。
+
+[`test_wsl_compressed_cache.py`](../scripts/test_wsl_compressed_cache.py) 的五项回归通过：正常冷暖序列、相同聚合计数但冷轮错位、缺失 / 重复 / 越界事件、错误读取模式、两个阶段超时与启动失败留证。另对真实量具和驱动分别做越界负对照，均在来源访问前拒绝；驱动在建目录及启动 WSL 前拒绝。验证命令：
+
+```bash
+uv run --with zstandard python scripts/test_wsl_compressed_cache.py
+```
