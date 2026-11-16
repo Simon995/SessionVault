@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { createProtectedRun, runLoggedCommand } from "../tests/fixtures/dsh-v4/io-harness.mjs";
+import { createProtectedRun, runLoggedCommand, runLoggedJsonCommand } from "../tests/fixtures/dsh-v4/io-harness.mjs";
 import { loadDshInstallation, SUPPORTED_DSH_VERSION } from "./dsh-installed.mjs";
 
 const repo = fileURLToPath(new URL("..", import.meta.url));
@@ -84,6 +84,73 @@ test("命令超时收尾覆盖直接子进程与后代", async () => {
   const pid = Number(readFileSync(pidFile, "utf8"));
   assert(Number.isSafeInteger(pid) && pid > 0);
   assert.throws(() => process.kill(pid, 0), (error) => error.code === "ESRCH");
+});
+
+test("JSON 调用先保留有效输出与非零退出记录，再拒绝通过", async () => {
+  const stem = join(run, "json-nonzero");
+  await assert.rejects(runLoggedJsonCommand(process.execPath, [
+    "--eval", 'console.log(JSON.stringify({ ok: true })); console.error("diagnostic"); process.exitCode = 7;',
+  ], { stem, cwd: repo, timeout: 5_000 }), (error) => {
+    assert.equal(error.code, "COMMAND_FAILED");
+    assert.equal(error.status, 7);
+    // 失败抛出时，调用记录和两份输出已经落盘。
+    const record = JSON.parse(readFileSync(`${stem}.json`, "utf8"));
+    assert.equal(record.rc, 7);
+    assert.equal(record.signal, null);
+    assert.deepEqual(JSON.parse(readFileSync(`${stem}.stdout.log`, "utf8")), { ok: true });
+    assert.equal(readFileSync(`${stem}.stderr.log`, "utf8").trim(), "diagnostic");
+    return true;
+  });
+});
+
+test("JSON 调用成功对照返回解析结果并保留退出记录", async () => {
+  const stem = join(run, "json-success");
+  const result = await runLoggedJsonCommand(process.execPath, [
+    "--eval", 'console.log(JSON.stringify({ ok: true })); console.error("diagnostic");',
+  ], { stem, cwd: repo, timeout: 5_000 });
+  assert.equal(result.status, 0);
+  assert.deepEqual(result.json, { ok: true });
+  assert.equal(result.stderr.trim(), "diagnostic");
+  assert.deepEqual(JSON.parse(readFileSync(`${stem}.stdout.log`, "utf8")), result.json);
+  const record = JSON.parse(readFileSync(`${stem}.json`, "utf8"));
+  assert.equal(record.command, process.execPath);
+  assert.equal(record.rc, 0);
+  assert.equal(record.signal, null);
+  assert.equal(record.error, undefined);
+});
+
+test("JSON 调用拒绝尾随输出与空结果，并接受完整多行 JSON", async () => {
+  for (const [index, output] of ['{"ok":true}\nerror', '{"ok":true}\n{"ok":false}', ''].entries()) {
+    const stem = join(run, `json-invalid-${index}`);
+    await assert.rejects(runLoggedJsonCommand(process.execPath, [
+      "--eval", `process.stdout.write(${JSON.stringify(output)});`,
+    ], { stem, cwd: repo, timeout: 5_000 }), SyntaxError);
+    assert.equal(JSON.parse(readFileSync(`${stem}.json`, "utf8")).rc, 0);
+    assert.equal(readFileSync(`${stem}.stdout.log`, "utf8"), output);
+  }
+  const result = await runLoggedJsonCommand(process.execPath, [
+    "--eval", 'console.log(JSON.stringify({ ok: true }, null, 2));',
+  ], { stem: join(run, "json-multiline"), cwd: repo, timeout: 5_000 });
+  assert.deepEqual(result.json, { ok: true });
+});
+
+test("JSON 调用超时保留部分输出、错误与进程树收尾记录", async () => {
+  const stem = join(run, "json-timeout");
+  const childCode = 'process.stdout.write("partial-json"); setInterval(() => {}, 1000);';
+  const parentCode = `const child = require("node:child_process").spawn(process.execPath, ["--eval", ${JSON.stringify(childCode)}], { stdio: ["ignore", "inherit", "inherit"] }); console.error(child.pid); setInterval(() => {}, 1000);`;
+  await assert.rejects(runLoggedJsonCommand(process.execPath, ["--eval", parentCode], {
+    stem, cwd: repo, timeout: 2_000,
+  }), (error) => {
+    assert.equal(error.code, "ETIMEDOUT");
+    const record = JSON.parse(readFileSync(`${stem}.json`, "utf8"));
+    assert.equal(record.error, "ETIMEDOUT");
+    assert.equal(record.cleanup_confirmed, true);
+    assert.equal(readFileSync(`${stem}.stdout.log`, "utf8"), "partial-json");
+    const childPid = Number(readFileSync(`${stem}.stderr.log`, "utf8").trim());
+    assert(Number.isSafeInteger(childPid) && childPid > 0);
+    assert.throws(() => process.kill(childPid, 0), (failure) => failure.code === "ESRCH");
+    return true;
+  });
 });
 
 const runQualification = (args, env = process.env) => {

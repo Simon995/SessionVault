@@ -1,6 +1,6 @@
 # 刷新性能：测量边界与已验证结论
 
-查证日期：2026-11-13。源码、可复跑工具和本仓实验是本文依据；消费方的安装身份、生产轮次与内部账本由消费方维护。当前任务顺序只维护在 [backlog.md](backlog.md)，本文不另开待办队列。
+查证日期：2026-11-16；各表保留原始实验日期。源码、可复跑工具和本仓实验是本文依据；消费方的安装身份、生产轮次与内部账本由消费方维护。当前任务顺序只维护在 [backlog.md](backlog.md)，本文不另开待办队列。
 
 ## 结论与根因
 
@@ -66,10 +66,10 @@ uv run python scripts/measure-wsl-whole-read.py --help
 
 ## 调用级诊断与合成 EOF 复核
 
-源码诊断使用既有 `log` facade，默认不输出 debug 日志。CLI 可用 `SVAULT_LOG=sv-scan=debug,sv-wsl=debug`；库形态由宿主设置同名 target 的过滤。新诊断随库消费者重新构建交付，不能把源码能力当成旧安装已经具备。
+源码诊断 `74e9ca6` 已合入并推送，使用既有 `log` facade，默认不输出 debug 日志。CLI 可用 `SVAULT_LOG=sv-scan=debug,sv-wsl=debug`；库形态由宿主设置同名 target 的过滤，CLI 环境变量不会自动为库宿主装配过滤。真实首轮前必须核新构建正在运行，且目标日志实际到达所核 sink；应用自己的 debug 设置、子模块更新或依赖测试通过，都不能代替这个条件。启用契约只在 [日志规范](LOGGING.md) 维护，消费方运行状态回各仓记录。
 
 - `sv-scan` 的 `compressed length/read/decode` 分开记录长度缓存命中、未复用、压缩件读取和本机解压；只记录匿名来源短哈希、大小与进程内 `compressed_call` 调用号；同一来源并发调用按调用号关联。`cache=not_reused` 不细分无缓存、身份变化和缓存锁不可用，`identity_available=false` 也不能解释成文件缺席。`read_ms` 包含 `take_whole` 的锁等待和可能的整批读取，不是纯传输耗时；从批内直接取回已读内容时可能很短。`elapsed_through_decode_ms` 包含读取及解码，不能与 `decode_ms` 相加。
-- `sv-wsl` 的 `whole batch` 输出整批 requested / fetched / absent / failed / unanswered / bytes / elapsed。`result=ok` 只指整批协议调用返回成功，须另看 fetched 是否齐全；absent 是确认缺席、failed 是逐条失败、unanswered 是协议未返回该路径，未取回的来源仍走原有回退。批时间与触发它的来源 `read_ms` 重叠，不能逐来源求和后再加整批。
+- `sv-wsl` 的 `whole batch` 输出整批 requested / fetched / absent_or_non_regular / failed / bytes / elapsed。`result=ok` 只指整批协议调用返回成功，须另看 fetched 是否齐全。`absent_or_non_regular` 合并确认缺席与非普通文件；`failed` 包含逐条读取失败、坏记录和协议缺答。`wsl::parse_read_many` 已将缺答补成错误，上层不能再用 HashMap 缺键另数；旧 `unanswered` 字段恒为零，已移除。未取回的来源仍走原有回退。批时间与触发它的来源 `read_ms` 重叠，不能逐来源求和后再加整批。
 - `sv-wsl` 的 `identity operation completed` 与 `identity completed` 记录每根后端 probe / read_text 的调用形状、结果与耗时；根只以 SHA256 短标识关联，不输出配置、remote 或原始根。后端调用次数不等于进程创建尝试。`probe_nested_us` / `read_text_nested_us` 属于 `total_inclusive_us`，诊断输出开销也可能进入总时长；该入口不含上游注册表查询、锁等待和持久化写入。短哈希仅供诊断，不是项目身份。
 
 静态调用链上，WSL 普通 `.git` 目录的可读 config 路径需两次 probe 与一次 read_text（源码推导，未核实机逐根次数）；worktree / submodule 随指针和 commondir 增加操作，缺席或未知会早退。该路径不经过 `read_whole`。每个可写库句柄的身份 seen 从空开始，已存身份不替代新句柄的首次磁盘核验；不能用预填 seen 隐藏 remote 变化。具体判决仍以 `identity.rs` 与 `store.rs` 实现为准。
@@ -98,7 +98,7 @@ uv run --with zstandard python scripts/measure-wsl-compressed-cache.py --help
 
 ### 2026-11-13 审查后复核
 
-本次修复收紧了独立 example 的夹具边界与宿主 / Linux 路径核对，保存两阶段超时和启动失败的已有输出；逐轮 begin/end 验证代替整段计数。新增 `compressed_call` 分离同源并发日志，批摘要将确认缺席、逐条失败、协议未返回分别计数，生产读取与回退语义不变。
+当次修复收紧了独立 example 的夹具边界与宿主 / Linux 路径核对，保存两阶段超时和启动失败的已有输出；逐轮 begin/end 验证代替整段计数，并新增 `compressed_call` 分离同源并发日志。2026-11-16 复核发现两处原说明过强：批摘要不能单独区分协议缺答，且旧逐轮计数未核事件顺序与调用关联，订正见后文。生产读取与回退语义不变。
 
 相同环境类别与生成方式，在新夹具目录重新实跑。驱动返回 0、report.complete=true；两组各三轮均逐轮验证：首轮未复用缓存且恰有一次读取和一次解码，后两轮各一次命中且无读取 / 解码。两组全部保持 EOF、零新增字节与零事件。
 
@@ -109,8 +109,18 @@ uv run --with zstandard python scripts/measure-wsl-compressed-cache.py --help
 
 暖轮预取仍为 390.975–419.276 ms。与前日样本的差异不是受控 A/B，不能归因于诊断修复或用于声称提速；本次仅证明修复后完整度断言和两条读取路径成立。
 
-[`test_wsl_compressed_cache.py`](../scripts/test_wsl_compressed_cache.py) 的五项回归通过：正常冷暖序列、相同聚合计数但冷轮错位、缺失 / 重复 / 越界事件、错误读取模式、两个阶段超时与启动失败留证。另对真实量具和驱动分别做越界负对照，均在来源访问前拒绝；驱动在建目录及启动 WSL 前拒绝。验证命令：
+当次 [`test_wsl_compressed_cache.py`](../scripts/test_wsl_compressed_cache.py) 的五项回归通过：正常冷暖序列、相同聚合计数但冷轮错位、部分缺失 / 重复 / 轮外事件、错误读取模式、两个阶段超时与启动失败留证；该轮没有覆盖所有额外事件、调用关联和事件顺序。另对真实量具和驱动分别做越界负对照，均在来源访问前拒绝；驱动在建目录及启动 WSL 前拒绝。验证命令：
 
 ```bash
 uv run --with zstandard python scripts/test_wsl_compressed_cache.py
 ```
+
+### 2026-11-16 判据与历史样本复核
+
+复核发现旧逐轮校验只数命中、读取与解码次数，能够接受多余的失败事件、同轮事件调用号不一致或解码先于读取。根因是计数不能表达一条完整调用链。驱动现要求冷轮严格按 `length(cache=not_reused)` → `read(result=found)` → `decode(result=ok)` 排列，三条日志的来源与调用号一致；暖轮只能有一条 `length(result=cache_hit)`。同时核冷暖逻辑长度、跨轮同源与调用号不复用，额外、缺失、错序或错关联均拒绝通过。
+
+八项 Python 回归自身 rc=0，包含正常对照与上述反例；用新校验重新读取 2026-11-13 保留的两组六轮日志仍通过，历史日志和 report 的 SHA-256 前后一致。没有为本次订正重跑 WSL 或替换原始时间表。旧 report 未记录 example 二进制 SHA-256，日志重核也不能补出这项来源绑定。
+
+同日后续 diff 审查补上新实验的 binary 绑定：report 保存运行前 SHA-256，每组调用前后检查同一路径字节，变化则保留 `complete=false` 并拒绝通过；事后摘要一并留证。Python 回归现为九项，自身 rc=0，新增调用前及调用中替换 binary 的反例。未重跑 WSL，旧实验缺失的 binary 摘要仍不可补推。
+
+批摘要另移除恒零的 `unanswered`：底层解析器已经把缺答补为 `Err`，上层再查缺键不可能识别它。缺答保留在 `failed`，确认缺席与非普通文件统一标为 `absent_or_non_regular`，读取及回退语义不变。debug 关闭时不再做批摘要计数和压缩阶段诊断计时；批调用计时仍保留，供失败时 warn 使用。以上是判据与诊断成本订正，没有新的生产性能百分比。

@@ -9,8 +9,10 @@ and no WSL filesystem is written. Results describe synthetic inputs, not product
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,7 +22,7 @@ MIB = 1024 * 1024
 
 
 def validate_round_diagnostics(
-    stderr: str, count: int, expected_mode: str
+    stderr: str, count: int, expected_mode: str, expected_bytes: int
 ) -> list[dict]:
     blocks = []
     current = None
@@ -38,49 +40,76 @@ def validate_round_diagnostics(
                 or line != f"synthetic round end: round={len(blocks) + 1}"
             ):
                 raise RuntimeError("invalid round end marker")
-            blocks.append("\n".join(current))
+            blocks.append(current)
             current = None
-        elif current is not None:
-            current.append(line)
-        elif any(
-            event in line
-            for event in (
-                "compressed length:",
-                "compressed read:",
-                "compressed decode:",
-            )
-        ):
-            raise RuntimeError("compressed diagnostic outside a round")
+        else:
+            event = re.search(r"\bcompressed (length|read|decode):\s*(.*)$", line)
+            if event is None:
+                continue
+            if current is None:
+                raise RuntimeError("compressed diagnostic outside a round")
+            fields = {}
+            for item in event[2].split():
+                key, separator, value = item.partition("=")
+                if not separator or not value or key in fields:
+                    raise RuntimeError("invalid compressed diagnostic fields")
+                fields[key] = value
+            current.append((event[1], fields))
     if current is not None or len(blocks) != count:
         raise RuntimeError("incomplete round diagnostics")
     diagnostics = []
+    source = None
+    calls = set()
     for index, block in enumerate(blocks):
-        hits = block.count("result=cache_hit")
-        misses = block.count("cache=not_reused")
-        reads = [line for line in block.splitlines() if "compressed read:" in line]
-        decodes = [line for line in block.splitlines() if "compressed decode:" in line]
+        expected_events = ["length", "read", "decode"] if index == 0 else ["length"]
+        if [event for event, _ in block] != expected_events:
+            raise RuntimeError(
+                f"round {index + 1}: unexpected compressed event sequence"
+            )
+        length = block[0][1]
+        round_source = length.get("source", "")
+        call = length.get("compressed_call", "")
+        if (
+            re.fullmatch(r"[0-9a-f]{12}", round_source) is None
+            or re.fullmatch(r"[1-9][0-9]*", call) is None
+            or (source is not None and round_source != source)
+            or call in calls
+            or any(
+                fields.get("source") != round_source
+                or fields.get("compressed_call") != call
+                for _, fields in block
+            )
+        ):
+            raise RuntimeError(f"round {index + 1}: mismatched compressed call")
+        source = round_source
+        calls.add(call)
         if index == 0:
+            read, decode = block[1][1], block[2][1]
             valid = (
-                hits == 0
-                and misses == 1
-                and len(reads) == 1
-                and len(decodes) == 1
-                and f"mode={expected_mode} result=found" in reads[0]
-                and "result=ok " in decodes[0]
+                length.get("cache") == "not_reused"
+                and "result" not in length
+                and read.get("mode") == expected_mode
+                and read.get("result") == "found"
+                and decode.get("result") == "ok"
+                and decode.get("logical_bytes") == f"Some({expected_bytes})"
             )
         else:
-            valid = hits == 1 and misses == 0 and not reads and not decodes
+            valid = (
+                length.get("result") == "cache_hit"
+                and "cache" not in length
+                and length.get("logical_bytes") == str(expected_bytes)
+            )
         if not valid:
             raise RuntimeError(
-                f"round {index + 1}: expected cold decode then warm hits"
+                f"round {index + 1}: expected cold decode then warm hits at {expected_bytes} bytes"
             )
         diagnostics.append(
             {
                 "round": index + 1,
-                "cache_hits": hits,
-                "cache_misses": misses,
-                "reads": len(reads),
-                "decodes": len(decodes),
+                "cache_hits": int(index != 0),
+                "cache_misses": int(index == 0),
+                "reads": int(index == 0),
+                "decodes": int(index == 0),
             }
         )
     return diagnostics
@@ -111,9 +140,16 @@ def main() -> None:
         parser.error("fixture parent must already exist")
     # An atomic new directory prevents accidental use of real data or old fixtures.
     fixture.mkdir(exist_ok=False)
+
+    def binary_sha256() -> str:
+        with binary.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+
+    fingerprint = binary_sha256()
     samples = []
     report = {
         "complete": False,
+        "binary_sha256": fingerprint,
         "zstandard_version": zstandard.__version__,
         "samples": samples,
     }
@@ -175,7 +211,6 @@ def main() -> None:
     mounted = converted.stdout.strip()
     if not mounted.startswith("/"):
         raise RuntimeError("wslpath did not return an absolute mount path")
-    modes = set()
     rng = random.Random(0)
     for size, expected_mode in ((4 * MIB, "batch"), (12 * MIB, "single")):
         # Incompressible synthetic bytes exercise below/above the batch-read limit.
@@ -194,6 +229,8 @@ def main() -> None:
         }
         samples.append(record)
         save_report()
+        if binary_sha256() != fingerprint:
+            raise RuntimeError("probe binary changed before sample; report incomplete")
         result = run_logged(
             [
                 str(binary),
@@ -207,6 +244,10 @@ def main() -> None:
             240,  # Independent 30s path guard, three 60s rounds, plus exit margin.
             record,
         )
+        record["binary_sha256_after"] = binary_sha256()
+        save_report()
+        if record["binary_sha256_after"] != fingerprint:
+            raise RuntimeError("probe binary changed during sample; report incomplete")
         if result.returncode:
             raise RuntimeError(
                 f"probe failed with rc={result.returncode}; see fixture logs"
@@ -223,13 +264,10 @@ def main() -> None:
         ):
             raise RuntimeError("probe output is incomplete or no longer at EOF")
         diagnostics = validate_round_diagnostics(
-            result.stderr, len(rounds), expected_mode
+            result.stderr, len(rounds), expected_mode, size
         )
         record["diagnostics"] = diagnostics
-        modes.add(expected_mode)
         save_report()
-    if modes != {"batch", "single"}:
-        raise RuntimeError("fixtures did not exercise both batch and single-file reads")
     report["complete"] = True
     save_report()
     print(json.dumps(report, indent=2))

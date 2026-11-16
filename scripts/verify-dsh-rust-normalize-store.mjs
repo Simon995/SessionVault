@@ -5,7 +5,7 @@
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import { createProtectedRun } from "../tests/fixtures/dsh-v4/io-harness.mjs";
+import { createProtectedRun, runLoggedJsonCommand } from "../tests/fixtures/dsh-v4/io-harness.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { constants, zstdCompressSync } from "node:zlib";
@@ -174,23 +174,12 @@ async function main() {
   saveStatus();
   console.error(JSON.stringify({ run: path.relative(repoRoot, tmpRoot) }));
   let invocation = 0;
-  const runSnapshotCli = (binary, args) => {
-    const result = spawnSync(binary, args, {
-      encoding: "utf8", windowsHide: true, timeout: 30_000,
-    });
-    const stem = path.join(tmpRoot, `invocation-${++invocation}`);
-    fs.writeFileSync(`${stem}.stdout.log`, result.stdout ?? "", { flag: "wx" });
-    fs.writeFileSync(`${stem}.stderr.log`, result.stderr ?? "", { flag: "wx" });
-    fs.writeFileSync(`${stem}.json`, JSON.stringify({ args, rc: result.status, signal: result.signal, error: result.error?.code }, null, 2), { flag: "wx" });
-    if (result.error) throw result.error;
-    const stdout = (result.stdout || "").trim();
-    const parsed = stdout ? JSON.parse(stdout.split(/\r?\n/)[0]) : null;
-    return { status: result.status, stdout, stderr: result.stderr, json: parsed };
-  };
-  const checks = [];
+  const runSnapshotCli = async (args) => runLoggedJsonCommand(binary, args, {
+    stem: path.join(tmpRoot, `invocation-${++invocation}`), timeout: 30_000,
+  });
+  const checks = status.checks;
   const check = (name, cond, detail = {}) => {
     checks.push({ name, ok: Boolean(cond), detail });
-    status.checks = checks;
     saveStatus();
     if (!cond) {
       throw new Error(`Check failed: ${name} -> ${JSON.stringify(detail)}`);
@@ -208,7 +197,7 @@ async function main() {
     const retryDir = path.join(tmpRoot, "retry-session");
     writePlainSession(retryDir, partialTurnDoc.header, partialTurnDoc.events);
 
-    const retryRes = runSnapshotCli(binary, [
+    const retryRes = await runSnapshotCli([
       "--session-dir",
       retryDir,
       "--source-instance",
@@ -245,7 +234,7 @@ async function main() {
     const childDoc = seedWithTurn(baseFixture, "child-01");
     const childDir = path.join(tmpRoot, "child-session");
     writePlainSession(childDir, childDoc.header, childDoc.events);
-    const childRes = runSnapshotCli(binary, [
+    const childRes = await runSnapshotCli([
       "--session-dir",
       childDir,
       "--source-instance",
@@ -277,7 +266,7 @@ async function main() {
     writeZstdSession(liveDir, docTurn1.header, docTurn1.events);
 
     const runStoreStep = (extraArgs = []) =>
-      runSnapshotCli(binary, [
+      runSnapshotCli([
         "--session-dir",
         liveDir,
         "--source-instance",
@@ -296,7 +285,7 @@ async function main() {
       ]);
 
     // Step A: Initial projection (complete-turn.json 产出 8 条 RawEvent: sys, dev, user, thinking, assistant msg, usage, tool call, tool result)
-    const stepA = runStoreStep();
+    const stepA = await runStoreStep();
     check("stepA_exit_0", stepA.status === 0, stepA);
     check(
       "stepA_initial_append",
@@ -309,7 +298,7 @@ async function main() {
     );
 
     // Step B: No-op unchanged
-    const stepB = runStoreStep();
+    const stepB = await runStoreStep();
     check(
       "stepB_noop",
       stepB.json.commit_gate.decision === "no_op_unchanged" &&
@@ -322,7 +311,7 @@ async function main() {
     // Step C: Append #1 (Turn 2: +3 RawEvents -> user msg, assistant msg, usage)
     const docTurn2 = appendCompleteTurn(docTurn1, 2, "turn 2 user", "turn 2 assistant");
     writeZstdSession(liveDir, docTurn2.header, docTurn2.events);
-    const stepC = runStoreStep();
+    const stepC = await runStoreStep();
     check(
       "stepC_append_1",
       stepC.json.commit_gate.decision === "incremental_append_candidate" &&
@@ -336,7 +325,7 @@ async function main() {
     // Step D: Append #2 (Turn 3: +3 RawEvents -> total 14 RawEvents)
     const docTurn3 = appendCompleteTurn(docTurn2, 3, "turn 3 user", "turn 3 assistant");
     writeZstdSession(liveDir, docTurn3.header, docTurn3.events);
-    const stepD = runStoreStep();
+    const stepD = await runStoreStep();
     check(
       "stepD_append_2",
       stepD.json.commit_gate.decision === "incremental_append_candidate" &&
@@ -350,7 +339,7 @@ async function main() {
     const docRewrittenSeg0 = structuredClone(docTurn3);
     docRewrittenSeg0.events[4].data.content[0].text = "rewritten first user message in segment 0";
     writeZstdSession(liveDir, docRewrittenSeg0.header, docRewrittenSeg0.events);
-    const stepECrash = runStoreStep(["--simulate-crash-before-save-state"]);
+    const stepECrash = await runStoreStep(["--simulate-crash-before-save-state"]);
     check(
       "stepE_rewrite_seg0_detected_and_rolled_back",
       stepECrash.json.relation === "prefix_rewritten" &&
@@ -363,7 +352,7 @@ async function main() {
     );
 
     // Step F: 崩溃重放（state_file 仍停留在 Step D）：ProjectionToken 必须幂等，不新开第 2 代
-    const stepFReplay = runStoreStep();
+    const stepFReplay = await runStoreStep();
     check(
       "stepF_crash_replay_idempotent",
       stepFReplay.json.commit_gate.decision === "rebuild_projection_candidate" &&
@@ -379,7 +368,7 @@ async function main() {
     const docTurn2Rewritten = structuredClone(docTurn2);
     docTurn2Rewritten.events[4].data.content[0].text = "rewritten first user message in segment 0";
     writeZstdSession(liveDir, docTurn2Rewritten.header, docTurn2Rewritten.events);
-    const stepGShrank = runStoreStep(["--force"]);
+    const stepGShrank = await runStoreStep(["--force"]);
     check(
       "stepG_prefix_shrank_holds_prior_projection",
       stepGShrank.json.relation === "prefix_shrank" &&
@@ -395,7 +384,7 @@ async function main() {
     // Step H: 生命周期变化（同一 session_id 下触发 seedWithTurn 产生新的 lifecycle_sha256）-> Rollback 开第 2 代
     const docSeededSameId = seedWithTurn(docTurn2Rewritten, docTurn1.header.id);
     writeZstdSession(liveDir, docSeededSameId.header, docSeededSameId.events);
-    const stepHLifecycle = runStoreStep();
+    const stepHLifecycle = await runStoreStep();
     check(
       "stepH_lifecycle_changed_rolls_back",
       stepHLifecycle.json.relation === "lifecycle_changed" &&
@@ -412,7 +401,7 @@ async function main() {
       path.join(liveDir, "session.v5.jsonl.zstd"),
       fs.readFileSync(path.join(liveDir, "session.v4.jsonl.zstd")),
     );
-    const stepIFutureGen = runStoreStep(["--force"]);
+    const stepIFutureGen = await runStoreStep(["--force"]);
     check(
       "stepI_future_generation_holds_prior_projection",
       stepIFutureGen.json.commit_gate.decision === "hold_prior_projection" &&
@@ -458,7 +447,7 @@ async function main() {
       }),
       "utf8",
     );
-    const stepJComplex = runSnapshotCli(binary, [
+    const stepJComplex = await runSnapshotCli([
       "--session-dir",
       complexDir,
       "--source-instance",
@@ -526,7 +515,7 @@ async function main() {
       "session-compact-v4-sub-1",
     );
     writeZstdSession(unseededSubDir, unseededSubDoc.header, unseededSubDoc.events);
-    const stepKUnseeded = runSnapshotCli(binary, [
+    const stepKUnseeded = await runSnapshotCli([
       "--session-dir",
       unseededSubDir,
       "--source-instance",
@@ -559,7 +548,7 @@ async function main() {
     const grandchild2Doc = seedWithTurn(mid1Doc, "session-grandchild-2");
     const grandchildDir = path.join(tmpRoot, "grandchild-fork-dir");
     writeZstdSession(grandchildDir, grandchild2Doc.header, grandchild2Doc.events);
-    const stepKGrandchild = runSnapshotCli(binary, [
+    const stepKGrandchild = await runSnapshotCli([
       "--session-dir",
       grandchildDir,
       "--source-instance",
@@ -615,7 +604,7 @@ async function main() {
     );
     const tempSubStoreDb = path.join(tmpRoot, "temp_sub_store.db");
     const tempSubStateFile = path.join(tmpRoot, "temp_sub_state.json");
-    const stepKTempInherited = runSnapshotCli(binary, [
+    const stepKTempInherited = await runSnapshotCli([
       "--session-dir",
       unseededSubDir,
       "--source-instance",
@@ -661,7 +650,7 @@ async function main() {
     writeZstdSession(conflictDir, baseFixture.header, baseFixture.events);
     writePlainSession(conflictDir, baseFixture.header, baseFixture.events);
 
-    const stepLDiscover = runSnapshotCli(binary, [
+    const stepLDiscover = await runSnapshotCli([
       "--sessions-root",
       discRoot,
       "--compression",
@@ -690,7 +679,7 @@ async function main() {
     // Step M: DSH 会话根目录批量扫描与入库（scan_dsh_sessions_root_to_store）：首轮入库 2 个 v4 会话（16 条事件），第 2 轮幂等 no-op，第 3 轮出现 v5 时 hold_prior_projection
     const rootStoreDb = path.join(tmpRoot, "root_scan_store.db");
     const rootStateFile = path.join(tmpRoot, "root_scan_states.json");
-    const stepM1 = runSnapshotCli(binary, [
+    const stepM1 = await runSnapshotCli([
       "--sessions-root",
       discRoot,
       "--compression",
@@ -718,7 +707,7 @@ async function main() {
     );
 
     // 第 2 轮：无变化，2 个 v4 会话均 no_op_unchanged，0 条新增
-    const stepM2 = runSnapshotCli(binary, [
+    const stepM2 = await runSnapshotCli([
       "--sessions-root",
       discRoot,
       "--compression",
@@ -747,7 +736,7 @@ async function main() {
       path.join(discRoot, "01-ready-zstd", "session.v5.jsonl.zstd"),
       "future-v5",
     );
-    const stepM3 = runSnapshotCli(binary, [
+    const stepM3 = await runSnapshotCli([
       "--sessions-root",
       discRoot,
       "--compression",
@@ -805,7 +794,7 @@ async function main() {
     const fidelityStateFile = path.join(tmpRoot, "usage_fidelity_state.json");
     writeZstdSession(fidelityDir, fidelityTurn5.header, fidelityTurn5.events);
 
-    const stepNFidelity = runSnapshotCli(binary, [
+    const stepNFidelity = await runSnapshotCli([
       "--session-dir",
       fidelityDir,
       "--source-instance",

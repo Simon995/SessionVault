@@ -2,6 +2,8 @@
 
 > 状态于 2026-11-12 订正，以下分节保留各自核查日期。第一轮安装源码与本机日志结构已交叉核对；静态 profile、原生样本、恢复边界、用量保真、原生 backend、受控并发、快照审计、Node 捕获、Rust 字节 / 原生位置、原生 admission、来源选代 / 保守提交门、`RawEvent` 归一化位置映射与实验性总库提交接线、以及 v4 复杂语义（`surfaceOp: "replace"`、`compaction/*`、`subagent/descriptor` / `subagent/catalog`、多层 seed fork）与会话根目录批量扫描提交（`discover_dsh_sessions_in_root` / `scan_dsh_sessions_root_to_store`）见 §8–§19 与 [dsh-read-state-design.md](dsh-read-state-design.md) §6–§12。控制面会话绑定、双层临时排除与真实来源保真（H.1–H.3）已随 `v2026.11.09.1`（`a151997`）正式发布；H.4 v4 复杂语义与批量扫描已合入 `main`（`dc682ff`），细粒度用量证据已合入 `main`（`498b7a3`）。显式配置来源已接到 `catalog::builtin_descriptors()` / `discover` / `scan-all` 并合入 `main`（`29beb8d`），不新增 `SourceType` / `SourceMode` 变体，已随 `v2026.11.11.1`（`b9339c3`）发布；宿主真实来源接入仍另验。配置、凭据与兼容边界见 [读取状态设计 §14–§15](dsh-read-state-design.md#14-常规来源接线与持久化凭据)。任务状态与先后只在 [backlog.md](backlog.md) H 节维护，职责见 [INGEST_KERNEL.md](INGEST_KERNEL.md) §2.2。
 
+后续版本沿革：§1–§19 的原始记录保留各自日期；rc.1 的扩展核验见 [读取状态设计 §12–§13](dsh-read-state-design.md)，rc.2 来源侧候选验证与未验边界见 [隔离记录](dsh-rc2-source-qualification.md)。物理格式 v4、安装版本和宿主生产准入是三项不同判据。
+
 ## 1. 证据范围
 
 - **安装源码**：本机 `@deepseek-ai/dsh` 及下列相关包，已核版本均为 `0.2.1-rc.5`。这是安装包快照，不声称 npm 最新版或上游 `main` 当前仍相同。包元数据指向 [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)，查证日期为 2026-11-05。

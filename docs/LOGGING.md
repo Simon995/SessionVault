@@ -11,9 +11,11 @@
 > "读一份日志就能定位问题"，而不是每次诊断先加日志再复现。
 
 状态：现行能力与规范目标分开记录
-最后核对：2026-11-12
+最后核对：2026-11-16
 
 **当前实现**：lib 通过 `log` 复用宿主 sink；CLI 使用 `env_logger`，输出到 stderr，格式为 `[target] message`。过滤优先读 `SVAULT_LOG`，再读 `RUST_LOG`，默认 `info`，依据 `src/bin/svault.rs::init_logging`；CLI 的 `emit` 单独输出 NDJSON。`src/logging.rs` 提供固定 tag。
+
+**库宿主的启用条件**：`SVAULT_LOG` / `RUST_LOG` 的解析属于 CLI 的 `env_logger`，不代表使用本库的宿主也解析这些变量。宿主必须为实际 target（性能诊断为 `sv-scan`、`sv-wsl`）放行 debug，并将记录送到所核验的 sink；仅打开应用自己的 debug 设置或更新依赖指针，不能证明库诊断已生效。验收以固定运行构建的实际诊断输出为准；没有输出时先检查过滤、调用路径和构建版本，不能解释成“没有耗时”或“没有读取”。本库不安装第二个 logger，也不绕过宿主过滤。
 
 **尚未实现**：CLI 没有 `--log-level` / `--log-format json` 参数，扫描链也未统一生成和传递逐轮 `run_id`。下文的关联字段和示例是规范目标，不能当作已可调用的参数或已齐备的诊断覆盖。实施任务只在 [backlog.md](backlog.md) F 节维护。刷新计时、嵌套阶段和进程级计数的解读见 [性能记录](refresh-performance.md)。
 
@@ -47,7 +49,7 @@
 
 落进 QuotaBar sink 后的整行（与 QuotaBar 自身日志统一）：
 ```
-[2026-06-13][19:20:33][session_vault::scan][WARN] [sv-cursor][codex/wsl:Ubuntu-22.04/r#a1b2] rolled back: reason=mtime_regress from=40960 to=0
+[2026-06-13][19:20:33][sv-cursor][WARN] [sv-cursor][codex/wsl:<distro>/r#a1b2] rolled back: reason=mtime_regress from=40960 to=0
 ```
 
 - **`module-tag`**：短、固定、**加 `sv-` 前缀**避免与 QuotaBar 的 `[claude]`/`[codex]` 在同一文件撞。固定表见 §4。
@@ -81,7 +83,7 @@
 | 级别 | 用途 | SessionVault 触发条件 |
 |---|---|---|
 | `error` | 不可恢复、用户必须看见 | 根读不了、schema 硬漂移、跨 panic 边界、CLI 致命参数错误 |
-| `warn` | **诊断主入口**（`RUST_LOG=warn` 应够） | 坏 JSON 行跳过、游标回退/重建、WSL 桥非 0 退出、未授权路径排除、provider 格式漂移 |
+| `warn` | 异常诊断入口；逐调用性能归因另需对应 target 的 `debug` | 坏 JSON 行跳过、游标回退/重建、WSL 桥非 0 退出、未授权路径排除、provider 格式漂移 |
 | `info` | 关键生命周期 | run 起止、每来源一行摘要、发现汇总 |
 | `debug` | 决策细节 | 游标推进量、env/config 解析、逐根探测、跳过未变文件 |
 | `trace` | **仅 fixture 调试**（生产不用，对齐 QuotaBar "trace 不用"精神） | 逐行解析 / 逐事件；**热循环里 level-gated、关闭零分配** |
@@ -150,7 +152,7 @@ log::warn!("{}", raw_jsonl_line);           // 🔴 正文/裸文本入日志
 log::info!("processing...");                // 无事件名
 log::debug!("content = {}", body);          // 🔴 泄正文
 println!("...");                            // 🔴 双重致命：不受 RUST_LOG 控 + 污染 stdout NDJSON
-log::warn!(target: "foo", "...");           // 不用与模块路径差异巨大的 target
+log::warn!(target: "foo", "...");           // 不使用未登记的 target；固定 sv-* target 见 §4
 ```
 
 **为什么这么严**：排查靠 `grep`。统一的 `sv-` tag + `run_id` scope 让 `grep 'r#a1b2'` 精准串起一整轮扫描；

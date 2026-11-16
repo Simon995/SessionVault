@@ -1,10 +1,10 @@
 # DSH rc.2 来源侧隔离验证
 
-查证日期：2026-11-13。仅本机 Windows、Node `v25.2.1`、无模型合成来源；不打开真库，不启动 Host/UI，不安装或发布。
+实验日期：2026-11-13；交付状态于 2026-11-16 核对。实验仅覆盖本机 Windows、Node `v25.2.1`、无模型合成来源；未打开真库或启动 Host/UI。源码 `a1435f5` 已合入并推送 main；这不代表已随独立 CLI 发布或在消费者安装。当前任务与交付状态统一见 [backlog.md](backlog.md)。
 
 ## 接线与固定证据
 
-基线为 `74e9ca648f6d81db0694e281c45dd509d225634c`，候选适配与后续审查修复位于分支 `fix/dsh-rc2-qualification`；本记录描述源码与隔离验证，不代表已推送、发布或安装。
+基线为 `74e9ca648f6d81db0694e281c45dd509d225634c`，候选适配与审查修复由分支 `fix/dsh-rc2-qualification` 合入为 `a1435f5`。以下保留该次隔离验证的取数口径与证据；不能由来源侧合成通过推导宿主生产准入通过。
 
 共享 `scripts/dsh-installed.mjs` 保留默认 `0.2.2-rc.1`，继续接受 `0.2.1-rc.5` / `0.2.2-rc.1`，显式增加 `0.2.2-rc.2`。安装入口先取 `realpath`，再按真实 package.json 建立模块解析锚点，以兼容 pnpm 目录链接。原生 admission 和各检查报告使用 `installation.version`，不以默认版本常量替代实测。
 
@@ -82,14 +82,24 @@ node scripts/verify-dsh-rc2-qualification.mjs --dsh-package <absolute-package-js
 
 2026-11-13 审查后修复六项问题：步骤超时时收尾整个子进程树；最终复核包目录外的依赖入口；记录并绑定跳过构建时实际使用的 binary；预检和最终摘要失败均保存失败终态；pnpm 链接回归实际验证依赖解析；normalize-store 将执行与留证封装在局部函数中，消除可变全局空回调。
 
-修复后的完整记录为 `target/dsh-rc2-qualification-2KyPfu/status.json`：`full_qualification=true`，16 个步骤各自 rc=0，binary、嵌入源码、安装包与依赖入口的结束复核均匹配。该轮包括上述来源、游标、usage 矩阵、499 项库测试、两种 bins 编译、全特性 Clippy 和两道仓库闸；binary 摘要与前表一致。
+修复后的完整记录为 `target/dsh-rc2-qualification-2KyPfu/status.json`：`full_qualification=true`，16 个步骤各自 rc=0，binary、嵌入源码、安装包与依赖入口的结束复核均匹配。该轮包括上述来源、游标、usage 矩阵、499 项库测试、两种 bins 编译、全特性 Clippy 和两道仓库闸；binary 摘要与前表一致。官方源码提交与候选 manifest 摘要来自首轮 `oFB6NV` 的可选预检，最终 `2KyPfu` 未重新传入这两项预检参数；结束绑定证明实际安装与执行字节一致，不能声称最终轮重新验证了源码提交与安装包的对应关系。
 
 安装与验收驱动回归由三项增至七项，新增非零退出/启动失败、超时后的父子进程退出、预检失败留证、包外依赖变更或消失时拒绝通过。跳过构建的 Rust 子集另行复核，明确记录 `built_by_this_run=false`，并核 binary 与依赖入口绑定；子集通过仍不替代完整验收。Windows 进程树超时路径通过，Unix 进程组路径通过 WSL 只读加载实际函数单独核验；这不等于 Linux 完整来源验收通过。normalize-store 自身的超时留证分支仍未单独注入。
 
+## 2026-11-16 命令成功判据复核
+
+本次复核发现 normalize-store 的局部执行器只对启动错误或超时抛错，部分后续业务检查仅看 JSON；有效 stdout 配合普通非零退出，仍可能被记为检查通过。对原保留输出的内存替身复现中，将第 4–11 次调用的退出码改为 7、保持 stdout 不变，旧判据仍通过 25 项；第 1 次调用改为 7 的对照则失败，证明退出检查分散且不完整。旧两轮保留记录各 20 次调用实际均为 rc=0，因此这项缺陷不推翻它们已有的成功结果。
+
+修复把 JSON 命令执行与留证合并到实际共用的 `runLoggedJsonCommand`：先保存 stdout、stderr 与调用记录，再拒绝启动错误、非零 rc 或 signal，最后解析 JSON。normalize-store 所有调用均走这个出口；删除重复 binary 参数与状态赋值，业务检查保留。驱动回归增至十项，自身 rc=0，新增“有效 JSON + rc=7 必须失败”、rc=0 成功对照、超时保留部分输出及父子进程退出三项。
+
+修复后 normalize-store 自身 rc=0、25 项通过，保留于 `target/dsh-norm-store-PzN4DY/`，20 次调用实际均为 rc=0。本次显式复用此前保留的 rc.2 安装与 snapshot binary，核的是修改后执行器和既有合成矩阵，未重建或交付新的 snapshot binary。共享执行函数的真实超时分支已注入并核对落盘记录与后代 PID 消失；整个 normalize-store 脚本的 `timed_out` 终态仍未另做进程级故障注入，不能把前者记为后者完成。
+
+同日后续 diff 审查补修完整 JSON 判据：执行器解析整个 stdout，拒绝首行有效但尾随错误文本、第二份结果或空输出，并接受格式化多行 JSON；原始输出与退出记录仍先落盘。Node 回归现为十一项，自身 rc=0。normalize-store 用同一份保留 binary 与 rc.2 安装复跑，`target/dsh-norm-store-OnWfM3/` 的二十五项通过，自身 rc=0；未修改消费方或操作真库。
+
 ## 生产 gate 与未验边界
 
-这次完成候选来源接线和合成兼容，不授予生产候选晋升。生产 pending dispose 阻断保持；本轮没有执行真实 Host 的 pending/晚到输入生命周期验证，不能宣称该阻断已解决。没有重试完整 bundle/UI，也未修改 Runtime 内核、消费者指针或部署状态。
+该次实验完成候选来源接线和合成兼容，不授予宿主生产候选晋升。实验未执行真实 Host 的 pending/晚到输入或 dispose 生命周期验证，不能证明 Runtime 收尾正确；这类准入与解除条件由宿主独立验收。该次实验没有重试完整 bundle/UI，也未修改 Runtime 内核、消费者指针或部署状态。
 
 物理/来源证据继续断言 `production_advance_permit: false`，没有放宽捕获、语义或提交门。合成持久化通过不等于真实宿主来源的授权、原子快照或生产准入通过。
 
-Linux 完整验收矩阵、远端、真实 Host/UI、真实模型与真库兼容均未验；WSL 仅单独核验新增的 Unix 进程组超时路径，未做跨系统写入。旧 SDK 的完整运行时矩阵仍未复跑。本轮不推送、发布或安装。
+Linux 完整验收矩阵、远端、真实 Host/UI、真实模型与真库兼容均未验；WSL 仅单独核验新增的 Unix 进程组超时路径，未做跨系统写入。旧 SDK 的完整运行时矩阵仍未复跑。源码后续已推送，但上述实验没有执行发布或安装；不要将后续交付状态回填成当时已经验证。

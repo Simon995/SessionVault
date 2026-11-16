@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { fork, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
-import { lstatSync, mkdirSync, mkdtempSync, realpathSync } from "node:fs";
+import { closeSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -93,6 +93,37 @@ export async function runLoggedCommand(command, args, {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/** 命令输出直写文件；先保存退出记录，再拒绝失败，最后解析完整 JSON。 */
+export async function runLoggedJsonCommand(command, args, { stem, ...options }) {
+  const stdoutFd = openSync(`${stem}.stdout.log`, "wx");
+  let stderrFd;
+  let result;
+  try {
+    stderrFd = openSync(`${stem}.stderr.log`, "wx");
+    result = await runLoggedCommand(command, args, {
+      ...options,
+      stdio: ["ignore", stdoutFd, stderrFd],
+    });
+  } finally {
+    closeSync(stdoutFd);
+    if (stderrFd !== undefined) closeSync(stderrFd);
+  }
+  writeFileSync(`${stem}.json`, JSON.stringify({
+    command, args, rc: result.status, signal: result.signal,
+    error: result.error?.code, cleanup_confirmed: result.cleanup_confirmed,
+  }, null, 2), { flag: "wx" });
+  if (result.error) throw result.error;
+  if (result.status !== 0 || result.signal) {
+    throw Object.assign(new Error(`command failed: rc=${result.status}, signal=${result.signal}`), {
+      code: "COMMAND_FAILED", status: result.status, signal: result.signal,
+    });
+  }
+  const stdout = readFileSync(`${stem}.stdout.log`, "utf8").trim();
+  const stderr = readFileSync(`${stem}.stderr.log`, "utf8");
+  const json = JSON.parse(stdout);
+  return { status: result.status, stdout, stderr, json };
 }
 
 export async function bounded(promise) {

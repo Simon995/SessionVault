@@ -9,7 +9,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 ## 1. 命令与门
 
 - 克隆后先执行 `git config core.hooksPath .githooks`：pre-push 在推送时跑下面两道闸，不过就拒绝推送；没配的克隆不受保护。
-- 提交前：`cargo fmt --all`、`cargo test --lib --features store`（动到 `dsh_snapshot` 时带 `--features store,dsh-experimental`）。feature 组合逐个编：`cargo check --bins`（默认）与 `--features store` 都要过。
+- 提交前：`cargo fmt --all`、`cargo test --lib --features store`（动到 `dsh_snapshot` 或其 `include_str!` 嵌入脚本时带 `--features store,dsh-experimental`）。feature 组合逐个编：`cargo check --bins`（默认）与 `--features store` 都要过。
 - clippy：`cargo clippy --all-targets --all-features -- -D warnings` 保持 0 条。
 - 公开仓闸：`uv run python scripts/check-public-safe.py`（扫整个工作区和 `origin/main..HEAD` 的 commit message，先自检再扫）。
 - 体量闸：`uv run python scripts/check-agents-budget.py`（本文件 ≤200 行、≤24 KB、单行 ≤320 字符；`CLAUDE.md` 只能是 `@AGENTS.md` 导入壳）。
@@ -17,6 +17,7 @@ SessionVault 是多个编程 agent 会话的摄取内核与加密总库（Rust c
 - 变异验证用 `scripts/mutate.py`：变异要打在生产实际走的路径上，脚本自己备份、自己还原并核字节一致。工作区里有的文件是 CRLF（检出遗留，入库仍是 LF），按字节匹配目标时按文件实际的换行写。
 - 实机测试默认不跑，单独开、`--test-threads=1`：`SVAULT_WSL_IT=1`（真 WSL；旧测试在 Windows 临时目录建夹具并沿用 `/mnt/<盘>`，单桥整件读取测试在本仓 `target` 下建夹具、经实际 `wslpath` 转换后读）、`SVAULT_KEYCHAIN_IT=1`（真钥匙链，测试专用服务名，只删自己建的条目）。
 - 改了非 Windows 分支（`wsl.rs` 的桩、Unix 文件权限）要在 WSL 里用 Linux 工具链编、跑一次：本仓没有 CI，开发机编不到那一支。
+- 清理构建目录前先看 `git worktree list --porcelain`：`target` 下可能有仍需保留的工作树与验证证据，不能仅凭目录名判可删。
 - 「没问成」在 `src/` 里的规模现查，不写进文档：`grep -rc 没问成 src/ --include=*.rs | awk -F: '{s+=$2} END {print s}'`。
 
 ### 提交与分支（不依赖全局指令：只读本文件的环境也要照做）
@@ -100,7 +101,7 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 - 是什么：`README.md`；设计契约：`docs/INGEST_KERNEL.md`；字段对账：`docs/rawevent-reconciliation.md`；扫描 / 投影状态模型：`docs/scan-state-model.md`。
 - 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
 - 控制面绑定、临时会话排除与真实来源契约：`docs/INGEST_KERNEL.md` §2.2、`src/session_binding.rs`；DSH 常规来源已注册、仅显式配置根时发现，物理快照核验仍以 `dsh-experimental` 门控；核查与设计见 `docs/dsh-ingest-survey.md`、`docs/dsh-read-state-design.md`。
-- 总库体积、回收判据与历史测量：`docs/storage-growth.md`；刷新性能的测量边界与已验证结论：`docs/refresh-performance.md`。
+- 总库体积、回收判据与历史测量：`docs/storage-growth.md`；刷新性能与宿主诊断启用边界：`docs/refresh-performance.md`；DSH rc.2 来源侧候选验证：`docs/dsh-rc2-source-qualification.md`。
 - 总库在多台机器之间同步（现状、决定、方案、实测记录）：`docs/linux-replica.md`。
 - **待做清单**（各项做到哪、谁来做，做完划掉写提交号）：`docs/backlog.md`。
 - 存档：本文件 2026-10-09 瘦身前的全文（判例、历史、细节），`docs/agents-full-2026-10-09.md`，不再维护。

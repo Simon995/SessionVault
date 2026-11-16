@@ -306,30 +306,37 @@ impl StatPrefetch {
             let started = std::time::Instant::now();
             match crate::wsl::read_many(&batch_distro, &paths, deadline) {
                 Ok(answers) => {
-                    let mut fetched = 0;
-                    let mut absent = 0;
-                    let mut failed = 0;
-                    let unanswered = paths
-                        .iter()
-                        .filter(|path| !answers.contains_key(*path))
-                        .count();
-                    let mut bytes = 0;
+                    let mut summary = log::log_enabled!(target: tag::WSL, log::Level::Debug)
+                        .then_some((0usize, 0usize, 0usize, 0usize));
                     for (path, answer) in answers {
                         match answer {
                             Ok(Some(read)) => {
-                                fetched += 1;
-                                bytes += read.bytes.len();
+                                if let Some((fetched, _, _, bytes)) = &mut summary {
+                                    *fetched += 1;
+                                    *bytes += read.bytes.len();
+                                }
                                 w.contents.insert((batch_distro.clone(), path), read);
                             }
-                            Ok(None) => absent += 1,
-                            Err(_) => failed += 1,
+                            Ok(None) => {
+                                if let Some((_, absent_or_non_regular, _, _)) = &mut summary {
+                                    *absent_or_non_regular += 1;
+                                }
+                            }
+                            Err(_) => {
+                                // The parser also represents missing protocol answers as Err.
+                                if let Some((_, _, failed, _)) = &mut summary {
+                                    *failed += 1;
+                                }
+                            }
                         }
                     }
-                    log::debug!(
-                        target: tag::WSL,
-                        "whole batch: requested={} fetched={fetched} absent={absent} failed={failed} unanswered={unanswered} bytes={bytes} elapsed_ms={:.3} result=ok",
-                        paths.len(), started.elapsed().as_secs_f64() * 1000.0
-                    );
+                    if let Some((fetched, absent_or_non_regular, failed, bytes)) = summary {
+                        log::debug!(
+                            target: tag::WSL,
+                            "whole batch: requested={} fetched={fetched} absent_or_non_regular={absent_or_non_regular} failed={failed} bytes={bytes} elapsed_ms={:.3} result=ok",
+                            paths.len(), started.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                 }
                 Err(e) => log::warn!(
                     target: tag::WSL,
@@ -866,9 +873,10 @@ impl WslSource<'_> {
     /// 再读）。否则整份读回来（预取规划的批，或单独一到两次 `wsl.exe`），在本机算；读到的与预取到的
     /// 身份对得上才记进缓存。预取确认两种形态都不在 ⇒ 直接报不在，不再起进程。
     fn stat_compressed(&self) -> Result<(u64, Option<i64>), String> {
-        let started = std::time::Instant::now();
+        let diagnostics = log::log_enabled!(target: tag::SCAN, log::Level::Debug);
+        let started = diagnostics.then(std::time::Instant::now);
         // Only compute the anonymous identifier when the caller enables diagnostics.
-        let source_id = log::log_enabled!(target: tag::SCAN, log::Level::Debug).then(|| {
+        let source_id = diagnostics.then(|| {
             use sha2::{Digest, Sha256};
             format!(
                 "{:x}",
@@ -895,8 +903,8 @@ impl WslSource<'_> {
         let id = match self.prefetched_compressed {
             Some(Ok(None)) => {
                 log::debug!(target: tag::SCAN,
-                    "compressed length: source={source_id} compressed_call={call_id} result=absent elapsed_ms={:.3}",
-                    started.elapsed().as_secs_f64() * 1000.0);
+                    "compressed length: source={source_id} compressed_call={call_id} result=absent_or_non_regular elapsed_ms={:.3}",
+                    started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0));
                 return Err(missing());
             }
             Some(Ok(Some(id))) => Some(*id),
@@ -909,13 +917,13 @@ impl WslSource<'_> {
                 self.identity.set(Some(id));
                 log::debug!(target: tag::SCAN,
                     "compressed length: source={source_id} compressed_call={call_id} result=cache_hit logical_bytes={len} elapsed_ms={:.3}",
-                    started.elapsed().as_secs_f64() * 1000.0);
+                    started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0));
                 return Ok((len, Some(id.mtime)));
             }
         }
         log::debug!(target: tag::SCAN,
             "compressed length: source={source_id} compressed_call={call_id} cache=not_reused identity_available={}", id.is_some());
-        let read_started = std::time::Instant::now();
+        let read_started = diagnostics.then(std::time::Instant::now);
         let (read, mode) = match self.whole.take_whole(self.distro, &zst) {
             Some(read) => (Ok(Some(read)), "batch"),
             None => (
@@ -925,17 +933,18 @@ impl WslSource<'_> {
         };
         log::debug!(target: tag::SCAN,
             "compressed read: source={source_id} compressed_call={call_id} mode={mode} result={} read_ms={:.3}",
-            match &read { Ok(Some(_)) => "found", Ok(None) => "absent", Err(_) => "unknown" },
-            read_started.elapsed().as_secs_f64() * 1000.0);
+            match &read { Ok(Some(_)) => "found", Ok(None) => "absent_or_non_regular", Err(_) => "unknown" },
+            read_started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0));
         let read = read
             .map_err(|e| format!("{}:{zst}: {e}", self.distro))?
             .ok_or_else(missing)?;
-        let decode_started = std::time::Instant::now();
+        let decode_started = diagnostics.then(std::time::Instant::now);
         let len = crate::compressed::decoded_len(&mut std::io::Cursor::new(&read.bytes));
         log::debug!(target: tag::SCAN,
             "compressed decode: source={source_id} compressed_call={call_id} compressed_bytes={} logical_bytes={:?} result={} decode_ms={:.3} elapsed_through_decode_ms={:.3}",
             read.bytes.len(), len.as_ref().ok(), if len.is_ok() { "ok" } else { "error" },
-            decode_started.elapsed().as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0);
+            decode_started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0),
+            started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0));
         let len = len.map_err(|e| format!("{}:{zst}: {e}", self.distro))?;
         if let Some(id) =
             id.filter(|id| id.size == read.bytes.len() as u64 && id.mtime == read.mtime)
