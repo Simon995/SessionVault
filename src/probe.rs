@@ -900,6 +900,18 @@ impl WslBackend {
             format!("/{linux}")
         })
     }
+
+    pub(crate) fn linux_or_err(&self, path: &Path) -> Result<String, ProbeError> {
+        self.to_linux(path).ok_or_else(|| {
+            ProbeError::new(
+                path,
+                format!(
+                    "not under this backend's declared WSL prefix {:?} (distro {})",
+                    self.prefix, self.distro
+                ),
+            )
+        })
+    }
 }
 
 impl ProbeBackend for WslBackend {
@@ -907,14 +919,9 @@ impl ProbeBackend for WslBackend {
     fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind> {
         // 🔴 **答不了 ≠ 这里没有。** 前缀对不上说明调用方拿错了命名空间；
         // 报 `Absent` 会让它据此删数据 —— 那正是本类型存在的理由的反面。
-        let Some(linux_path) = self.to_linux(path) else {
-            return Probed::Unknown(ProbeError::new(
-                path,
-                format!(
-                    "not under this backend's declared WSL prefix {:?} (distro {})",
-                    self.prefix, self.distro
-                ),
-            ));
+        let linux_path = match self.linux_or_err(path) {
+            Ok(p) => p,
+            Err(e) => return Probed::Unknown(e),
         };
         match crate::wsl::stat_kind(&self.distro, &linux_path, deadline) {
             Ok(Some(crate::wsl::PathKind::Dir)) => Probed::Found(FileKind::Dir),
@@ -932,19 +939,163 @@ impl ProbeBackend for WslBackend {
     /// `Ok(None)` 已经是发行版自己说的「没有」，而发行版能应答本身就证明了
     /// 命名空间可达 —— 桥不通时它给的是 `Err`。
     fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String> {
-        let Some(linux_path) = self.to_linux(path) else {
-            return Probed::Unknown(ProbeError::new(
-                path,
-                format!(
-                    "not under this backend's declared WSL prefix {:?} (distro {})",
-                    self.prefix, self.distro
-                ),
-            ));
+        let linux_path = match self.linux_or_err(path) {
+            Ok(p) => p,
+            Err(e) => return Probed::Unknown(e),
         };
         match crate::wsl::read_file_at(&self.distro, &linux_path, deadline) {
             Ok(Some(t)) => Probed::Found(t),
             Ok(None) => Probed::Absent,
             Err(e) => Probed::Unknown(ProbeError::new(path, e)),
+        }
+    }
+}
+
+/// 挂着 [`crate::wsl::probe_git_roots`] 预取快照的 WSL 探测后端。
+///
+/// 只负责把单根或多根的候选路径合并进一次桥调用，**不做任何 git 配置解析**：
+/// `identity.rs` 照旧通过 [`ProbeBackend`] 跑同一份规则，命中快照时直接返回，
+/// 超过单文件预取上限或未覆盖的罕见路径回落给内层后端。
+pub(crate) struct PrefetchedWslBackend<'a, F: ProbeBackend = WslBackend> {
+    addressing: WslBackend,
+    fallback: F,
+    source: PrefetchSource<'a>,
+}
+
+enum PrefetchSource<'a> {
+    Single {
+        root: String,
+        fetched: std::cell::OnceCell<crate::wsl::GitRootsSnapshot>,
+    },
+    Shared(&'a crate::wsl::GitRootsSnapshot),
+}
+
+impl PrefetchedWslBackend<'static, WslBackend> {
+    /// 单根惰性预取：首次探测或读取时发起唯一一次 [`crate::wsl::probe_git_roots`]。
+    pub(crate) fn single(distro: impl Into<String>, linux_root: impl Into<String>) -> Self {
+        let addressing = WslBackend::new(distro);
+        let fallback = addressing.clone();
+        Self {
+            addressing,
+            fallback,
+            source: PrefetchSource::Single {
+                root: linux_root.into(),
+                fetched: std::cell::OnceCell::new(),
+            },
+        }
+    }
+}
+
+impl<'a> PrefetchedWslBackend<'a, WslBackend> {
+    /// 复用一轮批预取已经拿到的发行版快照（或发行版级桥错误）。
+    pub(crate) fn shared(
+        distro: impl Into<String>,
+        snapshot: &'a crate::wsl::GitRootsSnapshot,
+    ) -> Self {
+        let addressing = WslBackend::new(distro);
+        let fallback = addressing.clone();
+        Self {
+            addressing,
+            fallback,
+            source: PrefetchSource::Shared(snapshot),
+        }
+    }
+}
+
+impl<'a, F: ProbeBackend> PrefetchedWslBackend<'a, F> {
+    #[cfg(test)]
+    pub(crate) fn with_fallback(
+        distro: impl Into<String>,
+        snapshot: &'a crate::wsl::GitRootsSnapshot,
+        fallback: F,
+    ) -> Self {
+        Self {
+            addressing: WslBackend::new(distro),
+            fallback,
+            source: PrefetchSource::Shared(snapshot),
+        }
+    }
+
+    fn snapshot(&self, deadline: Deadline) -> &crate::wsl::GitRootsSnapshot {
+        match &self.source {
+            PrefetchSource::Single { root, fetched } => fetched.get_or_init(|| {
+                crate::wsl::probe_git_roots(
+                    &self.addressing.distro,
+                    std::slice::from_ref(root),
+                    deadline,
+                )
+            }),
+            PrefetchSource::Shared(snapshot) => snapshot,
+        }
+    }
+}
+
+impl<F: ProbeBackend> ProbeBackend for PrefetchedWslBackend<'_, F> {
+    fn probe(&self, path: &Path, deadline: Deadline) -> Probed<FileKind> {
+        let linux_path = match self.addressing.linux_or_err(path) {
+            Ok(p) => p,
+            Err(e) => return Probed::Unknown(e),
+        };
+        let map = match self.snapshot(deadline) {
+            Ok(map) => map,
+            Err(e) => return Probed::Unknown(ProbeError::new(path, e.clone())),
+        };
+        match map.get(&linux_path) {
+            Some(crate::wsl::GitPathProbe::Present { kind, .. }) => Probed::Found(match kind {
+                crate::wsl::PathKind::Dir => FileKind::Dir,
+                crate::wsl::PathKind::File => FileKind::File,
+                crate::wsl::PathKind::Other => FileKind::Other,
+            }),
+            Some(crate::wsl::GitPathProbe::Absent) => Probed::Absent,
+            Some(crate::wsl::GitPathProbe::Unknown(why)) => {
+                Probed::Unknown(ProbeError::new(path, why.clone()))
+            }
+            None => self.fallback.probe(path, deadline),
+        }
+    }
+
+    fn read_text(&self, path: &Path, deadline: Deadline) -> Probed<String> {
+        let linux_path = match self.addressing.linux_or_err(path) {
+            Ok(p) => p,
+            Err(e) => return Probed::Unknown(e),
+        };
+        let map = match self.snapshot(deadline) {
+            Ok(map) => map,
+            Err(e) => return Probed::Unknown(ProbeError::new(path, e.clone())),
+        };
+        match map.get(&linux_path) {
+            Some(crate::wsl::GitPathProbe::Present {
+                kind: crate::wsl::PathKind::File,
+                text,
+            }) => match text {
+                crate::wsl::GitTextProbe::Bytes(bytes) => match std::str::from_utf8(bytes) {
+                    Ok(s) => Probed::Found(s.to_owned()),
+                    Err(e) => Probed::Unknown(ProbeError::new(
+                        path,
+                        format!(
+                            "wsl read {}:{linux_path} not valid UTF-8: {e}",
+                            self.addressing.distro
+                        ),
+                    )),
+                },
+                crate::wsl::GitTextProbe::ReadFailed(why) => {
+                    Probed::Unknown(ProbeError::new(path, why.clone()))
+                }
+                crate::wsl::GitTextProbe::NotPrefetched => self.fallback.read_text(path, deadline),
+            },
+            // 与 `WslBackend::read_text`（`[ -f ] || exit 7`）保持同构：非普通文件与缺席均为 Absent，
+            // 上层若刚确认存在会按既定 fail-safe 转为 Unknown。
+            Some(
+                crate::wsl::GitPathProbe::Present {
+                    kind: crate::wsl::PathKind::Dir | crate::wsl::PathKind::Other,
+                    ..
+                }
+                | crate::wsl::GitPathProbe::Absent,
+            ) => Probed::Absent,
+            Some(crate::wsl::GitPathProbe::Unknown(why)) => {
+                Probed::Unknown(ProbeError::new(path, why.clone()))
+            }
+            None => self.fallback.read_text(path, deadline),
         }
     }
 }
@@ -1415,5 +1566,130 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefetched_wsl_backend_preserves_tristate_and_falls_back_only_when_unprefetched() {
+        use crate::wsl::{GitPathProbe, GitTextProbe, PathKind};
+
+        struct PanicFallback;
+        impl ProbeBackend for PanicFallback {
+            fn probe(&self, p: &Path, _d: Deadline) -> Probed<FileKind> {
+                panic!("unexpected fallback probe for {p:?}");
+            }
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                panic!("unexpected fallback read_text for {p:?}");
+            }
+        }
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "/w/repo/.git".to_string(),
+            GitPathProbe::Present {
+                kind: PathKind::Dir,
+                text: GitTextProbe::NotPrefetched,
+            },
+        );
+        map.insert(
+            "/w/repo/.git/config".to_string(),
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::Bytes(b"[remote \"origin\"]\n".to_vec()),
+            },
+        );
+        map.insert(
+            "/w/bad-utf8/.git/config".to_string(),
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::Bytes(vec![0xff, 0xfe]),
+            },
+        );
+        map.insert(
+            "/w/unreadable/.git/config".to_string(),
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::ReadFailed("Permission denied".to_string()),
+            },
+        );
+        map.insert("/w/gone".to_string(), GitPathProbe::Absent);
+        map.insert(
+            "/w/denied".to_string(),
+            GitPathProbe::Unknown("stat: Permission denied".to_string()),
+        );
+        let ok_snap = Ok(map);
+        let backend = PrefetchedWslBackend::with_fallback("dev", &ok_snap, PanicFallback);
+        let d = Deadline::unbounded();
+
+        assert_eq!(
+            backend.probe(&Path::new("/w/repo").join(".git"), d),
+            Probed::Found(FileKind::Dir)
+        );
+        assert_eq!(
+            backend.read_text(&Path::new("/w/repo").join(".git"), d),
+            Probed::Absent
+        );
+        assert_eq!(
+            backend.read_text(&Path::new("/w/repo/.git").join("config"), d),
+            Probed::Found("[remote \"origin\"]\n".to_string())
+        );
+        assert!(matches!(
+            backend.read_text(Path::new("/w/bad-utf8/.git/config"), d),
+            Probed::Unknown(e) if e.message.contains("not valid UTF-8")
+        ));
+        assert!(matches!(
+            backend.read_text(Path::new("/w/unreadable/.git/config"), d),
+            Probed::Unknown(e) if e.message.contains("Permission denied")
+        ));
+        assert_eq!(backend.probe(Path::new("/w/gone"), d), Probed::Absent);
+        assert!(matches!(
+            backend.probe(Path::new("/w/denied"), d),
+            Probed::Unknown(e) if e.message.contains("Permission denied")
+        ));
+
+        let err_snap = Err("wsl probe_git_roots dev exited Some(1): boom".to_string());
+        let failed = PrefetchedWslBackend::with_fallback("dev", &err_snap, PanicFallback);
+        assert!(matches!(
+            failed.probe(Path::new("/w/repo/.git"), d),
+            Probed::Unknown(e) if e.message.contains("wsl probe_git_roots")
+        ));
+
+        struct CountingFallback(std::cell::Cell<usize>);
+        impl ProbeBackend for CountingFallback {
+            fn probe(&self, _p: &Path, _d: Deadline) -> Probed<FileKind> {
+                self.0.set(self.0.get() + 1);
+                Probed::Found(FileKind::File)
+            }
+            fn read_text(&self, _p: &Path, _d: Deadline) -> Probed<String> {
+                self.0.set(self.0.get() + 1);
+                Probed::Found("from-fallback".to_string())
+            }
+        }
+
+        let mut partial = std::collections::HashMap::new();
+        partial.insert(
+            "/w/huge/.git/config".to_string(),
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::NotPrefetched,
+            },
+        );
+        let partial_snap = Ok(partial);
+        let with_fb =
+            PrefetchedWslBackend::with_fallback("dev", &partial_snap, CountingFallback(0.into()));
+        assert_eq!(
+            with_fb.probe(Path::new("/w/huge/.git/config"), d),
+            Probed::Found(FileKind::File)
+        );
+        assert_eq!(with_fb.fallback.0.get(), 0, "probe hit snapshot");
+        assert_eq!(
+            with_fb.read_text(Path::new("/w/huge/.git/config"), d),
+            Probed::Found("from-fallback".to_string())
+        );
+        assert_eq!(with_fb.fallback.0.get(), 1, "oversized text fell back");
+        assert_eq!(
+            with_fb.probe(Path::new("/w/unplanned"), d),
+            Probed::Found(FileKind::File)
+        );
+        assert_eq!(with_fb.fallback.0.get(), 2, "unplanned path fell back");
     }
 }

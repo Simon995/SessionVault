@@ -921,6 +921,376 @@ pub enum PathKind {
     Other,
 }
 
+/// 身份预取批内联带回的单文件字节上限（1 MiB）。
+///
+/// `.git` 指针、`commondir` 与 `.git/config` 正常只有数十字节到数 KiB；
+/// 超过上限只返回存在性与类型，读取按需回落到单件调用。
+pub const GIT_PROBE_TEXT_MAX: u64 = 1024 * 1024;
+
+/// 预取脚本在发行版内解码展开下一跳（`.git` 指针 / `commondir`）的字节上限（64 KiB）。
+#[cfg(any(windows, test))]
+const GIT_REF_EXPAND_MAX: u64 = 64 * 1024;
+
+/// [`probe_git_roots`] 对单条候选路径的正文预取状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitTextProbe {
+    /// 未请求正文（如仅需存在性的项目根），或超过 [`GIT_PROBE_TEXT_MAX`] 留给单件读。
+    NotPrefetched,
+    /// 已从同一打开的普通文件描述符读出原始字节（调用方在需要文本时核 UTF-8）。
+    Bytes(Vec<u8>),
+    /// 路径是普通文件，但打开或读取失败（权限拒绝、中途不再是普通文件、I/O 错误）。
+    ReadFailed(String),
+}
+
+/// [`probe_git_roots`] 对单条候选路径的探测快照 —— 三态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitPathProbe {
+    /// 路径存在：附带类型与可选的正文预取结果。
+    Present { kind: PathKind, text: GitTextProbe },
+    /// 确认不存在（`No such file or directory` / `Not a directory` 且非断链）。
+    Absent,
+    /// 没问成（权限拒绝、符号链接环、I/O 错误等）。
+    Unknown(String),
+}
+
+/// [`probe_git_roots`] 对一批根返回的快照（或发行版级桥错误）。
+pub type GitRootsSnapshot = Result<std::collections::HashMap<String, GitPathProbe>, String>;
+
+/// 一次 `wsl.exe` 预取一个或多个项目根在发行版内的 git 身份相关路径状态与小文本。
+///
+/// 只收集路径事实（`<root>`、`<root>/.git`、以及 `.git` 文件展开出的 `commondir` / `config`
+/// 候选），不做身份判决 —— 判决仍由 `identity.rs` 的唯一规则在内存快照上完成。
+/// 单条路径的权限错误或读取失败记入对应条目，不中断同批其余根；外层 `Err` 仅表示桥进程失败、
+/// 预算耗尽或线协议损坏。
+#[cfg(windows)]
+pub fn probe_git_roots(
+    distro: &str,
+    roots: &[String],
+    deadline: crate::deadline::Deadline,
+) -> GitRootsSnapshot {
+    let script = probe_git_roots_script(roots);
+    if script.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let out = run_bash_stdin(distro, &script, deadline)?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl probe_git_roots {distro} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_probe_git_roots(&out.stdout)
+}
+
+#[cfg(any(windows, test))]
+fn probe_git_roots_script(roots: &[String]) -> String {
+    let deduped: std::collections::BTreeSet<&str> = roots
+        .iter()
+        .map(|r| r.trim_end_matches('/'))
+        .filter(|r| !r.is_empty() && r.starts_with('/'))
+        .collect();
+    if deduped.is_empty() {
+        return String::new();
+    }
+    let read_cap = GIT_PROBE_TEXT_MAX + 3;
+    let b64_cap = GIT_PROBE_TEXT_MAX.div_ceil(3) * 4;
+    let ref_b64_cap = GIT_REF_EXPAND_MAX.div_ceil(3) * 4;
+    let mut script = format!(
+        r#"LC_ALL=C
+set -u
+
+trim_ws() {{
+    local s="$1"
+    s="${{s#"${{s%%[![:space:]]*}}"}}"
+    s="${{s%"${{s##*[![:space:]]}}"}}"
+    TRIMMED="$s"
+}}
+
+strip_trailing_slashes() {{
+    local s="$1"
+    while [ "$s" != "/" ] && [ "${{s%/}}" != "$s" ]; do
+        s="${{s%/}}"
+    done
+    STRIPPED="$s"
+}}
+
+join_ref() {{
+    local base="$1" raw="$2"
+    raw="${{raw//\\//}}"
+    if [ -z "$raw" ]; then
+        JOINED="$base"
+    elif [ "${{raw#/}}" != "$raw" ] || [[ "$raw" == [A-Za-z]:/* ]] || [[ "$raw" == [A-Za-z]: ]]; then
+        JOINED="$raw"
+    else
+        strip_trailing_slashes "$base"
+        if [ "$STRIPPED" = "/" ]; then
+            JOINED="/$raw"
+        else
+            JOINED="$STRIPPED/$raw"
+        fi
+    fi
+}}
+
+join_child() {{
+    strip_trailing_slashes "$1"
+    if [ "$STRIPPED" = "/" ]; then
+        JOINED="/$2"
+    else
+        JOINED="$STRIPPED/$2"
+    fi
+}}
+
+find_gitdir_line() {{
+    FOUND_GITDIR=0
+    GITDIR_VAL=""
+    local text="$1" line=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        trim_ws "$line"
+        case "$TRIMMED" in
+            gitdir:*)
+                trim_ws "${{TRIMMED#gitdir:}}"
+                FOUND_GITDIR=1
+                GITDIR_VAL="$TRIMMED"
+                return 0
+                ;;
+        esac
+    done <<< "$text"
+}}
+
+capture_regular_b64() (
+    set -o pipefail
+    exec 3<"$1"
+    if [ ! -f /proc/self/fd/3 ]; then
+        printf 'opened file is no longer regular\n' >&2
+        exit 1
+    fi
+    head -c {read_cap} <&3 | base64 | tr -d '\r\n'
+)
+
+probe_one() {{
+    local p="$1" want="$2" out="" detail="" sp=""
+    LAST_KIND=""
+    LAST_TEXT_OK="0"
+    LAST_TEXT=""
+    if [ -d "$p" ]; then
+        LAST_KIND="D"
+        printf 'D\0%s\0\0' "$p"
+        return 0
+    fi
+    if [ -f "$p" ]; then
+        LAST_KIND="F"
+        if [ "$want" = "0" ]; then
+            printf 'P\0%s\0\0' "$p"
+            return 0
+        fi
+        if out=$(capture_regular_b64 "$p" 2>&1); then
+            if [ "${{#out}}" -gt {b64_cap} ]; then
+                printf 'P\0%s\0\0' "$p"
+            else
+                printf 'F\0%s\0%s\0' "$p" "$out"
+                if [ "$want" = "2" ] && [ "${{#out}}" -le {ref_b64_cap} ]; then
+                    LAST_TEXT_OK="1"
+                    LAST_TEXT=$(printf '%s' "$out" | base64 -d 2>/dev/null | tr -d '\0' || true)
+                fi
+            fi
+        else
+            out=${{out//$'\n'/ }}
+            printf 'X\0%s\0%s\0' "$p" "$out"
+        fi
+        return 0
+    fi
+    if [ -e "$p" ]; then
+        LAST_KIND="O"
+        printf 'O\0%s\0\0' "$p"
+        return 0
+    fi
+    case "$p" in
+        /*) sp="$p" ;;
+        *) sp="./$p" ;;
+    esac
+    if detail=$(stat -L "$sp" 2>&1); then
+        if [ -d "$p" ]; then
+            LAST_KIND="D"
+            printf 'D\0%s\0\0' "$p"
+        elif [ -f "$p" ]; then
+            LAST_KIND="F"
+            printf 'P\0%s\0\0' "$p"
+        else
+            LAST_KIND="O"
+            printf 'O\0%s\0\0' "$p"
+        fi
+        return 0
+    fi
+    case "$detail" in
+        *': No such file or directory'|*': Not a directory')
+            if [ -L "$p" ]; then
+                LAST_KIND="O"
+                printf 'O\0%s\0\0' "$p"
+            else
+                LAST_KIND="M"
+                printf 'M\0%s\0\0' "$p"
+            fi
+            ;;
+        *)
+            LAST_KIND="U"
+            detail=${{detail//$'\n'/ }}
+            printf 'U\0%s\0%s\0' "$p" "$detail"
+            ;;
+    esac
+}}
+
+probe_root() {{
+    local base="$1"
+    strip_trailing_slashes "$base"
+    base="$STRIPPED"
+    [ -n "$base" ] && [ "$base" != "/" ] || return 0
+
+    local dot_git="$base/.git"
+    probe_one "$dot_git" 2
+    case "$LAST_KIND" in
+        D)
+            probe_one "$dot_git/config" 1
+            ;;
+        M|O)
+            probe_one "$base" 0
+            ;;
+        F)
+            if [ "$LAST_TEXT_OK" = "1" ]; then
+                find_gitdir_line "$LAST_TEXT"
+                if [ "$FOUND_GITDIR" = "1" ]; then
+                    join_ref "$base" "$GITDIR_VAL"
+                    local gitdir="$JOINED"
+                    join_child "$gitdir" "commondir"
+                    local commondir_path="$JOINED"
+                    probe_one "$commondir_path" 2
+                    case "$LAST_KIND" in
+                        M)
+                            join_child "$gitdir" "config"
+                            probe_one "$JOINED" 1
+                            ;;
+                        F)
+                            if [ "$LAST_TEXT_OK" = "1" ]; then
+                                trim_ws "$LAST_TEXT"
+                                join_ref "$gitdir" "$TRIMMED"
+                                join_child "$JOINED" "config"
+                                probe_one "$JOINED" 1
+                            fi
+                            ;;
+                        D|O)
+                            probe_one "$base" 0
+                            ;;
+                    esac
+                else
+                    probe_one "$base" 0
+                fi
+            fi
+            ;;
+    esac
+}}
+"#
+    );
+    for root in deduped {
+        script.push_str(&format!("probe_root \"{}\"\n", shell_escape(root)));
+    }
+    script
+}
+
+/// 解析 [`probe_git_roots`] 的 `<tag>\0<path>\0<payload>\0` 帧流。
+#[cfg(any(windows, test))]
+fn parse_probe_git_roots(bytes: &[u8]) -> GitRootsSnapshot {
+    use base64::Engine;
+    if bytes.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    if bytes.last() != Some(&0) {
+        return Err("wsl probe_git_roots: unterminated stream".to_string());
+    }
+    let fields: Vec<&[u8]> = bytes[..bytes.len() - 1].split(|b| *b == 0).collect();
+    let chunks = fields.chunks_exact(3);
+    if !chunks.remainder().is_empty() {
+        return Err(format!(
+            "wsl probe_git_roots: malformed stream ({} fields, expected multiple of 3)",
+            fields.len()
+        ));
+    }
+    let mut out = std::collections::HashMap::with_capacity(chunks.len());
+    for chunk in chunks {
+        let tag = std::str::from_utf8(chunk[0])
+            .map_err(|_| "wsl probe_git_roots: non-UTF-8 record tag".to_string())?;
+        let Ok(path) = std::str::from_utf8(chunk[1]) else {
+            // 候选路径若由非 UTF-8 `gitdir:` 派生，Rust `Path`/`to_linux` 不会按原始非 UTF-8 键命中；
+            // 跳过该派生条目，交由按需回落报告 UTF-8 错误。
+            if tag == "D"
+                || tag == "O"
+                || tag == "M"
+                || tag == "P"
+                || tag == "F"
+                || tag == "U"
+                || tag == "X"
+            {
+                continue;
+            }
+            return Err(format!("wsl probe_git_roots: unknown record tag {tag:?}"));
+        };
+        let entry = match tag {
+            "D" if chunk[2].is_empty() => GitPathProbe::Present {
+                kind: PathKind::Dir,
+                text: GitTextProbe::NotPrefetched,
+            },
+            "O" if chunk[2].is_empty() => GitPathProbe::Present {
+                kind: PathKind::Other,
+                text: GitTextProbe::NotPrefetched,
+            },
+            "M" if chunk[2].is_empty() => GitPathProbe::Absent,
+            "P" if chunk[2].is_empty() => GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::NotPrefetched,
+            },
+            "F" => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(chunk[2])
+                    .map_err(|e| format!("wsl probe_git_roots {path}: bad base64: {e}"))?;
+                let text = if decoded.len() as u64 > GIT_PROBE_TEXT_MAX {
+                    GitTextProbe::NotPrefetched
+                } else {
+                    GitTextProbe::Bytes(decoded)
+                };
+                GitPathProbe::Present {
+                    kind: PathKind::File,
+                    text,
+                }
+            }
+            "U" => {
+                let detail = String::from_utf8_lossy(chunk[2]).trim().to_string();
+                GitPathProbe::Unknown(if detail.is_empty() {
+                    "wsl probe_git_roots: unknown stat error".to_string()
+                } else {
+                    detail
+                })
+            }
+            "X" => {
+                let detail = String::from_utf8_lossy(chunk[2]).trim().to_string();
+                GitPathProbe::Present {
+                    kind: PathKind::File,
+                    text: GitTextProbe::ReadFailed(if detail.is_empty() {
+                        "wsl probe_git_roots: read failed".to_string()
+                    } else {
+                        detail
+                    }),
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "wsl probe_git_roots: malformed record tag={tag:?} path={path:?}"
+                ))
+            }
+        };
+        out.insert(path.to_string(), entry);
+    }
+    Ok(out)
+}
+
 // 🔴 **非 Windows 的桩曾经是「第二份签名」，而开发机永远不编译它**
 // （2026-08-14 CI 实测：`stat` 的真实现丢了 `#[cfg(windows)]` ⇒ 与桩重复定义；
 // `list_distros` / `find_project_root` 的桩少了 `deadline` 参数 —— 三处都是加参数时
@@ -979,6 +1349,12 @@ stub_on_non_windows! {
         abs_path: &str,
         deadline: crate::deadline::Deadline,
     ) -> Result<Option<PathKind>, String>;
+
+    pub fn probe_git_roots(
+        distro: &str,
+        roots: &[String],
+        deadline: crate::deadline::Deadline,
+    ) -> GitRootsSnapshot;
 
     pub fn stat_many(
         distro: &str,
@@ -1170,33 +1546,25 @@ pub fn read_range(
 /// 读发行版内**绝对路径**文件的全文。`Ok(None)` = 文件不存在（exit 7 哨兵），
 /// 据此区分「该来源没跑过 CLI」与「wsl.exe 挂了」。
 ///
-/// 绝对路径不含 `$`，故安全走 `bash -c`（无 stdin-pipe 需求）。
+#[cfg(any(windows, test))]
+fn read_file_at_script(abs_path: &str) -> String {
+    let escaped = shell_escape(abs_path);
+    format!("set -eu\n[ -f \"{escaped}\" ] || exit 7\ncat -- \"{escaped}\"\n")
+}
+
+/// 经 `run_bash_stdin` 读取发行版内普通 UTF-8 文件。
+///
+/// 🔴 **不许走 `wsl.exe -d <distro> -- bash -c <script>`**（2026-11-16 实测踩中）：
+/// 没有 `--exec` 时 `wsl.exe` 先经发行版默认 shell 二次解析 argv，路径含单引号 `'`、
+/// `$` 或反引号 `` ` `` 时外层引号错配直接报 `exit 2`（`unexpected EOF while looking for matching '''`）。
+/// 脚本走 stdin 只经一层 `bash`，`shell_escape` 的双引号转义才完备。
 #[cfg(windows)]
 pub fn read_file_at(
     distro: &str,
     abs_path: &str,
     deadline: crate::deadline::Deadline,
 ) -> Result<Option<String>, String> {
-    use std::process::{Command, Stdio};
-
-    let escaped = shell_escape(abs_path);
-    let script = format!("[ -f \"{escaped}\" ] || exit 7\ncat \"{escaped}\"\n");
-
-    let mut cmd = Command::new("wsl.exe");
-    cmd.args(["-d", distro, "--", "bash", "-c", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_no_window(&mut cmd);
-
-    // 🔴 与 `run_bash_stdin` / `list_distros` 同一条：**`.output()` 没有上限**。
-    // 快照全文读走这里（`scan_snapshot`），一个卡死的 WSL 会让 `svault scan-all`
-    // 无限期挂住。评审 [P2] 指出前两处改了、这处漏了 —— 加超时这件事必须**逐个
-    // 出站调用**核，不能核到「主要那条路径」为止。
-    let budget = deadline
-        .budget_for(WSL_CALL_TIMEOUT)
-        .ok_or_else(|| format!("wsl read {distro}: round budget exhausted before the call"))?;
-    let output = wait_with_deadline(spawn(&mut cmd)?, budget)?;
+    let output = run_bash_stdin(distro, &read_file_at_script(abs_path), deadline)?;
 
     match output.status.code() {
         Some(0) => String::from_utf8(output.stdout)
@@ -1909,6 +2277,11 @@ mod tests {
         assert_eq!(shell_escape(r#"a"b"#), r#"a\"b"#);
         assert_eq!(shell_escape("$HOME/x"), "\\$HOME/x");
         assert_eq!(shell_escape("a`b\\c"), "a\\`b\\\\c");
+        let s = read_file_at_script("/mnt/c/repo ' $` 中文/.git/config");
+        assert_eq!(
+            s,
+            "set -eu\n[ -f \"/mnt/c/repo ' \\$\\` 中文/.git/config\" ] || exit 7\ncat -- \"/mnt/c/repo ' \\$\\` 中文/.git/config\"\n"
+        );
     }
 
     /// 实机集成测试：验证 `stat` + `read_range`（含 `start>0` 增量 tail）打通真实
@@ -2000,6 +2373,168 @@ mod tests {
             distro,
             &format!("rm -f {path}\n"),
             crate::deadline::Deadline::unbounded(),
+        );
+    }
+
+    #[test]
+    fn probe_git_roots_script_escapes_dedupes_and_skips_empty_roots() {
+        assert!(probe_git_roots_script(&[]).is_empty());
+        assert!(probe_git_roots_script(&["/".into(), "".into(), "rel/path".into()]).is_empty());
+
+        let roots = vec![
+            "/home/u/a$b`c\"d\\e/".to_string(),
+            "/home/u/a$b`c\"d\\e".to_string(),
+        ];
+        let script = probe_git_roots_script(&roots);
+        let expected_call = r#"probe_root "/home/u/a\$b\`c\"d\\e""#;
+        assert_eq!(script.matches(expected_call).count(), 1);
+        assert!(script.contains("exec 3<\"$1\""));
+        assert!(script.contains("/proc/self/fd/3"));
+    }
+
+    #[test]
+    fn parse_probe_git_roots_decodes_all_tags_and_rejects_corruption() {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+
+        assert!(parse_probe_git_roots(b"").unwrap().is_empty());
+
+        let payload = b"[remote \"origin\"]\n\turl = git@github.com:o/r.git\n";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"D\0/w/repo/.git\0\0");
+        wire.extend_from_slice(format!("F\0/w/repo/.git/config\0{}\0", b64(payload)).as_bytes());
+        wire.extend_from_slice(b"M\0/w/plain/.git\0\0");
+        wire.extend_from_slice(b"D\0/w/plain\0\0");
+        wire.extend_from_slice(b"O\0/w/broken/.git\0\0");
+        wire.extend_from_slice(b"P\0/w/huge/.git/config\0\0");
+        wire.extend_from_slice(b"U\0/w/denied/.git\0stat: Permission denied\0");
+        wire.extend_from_slice(b"X\0/w/unreadable/.git/config\0open: Permission denied\0");
+
+        let parsed = parse_probe_git_roots(&wire).unwrap();
+        assert_eq!(
+            parsed["/w/repo/.git"],
+            GitPathProbe::Present {
+                kind: PathKind::Dir,
+                text: GitTextProbe::NotPrefetched,
+            }
+        );
+        assert_eq!(
+            parsed["/w/repo/.git/config"],
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::Bytes(payload.to_vec()),
+            }
+        );
+        assert_eq!(parsed["/w/plain/.git"], GitPathProbe::Absent);
+        assert_eq!(
+            parsed["/w/broken/.git"],
+            GitPathProbe::Present {
+                kind: PathKind::Other,
+                text: GitTextProbe::NotPrefetched,
+            }
+        );
+        assert_eq!(
+            parsed["/w/huge/.git/config"],
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::NotPrefetched,
+            }
+        );
+        assert_eq!(
+            parsed["/w/denied/.git"],
+            GitPathProbe::Unknown("stat: Permission denied".to_string())
+        );
+        assert_eq!(
+            parsed["/w/unreadable/.git/config"],
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::ReadFailed("open: Permission denied".to_string()),
+            }
+        );
+
+        let over_limit = vec![b'a'; GIT_PROBE_TEXT_MAX as usize + 1];
+        let over_wire = format!("F\0/w/over/.git/config\0{}\0", b64(&over_limit));
+        assert_eq!(
+            parse_probe_git_roots(over_wire.as_bytes()).unwrap()["/w/over/.git/config"],
+            GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::NotPrefetched,
+            }
+        );
+
+        for bad in [
+            &b"D\0/w/a\0"[..],
+            b"D\0/w/a\0\0F\0/w/b\0",
+            b"Z\0/w/a\0\0",
+            b"D\0/w/a\0unexpected\0",
+            b"F\0/w/a\0!!!not-base64!!!\0",
+        ] {
+            assert!(parse_probe_git_roots(bad).is_err(), "bad={bad:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn probe_git_roots_non_windows_is_unavailable() {
+        assert!(probe_git_roots(
+            "dev",
+            &["/home/u/proj".to_string()],
+            crate::deadline::Deadline::unbounded()
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wsl_read_file_at_and_probe_git_roots_special_chars_it() {
+        if std::env::var("SVAULT_WSL_IT").is_err() {
+            return;
+        }
+        let distros = list_distros(crate::deadline::Deadline::unbounded()).expect("list_distros");
+        let distro = distros
+            .iter()
+            .find(|d| is_user_distro(d))
+            .expect("need at least one user distro");
+
+        let host_base = std::env::temp_dir().join(format!(
+            "svault-wsl-special-{}-repo ' $` 中文",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&host_base);
+        let git_dir = host_base.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir");
+        let cfg_body = "[remote \"origin\"]\n\turl = git@github.com:o/special.git\n";
+        std::fs::write(git_dir.join("config"), cfg_body.as_bytes()).expect("write config");
+
+        let out = std::process::Command::new("wsl.exe")
+            .args(["-d", distro, "--exec", "wslpath", "-a", "-u"])
+            .arg(&host_base)
+            .output()
+            .expect("wslpath");
+        assert!(out.status.success(), "wslpath failed: {out:?}");
+        let linux_root = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let linux_cfg = format!("{linux_root}/.git/config");
+
+        let d = crate::deadline::Deadline::unbounded();
+        let read_res = read_file_at(distro, &linux_cfg, d);
+        let snap_res = probe_git_roots(distro, std::slice::from_ref(&linux_root), d);
+        let _ = std::fs::remove_dir_all(&host_base);
+
+        assert_eq!(
+            read_res.expect("read_file_at special chars"),
+            Some(cfg_body.to_string())
+        );
+        let snap = snap_res.expect("probe_git_roots special chars");
+        assert_eq!(
+            snap.get(&linux_cfg),
+            Some(&GitPathProbe::Present {
+                kind: PathKind::File,
+                text: GitTextProbe::Bytes(cfg_body.as_bytes().to_vec()),
+            })
         );
     }
 }

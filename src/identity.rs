@@ -371,6 +371,87 @@ pub fn repo_id_for_root(
     mounts: &crate::pathnorm::DriveMounts,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
+    repo_id_for_root_with_prefetch(root, default_distro, mounts, None, deadline)
+}
+
+/// 一轮注册根扫描中按发行版惰性执行的 WSL 身份预取。
+///
+/// 构造时只按 [`crate::pathnorm::reach_of`] 把本轮待核的 WSL 根按发行版分好组，
+/// **不发起任何桥进程**：排在前面的本机根照旧先跑，只有实际处理到某发行版的第一个
+/// WSL 根（且预算未到期）时才执行一次 [`crate::wsl::probe_git_roots`]。
+#[derive(Default)]
+pub(crate) struct IdentityPrefetch {
+    by_distro: std::collections::BTreeMap<
+        String,
+        (
+            Vec<String>,
+            std::cell::OnceCell<crate::wsl::GitRootsSnapshot>,
+        ),
+    >,
+}
+
+impl IdentityPrefetch {
+    pub(crate) fn plan(
+        roots: &[String],
+        default_distro: Option<&str>,
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> Self {
+        let host = crate::pathnorm::HostPlatform::current();
+        let mut by_distro: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for root in roots {
+            if let crate::pathnorm::RootReach::Wsl { distro, linux } =
+                crate::pathnorm::reach_of(root, default_distro, mounts, host)
+            {
+                by_distro.entry(distro).or_default().push(linux);
+            }
+        }
+        Self {
+            by_distro: by_distro
+                .into_iter()
+                .map(|(distro, paths)| (distro, (paths, std::cell::OnceCell::new())))
+                .collect(),
+        }
+    }
+
+    fn get_or_fetch(
+        &self,
+        distro: &str,
+        deadline: Deadline,
+    ) -> Option<&crate::wsl::GitRootsSnapshot> {
+        let (paths, cell) = self.by_distro.get(distro)?;
+        Some(cell.get_or_init(|| {
+            let started = log::log_enabled!(target: crate::logging::tag::WSL, log::Level::Debug)
+                .then(std::time::Instant::now);
+            let res = crate::wsl::probe_git_roots(distro, paths, deadline);
+            if let Some(started) = started {
+                match &res {
+                    Ok(map) => log::debug!(
+                        target: crate::logging::tag::WSL,
+                        "identity batch: roots={} snapshots={} elapsed_ms={:.3} result=ok",
+                        paths.len(),
+                        map.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                    Err(_) => log::debug!(
+                        target: crate::logging::tag::WSL,
+                        "identity batch: roots={} snapshots=0 elapsed_ms={:.3} result=err",
+                        paths.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                }
+            }
+            res
+        }))
+    }
+}
+
+pub(crate) fn repo_id_for_root_with_prefetch(
+    root: &str,
+    default_distro: Option<&str>,
+    mounts: &crate::pathnorm::DriveMounts,
+    prefetch: Option<&IdentityPrefetch>,
+    deadline: Deadline,
+) -> Result<RepoIdentity, crate::probe::ProbeError> {
     // 🔴 **形态分派收口到 `pathnorm::reach_of`**（2026-08-15）。
     //
     // 这里从前只认两种形态（规范形 / 其余），于是**裸 Linux 路径与 `/mnt/<drive>/…`
@@ -387,7 +468,12 @@ pub fn repo_id_for_root(
         crate::pathnorm::HostPlatform::current(),
     ) {
         crate::pathnorm::RootReach::Wsl { distro, linux } => {
-            wsl_repo_id(&distro, &linux, root, deadline)
+            if let Some(snapshot) = prefetch.and_then(|p| p.get_or_fetch(&distro, deadline)) {
+                let backend = crate::probe::PrefetchedWslBackend::shared(&distro, snapshot);
+                wsl_repo_id_with(&linux, root, &backend, deadline)
+            } else {
+                wsl_repo_id(&distro, &linux, root, deadline)
+            }
         }
         // 🔴 **`Unknown` 是「没问成」，不是「没有身份」。** 报 `Err` 让调用方撤回
         // 「问过了」缓存、下一轮重试；落 `path:` 会把一个暂时的不确定变成终态。
@@ -461,8 +547,9 @@ fn wsl_repo_id(
     original_root: &str,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
-    // 发行版内部绝对路径寻址 —— 与调用方手上的 `linux_path` 同一种写法。
-    let backend = crate::probe::WslBackend::new(distro);
+    // 发行版内部绝对路径寻址：单根候选路径合并为一次惰性 `probe_git_roots`，
+    // 仍经 `ProbeBackend` 喂给同一份 `wsl_repo_id_impl` 规则。
+    let backend = crate::probe::PrefetchedWslBackend::single(distro, linux_path);
     wsl_repo_id_with(linux_path, original_root, &backend, deadline)
 }
 
@@ -955,7 +1042,9 @@ mod tests {
         .expect_err("不存在的发行版必须报「没问成」，不能给出一个身份");
         let msg = err.to_string();
         assert!(
-            msg.contains("wsl stat_kind") || msg.contains("wsl read"),
+            msg.contains("wsl probe_git_roots")
+                || msg.contains("wsl stat_kind")
+                || msg.contains("wsl read"),
             "错误应带访问桥自己的操作名；走本机 FS 时这里会是 InvalidFilename。实际：{msg}"
         );
     }
@@ -1178,5 +1267,135 @@ mod tests {
             ),
             GitRoot::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn prefetched_wsl_snapshot_covers_repo_worktree_submodule_and_missing_without_fallback() {
+        use crate::wsl::{GitPathProbe, GitTextProbe, PathKind};
+
+        struct ZeroFallback;
+        impl ProbeBackend for ZeroFallback {
+            fn probe(&self, p: &Path, _d: Deadline) -> Probed<FileKind> {
+                panic!("unexpected fallback probe for {p:?}");
+            }
+            fn read_text(&self, p: &Path, _d: Deadline) -> Probed<String> {
+                panic!("unexpected fallback read_text for {p:?}");
+            }
+        }
+
+        let plan = IdentityPrefetch::plan(
+            &[
+                "C:\\local\\repo".to_string(),
+                "wsl:Ubuntu:/w/repo".to_string(),
+                "wsl:Ubuntu:/w/wt".to_string(),
+                "wsl:Debian:/w/other".to_string(),
+            ],
+            None,
+            &Vec::new(),
+        );
+        assert_eq!(
+            plan.by_distro.get("Ubuntu").map(|(p, _)| p.as_slice()),
+            Some(&["/w/repo".to_string(), "/w/wt".to_string()][..])
+        );
+        assert_eq!(
+            plan.by_distro.get("Debian").map(|(p, _)| p.as_slice()),
+            Some(&["/w/other".to_string()][..])
+        );
+        assert!(!plan.by_distro.contains_key("C:\\local\\repo"));
+
+        let dir_entry = || GitPathProbe::Present {
+            kind: PathKind::Dir,
+            text: GitTextProbe::NotPrefetched,
+        };
+        let text_entry = |s: &str| GitPathProbe::Present {
+            kind: PathKind::File,
+            text: GitTextProbe::Bytes(s.as_bytes().to_vec()),
+        };
+
+        let mut map = std::collections::HashMap::new();
+        // 1) 标准 `.git/config`
+        map.insert("/w/repo/.git".to_string(), dir_entry());
+        map.insert(
+            "/w/repo/.git/config".to_string(),
+            text_entry("[remote \"origin\"]\n\turl = git@github.com:o/repo.git\n"),
+        );
+        // 2) linked worktree：`.git` 指针 → `commondir` → `../../config`
+        map.insert(
+            "/w/wt/.git".to_string(),
+            text_entry("gitdir: /w/main/.git/worktrees/wt\n"),
+        );
+        map.insert(
+            "/w/main/.git/worktrees/wt/commondir".to_string(),
+            text_entry("../..\n"),
+        );
+        map.insert(
+            "/w/main/.git/worktrees/wt/../../config".to_string(),
+            text_entry("[remote \"origin\"]\n\turl = https://github.com/o/main.git\n"),
+        );
+        // 3) submodule：`.git` 指针 → 无 `commondir` → `<gitdir>/config`
+        map.insert(
+            "/w/sub/.git".to_string(),
+            text_entry("gitdir: ../.git/modules/sub\n"),
+        );
+        map.insert(
+            "/w/sub/../.git/modules/sub/commondir".to_string(),
+            GitPathProbe::Absent,
+        );
+        map.insert(
+            "/w/sub/../.git/modules/sub/config".to_string(),
+            text_entry("[remote \"origin\"]\n\turl = https://github.com/o/sub.git\n"),
+        );
+        // 4) 普通目录（存在但无 `.git`）
+        map.insert("/w/plain/.git".to_string(), GitPathProbe::Absent);
+        map.insert("/w/plain".to_string(), dir_entry());
+        // 5) checkout 已删除
+        map.insert("/w/gone/.git".to_string(), GitPathProbe::Absent);
+        map.insert("/w/gone".to_string(), GitPathProbe::Absent);
+
+        let snap = Ok(map);
+        let backend =
+            crate::probe::PrefetchedWslBackend::with_fallback("Ubuntu", &snap, ZeroFallback);
+        let d = Deadline::unbounded();
+
+        assert_eq!(
+            wsl_repo_id_with("/w/repo/", "wsl:Ubuntu:/w/repo", &backend, d).unwrap(),
+            RepoIdentity {
+                id: "git:github.com/o/repo".to_string(),
+                repo_root: Some("wsl:Ubuntu:/w/repo".to_string()),
+                checkout_missing: false,
+            }
+        );
+        assert_eq!(
+            wsl_repo_id_with("/w/wt", "wsl:Ubuntu:/w/wt", &backend, d).unwrap(),
+            RepoIdentity {
+                id: "git:github.com/o/main".to_string(),
+                repo_root: Some("wsl:Ubuntu:/w/wt".to_string()),
+                checkout_missing: false,
+            }
+        );
+        assert_eq!(
+            wsl_repo_id_with("/w/sub", "wsl:Ubuntu:/w/sub", &backend, d).unwrap(),
+            RepoIdentity {
+                id: "git:github.com/o/sub".to_string(),
+                repo_root: Some("wsl:Ubuntu:/w/sub".to_string()),
+                checkout_missing: false,
+            }
+        );
+        assert_eq!(
+            wsl_repo_id_with("/w/plain", "wsl:Ubuntu:/w/plain", &backend, d).unwrap(),
+            RepoIdentity {
+                id: "path:wsl:Ubuntu:/w/plain".to_string(),
+                repo_root: None,
+                checkout_missing: false,
+            }
+        );
+        assert_eq!(
+            wsl_repo_id_with("/w/gone", "wsl:Ubuntu:/w/gone", &backend, d).unwrap(),
+            RepoIdentity {
+                id: "path:wsl:Ubuntu:/w/gone".to_string(),
+                repo_root: None,
+                checkout_missing: true,
+            }
+        );
     }
 }

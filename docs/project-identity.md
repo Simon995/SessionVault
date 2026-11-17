@@ -181,7 +181,8 @@ pub trait ProbeBackend {
 | 后端            | `read_text`                                               |
 | --------------- | --------------------------------------------------------- |
 | `LocalBackend`  | 现有自由函数（含 `namespace_confirms_absence` 与 anchor） |
-| `WslBackend`    | `to_linux()` → `wsl::read_file_at`                        |
+| `WslBackend`    | `to_linux()` → `wsl::read_file_at`（经 `run_bash_stdin`，避免 `-- bash -c` 二次 shell 解析） |
+| `PrefetchedWslBackend` | 2026-11-16 新增：单根或按发行版批预取 `wsl::probe_git_roots` 快照喂给同一套 `ProbeBackend`，超限或未覆盖路径回落 `WslBackend` |
 | `WslUncBackend` | 与 `probe` 同构：宿主先读，`Unknown` 才回落权威           |
 
 ⚠️ **`read_text` 的 anchor 语义不能丢**：`LocalBackend` 那份对 `NotFound` 会再核一次

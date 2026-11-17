@@ -8,18 +8,20 @@
 | --- | --- | --- |
 | 重启后扫描报告零新字节，仍有压缩读取成本 | `scan` 在 EOF 早退前请求逻辑长度；WSL `.zst` 解压长度按压缩文件身份缓存，缓存属于进程，重启即为空 | `bytes_read=0` 只描述后续增量读取，不能排除前面的压缩件搬运和求长度 |
 | 超过批上限的整件读取重复启动桥 | 旧 `read_whole` 先尝试 `read_many`，超限后再 `stat`、`read_range`；成功路径实际三次桥调用 | `556d1f8` 将元数据与正文合并为一次桥调用，直接消除了两次重复启动 |
+| WSL 项目身份探测逐跳串行启动桥 | 旧 `wsl_repo_id` 经 `WslBackend` 每次 `probe` / `read_text` 单独启动 `wsl.exe`（标准仓 3 次、submodule 5 次、worktree 6 次），总库扫描逐根累加 | `probe_git_roots` + `PrefetchedWslBackend` 将单根多跳与同发行版批扫描各合并为 1 次桥调用，判决仍走 `identity.rs` 唯一规则 |
 | 日志中的 guard 时间很大 | 调用方可在 `with_session_bindings` 回调中执行投影、本地索引与确认；guard 包围这些工作 | guard 总时间不能当作锁等待，也不能与其包含的 index / projection 再相加 |
 | 首轮与稳态差异很大 | 进程缓存、首次身份探测、来源积压、变化来源和并发工作可能不同 | 自然轮次只支持当轮观测；来源数相同也不证明输入、缓存或负载相同 |
 
 生产调用链分别见 [`scan.rs`](../src/scan.rs)、[`probe.rs`](../src/probe.rs)、[`compressed.rs`](../src/compressed.rs)、[`wsl.rs`](../src/wsl.rs) 和 [`store.rs`](../src/store.rs)。本地压缩长度探针直接调用解码函数，未复现 WSL 搬运及进程长度缓存；不能用其单轮结果否定 WSL 冷读成本。
 
-## 三类实验各自测了什么
+## 四类实验各自测了什么
 
 | 工具 | 输入与计时范围 | 不覆盖的工作 |
 | --- | --- | --- |
 | `measure_compressed_len` | 只读索引中非归档的本机 Codex 路径，逐项探测并调用生产 `decoded_len`；分别报告查询、求长度和遍历 wall | WSL、真实刷新全链路、OS 冷缓存保证；不可测项计数非零时命令失败 |
 | `measure_binding_guard` | 自建隔离磁盘库，经公开 `with_session_bindings`；分别运行 guard-only 与 guard+账本 SQL 复现 | 生产连接争用、历史正文、本地索引方法或真实投影负载；两种模式按固定顺序运行，不是随机 A/B |
 | `measure_wsl_read_whole` + Python 对照 | 同一合成文件、同一生产读取 API，逐轮交替新旧二进制先后；发行版枚举在计时外，SHA-256 在读取计时后计算 | 解压、scan、整个应用首轮、ext4 真实来源与 OS 冷缓存保证 |
+| `measure_wsl_identity` + Python 对照 | `agent-logs` 下合成 git 夹具，经公开 `repo_id_for_root`（单根）与内存库 `sweep_registered_root_identities`（8 根混合批），逐轮交替新旧二进制并核对判决与二进制哈希 | 真实磁盘总库锁竞争、`drive_mounts` 枚举、ext4 真实项目树、OS 冷缓存保证与整个应用首轮 |
 
 绑定守卫的本仓隔离实验使用 910 个合成来源、每模式三轮：guard-only 含 prior 查询的 wall 为 134.85–160.29 ms，加入账本 SQL 后为 319.63–353.08 ms。`index_ack_ms` 位于 `guard_ms` 内，不能再相加；这些结果既不证明生产没有锁竞争，也不支持删除准入守卫。
 
@@ -70,9 +72,9 @@ uv run python scripts/measure-wsl-whole-read.py --help
 
 - `sv-scan` 的 `compressed length/read/decode` 分开记录长度缓存命中、未复用、压缩件读取和本机解压；只记录匿名来源短哈希、大小与进程内 `compressed_call` 调用号；同一来源并发调用按调用号关联。`cache=not_reused` 不细分无缓存、身份变化和缓存锁不可用，`identity_available=false` 也不能解释成文件缺席。`read_ms` 包含 `take_whole` 的锁等待和可能的整批读取，不是纯传输耗时；从批内直接取回已读内容时可能很短。`elapsed_through_decode_ms` 包含读取及解码，不能与 `decode_ms` 相加。
 - `sv-wsl` 的 `whole batch` 输出整批 requested / fetched / absent_or_non_regular / failed / bytes / elapsed。`result=ok` 只指整批协议调用返回成功，须另看 fetched 是否齐全。`absent_or_non_regular` 合并确认缺席与非普通文件；`failed` 包含逐条读取失败、坏记录和协议缺答。`wsl::parse_read_many` 已将缺答补成错误，上层不能再用 HashMap 缺键另数；旧 `unanswered` 字段恒为零，已移除。未取回的来源仍走原有回退。批时间与触发它的来源 `read_ms` 重叠，不能逐来源求和后再加整批。
-- `sv-wsl` 的 `identity operation completed` 与 `identity completed` 记录每根后端 probe / read_text 的调用形状、结果与耗时；根只以 SHA256 短标识关联，不输出配置、remote 或原始根。后端调用次数不等于进程创建尝试。`probe_nested_us` / `read_text_nested_us` 属于 `total_inclusive_us`，诊断输出开销也可能进入总时长；该入口不含上游注册表查询、锁等待和持久化写入。短哈希仅供诊断，不是项目身份。
+- `sv-wsl` 的 `identity batch`、`identity operation completed` 与 `identity completed` 记录按发行版批预取摘要及每根后端 probe / read_text 的调用形状、结果与耗时；根只以 SHA256 短标识关联，不输出配置、remote 或原始根。后端调用次数是 `ProbeBackend` trait 调用数，不等于进程创建尝试：命中预取快照的调用在内存完成。`sweep_registered_root_identities` 触发某发行版首次批预取时，`identity batch` 在进入首个根的 `wsl_repo_id_with` 前执行，其 `elapsed_ms` 与各根 `total_inclusive_us` 不重叠；单根 `repo_id_for_root` 无外层批规划，惰性预取计入首个 `probe` 调用。`probe_nested_us` / `read_text_nested_us` 属于 `total_inclusive_us`，诊断输出开销也可能进入总时长；该入口不含上游注册表查询、锁等待和持久化写入。短哈希仅供诊断，不是项目身份。
 
-静态调用链上，WSL 普通 `.git` 目录的可读 config 路径需两次 probe 与一次 read_text（源码推导，未核实机逐根次数）；worktree / submodule 随指针和 commondir 增加操作，缺席或未知会早退。该路径不经过 `read_whole`。每个可写库句柄的身份 seen 从空开始，已存身份不替代新句柄的首次磁盘核验；不能用预填 seen 隐藏 remote 变化。具体判决仍以 `identity.rs` 与 `store.rs` 实现为准。
+静态调用链上，WSL 普通 `.git` 目录的可读 config 路径经 `ProbeBackend` 产生两次 probe 与一次 read_text，worktree / submodule 随指针和 commondir 增加 trait 操作，缺席或未知会早退；预取上线后，常规单根或同发行版整批的候选路径由一次 `probe_git_roots` 桥调用装入快照，仅超过单文件预取上限（1 MiB）或未覆盖路径才回落单件桥调用。该路径不经过 `read_whole`。每个可写库句柄的身份 seen 从空开始，已存身份不替代新句柄的首次磁盘核验；不能用预填 seen 隐藏 remote 变化。具体判决仍以 `identity.rs` 与 `store.rs` 实现为准。
 
 合成复核入口为 [`measure_wsl_compressed_cache`](../examples/measure_wsl_compressed_cache.rs) 与 [`measure-wsl-compressed-cache.py`](../scripts/measure-wsl-compressed-cache.py)：新进程扫描两种大小的随机合成 `.zst`，游标预置于 EOF，连续三轮验证 `bytes_read=0`、零事件、逻辑长度与游标不变，同时要求首次解压、后两轮命中，以及批读 / 单件两条路径都被覆盖。使用显式空绑定和空项目注册表，不加载真实控制面、索引或总库；合成内容无需具备会话语义，实验不验证 parser。
 
@@ -124,3 +126,27 @@ uv run --with zstandard python scripts/test_wsl_compressed_cache.py
 同日后续 diff 审查补上新实验的 binary 绑定：report 保存运行前 SHA-256，每组调用前后检查同一路径字节，变化则保留 `complete=false` 并拒绝通过；事后摘要一并留证。Python 回归现为九项，自身 rc=0，新增调用前及调用中替换 binary 的反例。未重跑 WSL，旧实验缺失的 binary 摘要仍不可补推。
 
 批摘要另移除恒零的 `unanswered`：底层解析器已经把缺答补为 `Err`，上层再查缺键不可能识别它。缺答保留在 `failed`，确认缺席与非普通文件统一标为 `absent_or_non_regular`，读取及回退语义不变。debug 关闭时不再做批摘要计数和压缩阶段诊断计时；批调用计时仍保留，供失败时 warn 使用。以上是判据与诊断成本订正，没有新的生产性能百分比。
+
+## WSL 身份多步与整批合并的受控对照
+
+2026-11-16 落地 [`wsl::probe_git_roots`](../src/wsl.rs)、[`probe::PrefetchedWslBackend`](../src/probe.rs) 与 [`identity::IdentityPrefetch`](../src/identity.rs)：在发行版内单次脚本中按打开后的普通文件 fd（`/proc/self/fd/3`）读取 `.git`、`commondir` 与 `config` 候选及根目录状态，以 `<tag>\0<path>\0<payload>\0` 二进制安全帧返回，判决逻辑仍完全复用 `identity.rs` 的唯一实现。`sweep_registered_root_identities` 构造阶段仅按 `reach_of` 对未见过的 WSL 根分桶，预算已耗尽时不发起任何桥进程，排在前面的本机根照旧先执行。
+
+旧臂为 `71c58ff` 隔离源码快照（仅原样补入测量入口 [`measure_wsl_identity.rs`](../examples/measure_wsl_identity.rs) 及对应 `Cargo.toml` example 声明，`src/` 未改），新臂为当前最终合并实现；共用同一份 `Cargo.lock` 与工具链编译 release（`--locked --release --features store`）。合成 git 夹具建在当前 checkout 的 Git `agent-logs` 严格子目录下，经 `wsl.exe --exec wslpath` 在计时外转换并双向校验边界。6 个场景、每场景每臂 6 轮（共 72 个独立新进程样本），奇偶轮交替先后，每次调用前后校验两份二进制 SHA-256 未变，未清 OS 缓存；全部 72 次调用的 `RepoIdentity`、`IdentitySweep` 与 `project_roots_report` 逐字段一致，本机报告为 `wsl-identity-ab-20261116-final.json`（`complete=true`）。
+
+| 场景（模式 / 根数） | 旧中位耗时 | 新中位耗时 | 耗时降低 | 旧 / 新桥启动尝试数 |
+| --- | ---: | ---: | ---: | ---: |
+| `single_standard_repo`（single / 1） | 654.340 ms | 210.447 ms | 67.84% | 3 / 1 |
+| `single_linked_worktree`（single / 1） | 1126.567 ms | 182.332 ms | 83.82% | 6 / 1 |
+| `single_submodule`（single / 1） | 929.289 ms | 182.794 ms | 80.33% | 5 / 1 |
+| `single_plain_dir`（single / 1） | 315.208 ms | 169.794 ms | 46.13% | 2 / 1 |
+| `single_missing_checkout`（single / 1） | 351.792 ms | 169.626 ms | 51.78% | 2 / 1 |
+| `sweep_mixed_8_roots`（sweep / 8） | 5017.964 ms | 261.207 ms | 94.79% | 30 / 1 |
+
+8 根混合 sweep 含 3 个标准仓（含无 origin 仓）、2 个相对/绝对路径 linked worktree、1 个 submodule、1 个普通目录与 1 个已删 checkout；6 轮耗时全距为旧臂 4979.263–5320.534 ms、新臂 259.280–285.736 ms（类型别名提取前的同构候选轮 `wsl-identity-ab-20261116-clean.json` 亦保留，8 根中位降低 94.35%）。独立 `diagnostic_smoke`（`SVAULT_LOG=sv-wsl=debug`）验证输出 1 条 `identity batch`（`roots=8 snapshots=19 result=ok`）与 8 条 `identity completed`，无原始路径或 remote URL 泄露。以上百分比描述合成夹具上的身份探测子阶段，不外推为生产整轮刷新百分比。
+
+首次实跑在含单引号、`$`、反引号与中文的合成目录上立即暴露出 `71c58ff` 旧臂既有缺陷并退出 1（原始失败报告 `wsl-identity-ab-20261116.json` 保留，`complete=false`）：旧 `wsl::read_file_at` 唯一仍使用 `wsl.exe -d <distro> -- bash -c <script>`，缺少 `--exec` 时先经发行版默认 shell 二次解析 argv，导致引号错配退出 2（`unexpected EOF while looking for matching '''`）。现已将 `read_file_at` 收口至 `run_bash_stdin`（stdin 单层 `bash` + `cat --`），经 `special_chars_smoke`（单桥 209.844 ms）与 `SVAULT_WSL_IT=1` 实机集成测试双路验证通过。复跑与驱动自检命令：
+
+```bash
+uv run python scripts/test_wsl_identity_driver.py
+uv run python scripts/measure-wsl-identity.py --help
+```

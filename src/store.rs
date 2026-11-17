@@ -2428,6 +2428,19 @@ impl TotalStore {
             collected
         };
         sweep.registered = roots.len();
+        let prefetch = if deadline.expired() {
+            crate::identity::IdentityPrefetch::default()
+        } else {
+            let unseen: Vec<String> = match self.identity_seen.lock() {
+                Ok(seen) => roots
+                    .iter()
+                    .filter(|r| !r.is_empty() && !seen.contains(*r))
+                    .cloned()
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            crate::identity::IdentityPrefetch::plan(&unseen, default_distro, mounts)
+        };
         for root in roots {
             if deadline.expired() {
                 // 说出来，不要静默截断 —— 「本轮只看了一半」和「本轮全看过了」在
@@ -2435,7 +2448,13 @@ impl TotalStore {
                 sweep.skipped_out_of_budget += 1;
                 continue;
             }
-            match self.record_identity_for_root(&root, default_distro, mounts, deadline) {
+            match self.record_identity_for_root(
+                &root,
+                default_distro,
+                mounts,
+                Some(&prefetch),
+                deadline,
+            ) {
                 IdentityOutcome::AlreadyProbed => sweep.already_probed += 1,
                 IdentityOutcome::Recorded => sweep.recorded += 1,
                 IdentityOutcome::NoRemote(_) => sweep.no_remote += 1,
@@ -2463,9 +2482,11 @@ impl TotalStore {
         root: &str,
         default_distro: Option<&str>,
         mounts: &crate::pathnorm::DriveMounts,
+        prefetch: Option<&crate::identity::IdentityPrefetch>,
         deadline: Deadline,
     ) -> IdentityOutcome {
-        let outcome = self.probe_identity_for_root(root, default_distro, mounts, deadline);
+        let outcome =
+            self.probe_identity_for_root(root, default_distro, mounts, prefetch, deadline);
         let verdict = match &outcome {
             // 缓存命中 ⇒ 本进程这一轮之前已经落过判决，不重复写。
             //
@@ -2523,6 +2544,7 @@ impl TotalStore {
         root: &str,
         default_distro: Option<&str>,
         mounts: &crate::pathnorm::DriveMounts,
+        prefetch: Option<&crate::identity::IdentityPrefetch>,
         deadline: Deadline,
     ) -> IdentityOutcome {
         if root.is_empty() {
@@ -2552,18 +2574,23 @@ impl TotalStore {
         // 三态各有各的处置：`Unknown` 是「本轮没问成」，它**已经**被上面的
         // `identity_seen` 记成「问过了」，所以必须撤回 —— 否则一次瞬时故障让这个
         // 项目在本进程内永远算不出身份。
-        let identity =
-            match crate::identity::repo_id_for_root(root, default_distro, mounts, deadline) {
-                Ok(identity) => identity,
-                Err(e) => {
-                    log::debug!(
-                        target: crate::logging::tag::SQLITE,
-                        "project identity unresolved, will retry: {e}"
-                    );
-                    self.forget_identity_probe(root);
-                    return IdentityOutcome::Unresolved(e.to_string());
-                }
-            };
+        let identity = match crate::identity::repo_id_for_root_with_prefetch(
+            root,
+            default_distro,
+            mounts,
+            prefetch,
+            deadline,
+        ) {
+            Ok(identity) => identity,
+            Err(e) => {
+                log::debug!(
+                    target: crate::logging::tag::SQLITE,
+                    "project identity unresolved, will retry: {e}"
+                );
+                self.forget_identity_probe(root);
+                return IdentityOutcome::Unresolved(e.to_string());
+            }
+        };
         // 🔴 「目录没了」先于「没有 remote」判 —— 后者说的是「这个仓确认没有
         // remote」，而目录都不在了，那句话没有依据。
         if identity.checkout_missing {
@@ -11419,6 +11446,7 @@ mod project_identity_tests {
             &root_str,
             None,
             &Vec::new(),
+            None,
             crate::deadline::Deadline::unbounded(),
         );
         assert_eq!(outcome, IdentityOutcome::CheckoutMissing, "{outcome:?}");
@@ -11432,6 +11460,7 @@ mod project_identity_tests {
             &plain_str,
             None,
             &Vec::new(),
+            None,
             crate::deadline::Deadline::unbounded(),
         );
         assert!(
