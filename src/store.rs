@@ -790,6 +790,22 @@ pub struct SnapshotSyncStats {
     pub appended: u64,
 }
 
+// Seek to the next greater value instead of visiting each event's index entry.
+// One statement keeps the entire walk in one read snapshot without ANALYZE.
+// Require the index: without it, every recursive step would scan raw_events.
+const DISTINCT_PROJECT_ROOTS_SQL: &str = r#"
+WITH RECURSIVE roots(project_root) AS (
+    SELECT MIN(project_root) FROM raw_events INDEXED BY idx_raw_events_project WHERE project_root > ''
+    UNION ALL
+    SELECT (SELECT MIN(e.project_root) FROM raw_events e INDEXED BY idx_raw_events_project
+            WHERE e.project_root > roots.project_root)
+    FROM roots WHERE roots.project_root IS NOT NULL
+)
+SELECT project_root FROM roots WHERE project_root IS NOT NULL
+"#;
+const DISTINCT_PROJECT_ROOTS_FALLBACK_SQL: &str =
+    "SELECT DISTINCT project_root FROM raw_events WHERE project_root IS NOT NULL AND project_root <> ''";
+
 /// `raw_events` 表 DDL（建库 + 迁移共用）。
 ///
 /// 🔴 **`generation` 已被 `(source_revision, projection_revision)` 取代**（ADR-044 决定 1）。
@@ -2778,21 +2794,47 @@ impl TotalStore {
     /// ⚠️ 它们**不是**项目根 —— 恰恰相反，其中大多是子目录（同一个项目被记成 11 个
     /// `project_root` 正是本 ADR 的症状）。发现侧要对每一条上溯到真正的根。
     ///
-    /// 🔴 **读不出来返回空，不报错**：发现是加法能力，它坏了该少发现几个根，
+    /// 🔴 **查询失败返回空，单条坏值只跳过该条**：发现是加法能力，它坏了该少发现几个根，
     /// 不该让摄取停下（与 [`Self::register_project_root`] 同一条）。
     pub fn distinct_project_roots(&self) -> Vec<String> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT DISTINCT project_root FROM raw_events              WHERE project_root IS NOT NULL AND project_root <> ''",
-        ) else {
-            return Vec::new();
+        let read_roots = |sql| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = conn.prepare_cached(sql)?;
+            let mut rows = stmt.query([])?;
+            let mut roots = Vec::new();
+            while let Some(row) = rows.next()? {
+                if let Ok(root) = row.get(0) {
+                    roots.push(root);
+                }
+            }
+            Ok(roots)
         };
-        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
-            return Vec::new();
-        };
-        rows.flatten().collect()
+        match read_roots(DISTINCT_PROJECT_ROOTS_SQL) {
+            Ok(roots) => roots,
+            // INDEXED BY reports SQLITE_ERROR when the index is absent, including
+            // when SQLite recompiles a cached statement on its first step. Check
+            // the schema to distinguish it from other SQL errors, without retrying
+            // a busy or broken connection or relying on SQLite's error text.
+            Err(
+                rusqlite::Error::SqliteFailure(error, _)
+                | rusqlite::Error::SqlInputError { error, .. },
+            ) if error.extended_code == rusqlite::ffi::SQLITE_ERROR => {
+                let missing = conn.query_row(
+                    "SELECT NOT EXISTS (SELECT 1 FROM main.sqlite_schema
+                     WHERE type = 'index' AND tbl_name = 'raw_events' AND name = 'idx_raw_events_project')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                );
+                if matches!(missing, Ok(true)) {
+                    read_roots(DISTINCT_PROJECT_ROOTS_FALLBACK_SQL).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// 记下一次「没探到根」的结果（`none` = 确认没有，`unreachable` = 没问成）。
@@ -8525,6 +8567,209 @@ mod tests {
         assert_eq!(summary.get_status(StatementStatus::FullscanStep), 0);
         assert!(
             summary.get_status(StatementStatus::VmStep) < old.get_status(StatementStatus::VmStep)
+        );
+    }
+
+    // Historical rows without a current head are still discovery candidates.
+    fn seed_project_roots(conn: &Connection) {
+        conn.execute_batch(
+            "WITH RECURSIVE seq(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 8191)
+             INSERT INTO raw_events (ingested_at, schema_version, source_type, source_location,
+                source_path, source_session_id, seq, event_type, project_root, event_json)
+             SELECT 0, 1, 'claude_code', 'local', '/sample', 'sample', n, 'message',
+                CASE n % 8 WHEN 0 THEN NULL WHEN 1 THEN '' WHEN 2 THEN ' '
+                WHEN 3 THEN '/Repo' WHEN 4 THEN '/repo' WHEN 5 THEN '/repo/sub'
+                WHEN 6 THEN 'ssh:example:/repo' ELSE '/history-only' END, '{}'
+             FROM seq;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn distinct_project_roots_seeks_in_an_unanalyzed_history_index() {
+        use rusqlite::StatementStatus;
+
+        let store = TotalStore::open_in_memory().unwrap();
+        assert!(store.distinct_project_roots().is_empty());
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+            seed_project_roots(&conn);
+            // The empty call ran the same statement; measure only the nonempty call.
+            conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL)
+                .unwrap()
+                .reset_status(StatementStatus::VmStep);
+        }
+        let mut roots = store.distinct_project_roots();
+        let conn = store.conn.lock().unwrap();
+        let mut old = conn.prepare(DISTINCT_PROJECT_ROOTS_FALLBACK_SQL).unwrap();
+        let mut expected = old
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        roots.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(roots, expected);
+        assert_eq!(
+            roots,
+            [
+                " ",
+                "/Repo",
+                "/history-only",
+                "/repo",
+                "/repo/sub",
+                "ssh:example:/repo"
+            ]
+        );
+        let actual = conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL).unwrap();
+        let steps = actual.get_status(StatementStatus::VmStep);
+        assert!(
+            steps > 0,
+            "the nonempty call must execute the indexed query"
+        );
+        assert!(
+            steps * 4 < old.get_status(StatementStatus::VmStep),
+            "root enumeration must skip repeated index values (VM steps: {steps})"
+        );
+    }
+
+    #[test]
+    fn distinct_project_roots_scans_once_when_the_index_is_missing() {
+        use rusqlite::StatementStatus;
+
+        let store = TotalStore::open_in_memory().unwrap();
+        seed_project_roots(&store.conn.lock().unwrap());
+        let mut expected = store.distinct_project_roots();
+        assert_eq!(expected.len(), 6);
+        // Simulate a missing index with the fast statement still in the cache.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP INDEX idx_raw_events_project")
+            .unwrap();
+        let mut roots = store.distinct_project_roots();
+        roots.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            roots, expected,
+            "fall back even with a warm statement cache"
+        );
+
+        let conn = store.conn.lock().unwrap();
+        let row_count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+            .unwrap();
+        let fallback = conn
+            .prepare_cached(DISTINCT_PROJECT_ROOTS_FALLBACK_SQL)
+            .unwrap();
+        let scanned = fallback.get_status(StatementStatus::FullscanStep);
+        assert!(
+            (1..=row_count).contains(&scanned),
+            "the fallback must make a single scan (fullscan steps: {scanned})"
+        );
+        drop(fallback);
+        conn.flush_prepared_statement_cache();
+        drop(conn);
+        let mut roots = store.distinct_project_roots();
+        roots.sort_unstable();
+        assert_eq!(
+            roots, expected,
+            "fall back when preparing without the index"
+        );
+    }
+
+    #[test]
+    fn distinct_project_roots_keeps_valid_roots_when_a_value_cannot_decode() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let mut expected = {
+            let conn = store.conn.lock().unwrap();
+            seed_project_roots(&conn);
+            drop(conn);
+            store.distinct_project_roots()
+        };
+        expected.sort_unstable();
+        assert_eq!(expected.len(), 6);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE raw_events SET project_root = X'80' WHERE project_root IS NULL")
+            .unwrap();
+        let mut indexed = store.distinct_project_roots();
+        indexed.sort_unstable();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP INDEX idx_raw_events_project")
+            .unwrap();
+        let mut fallback = store.distinct_project_roots();
+        fallback.sort_unstable();
+        assert_eq!(indexed, expected, "indexed read must preserve valid roots");
+        assert_eq!(fallback, expected, "fallback must preserve valid roots");
+    }
+
+    #[test]
+    fn distinct_project_roots_does_not_retry_a_busy_connection() {
+        use std::cell::Cell;
+
+        thread_local! { static BUSY_CALLS: Cell<usize> = const { Cell::new(0) }; }
+        fn refuse_busy(_: i32) -> bool {
+            BUSY_CALLS.with(|calls| calls.set(calls.get() + 1));
+            false
+        }
+
+        let (dir, path) = file_store_with_snapshot("roots-busy");
+        let writer = Connection::open(&path).unwrap();
+        let journal: String = writer
+            .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        let store =
+            TotalStore::open_read_only_with_key(&path, StoreKey::from_bytes([7; 32])).unwrap();
+        assert!(store.distinct_project_roots().is_empty());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(refuse_busy))
+            .unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // Use the same warmed SQL and handler as the public call. Count attempts,
+        // not wall time: the handler refuses every lock wait immediately.
+        let error = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare_cached(DISTINCT_PROJECT_ROOTS_SQL)
+            .and_then(|mut stmt| stmt.exists([]))
+            .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        let one_query = BUSY_CALLS.with(|calls| calls.replace(0));
+        assert!(one_query > 0, "the control query must hit the lock");
+        let roots = store.distinct_project_roots();
+        let public_call = BUSY_CALLS.with(|calls| calls.replace(0));
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(store);
+        drop(writer);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(roots.is_empty());
+        assert_eq!(
+            public_call, one_query,
+            "a busy query must not trigger fallback"
         );
     }
 
