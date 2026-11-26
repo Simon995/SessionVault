@@ -790,6 +790,19 @@ pub struct SnapshotSyncStats {
     pub appended: u64,
 }
 
+// Seek to the next greater value instead of visiting each event's index entry.
+// One statement keeps the entire walk in one read snapshot. This also works in
+// a fresh or copied database without planner statistics from ANALYZE.
+const DISTINCT_PROJECT_ROOTS_SQL: &str = r#"
+WITH RECURSIVE roots(project_root) AS (
+    SELECT MIN(project_root) FROM raw_events WHERE project_root > ''
+    UNION ALL
+    SELECT (SELECT MIN(e.project_root) FROM raw_events e WHERE e.project_root > roots.project_root)
+    FROM roots WHERE roots.project_root IS NOT NULL
+)
+SELECT project_root FROM roots WHERE project_root IS NOT NULL
+"#;
+
 /// `raw_events` 表 DDL（建库 + 迁移共用）。
 ///
 /// 🔴 **`generation` 已被 `(source_revision, projection_revision)` 取代**（ADR-044 决定 1）。
@@ -2784,9 +2797,7 @@ impl TotalStore {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT DISTINCT project_root FROM raw_events              WHERE project_root IS NOT NULL AND project_root <> ''",
-        ) else {
+        let Ok(mut stmt) = conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL) else {
             return Vec::new();
         };
         let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
@@ -8505,6 +8516,68 @@ mod tests {
         assert_eq!(summary.get_status(StatementStatus::FullscanStep), 0);
         assert!(
             summary.get_status(StatementStatus::VmStep) < old.get_status(StatementStatus::VmStep)
+        );
+    }
+
+    #[test]
+    fn distinct_project_roots_seeks_in_an_unanalyzed_history_index() {
+        use rusqlite::StatementStatus;
+
+        let store = TotalStore::open_in_memory().unwrap();
+        assert!(store.distinct_project_roots().is_empty());
+        {
+            let conn = store.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+            conn.execute_batch(
+                "WITH RECURSIVE seq(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 8191)
+                 INSERT INTO raw_events (ingested_at, schema_version, source_type, source_location,
+                    source_path, source_session_id, seq, event_type, project_root, event_json)
+                 SELECT 0, 1, 'claude_code', 'local', '/sample', 'sample', n, 'message',
+                    CASE n % 8 WHEN 0 THEN NULL WHEN 1 THEN '' WHEN 2 THEN ' '
+                    WHEN 3 THEN '/Repo' WHEN 4 THEN '/repo' WHEN 5 THEN '/repo/sub'
+                    WHEN 6 THEN 'ssh:example:/repo' ELSE '/history-only' END, '{}'
+                 FROM seq;",
+            )
+            .unwrap();
+        }
+        // Historical rows without a current head are still discovery candidates.
+        let roots = store.distinct_project_roots();
+        let conn = store.conn.lock().unwrap();
+        let mut old = conn
+            .prepare("SELECT DISTINCT project_root FROM raw_events WHERE project_root IS NOT NULL AND project_root <> '' ORDER BY project_root")
+            .unwrap();
+        let expected = old
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(roots, expected);
+        assert_eq!(
+            roots,
+            [
+                " ",
+                "/Repo",
+                "/history-only",
+                "/repo",
+                "/repo/sub",
+                "ssh:example:/repo"
+            ]
+        );
+        // Reopen the same cached statement to read the actual public call's work.
+        let actual = conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL).unwrap();
+        let steps = actual.get_status(StatementStatus::VmStep);
+        assert!(steps > 0, "the production query must have run");
+        assert!(
+            steps * 4 < old.get_status(StatementStatus::VmStep),
+            "root enumeration must skip repeated index values (VM steps: {steps})"
         );
     }
 
