@@ -5,7 +5,7 @@
 
 ## 当前状态（2026-11-26 核）
 
-- **主线源码**：Remote SSH 归属已在 `8602d5128796` 实现，验收见 [归属契约](remote-ssh-attribution.md)。WSL 单桥读取、调用级诊断、DSH rc.2 来源侧接线、实验判据加固与 WSL 身份批探测的提交见 B 节。
+- **主线源码**：Windows Antigravity CLI 只读首版已在 `0cecdbfda52d` 实现，契约与四类消费影响见 [antigravity-cli.md](antigravity-cli.md)；Remote SSH 归属已在 `8602d5128796` 实现，验收见 [归属契约](remote-ssh-attribution.md)。WSL 单桥读取、调用级诊断、DSH rc.2 来源侧接线、实验判据加固与 WSL 身份批探测的提交见 B 节。
 - **独立 CLI**：GitHub [最新正式 Release](https://github.com/Simon995/SessionVault/releases/tag/v2026.11.11.1) 仍为 `v2026.11.11.1`；远端 tag 解引用为 `b9339c3`，本机约定安装入口的 `--version` 同样指向 `b9339c3`。不把 main 上的后续源码算进该版。
 - **消费验收**：依赖指针提交、构建、安装后正在运行的版本、真实来源或自然首轮验收分别确认。本仓没有可据以关闭 Remote SSH 存量订正、WSL 完整首轮复验或 DSH 真实联合验收的记录；消费方的内部进展在各自仓库维护。
 
@@ -46,10 +46,11 @@
 ## B. 发版
 
 - ~~`v2026.11.11.1`~~ ✅ `b9339c3`：双平台发布资产与依赖锁已回下载核哈希，本机独立 CLI 已安装；发布内容与旧写者限制见 [读取状态设计 §15](dsh-read-state-design.md#15-h7-兼容验收与升级边界)。更早发布见历史快照 B 节。
-- `556d1f8` / `74e9ca6` / `a1435f5` / `71c58ff` / `55d1daa` 已远端交付并通知消费方；Rust 升级不要求先重发独立 CLI。只有独立 CLI 消费方需要这些能力时，才另按 `release.py` 的试运行、批准发布与装机流程交付，不把源码推送记为新 CLI 已发布。
+- `556d1f8` / `74e9ca6` / `a1435f5` / `71c58ff` / `55d1daa` / `8602d51` / `0cecdbf` 已远端交付并通知消费方；Rust 升级不要求先重发独立 CLI。只有独立 CLI 消费方需要这些能力时，才另按 `release.py` 的试运行、批准发布与装机流程交付，不把源码推送记为新 CLI 已发布。
 
 ## C. 消费需求与性能
 
+- ~~Windows Antigravity CLI 只读首版~~ ✅ `0cecdbfda52d`。状态保护、UUID 准入、坏正文冻结、专属绑定、摘要并发、定向 WSL 隔离、写者发现范围、专属游标和旧归属告警已验证；`Cursor` 保持原公共字段（双指纹收进 `content_hash` 的 `agv1:` 格式），沙箱实测 QuotaBar 仅剩 `SourceType::AntigravityCli` 1 处穷举匹配，补 1 行后全目标检查与 119 项桥接/索引单测通过。契约与四类消费影响见 [antigravity-cli.md](antigravity-cli.md#证据与消费影响)；消费方按需升级指针并自行适配。
 - ~~Remote SSH 项目归属与隔离回归~~ ✅ `8602d5128796`。本机与远端归属隔离，已验证显式登记远端根的扫描及旧 revision 的未变字节重投影。消费方适配和真实来源验收见执行顺序。
 - ~~发现阶段批量、逻辑压缩来源、按根重算、WSL 压缩长度身份缓存~~ ✅ 已交付（`c337c6d` / `6189b16` / `cbffc71` / `d92442f`）。历史样本与消费验收见快照 C 节；进程缓存并不免除重启后的首次求长度。
 - ~~`stores` / 单库 `pull` 窄元数据查询~~ ✅ `29beb8d`，已随 `v2026.11.11.1` 发布。合成 SQL 测量与命令时限的区别见 [store-metadata.md](store-metadata.md)；生产时限由消费方复验。
