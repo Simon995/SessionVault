@@ -791,17 +791,20 @@ pub struct SnapshotSyncStats {
 }
 
 // Seek to the next greater value instead of visiting each event's index entry.
-// One statement keeps the entire walk in one read snapshot. This also works in
-// a fresh or copied database without planner statistics from ANALYZE.
+// One statement keeps the entire walk in one read snapshot without ANALYZE.
+// Require the index: without it, every recursive step would scan raw_events.
 const DISTINCT_PROJECT_ROOTS_SQL: &str = r#"
 WITH RECURSIVE roots(project_root) AS (
-    SELECT MIN(project_root) FROM raw_events WHERE project_root > ''
+    SELECT MIN(project_root) FROM raw_events INDEXED BY idx_raw_events_project WHERE project_root > ''
     UNION ALL
-    SELECT (SELECT MIN(e.project_root) FROM raw_events e WHERE e.project_root > roots.project_root)
+    SELECT (SELECT MIN(e.project_root) FROM raw_events e INDEXED BY idx_raw_events_project
+            WHERE e.project_root > roots.project_root)
     FROM roots WHERE roots.project_root IS NOT NULL
 )
 SELECT project_root FROM roots WHERE project_root IS NOT NULL
 "#;
+const DISTINCT_PROJECT_ROOTS_FALLBACK_SQL: &str =
+    "SELECT DISTINCT project_root FROM raw_events WHERE project_root IS NOT NULL AND project_root <> ''";
 
 /// `raw_events` 表 DDL（建库 + 迁移共用）。
 ///
@@ -2797,13 +2800,16 @@ impl TotalStore {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
-        let Ok(mut stmt) = conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL) else {
-            return Vec::new();
+        let read_roots = |sql| -> rusqlite::Result<Vec<String>> {
+            let mut stmt = conn.prepare_cached(sql)?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect()
         };
-        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
-            return Vec::new();
-        };
-        rows.flatten().collect()
+        // A read-only store may be missing the index after an interrupted migration.
+        // A cached statement can discover that at step time, not just at prepare time.
+        read_roots(DISTINCT_PROJECT_ROOTS_SQL)
+            .or_else(|_| read_roots(DISTINCT_PROJECT_ROOTS_FALLBACK_SQL))
+            .unwrap_or_default()
     }
 
     /// 记下一次「没探到根」的结果（`none` = 确认没有，`unreachable` = 没问成）。
@@ -8519,6 +8525,21 @@ mod tests {
         );
     }
 
+    // Historical rows without a current head are still discovery candidates.
+    fn seed_project_roots(conn: &Connection) {
+        conn.execute_batch(
+            "WITH RECURSIVE seq(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 8191)
+             INSERT INTO raw_events (ingested_at, schema_version, source_type, source_location,
+                source_path, source_session_id, seq, event_type, project_root, event_json)
+             SELECT 0, 1, 'claude_code', 'local', '/sample', 'sample', n, 'message',
+                CASE n % 8 WHEN 0 THEN NULL WHEN 1 THEN '' WHEN 2 THEN ' '
+                WHEN 3 THEN '/Repo' WHEN 4 THEN '/repo' WHEN 5 THEN '/repo/sub'
+                WHEN 6 THEN 'ssh:example:/repo' ELSE '/history-only' END, '{}'
+             FROM seq;",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn distinct_project_roots_seeks_in_an_unanalyzed_history_index() {
         use rusqlite::StatementStatus;
@@ -8536,29 +8557,22 @@ mod tests {
                 .unwrap(),
                 0
             );
-            conn.execute_batch(
-                "WITH RECURSIVE seq(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM seq WHERE n < 8191)
-                 INSERT INTO raw_events (ingested_at, schema_version, source_type, source_location,
-                    source_path, source_session_id, seq, event_type, project_root, event_json)
-                 SELECT 0, 1, 'claude_code', 'local', '/sample', 'sample', n, 'message',
-                    CASE n % 8 WHEN 0 THEN NULL WHEN 1 THEN '' WHEN 2 THEN ' '
-                    WHEN 3 THEN '/Repo' WHEN 4 THEN '/repo' WHEN 5 THEN '/repo/sub'
-                    WHEN 6 THEN 'ssh:example:/repo' ELSE '/history-only' END, '{}'
-                 FROM seq;",
-            )
-            .unwrap();
+            seed_project_roots(&conn);
+            // The empty call ran the same statement; measure only the nonempty call.
+            conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL)
+                .unwrap()
+                .reset_status(StatementStatus::VmStep);
         }
-        // Historical rows without a current head are still discovery candidates.
-        let roots = store.distinct_project_roots();
+        let mut roots = store.distinct_project_roots();
         let conn = store.conn.lock().unwrap();
-        let mut old = conn
-            .prepare("SELECT DISTINCT project_root FROM raw_events WHERE project_root IS NOT NULL AND project_root <> '' ORDER BY project_root")
-            .unwrap();
-        let expected = old
+        let mut old = conn.prepare(DISTINCT_PROJECT_ROOTS_FALLBACK_SQL).unwrap();
+        let mut expected = old
             .query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        roots.sort_unstable();
+        expected.sort_unstable();
         assert_eq!(roots, expected);
         assert_eq!(
             roots,
@@ -8571,13 +8585,52 @@ mod tests {
                 "ssh:example:/repo"
             ]
         );
-        // Reopen the same cached statement to read the actual public call's work.
         let actual = conn.prepare_cached(DISTINCT_PROJECT_ROOTS_SQL).unwrap();
         let steps = actual.get_status(StatementStatus::VmStep);
-        assert!(steps > 0, "the production query must have run");
+        assert!(
+            steps > 0,
+            "the nonempty call must execute the indexed query"
+        );
         assert!(
             steps * 4 < old.get_status(StatementStatus::VmStep),
             "root enumeration must skip repeated index values (VM steps: {steps})"
+        );
+    }
+
+    #[test]
+    fn distinct_project_roots_scans_once_when_the_index_is_missing() {
+        use rusqlite::StatementStatus;
+
+        let store = TotalStore::open_in_memory().unwrap();
+        seed_project_roots(&store.conn.lock().unwrap());
+        let mut expected = store.distinct_project_roots();
+        assert_eq!(expected.len(), 6);
+        // Simulate a missing index with the fast statement still in the cache.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP INDEX idx_raw_events_project")
+            .unwrap();
+        let mut roots = store.distinct_project_roots();
+        roots.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            roots, expected,
+            "fall back even with a warm statement cache"
+        );
+
+        let conn = store.conn.lock().unwrap();
+        let row_count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM raw_events", [], |r| r.get(0))
+            .unwrap();
+        let fallback = conn
+            .prepare_cached(DISTINCT_PROJECT_ROOTS_FALLBACK_SQL)
+            .unwrap();
+        let scanned = fallback.get_status(StatementStatus::FullscanStep);
+        assert!(
+            (1..=row_count).contains(&scanned),
+            "the fallback must make a single scan (fullscan steps: {scanned})"
         );
     }
 
