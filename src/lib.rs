@@ -7,6 +7,7 @@
 //! （ADR-026），由宿主（QuotaBar / `svault`）决定输出。
 #![allow(dead_code)]
 
+mod antigravity;
 pub mod attribution;
 pub mod catalog;
 /// Class-B（状态制品）快照来源的枚举 —— 2026-08-16 从 QuotaBar 搬来，

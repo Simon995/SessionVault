@@ -112,6 +112,23 @@ CLI：
 
 接入写库前需协调所有写者升级：旧版整代重写会丢掉 `usage_evidence`，包含旧 CLI `reattribute --apply`，以及消费方旧版归属重算路径。Rust 消费方还需持久化 `Cursor.dsh_state`，适配 `SourceChange::ReparseRequired` 的完整重投影语义；DSH 写库应使用 `dsh_provider::scan_source` 与 `apply_dsh_planned_projection`，以完整目标核对总库、避免只读游标领先时漏写。只读取原四桶的消费方不会自动获得新的细粒度用量汇总。完整证据与可复跑命令见 [读取状态设计 §14–§15](docs/dsh-read-state-design.md#14-常规来源接线与持久化凭据)。
 
+## Windows Antigravity CLI（实验性，只读来源）
+
+使用带 `store` feature 的 Windows 构建。把 `SVAULT_ANTIGRAVITY_CLI_DIR` 设为 Antigravity CLI 数据根的本机绝对路径（通常为 `%USERPROFILE%\.gemini\antigravity-cli`）；不设就不扫描。仅发现 `brain/<会话 ID>/.system_generated/logs/transcript.jsonl`，不启动 Antigravity、不装 Hook，也不扫描 App、独立 IDE 或 WSL 实例。
+
+```powershell
+$env:SVAULT_ANTIGRAVITY_CLI_DIR = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
+svault scan-all --only antigravity-cli --profile full --stateless
+```
+
+输出 `source_type=antigravity_cli`、`source_mode=append_log`。`--profile full` 只输出已完成的用户与助手正文。归属用会话摘要中的工作区和已有总库的项目根注册表判定。定向扫描跳过 WSL 发现与挂载探测。示例不读取或保存游标，仍可只读加载已有总库的项目根和会话绑定，不创建或迁移总库。
+
+如需配置 `backend: "antigravity_cli"` 的绑定或未决条目，用 `SVAULT_ANTIGRAVITY_SESSION_BINDINGS` 指向独立的 v1 JSON 文件。原有文件和库内共享清单沿用旧写者支持的格式。专属配置出错时，仅 Antigravity 暂停输出。
+
+有状态扫描把 Antigravity 游标保存在基础状态路径追加 `.antigravity.json` 的文件中。默认使用 `cursors.json.antigravity.json`，与旧写者的 `cursors.json` 分开。`--state` 覆盖基础路径。
+
+首版只输出扫描流。常规 `--write-store` 在发现前排除 Antigravity CLI，Rust 会话索引的转录发现也采用此范围。`--write-store` 显式选中该来源时在打开总库前拒绝，通用投影入口同样拒绝。见[来源契约与验证](docs/antigravity-cli.md)。
+
 ## 历史落地路线（绞杀者迁移）
 
 以下保留 2026-06 至 2026-07 的抽取与迁移记录；P0–P3 是当时的阶段划分，soak 与消费方接入状态不代表今天的进度。当前本仓任务以 [待做清单](docs/backlog.md) 为准，消费方收尾回各仓维护。

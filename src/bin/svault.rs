@@ -53,13 +53,14 @@ enum Command {
         /// 写总库时 `full`（总库按 §13.1 以 full 物化，含正文）。
         #[arg(long, value_enum)]
         profile: Option<ProfileArg>,
-        /// 游标状态文件路径（覆盖默认 `<data_local_dir>/svault/cursors.json`）。
+        /// 游标状态文件的基础路径（默认 `<data_local_dir>/svault/cursors.json`）。
+        /// Antigravity CLI 的游标使用追加 `.antigravity.json` 后缀的独立文件。
         #[arg(long)]
         state: Option<PathBuf>,
         /// 无状态：忽略且不写状态文件，每次从头全量扫（调试/一次性用）。
         #[arg(long)]
         stateless: bool,
-        /// **只扫这几类来源**（可重复）。不给 = 扫全部（既有行为逐字不变）。
+        /// **只扫这几类来源**（可重复）。不给 = 扫全部适用于本次模式的来源。
         ///
         /// 🔴 **它存在是因为「靠环境变量做隔离」不成立。** `CLAUDE_CONFIG_DIR` /
         /// `CODEX_HOME` 只覆盖宿主本机的根，而 **WSL 发现是第三条路**，不受它们管。
@@ -88,7 +89,7 @@ enum Command {
         #[arg(long)]
         write_store: bool,
         /// 总库路径（覆盖默认 `<data_local_dir>/svault/total_store.db`）。
-        /// 只在 `--write-store` 下有意义；也用于读项目根注册表（归属的唯一输入）。
+        /// 写库时指定目标库，只读扫描时指定用于加载项目根注册表的已有库。
         #[cfg(feature = "store")]
         #[arg(long)]
         store: Option<PathBuf>,
@@ -476,6 +477,7 @@ enum SourceTypeArg {
     Codex,
     Cursor,
     Gemini,
+    AntigravityCli,
     Jsonl,
 }
 
@@ -486,6 +488,7 @@ impl From<SourceTypeArg> for SourceType {
             SourceTypeArg::Codex => SourceType::Codex,
             SourceTypeArg::Cursor => SourceType::Cursor,
             SourceTypeArg::Gemini => SourceType::Gemini,
+            SourceTypeArg::AntigravityCli => SourceType::AntigravityCli,
             SourceTypeArg::Jsonl => SourceType::Jsonl,
         }
     }
@@ -595,6 +598,9 @@ enum Out<'a> {
     SyncUnreachable { reason: &'a str },
     SourceReport {
         report: &'a session_vault::report::SourceReport,
+        /// 新来源的流式消费者按此区分替换和追加；老来源保持原 NDJSON 形状。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replacement: Option<&'static str>,
     },
     Summary {
         sources: usize,
@@ -626,6 +632,10 @@ enum Out<'a> {
         /// 它是个**说得出口但没用**的答案，与「这台机器上确实没有项目」长得一样，
         /// 所以进摘要而不只是一行日志。
         roots_empty: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        roots_unavailable: Option<&'a str>,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        discovery_unreachable: &'a [String],
     },
     /// `scan-all --write-store`：一个来源的事件落库了。
     ///
@@ -1329,9 +1339,11 @@ fn emit(out: &Out) {
 }
 
 fn run_discover() -> i32 {
-    match session_vault::discover() {
-        Ok(sources) => {
-            for s in &sources {
+    match session_vault::discover::discover_all_reported(
+        session_vault::deadline::Deadline::unbounded(),
+    ) {
+        Ok(outcome) => {
+            for s in &outcome.sources {
                 emit(&Out::Source {
                     source_type: s.source_type,
                     source_location: s.source_location.clone(),
@@ -1341,7 +1353,7 @@ fn run_discover() -> i32 {
                 });
             }
             emit(&Out::Summary {
-                sources: sources.len(),
+                sources: outcome.sources.len(),
                 events: 0,
                 state_saved: None,
                 // `discover` 只枚举来源、不读内容、不写库，写库那几格都是「不适用」。
@@ -1351,6 +1363,8 @@ fn run_discover() -> i32 {
                 held_sources: None,
                 snapshot_sources: None,
                 roots_empty: false,
+                roots_unavailable: None,
+                discovery_unreachable: &outcome.unreachable,
             });
             0
         }
@@ -1782,30 +1796,15 @@ impl ScanWriter {
     }
 }
 
-/// 按 `--only` 过滤发现结果。`only` 为空 = 不过滤（既有行为逐字不变）。
-///
-/// 🔴 **过滤必须发生在发现之后**，因为只有这里看得见**全部**发现路径的产物：
-/// 宿主本机根、WSL 发行版、描述符各是一条，而调用方能设的环境变量只管得住其中两条。
-/// 把过滤前移到某条路径内部，就又造出一个「只挡住我想到的那几条」的护栏 ——
-/// 而**一个覆盖不全的检查，和没有检查长得一模一样**。
-fn retain_only(sources: Vec<SourceRef>, only: &[SourceTypeArg]) -> Vec<SourceRef> {
-    if only.is_empty() {
-        return sources;
+/// 对全部发现结果应用来源过滤，覆盖宿主本机、WSL 与描述符各条发现路径。
+fn select_scan_sources(mut sources: Vec<SourceRef>, only: &[SourceTypeArg]) -> Vec<SourceRef> {
+    if !only.is_empty() {
+        let want: Vec<SourceType> = only.iter().copied().map(SourceType::from).collect();
+        let before = sources.len();
+        sources.retain(|source| want.contains(&source.source_type));
+        log::info!(target: tag::CLI, "--only {only:?} kept {} of {before} sources", sources.len());
     }
-    let want: Vec<SourceType> = only.iter().copied().map(SourceType::from).collect();
-    let before = sources.len();
-    let kept: Vec<SourceRef> = sources
-        .into_iter()
-        .filter(|s| want.contains(&s.source_type))
-        .collect();
-    // **说出挡掉了多少。** 一个静默过滤的扫描，「隔离生效」与「机器上什么都没有」
-    // 长得一模一样 —— 而这两者需要完全不同的处理。
-    log::info!(
-        target: tag::CLI,
-        "--only {only:?} kept {} of {before} sources",
-        kept.len()
-    );
-    kept
+    sources
 }
 
 fn run_scan_all(
@@ -1816,6 +1815,11 @@ fn run_scan_all(
     write_store: bool,
     store_arg: Option<PathBuf>,
 ) -> i32 {
+    let spawns_before = session_vault::wsl::spawn_count();
+    if write_store && only.contains(&SourceTypeArg::AntigravityCli) {
+        log::error!(target: tag::CLI, "antigravity-cli is a read-only source; omit --write-store");
+        return 1;
+    }
     let profile = match resolve_scan_profile(profile_arg, write_store) {
         Ok(p) => p,
         Err(why) => {
@@ -1823,6 +1827,30 @@ fn run_scan_all(
             return 1;
         }
     };
+
+    let selects_antigravity = only.contains(&SourceTypeArg::AntigravityCli);
+    let antigravity_only = selects_antigravity
+        && only
+            .iter()
+            .all(|source_type| *source_type == SourceTypeArg::AntigravityCli);
+    let discover_antigravity = !write_store && (only.is_empty() || selects_antigravity);
+
+    // 在打开写库、读游标或发事件前拒绝与源数据树相交的状态输出。
+    let state_path = if stateless {
+        None
+    } else {
+        resolve_state_path(state_arg)
+    };
+    let dedicated_state_path = state_path
+        .as_deref()
+        .filter(|_| discover_antigravity)
+        .map(antigravity_state_path);
+    for path in state_path.iter().chain(dedicated_state_path.iter()) {
+        if let Err(error) = session_vault::discover::check_antigravity_state_path(path) {
+            log::error!(target: tag::CLI, "unsafe scan state path {}: {error}", path.display());
+            return 1;
+        }
+    }
 
     // 🔴 **先开库，再扫。** 反过来的话，一轮几分钟的全量扫描跑完才发现库打不开 ——
     // 那一轮的读全白做，而且游标没推进，下一轮还得重来。
@@ -1836,29 +1864,38 @@ fn run_scan_all(
         None
     };
 
-    let sources = match session_vault::discover() {
-        Ok(s) => s,
+    let deadline = session_vault::deadline::Deadline::unbounded();
+    let discovered = if antigravity_only {
+        session_vault::discover::discover_antigravity_cli_reported(deadline)
+    } else if discover_antigravity {
+        session_vault::discover::discover_all_reported(deadline)
+    } else {
+        session_vault::discover::discover_store_sources_reported(deadline)
+    };
+    let (sources, discovery_unreachable) = match discovered {
+        Ok(outcome) => (
+            select_scan_sources(outcome.sources, &only),
+            outcome.unreachable,
+        ),
         Err(e) => {
             log::error!(target: tag::CLI, "discover failed: {e}");
             return 1;
         }
     };
-    let sources = retain_only(sources, &only);
 
-    // 状态：source_key → 游标 + 产出它的解析器版本 + 上一版源指纹。stateless 时为空 map。
-    let state_path = if stateless {
-        None
-    } else {
-        resolve_state_path(state_arg)
-    };
-    let mut cursors: HashMap<String, SourceState> = match &state_path {
-        Some(p) => load_cursors(p),
-        None => HashMap::new(),
-    };
+    let include_antigravity = sources
+        .iter()
+        .any(|source| source.source_type == SourceType::AntigravityCli);
+    let shared_state_path = state_path.as_deref().filter(|_| !antigravity_only);
+    let dedicated_state_path = dedicated_state_path
+        .as_deref()
+        .filter(|_| include_antigravity || antigravity_only);
+    let (mut shared_cursors, mut dedicated_cursors) = load_scan_cursors(
+        state_path.as_deref(),
+        shared_state_path,
+        dedicated_state_path,
+    );
 
-    // 归属的唯一输入。读不出来就是空注册表 ⇒ 一致地 `Unattributed`，**不退回 cwd**。
-    // 🔴 空表要说出来：一份静默为空的注册表会让整轮扫描的 `project_root` 全成兜底值，
-    // 而那与「本机确实一个项目根都没发现」在输出里长得一模一样。
     let session_bindings =
         session_vault::SessionBindingRegistry::load_for_context(None, store_arg.as_deref());
     #[cfg(feature = "store")]
@@ -1866,9 +1903,24 @@ fn run_scan_all(
         Some(writer) => writer.store.load_session_bindings(),
         None => session_bindings,
     };
-    let roots = std::sync::Arc::new(project_roots(store_arg));
+    let ScanReadSettings {
+        roots,
+        roots_error,
+        antigravity_bindings,
+    } = scan_read_settings(store_arg, include_antigravity, antigravity_only);
+    let antigravity_bindings = (include_antigravity && roots_error.is_none()).then(|| {
+        antigravity_bindings
+            .as_ref()
+            .unwrap_or(&session_bindings)
+            .for_antigravity_scan()
+    });
+    if let Some(error) = roots_error.as_deref() {
+        log::warn!(target: tag::CLI, "{error}");
+    }
+    // 旧消费者只看 roots_empty。读得零条根时保留告警位，另用 roots_unavailable 区分失败。
     let roots_empty = roots.is_empty();
-    if roots_empty {
+    let roots = std::sync::Arc::new(roots);
+    if roots_empty && roots_error.is_none() {
         log::warn!(
             target: tag::CLI,
             "project root registry is empty — every path will be Unattributed"
@@ -1904,7 +1956,6 @@ fn run_scan_all(
     let mut snapshot_sources = 0u64;
 
     // WSL 上没变化的会话日志只需要 stat、快照每轮要整份读：都按发行版一次 `wsl.exe` 问完。
-    let spawns_before = session_vault::wsl::spawn_count();
     let prefetch = Prefetched {
         stats: session_vault::scan::StatPrefetch::for_sources(
             &sources,
@@ -1917,6 +1968,27 @@ fn run_scan_all(
     };
 
     for s in &sources {
+        if let Some(error) = roots_error
+            .as_deref()
+            .filter(|_| s.source_type == SourceType::AntigravityCli)
+        {
+            let report = session_vault::report::SourceReport {
+                source_path: s.path.display().to_string(),
+                source_mode: Some(s.source_mode),
+                warnings: vec![error.to_string()],
+                ..Default::default()
+            };
+            emit(&Out::SourceReport {
+                report: &report,
+                replacement: None,
+            });
+            continue;
+        }
+        let cursors = if s.source_type == SourceType::AntigravityCli {
+            &mut dedicated_cursors
+        } else {
+            &mut shared_cursors
+        };
         let key = source_key(s);
         let prev = cursors.get(&key).cloned();
 
@@ -2014,7 +2086,11 @@ fn run_scan_all(
             profile,
             roots.clone(),
             &prefetch,
-            &session_bindings,
+            if s.source_type == SourceType::AntigravityCli {
+                antigravity_bindings.as_ref().unwrap_or(&session_bindings)
+            } else {
+                &session_bindings
+            },
             #[cfg(feature = "store")]
             Some(DshScanContext {
                 reasons,
@@ -2037,7 +2113,23 @@ fn run_scan_all(
                 emit(&Out::Event { event: ev });
             }
         }
-        emit(&Out::SourceReport { report: &report });
+        let replacement = match &scanned {
+            Scanned::Observed(obs)
+                if s.source_type == SourceType::AntigravityCli && obs.events_are_usable() =>
+            {
+                use session_vault::observation::SourceChange;
+                match obs.source_change {
+                    SourceChange::Appended => None,
+                    SourceChange::RollbackOrRewrite => Some("rollback_or_rewrite"),
+                    SourceChange::ReparseRequired => Some("reparse_required"),
+                }
+            }
+            _ => None,
+        };
+        emit(&Out::SourceReport {
+            report: &report,
+            replacement,
+        });
 
         // 写库。**只有计划说该写、且真的写成功了，才推进这个来源的游标** ——
         // 反过来会把没落库的那段字节永久跳过：下一轮从新游标续读，那批事件再也
@@ -2047,6 +2139,9 @@ fn run_scan_all(
             (None, Scanned::Dsh(planned)) => {
                 planned.plan.cursor() == session_vault::scan_plan::CursorAction::Advance
                     && planned.candidate_state.is_some()
+            }
+            (None, Scanned::Observed(obs)) if s.source_type == SourceType::AntigravityCli => {
+                obs.events_are_usable()
             }
             (None, _) => true,
             // 🔴 **快照来源不由这条路写。** Class-B 的写入口是 `sync-snapshots`
@@ -2146,28 +2241,21 @@ fn run_scan_all(
         }
     }
 
+    // 混选时两份状态各自落盘，任一失败仍按原有的状态保存失败报告。
+    let state_saved = [
+        (shared_state_path, &shared_cursors),
+        (dedicated_state_path, &dedicated_cursors),
+    ]
+    .into_iter()
+    .filter_map(|(path, cursors)| path.map(|p| save_scan_state(p, cursors)))
+    .reduce(|first, second| first && second);
+
     log::info!(
         target: tag::CLI,
-        "wsl.exe spawned {} times while scanning {} sources",
+        "wsl.exe spawn attempts during scan-all: {} ({} sources)",
         session_vault::wsl::spawn_count() - spawns_before,
         sources.len()
     );
-
-    // 状态持久化结果：None=stateless；Some(true/false)=尝试落盘的成败。
-    let state_saved = match &state_path {
-        None => None,
-        Some(p) => match save_cursors(p, &cursors) {
-            Ok(()) => {
-                log::info!(target: tag::CLI, "state saved: path={} entries={}", p.display(), cursors.len());
-                Some(true)
-            }
-            Err(e) => {
-                log::error!(target: tag::CLI, "save state failed: path={} err={e}", p.display());
-                Some(false)
-            }
-        },
-    };
-
     emit(&Out::Summary {
         sources: sources.len(),
         events: total_events,
@@ -2184,6 +2272,8 @@ fn run_scan_all(
         // 枚举到但不由这条路写的快照来源数（Class-B 归 `sync-snapshots`）。
         snapshot_sources: write_store.then_some(snapshot_sources),
         roots_empty,
+        roots_unavailable: roots_error.as_deref(),
+        discovery_unreachable: &discovery_unreachable,
     });
 
     // 退出码：0 正常；1 起步就没跑成（参数/发现/开库）；2 游标没落盘（下轮会重复）；
@@ -2997,49 +3087,62 @@ where
     }
 }
 
-/// 打开总库读项目根注册表；**任何一步拿不到就是空注册表**（一致地说不出来）。
-///
-/// 📌 这里从前写着「`scan-all` 没有 `--store` 参数（它是流式的、不写库），所以走
-/// 默认路径」。`--write-store`（task #44）落地之后**那个理由过期了**：同一次运行会
-/// 往 `--store` 指的那个库里写，归属却从**另一个**库读 —— 两个库的注册表不同时，
-/// 写进去的 `project_root` 会来自一份与目标库无关的注册表，而且不报错。
-/// 所以路径必须透传。
+#[derive(Default)]
+struct ScanReadSettings {
+    roots: session_vault::attribution::RootRegistry,
+    roots_error: Option<String>,
+    antigravity_bindings: Option<session_vault::SessionBindingRegistry>,
+}
+
+/// 只读加载本轮所用总库的项目根和 Antigravity 绑定。读取失败时仍保留已读出的项目根，
+/// 原有来源继续使用它们，Antigravity 暂停发布可能更改归属的事件。
 #[cfg(feature = "store")]
-fn project_roots(store_arg: Option<PathBuf>) -> session_vault::attribution::RootRegistry {
-    let empty = session_vault::attribution::RootRegistry::new;
-    let Some(p) = resolve_store_path(store_arg) else {
-        return empty();
+fn scan_read_settings(
+    store_arg: Option<PathBuf>,
+    include_antigravity: bool,
+    antigravity_only: bool,
+) -> ScanReadSettings {
+    let open = || -> Result<Option<session_vault::TotalStore>, String> {
+        let path = resolve_store_path(store_arg).ok_or("no data_local_dir; pass --store")?;
+        if !total_store_present(&path)? {
+            return Ok(None);
+        }
+        open_total_store_read_only(&path)
+            .map(Some)
+            .map_err(|error| error.to_string())
     };
-    match total_store_present(&p) {
-        Ok(true) => {}
-        // 没有注册表就是空注册表 —— 事实。
-        Ok(false) => return empty(),
-        // 探不动也只能返回空（本函数的返回类型说不出第三种），但**要留一行**：
-        // 否则「归属注册表突然空了」与「这台机器还没建库」在日志里一模一样。
-        Err(why) => {
-            log::warn!(target: tag::CLI, "project roots unavailable: {why}");
-            return empty();
+    match open() {
+        Ok(Some(store)) => {
+            // 定向 Antigravity 扫描只用已有根的路径信息，不为归属启动发行版探挂载。
+            let mounts = if antigravity_only {
+                Vec::new()
+            } else {
+                session_vault::host_drive_mounts()
+            };
+            let (roots, status) = store.project_root_registry_reported(&mounts);
+            ScanReadSettings {
+                roots,
+                roots_error: status
+                    .err()
+                    .map(|error| format!("project roots unavailable: {error}")),
+                antigravity_bindings: include_antigravity.then(|| store.load_session_bindings()),
+            }
         }
-    }
-    match open_total_store(&p) {
-        Ok(store) => {
-            session_vault::project_root_registry(&store, &session_vault::host_drive_mounts())
-        }
-        Err(e) => {
-            log::warn!(target: tag::CLI, "open total store for roots failed: {e}");
-            empty()
-        }
+        Ok(None) => ScanReadSettings::default(),
+        Err(error) => ScanReadSettings {
+            roots_error: Some(format!("project roots unavailable: {error}")),
+            ..Default::default()
+        },
     }
 }
 
-/// 无 `store` feature 时**没有注册表可读** —— 归属一致地说不出来。
-///
-/// 🔴 这不是「补个空桩让它编译过」：默认 feature 下 `scan-all` 会把每条路径记成
-/// `unattributed`，那是**真话**（这个构建确实无从知道项目根），但它对消费方几乎没用。
-/// 所以调用点会 `warn` 一行说出来 —— 见 `run_scan_all`。**要有归属就带 `--features store`。**
 #[cfg(not(feature = "store"))]
-fn project_roots(_store_arg: Option<PathBuf>) -> session_vault::attribution::RootRegistry {
-    session_vault::attribution::RootRegistry::new()
+fn scan_read_settings(
+    _store_arg: Option<PathBuf>,
+    _include_antigravity: bool,
+    _antigravity_only: bool,
+) -> ScanReadSettings {
+    ScanReadSettings::default()
 }
 
 /// 解析总库路径：`--store` 优先，否则 `<data_local_dir>/svault/total_store.db`
@@ -3126,13 +3229,7 @@ struct StoredFingerprint {
 
 /// 来源的稳定身份键（跨运行定位游标）：`<type>|<location>|<path>`。
 fn source_key(s: &SourceRef) -> String {
-    let st = match s.source_type {
-        SourceType::ClaudeCode => "claude_code",
-        SourceType::Codex => "codex",
-        SourceType::Cursor => "cursor",
-        SourceType::Gemini => "gemini",
-        SourceType::Jsonl => "jsonl",
-    };
+    let st = s.source_type.as_key();
     format!("{st}|{}|{}", s.source_location.as_key(), s.path.display())
 }
 
@@ -3154,42 +3251,80 @@ fn resolve_state_path(arg: Option<PathBuf>) -> Option<PathBuf> {
     }
 }
 
-/// 读状态文件 → 游标表。不存在或损坏 → 空表（发警告，不崩）。
-fn load_cursors(path: &std::path::Path) -> HashMap<String, SourceState> {
+fn antigravity_state_path(base: &std::path::Path) -> PathBuf {
+    let mut path = base.as_os_str().to_os_string();
+    path.push(".antigravity.json");
+    PathBuf::from(path)
+}
+
+fn load_scan_cursors(
+    base: Option<&std::path::Path>,
+    shared: Option<&std::path::Path>,
+    dedicated: Option<&std::path::Path>,
+) -> (HashMap<String, SourceState>, HashMap<String, SourceState>) {
+    let mut shared_cursors = shared.and_then(load_cursors).unwrap_or_default();
+    let dedicated_cursors = dedicated.map_or_else(HashMap::new, |path| {
+        load_cursors(path).unwrap_or_else(|| {
+            // 首次切到专属文件时承接开发版已有游标。单选只读旧文件，混选复用已载入的表。
+            if shared.is_none() {
+                shared_cursors = base.and_then(load_cursors).unwrap_or_default();
+            }
+            let prefix = format!("{}|", SourceType::AntigravityCli.as_key());
+            shared_cursors
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, cursor)| (key.clone(), cursor.clone()))
+                .collect()
+        })
+    });
+    (shared_cursors, dedicated_cursors)
+}
+
+/// 确认缺席时返回 None。损坏或读失败时警告并从空表开始。
+fn load_cursors(path: &std::path::Path) -> Option<HashMap<String, SourceState>> {
     let bytes = match session_vault::probe::read_bytes(path, None) {
         session_vault::probe::Probed::Found(b) => b,
         // 没有状态文件 = 第一次跑，是事实。
-        session_vault::probe::Probed::Absent => return HashMap::new(),
-        // 读不成也退回空表（游标丢了只是重扫一遍，不丢数据），但要留一行 ——
-        // 「第一次跑」与「读不了」在结果上一样，在日志里必须分得开。
+        session_vault::probe::Probed::Absent => return None,
         session_vault::probe::Probed::Unknown(e) => {
             log::warn!(target: tag::CLI, "read state failed (starting empty): {e}");
-            return HashMap::new();
+            return Some(HashMap::new());
         }
     };
-    match serde_json::from_slice(&bytes) {
+    Some(match serde_json::from_slice(&bytes) {
         Ok(m) => m,
         Err(e) => {
             log::warn!(target: tag::CLI, "parse state failed (starting empty): path={} err={e}", path.display());
             HashMap::new()
         }
+    })
+}
+
+fn save_scan_state(path: &std::path::Path, cursors: &HashMap<String, SourceState>) -> bool {
+    match save_cursors(path, cursors) {
+        Ok(()) => {
+            log::info!(target: tag::CLI, "state saved: path={} entries={}", path.display(), cursors.len());
+            true
+        }
+        Err(e) => {
+            log::error!(target: tag::CLI, "save state failed: path={} err={e}", path.display());
+            false
+        }
     }
 }
 
-/// 原子写状态文件：先写 `.tmp` 再 rename，避免半写损坏。
+/// 原子写状态文件：独占创建同目录的暂存文件，避免覆盖别名或写出半份状态。
 fn save_cursors(
     path: &std::path::Path,
     cursors: &HashMap<String, SourceState>,
 ) -> std::io::Result<()> {
+    session_vault::discover::check_antigravity_state_path(path)?;
     if let Some(parent) = path.parent() {
         session_vault::probe::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec_pretty(cursors)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp = path.with_extension("json.tmp");
-    session_vault::probe::write_bytes(&tmp, &json)?;
-    session_vault::probe::rename(&tmp, path)?;
-    Ok(())
+    session_vault::probe::replace_file_atomically(path, &json)
 }
 
 #[cfg(all(test, feature = "store"))]
@@ -5141,19 +5276,19 @@ mod only_tests {
     #[test]
     fn no_only_flag_changes_nothing() {
         // 既有调用方一个字节都不受影响 —— 这是这条新参数可以默认关着的前提。
-        assert_eq!(retain_only(fixture(), &[]).len(), 4);
+        assert_eq!(select_scan_sources(fixture(), &[]).len(), 4);
     }
 
     #[test]
     fn only_keeps_exactly_the_requested_types() {
-        let kept = retain_only(fixture(), &[SourceTypeArg::Jsonl]);
+        let kept = select_scan_sources(fixture(), &[SourceTypeArg::Jsonl]);
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|s| s.source_type == SourceType::Jsonl));
     }
 
     #[test]
     fn only_accepts_more_than_one_type() {
-        let kept = retain_only(fixture(), &[SourceTypeArg::Jsonl, SourceTypeArg::Codex]);
+        let kept = select_scan_sources(fixture(), &[SourceTypeArg::Jsonl, SourceTypeArg::Codex]);
         assert_eq!(kept.len(), 3);
         assert!(!kept.iter().any(|s| s.source_type == SourceType::ClaudeCode));
     }
@@ -5167,13 +5302,13 @@ mod only_tests {
         let mut wsl = src(SourceType::Codex, "/home/u/.codex/x.jsonl");
         wsl.source_location = SourceLocation::Wsl("Distro".into());
         sources.push(wsl);
-        let kept = retain_only(sources, &[SourceTypeArg::Jsonl]);
+        let kept = select_scan_sources(sources, &[SourceTypeArg::Jsonl]);
         assert_eq!(kept.len(), 2, "WSL 来源必须与本机来源一样被挡在外面");
     }
 
     #[test]
     fn asking_for_a_type_that_is_absent_yields_nothing_not_everything() {
         // 「过滤后为空」不许退化成「那就全都要」—— 那正是护栏最容易的死法。
-        assert!(retain_only(fixture(), &[SourceTypeArg::Cursor]).is_empty());
+        assert!(select_scan_sources(fixture(), &[SourceTypeArg::Cursor]).is_empty());
     }
 }

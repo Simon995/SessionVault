@@ -390,6 +390,7 @@ pub fn builtin_descriptors() -> Vec<ProviderDescriptor> {
             }],
         },
     ];
+    descriptors.push(crate::antigravity::descriptor());
     descriptors.push(crate::dsh_provider::descriptor());
     descriptors
 }

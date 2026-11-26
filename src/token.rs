@@ -35,7 +35,9 @@
 //! ⚠️ **少一个分量就会把两次不同的操作当成同一次**，于是第二次被静默忽略 ——
 //! 那比多开一代更糟：它会让新解析器的结果永远进不去。
 
-use crate::rawevent::{SourceLocation, SourceType};
+use crate::rawevent::SourceLocation;
+#[cfg(test)]
+use crate::rawevent::SourceType;
 use crate::store::SourceKey;
 
 /// 版本前缀 —— token 的构成规则将来改了，旧 token 不会被误当成同一次操作。
@@ -65,15 +67,7 @@ impl ProjectionToken {
             SourceLocation::Local => "local".to_string(),
             SourceLocation::Wsl(d) => format!("wsl:{d}"),
         };
-        let source_type = match source.source_type {
-            SourceType::ClaudeCode => "claude_code",
-            SourceType::Codex => "codex",
-            SourceType::Cursor => "cursor",
-            SourceType::Gemini => "gemini",
-            SourceType::Jsonl => "jsonl",
-            // 穷举匹配：将来加 SourceType 变体时编译器会指到这里 ——
-            // 新来源必须拿到自己的 token 前缀，不能悄悄复用别人的。
-        };
+        let source_type = source.source_type.as_key();
         // 路径里可能有 `|`，所以用长度前缀而不是纯分隔符 —— 否则两个不同的
         // (路径, 指纹) 组合可以拼出同一个串。
         let fp = source_fingerprint.unwrap_or("nofp");

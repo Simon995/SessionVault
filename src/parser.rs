@@ -208,6 +208,7 @@ pub fn parse_lines(
         SourceType::ClaudeCode => parse_claude(ctx, lines, base_seq),
         SourceType::Codex => parse_codex(ctx, lines, base_seq, codex_state),
         SourceType::Jsonl => parse_jsonl(ctx, lines, base_seq),
+        SourceType::AntigravityCli => parse_antigravity(ctx, lines, base_seq),
         // 其它 provider v0 未实装解析器：仅校验 JSON、计 skipped，状态透传。
         _ => {
             let mut out = ParseOut {
@@ -351,6 +352,86 @@ fn jsonl_timestamp(v: Option<&Value>) -> Option<String> {
         Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
         _ => None,
     }
+}
+
+fn parse_antigravity(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
+    let mut out = ParseOut::default();
+    let Some((_, session_id)) =
+        crate::antigravity::transcript_layout(std::path::Path::new(&ctx.source_path))
+    else {
+        out.skipped = lines.len() as u64;
+        out.warnings
+            .push("invalid Antigravity CLI transcript path".into());
+        return out;
+    };
+    for (idx, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Map<String, Value> = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                record_skip(&mut out, &ctx.source_path, idx, &error);
+                continue;
+            }
+        };
+        let field = |key| value.get(key).and_then(Value::as_str);
+        let (step, source, status) = (field("type"), field("source"), field("status"));
+        let mut invalid_field = |field: &str| {
+            out.skipped += 1;
+            if out.skipped == 1 {
+                out.warnings.push(format!(
+                    "{}:{}: invalid Antigravity CLI {field}",
+                    ctx.source_path,
+                    idx + 1
+                ));
+            }
+        };
+        if value.get("step_index").and_then(Value::as_u64).is_none()
+            || step.is_none()
+            || source.is_none()
+            || status.is_none()
+        {
+            invalid_field("step fields");
+            continue;
+        }
+        let actor = match (step, source, status) {
+            (Some("USER_INPUT"), Some("USER_EXPLICIT"), Some("DONE")) => Actor::User,
+            (Some("PLANNER_RESPONSE"), Some("MODEL"), Some("DONE")) => Actor::Assistant,
+            _ => continue,
+        };
+        let Some(content) = field("content") else {
+            invalid_field("completed message content (expected a string)");
+            continue;
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let mut event = ctx.event(
+            base_seq + out.events.len() as u64,
+            session_id,
+            EventType::Message,
+            Some(actor),
+            jsonl_timestamp(value.get("created_at")),
+            None,
+            None,
+        );
+        if actor == Actor::User {
+            event.input_origin = Some(classify_user_input_origin(None, content, &ctx.source_path));
+        }
+        if actor == Actor::Assistant {
+            event.model = field("model")
+                .filter(|model| !model.is_empty())
+                .map(str::to_string);
+        }
+        if ctx.want_content() {
+            event.content = Some(content.to_string());
+        }
+        event.event_key = Some(RecordSlots::new(line).next(event.event_type));
+        out.events.push(event);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

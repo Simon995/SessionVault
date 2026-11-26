@@ -170,10 +170,7 @@ struct Report {
 fn provider_key(t: SourceType) -> &'static str {
     match t {
         SourceType::ClaudeCode => "claude",
-        SourceType::Codex => "codex",
-        SourceType::Cursor => "cursor",
-        SourceType::Gemini => "gemini",
-        SourceType::Jsonl => "jsonl",
+        other => other.as_key(),
     }
 }
 

@@ -634,6 +634,28 @@ pub fn lstat_entry(path: &Path, anchor_root: Option<&Path>) -> Probed<RealEntryK
     }
 }
 
+/// 只读持有普通文件，阻止其他 Windows 句柄写入、删除或替换它。
+/// 已有写句柄时返回错误，即使该句柄当前没有写入。
+#[cfg(all(windows, feature = "store"))]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn pin_windows_file_against_writes(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 /// 同句柄身份核对的有界普通文件读取结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PinnedRead {
@@ -744,6 +766,48 @@ fn anchor(root: Option<&Path>) -> Anchor {
     }
 }
 
+/// 解析现有路径或不存在的输出路径：只对已存在的祖先做真实路径解析，
+/// 缺失的尾部按原目录段补回。损坏的链接或无法访问的目录不按「缺失」处理。
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn resolve_local_output_path(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    use std::io::{Error, ErrorKind};
+    use std::path::Component;
+
+    let absolute = std::path::absolute(path)?;
+    if absolute
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "unresolved parent component",
+        ));
+    }
+    for ancestor in absolute.ancestors() {
+        match std::fs::canonicalize(ancestor) {
+            Ok(actual) => {
+                let tail = absolute
+                    .strip_prefix(ancestor)
+                    .expect("ancestor is a prefix");
+                return Ok(actual.join(tail));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(ancestor) {
+                    Err(missing) if missing.kind() == ErrorKind::NotFound => continue,
+                    Err(other) => return Err(other),
+                    Ok(_) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::new(
+        ErrorKind::NotFound,
+        "cannot resolve a local ancestor",
+    ))
+}
+
 /// 建目录（含父级）。**变更操作，透传 `Result`** —— 见本节开头。
 #[allow(clippy::disallowed_methods)]
 pub fn create_dir_all(path: &Path) -> std::io::Result<()> {
@@ -812,6 +876,39 @@ pub fn held_open_elsewhere(path: &Path) -> Probed<bool> {
 #[allow(clippy::disallowed_methods)]
 pub fn write_bytes(path: &Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     std::fs::write(path, contents)
+}
+
+/// 在目标同目录独占新建暂存文件，再替换目标目录项。既有暂存路径可能是硬链接，
+/// 不得打开后截断；也不按旧文件名清理任何不属于这次写入的文件。
+#[allow(clippy::disallowed_methods)]
+pub fn replace_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::{ErrorKind, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let (temp, mut file) = loop {
+        let id = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_file_name(format!(".svault-{}-{id}.tmp", std::process::id()));
+        if temp == path {
+            continue;
+        }
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(contents);
+    drop(file);
+    let result = written.and_then(|()| rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// 改名。**变更操作，透传 `Result`**。

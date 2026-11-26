@@ -54,7 +54,7 @@ pub struct Cursor {
     /// 上轮 mtime（秒），变小或 size 变小即判定回退 → 全量重读。
     pub mtime: Option<i64>,
 
-    // --- snapshot_file ---
+    // --- snapshot_file / Antigravity append_log 双指纹 ---
     pub content_hash: Option<String>,
 
     // --- sqlite_store ---

@@ -370,6 +370,11 @@ pub fn scan_append_log_prefetched(
     prefetch: &StatPrefetch,
 ) -> (AppendLogObservation, SourceReport) {
     let bindings = SessionBindingRegistry::load_for_context(None, None);
+    let bindings = if source.source_type == crate::rawevent::SourceType::AntigravityCli {
+        bindings.for_antigravity_scan()
+    } else {
+        bindings
+    };
     scan_append_log_with_bindings(
         source,
         cursor_in,
@@ -383,6 +388,7 @@ pub fn scan_append_log_prefetched(
 }
 
 /// 带显式控制面会话绑定注册表的 append-log 扫描入口（H.1 / H.2 / H.3）。
+/// Antigravity 调用方可用 [`SessionBindingRegistry::for_antigravity_scan`] 构造本轮有效快照。
 #[allow(clippy::too_many_arguments)]
 pub fn scan_append_log_with_bindings(
     source: &SourceRef,
@@ -394,6 +400,17 @@ pub fn scan_append_log_with_bindings(
     prefetch: &StatPrefetch,
     bindings: &SessionBindingRegistry,
 ) -> (AppendLogObservation, SourceReport) {
+    if source.source_type == crate::rawevent::SourceType::AntigravityCli {
+        return scan_antigravity(
+            source,
+            cursor_in,
+            prior_fingerprint,
+            profile,
+            roots,
+            deadline,
+            bindings,
+        );
+    }
     if crate::dsh_provider::is_source(source) {
         #[cfg(feature = "store")]
         {
@@ -1018,6 +1035,188 @@ impl ByteSource for WslSource<'_> {
     }
 }
 
+const ANTIGRAVITY_CURSOR_HASH_PREFIX: &str = "agv1:";
+const ANTIGRAVITY_CURSOR_ATTR_SEP: &str = ";attr=";
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    })
+}
+
+fn encode_antigravity_cursor_hashes(
+    prefix: &SourceFingerprint,
+    attribution: &SourceFingerprint,
+) -> String {
+    format!(
+        "{ANTIGRAVITY_CURSOR_HASH_PREFIX}{}{ANTIGRAVITY_CURSOR_ATTR_SEP}{}",
+        prefix.as_str(),
+        attribution.as_str(),
+    )
+}
+
+/// 解析 Antigravity 游标在 `content_hash` 中保存的前缀与归属指纹。
+///
+/// - `agv1:sha256:<prefix>;attr=sha256:<attr>`：当前双指纹格式；
+/// - 裸 `sha256:<prefix>`：兼容旧开发版或仅保存前缀指纹的调用方——仍检出前缀改写，
+///   归属指纹视为缺失，在已有消费偏移时触发 `ReparseRequired` 以补齐双指纹；
+/// - 其余损坏格式返回 `None`，由调用方保守触发重读。
+fn parse_antigravity_cursor_hashes(
+    stored: &str,
+    covered_len: u64,
+) -> Option<(SourceFingerprint, Option<&str>)> {
+    if let Some(rest) = stored.strip_prefix(ANTIGRAVITY_CURSOR_HASH_PREFIX) {
+        let (prefix, attr) = rest.split_once(ANTIGRAVITY_CURSOR_ATTR_SEP)?;
+        return (is_sha256_digest(prefix) && is_sha256_digest(attr)).then(|| {
+            (
+                SourceFingerprint::from_stored(prefix, covered_len),
+                Some(attr),
+            )
+        });
+    }
+    is_sha256_digest(stored).then(|| (SourceFingerprint::from_stored(stored, covered_len), None))
+}
+
+/// Antigravity 的正常轮次只解析尾部，但不信任旧行不可变。一次有界全文读取既是
+/// 前缀见证，也是解析所用字节；不能先核前缀再另开一次文件读尾巴。
+fn scan_antigravity(
+    source: &SourceRef,
+    previous: Option<Cursor>,
+    prior_fingerprint: Option<SourceFingerprint>,
+    profile: Profile,
+    roots: Arc<RootRegistry>,
+    deadline: crate::deadline::Deadline,
+    bindings: &SessionBindingRegistry,
+) -> (AppendLogObservation, SourceReport) {
+    let unavailable = |error: String, bytes_read: u64, pending_tail_bytes: u64| {
+        (
+            observe(
+                SourceChange::Appended,
+                ParseQuality::Unavailable(ScanFailure::Read(error.clone())),
+                previous.clone().unwrap_or_else(Cursor::new_byte_offset),
+                None,
+            ),
+            SourceReport {
+                source_path: source.path.display().to_string(),
+                source_mode: Some(SourceMode::AppendLog),
+                cursor_kind: Some(CursorKind::ByteOffset),
+                bytes_read,
+                pending_tail_bytes,
+                warnings: vec![error],
+                ..Default::default()
+            },
+        )
+    };
+    let input = match crate::antigravity::read_input(source, &roots, deadline) {
+        Ok(input) => input,
+        Err(error) => return unavailable(error, 0, 0),
+    };
+    let bytes = input.bytes.as_slice();
+    let covered = &bytes[..complete_jsonl_len(bytes)];
+    let pending = (bytes.len() - covered.len()) as u64;
+    let fingerprint = SourceFingerprint::of(covered);
+    let attr_hash = SourceFingerprint::of(
+        &serde_json::to_vec(&input.attribution)
+            .expect("serializing string-only attribution cannot fail"),
+    );
+    let previous_hashes = previous.as_ref().and_then(|p| {
+        p.content_hash
+            .as_deref()
+            .and_then(|raw| parse_antigravity_cursor_hashes(raw, p.safe_offset))
+    });
+    let previous_prefix = previous_hashes.as_ref().map(|(fp, _)| fp);
+    let previous_attr_matches = previous_hashes
+        .as_ref()
+        .is_some_and(|(_, attr)| *attr == Some(attr_hash.as_str()));
+    let changed = if previous_prefix
+        .or(prior_fingerprint.as_ref())
+        .is_some_and(
+            |old| match fingerprint.covered_len().cmp(&old.covered_len()) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => fingerprint != *old,
+                std::cmp::Ordering::Greater => old.prefix_differs_from(covered),
+            },
+        ) {
+        SourceChange::RollbackOrRewrite
+    } else if previous
+        .as_ref()
+        .is_some_and(|p| p.safe_offset > 0 && (previous_prefix.is_none() || !previous_attr_matches))
+    {
+        SourceChange::ReparseRequired
+    } else {
+        SourceChange::Appended
+    };
+    if pending > 0 && changed != SourceChange::Appended {
+        return unavailable(
+            "Antigravity CLI replacement has a partial last line; retry".into(),
+            bytes.len() as u64,
+            pending,
+        );
+    }
+    if std::str::from_utf8(covered).is_err() {
+        return unavailable(
+            "Antigravity CLI transcript contains invalid UTF-8".into(),
+            bytes.len() as u64,
+            pending,
+        );
+    }
+    let parse_cursor = if changed == SourceChange::Appended {
+        previous.clone()
+    } else {
+        // 已有投影遇到坏行必须冻结，不能用半份好数据取代。
+        Some(Cursor::new_byte_offset())
+    };
+    let full_parse = parse_cursor.as_ref().is_none_or(|c| c.safe_offset == 0);
+    let (mut observation, mut report) = scan_append_log(
+        &BufferedSource(bytes),
+        source,
+        parse_cursor,
+        None,
+        profile,
+        roots,
+        bindings,
+    );
+    report.bytes_read = bytes.len() as u64;
+    if !observation.events_are_usable()
+        || report.admission_status.as_deref() == Some("temporary_excluded")
+        || observation.cursor.safe_offset != covered.len() as u64
+    {
+        observation.cursor = previous.unwrap_or_else(Cursor::new_byte_offset);
+        observation.source_fingerprint = None;
+        // 临时排除的空批也不得发出替换信号或更新前缀。
+        if observation.events_are_usable() {
+            observation.quality = ParseQuality::Unavailable(ScanFailure::Read(
+                "Antigravity CLI batch was not consumed".into(),
+            ));
+        }
+        return (observation, report);
+    }
+    observation.source_change = changed;
+    report.rollback_detected = changed == SourceChange::RollbackOrRewrite;
+    observation.cursor.content_hash =
+        Some(encode_antigravity_cursor_hashes(&fingerprint, &attr_hash));
+    observation.source_fingerprint = full_parse.then_some(fingerprint);
+    for event in &mut observation.events {
+        event.set_attribution(input.attribution.clone());
+    }
+    (observation, report)
+}
+
+struct BufferedSource<'a>(&'a [u8]);
+
+impl ByteSource for BufferedSource<'_> {
+    fn stat(&self) -> Result<(u64, Option<i64>), String> {
+        Ok((self.0.len() as u64, None))
+    }
+
+    fn read_range(&self, start: u64, end: u64) -> Result<Vec<u8>, String> {
+        Ok(self.0[start as usize..end as usize].to_vec())
+    }
+}
+
 /// 追加型日志增量扫描（字节来源经 [`ByteSource`] 抽象，本地/WSL 共用此函数）。
 fn scan_append_log<S: ByteSource>(
     src: &S,
@@ -1087,7 +1286,7 @@ fn scan_append_log<S: ByteSource>(
 
     if start >= size {
         // 无新增字节时，仍检查控制面绑定状态（确保未决/损坏 fail-closed，且临时排除状态可观察）。
-        let pre_verdict = bindings.evaluate(
+        let pre_verdict = bindings.evaluate_source(
             source.source_type,
             &source.source_location,
             &report.source_path,
@@ -1095,7 +1294,6 @@ fn scan_append_log<S: ByteSource>(
                 .codex_state
                 .as_ref()
                 .and_then(|s| s.current_session_id.as_deref()),
-            None,
         );
         match pre_verdict {
             IngestAdmissionVerdict::UnknownHold { reason } => {
@@ -3415,5 +3613,97 @@ mod tests {
             assert_eq!(comparable(res), comparable(&plain), "{}", s.path.display());
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn antigravity_cursor_hash_round_trip_and_compat_cases() {
+        use crate::observation::SourceFingerprint;
+
+        let prefix = SourceFingerprint::of(b"{\"step\":0}\n");
+        let attr = SourceFingerprint::of(b"{\"project_root\":\"C:/proj\"}");
+        let encoded = super::encode_antigravity_cursor_hashes(&prefix, &attr);
+        let (decoded_prefix, decoded_attr) =
+            super::parse_antigravity_cursor_hashes(&encoded, prefix.covered_len()).unwrap();
+        assert_eq!(decoded_prefix, prefix);
+        assert_eq!(decoded_attr, Some(attr.as_str()));
+
+        // 旧开发版或仅保存前缀指纹的调用方：保留前缀核验，归属缺失留待触发重解析。
+        let (legacy_prefix, legacy_attr) =
+            super::parse_antigravity_cursor_hashes(prefix.as_str(), prefix.covered_len()).unwrap();
+        assert_eq!(legacy_prefix, prefix);
+        assert_eq!(legacy_attr, None);
+
+        for invalid in [
+            "",
+            "sha256:deadbeef",
+            &prefix.as_str().to_ascii_uppercase(),
+            &format!("agv1:{}", prefix.as_str()),
+            &format!("agv1:{};attr=sha256:short", prefix.as_str()),
+            &format!("agv1:{};attr={};extra=1", prefix.as_str(), attr.as_str()),
+            &format!("agv2:{};attr={}", prefix.as_str(), attr.as_str()),
+        ] {
+            assert!(
+                super::parse_antigravity_cursor_hashes(invalid, prefix.covered_len()).is_none(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_keeps_legacy_public_fields_for_downstream_struct_literals() {
+        use crate::cursor::{Cursor, CursorKind};
+
+        let cursor = Cursor {
+            kind: CursorKind::ByteOffset,
+            safe_offset: 12,
+            size: 12,
+            mtime: Some(1_700_000_000),
+            content_hash: Some("agv1:demo".into()),
+            last_rowid: None,
+            schema_fingerprint: None,
+            codex_state: None,
+            dsh_state: None,
+            next_seq: 3,
+        };
+        let Cursor {
+            kind,
+            safe_offset,
+            size,
+            mtime,
+            content_hash,
+            last_rowid,
+            schema_fingerprint,
+            codex_state,
+            dsh_state,
+            next_seq,
+        } = cursor;
+        assert_eq!(kind, CursorKind::ByteOffset);
+        assert_eq!(safe_offset, 12);
+        assert_eq!(size, 12);
+        assert_eq!(mtime, Some(1_700_000_000));
+        assert_eq!(content_hash.as_deref(), Some("agv1:demo"));
+        assert_eq!(last_rowid, None);
+        assert_eq!(schema_fingerprint, None);
+        assert!(codex_state.is_none());
+        assert!(dsh_state.is_none());
+        assert_eq!(next_seq, 3);
+
+        // 旧开发版曾写出独立字段的 JSON 仍能无错反序列化。
+        let legacy_json = serde_json::json!({
+            "kind": "byte_offset",
+            "safe_offset": 12,
+            "size": 12,
+            "mtime": 1_700_000_000,
+            "content_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "last_rowid": null,
+            "schema_fingerprint": null,
+            "codex_state": null,
+            "dsh_state": null,
+            "antigravity_attribution_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "next_seq": 3
+        });
+        let parsed: Cursor = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(parsed.safe_offset, 12);
+        assert_eq!(parsed.next_seq, 3);
     }
 }

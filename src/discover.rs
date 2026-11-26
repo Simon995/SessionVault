@@ -29,19 +29,30 @@ pub struct SourceRef {
     pub artifact_kind: Option<String>,
 }
 
-/// 发现全部内置 provider 的本地来源。
+/// 发现全部内置 provider 的本机与 WSL 来源。
 pub fn discover_all(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
-    discover(false, deadline)
+    Ok(discover_all_reported(deadline)?.sources)
+}
+
+/// 发现所有形态，同时保留未能完整枚举的位置。
+pub fn discover_all_reported(deadline: crate::deadline::Deadline) -> Result<DiscoveryOutcome> {
+    discover_reported(false, true, deadline)
+}
+
+/// 发现总库支持的来源。只读来源在枚举前排除，避免把其错误计入写者的可达性报告。
+pub fn discover_store_sources_reported(
+    deadline: crate::deadline::Deadline,
+) -> Result<DiscoveryOutcome> {
+    discover_reported(false, false, deadline)
 }
 
 pub fn discover_local(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
-    discover(true, deadline)
+    Ok(discover_reported(true, true, deadline)?.sources)
 }
 
-/// 只发现会话 append_log。QuotaBar 会话索引必须使用本接口，避免 snapshot
-/// 状态制品污染 `agent_sessions` 投影。
+/// 发现可投影到总库的会话 append_log。只读转录和状态快照均不参与枚举。
 pub fn discover_transcripts(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
-    Ok(discover_by_mode(false, SourceMode::AppendLog, deadline)?.sources)
+    Ok(discover_transcripts_reported(deadline)?.sources)
 }
 
 /// 同上，但**同时报出哪些位置没问成**。
@@ -51,17 +62,55 @@ pub fn discover_transcripts(deadline: crate::deadline::Deadline) -> Result<Vec<S
 pub fn discover_transcripts_reported(
     deadline: crate::deadline::Deadline,
 ) -> Result<DiscoveryOutcome> {
-    discover_by_mode(false, SourceMode::AppendLog, deadline)
+    discover_by_mode(false, SourceMode::AppendLog, false, deadline)
+}
+
+/// 状态文件不能写在已配置的 Antigravity CLI 源数据树中，即使本轮只扫描其他来源。
+/// 检查按宿主解析出的路径进行，覆盖已存在的路径别名和尚未创建的输出。
+pub fn check_antigravity_state_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if let Some(root) = crate::antigravity::config_dir() {
+        use crate::probe::resolve_local_output_path;
+        let path = std::path::absolute(path)?;
+        let windows_key = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        let root = windows_key(&resolve_local_output_path(&root)?);
+        // 替换的是目标目录项；即使该目录项是指向树外的链接，同目录暂存也不能进源数据树。
+        let parent = path.parent().unwrap_or(&path);
+        if windows_key(&resolve_local_output_path(parent)?).starts_with(&root)
+            || windows_key(&resolve_local_output_path(&path)?).starts_with(&root)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "state file must be outside the Antigravity CLI data root",
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+
+/// 只探显式配置的 Windows Antigravity CLI 根，不枚举任何其他来源。
+/// 需要据结果 prune 的调用方应使用 [`discover_antigravity_cli_reported`]。
+pub fn discover_antigravity_cli(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
+    Ok(discover_antigravity_cli_reported(deadline)?.sources)
+}
+
+/// 同上，并在部分枚举失败时一并返回健康来源与 `unreachable` 中的本机位置键。
+pub fn discover_antigravity_cli_reported(
+    deadline: crate::deadline::Deadline,
+) -> Result<DiscoveryOutcome> {
+    crate::antigravity::discover_configured(deadline)
 }
 
 pub fn discover_transcripts_local(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
-    Ok(discover_by_mode(true, SourceMode::AppendLog, deadline)?.sources)
+    Ok(discover_by_mode(true, SourceMode::AppendLog, false, deadline)?.sources)
 }
 
 /// 只发现工具配置根内的 Class-B 状态快照。项目 instruction 由
 /// [`discover_project_snapshots`] 接收宿主已经算好的项目身份后发现。
 pub fn discover_snapshots(deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
-    Ok(discover_by_mode(false, SourceMode::SnapshotFile, deadline)?.sources)
+    Ok(discover_by_mode(false, SourceMode::SnapshotFile, false, deadline)?.sources)
 }
 
 /// 宿主这一侧怎么探这个项目根 —— **路径与「谁能回答它」绑在一起**。
@@ -280,10 +329,6 @@ pub fn discover_project_snapshots(
     }
 }
 
-fn discover(local_only: bool, deadline: crate::deadline::Deadline) -> Result<Vec<SourceRef>> {
-    Ok(discover_reported(local_only, deadline)?.sources)
-}
-
 /// 一次发现的完整结果：**找到了什么** + **哪些位置没问成**。
 ///
 /// 🔴 后者是承重的，不是诊断信息。`discover_wsl` 的两级失败（`list_distros` /
@@ -303,16 +348,23 @@ pub const LOCAL_LOCATION: &str = "local";
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryOutcome {
     pub sources: Vec<SourceRef>,
-    /// 枚举失败的位置（`wsl:<distro>` 形式）。调用方**不得**据本轮结果删除它们的存量。
+    /// 枚举完全或部分失败的位置（`local`、`wsl:<distro>` 或 `wsl:*`）。
+    /// 调用方**不得**据本轮结果删除这些位置的存量，即使发现了其中部分来源。
     pub unreachable: Vec<String>,
 }
 
 fn discover_reported(
     local_only: bool,
+    include_antigravity: bool,
     deadline: crate::deadline::Deadline,
 ) -> Result<DiscoveryOutcome> {
-    let mut first = discover_by_mode(local_only, SourceMode::AppendLog, deadline)?;
-    let second = discover_by_mode(local_only, SourceMode::SnapshotFile, deadline)?;
+    let mut first = discover_by_mode(
+        local_only,
+        SourceMode::AppendLog,
+        include_antigravity,
+        deadline,
+    )?;
+    let second = discover_by_mode(local_only, SourceMode::SnapshotFile, false, deadline)?;
     first.sources.extend(second.sources);
     for u in second.unreachable {
         if !first.unreachable.contains(&u) {
@@ -326,6 +378,7 @@ fn discover_reported(
 fn discover_by_mode(
     local_only: bool,
     wanted: SourceMode,
+    include_antigravity: bool,
     deadline: crate::deadline::Deadline,
 ) -> Result<DiscoveryOutcome> {
     let mut out = Vec::new();
@@ -343,6 +396,30 @@ fn discover_by_mode(
             );
             continue;
         };
+        if desc.source_type == SourceType::AntigravityCli {
+            if include_antigravity {
+                match crate::antigravity::discover(root, deadline) {
+                    Ok(outcome) => {
+                        out.extend(outcome.sources);
+                        for location in outcome.unreachable {
+                            if !unreachable.contains(&location) {
+                                unreachable.push(location);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!(target: tag::DISCOVER, "{error}");
+                        if !unreachable
+                            .iter()
+                            .any(|location| location == LOCAL_LOCATION)
+                        {
+                            unreachable.push(LOCAL_LOCATION.to_string());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         for art in &desc.artifacts {
             if matches!(art.status, Status::Planned) {
                 continue;

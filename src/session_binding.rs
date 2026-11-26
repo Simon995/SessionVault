@@ -17,6 +17,7 @@
 //!      **绝不把缺失或冲突静默当成 `temporary: false`**；
 //!    - `PersistentAllowed` ⇒ 允许摄取（含 `temporary: false, read_memory: false`）。
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
@@ -39,6 +40,15 @@ pub const SESSION_BINDINGS_ENV: &str = "SVAULT_SESSION_BINDINGS";
 
 /// 默认控制面绑定清单文件名（位于 `<store_dir>/session_bindings.json` 或 `<data_local_dir>/svault/session_bindings.json`）。
 pub const SESSION_BINDINGS_FILENAME: &str = "session_bindings.json";
+
+/// 只读 Antigravity 扫描专属绑定文件，不属于旧写者共享的 v1 注册表。
+const ANTIGRAVITY_BINDINGS_ENV: &str = "SVAULT_ANTIGRAVITY_SESSION_BINDINGS";
+
+#[derive(Clone, Copy)]
+enum BindingInput {
+    Shared,
+    AntigravityOnly,
+}
 
 /// 带命名空间的受控引用（对齐 TumeChat `context-mapping.ts` 的 `Ref`）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -397,8 +407,28 @@ impl SessionBindingRegistry {
     /// - `must_exist = false`：默认探测位置，`Probed::Absent` 视为未配置（`empty`），
     ///   但 **`Probed::Unknown`（权限/IO 没问成）一律按 `RegistryUnreadable` fail-closed 处理**！
     pub fn load_from_path(path: &Path, must_exist: bool) -> Self {
+        Self::load_path(path, must_exist, BindingInput::Shared)
+    }
+
+    /// 只供 Antigravity 扫描使用的有效绑定快照。共享规则仍适用；独立文件由
+    /// `SVAULT_ANTIGRAVITY_SESSION_BINDINGS` 指定。未配置时只用共享规则；显式配置却不可读、
+    /// 损坏或混入其他来源的绑定时，本快照 fail-closed。不把此快照持久化到共享键。
+    pub fn for_antigravity_scan(&self) -> Self {
+        let mut effective = match std::env::var_os(ANTIGRAVITY_BINDINGS_ENV) {
+            Some(path) if !path.is_empty() => self.merged_with(&Self::load_path(
+                Path::new(&path),
+                true,
+                BindingInput::AntigravityOnly,
+            )),
+            _ => self.clone(),
+        };
+        effective.raw_json = None;
+        effective
+    }
+
+    fn load_path(path: &Path, must_exist: bool, input: BindingInput) -> Self {
         match LocalBackend::unanchored().read_text(path, Deadline::unbounded()) {
-            Probed::Found(text) => Self::from_json_str(&text),
+            Probed::Found(text) => Self::parse_input(&text, input),
             Probed::Absent => {
                 if must_exist {
                     Self::faulted(BindingUncertainty::RegistryUnreadable {
@@ -417,8 +447,12 @@ impl SessionBindingRegistry {
         }
     }
 
-    /// 从 JSON 字符串解析绑定清单。任何语法错误、版本不符或缺必填字段均进入 `fault`（fail-closed）。
+    /// 从 JSON 字符串解析旧写者共享的绑定清单。语法、版本、字段或来源不符合共享格式时 fail-closed。
     pub fn from_json_str(raw: &str) -> Self {
+        Self::parse_input(raw, BindingInput::Shared)
+    }
+
+    fn parse_input(raw: &str, input: BindingInput) -> Self {
         let value: Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
@@ -427,17 +461,27 @@ impl SessionBindingRegistry {
                 });
             }
         };
-        match Self::parse_value(&value) {
-            Ok(mut reg) => {
-                reg.raw_json = Some(raw.to_string());
-                reg
+        let parsed = Self::parse_value(&value).and_then(|registry| {
+            let mut typed_sources = registry
+                .records
+                .iter()
+                .map(|record| record.native_source.source_type)
+                .chain(registry.pending_sources.iter().filter_map(|pending| pending.source_type));
+            let antigravity_only = matches!(input, BindingInput::AntigravityOnly);
+            if typed_sources.any(|source| (source == SourceType::AntigravityCli) != antigravity_only) {
+                let detail = match input {
+                    BindingInput::Shared => format!("antigravity_cli binding rules require the dedicated {ANTIGRAVITY_BINDINGS_ENV} file"),
+                    BindingInput::AntigravityOnly => "the dedicated Antigravity binding file cannot contain other source types".to_string(),
+                };
+                return Err(BindingUncertainty::InvalidRecord { detail });
             }
-            Err(uncertainty) => {
-                let mut reg = Self::faulted(uncertainty);
-                reg.raw_json = Some(raw.to_string());
-                reg
-            }
+            Ok(registry)
+        });
+        let mut registry = parsed.unwrap_or_else(Self::faulted);
+        if matches!(input, BindingInput::Shared) {
+            registry.raw_json = Some(raw.to_string());
         }
+        registry
     }
 
     fn parse_value(value: &Value) -> Result<Self, BindingUncertainty> {
@@ -686,6 +730,9 @@ impl SessionBindingRegistry {
         }
 
         // 4. 查找匹配的绑定记录（按路径匹配或按 `(source_type, source_location, native_session_id)` 匹配）。
+        let session_key = session_id
+            .filter(|id| !id.is_empty())
+            .map(|id| native_id_key(source_type, id));
         let mut matched = Vec::new();
         for rec in &self.records {
             if rec.native_source.source_type != source_type
@@ -693,9 +740,9 @@ impl SessionBindingRegistry {
             {
                 continue;
             }
-            let sid_match = session_id
-                .filter(|s| !s.is_empty())
-                .is_some_and(|sid| sid == rec.native_source.native_session_id);
+            let sid_match = session_key.as_ref().is_some_and(|sid| {
+                *sid == native_id_key(source_type, &rec.native_source.native_session_id)
+            });
             let path_match = match (&norm_path, &rec.native_source.source_path) {
                 (Some(np), Some(rp)) if !sid_match => {
                     let rule_key = normalize_source_path_key(rp, source_location);
@@ -748,8 +795,9 @@ impl SessionBindingRegistry {
 
         // 7. 递归检查父会话血缘（若父会话为 TemporaryExcluded 或 UnknownHold，子会话必须继承！）。
         if let Some(parent_sid) = derived_parent.filter(|p| !p.is_empty()) {
-            if Some(parent_sid.as_str()) != session_id {
-                if !visited.insert(parent_sid.clone()) {
+            let parent_key = native_id_key(source_type, &parent_sid);
+            if Some(&parent_key) != session_key.as_ref() {
+                if !visited.insert(parent_key.into_owned()) {
                     return IngestAdmissionVerdict::UnknownHold {
                         reason: BindingUncertainty::ParentLineageUnknown {
                             parent_session_id: parent_sid,
@@ -826,6 +874,24 @@ impl SessionBindingRegistry {
         }
     }
 
+    pub(crate) fn evaluate_source(
+        &self,
+        source_type: SourceType,
+        source_location: &SourceLocation,
+        source_path: &str,
+        fallback_session_id: Option<&str>,
+    ) -> IngestAdmissionVerdict {
+        // 通用日志可能包含多个会话。Antigravity 的目录已确定唯一会话，空批也必须检查它。
+        let session_id = match source_type {
+            SourceType::AntigravityCli => {
+                crate::antigravity::transcript_layout(Path::new(source_path))
+                    .map(|(_, session_id)| session_id)
+            }
+            _ => fallback_session_id,
+        };
+        self.evaluate(source_type, source_location, source_path, session_id, None)
+    }
+
     /// 对一批解析出的 `RawEvent` 应用统一的临时会话排除、未知状态拦截与控制面 `InputOrigin` 丰富。
     ///
     /// - 若来源或批中任一会话处于 `UnknownHold` ⇒ 返回 `Err(BindingUncertainty)`（调用方冻住游标、拒绝入库）；
@@ -841,8 +907,7 @@ impl SessionBindingRegistry {
         events: Vec<RawEvent>,
         line_parent_sessions: &HashMap<String, String>,
     ) -> Result<FilteredEvents, BindingUncertainty> {
-        // 来源级只按路径判定；一个文件可能包含多个会话，首条事件不能代表后续会话。
-        let source_verdict = self.evaluate(source_type, source_location, source_path, None, None);
+        let source_verdict = self.evaluate_source(source_type, source_location, source_path, None);
         if let IngestAdmissionVerdict::UnknownHold { reason } = source_verdict {
             return Err(reason);
         }
@@ -1662,6 +1727,18 @@ fn parse_ref_value(v: Option<&Value>) -> Result<BindingRef, String> {
     Ok(r)
 }
 
+/// 控制面比较用的 ID 键；只折叠 Antigravity UUID，不改事件里的原始拼写。
+fn native_id_key(source_type: SourceType, id: &str) -> Cow<'_, str> {
+    if source_type == SourceType::AntigravityCli
+        && crate::antigravity::valid_id(id)
+        && id.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        Cow::Owned(id.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(id)
+    }
+}
+
 fn parse_backend_to_source_type(backend: &str) -> Result<SourceType, String> {
     match backend.trim() {
         "claude-cli" | "claude_code" | "claude" => Ok(SourceType::ClaudeCode),
@@ -1669,6 +1746,7 @@ fn parse_backend_to_source_type(backend: &str) -> Result<SourceType, String> {
         "dsh-native" | "deepseek" | "jsonl" => Ok(SourceType::Jsonl),
         "cursor" => Ok(SourceType::Cursor),
         "gemini" => Ok(SourceType::Gemini),
+        "antigravity_cli" => Ok(SourceType::AntigravityCli),
         other => Err(format!("unsupported nativeSource.backend: {other:?}")),
     }
 }

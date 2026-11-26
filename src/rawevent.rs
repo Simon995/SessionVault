@@ -72,8 +72,23 @@ pub enum SourceType {
     Codex,
     Cursor,
     Gemini,
+    AntigravityCli,
     /// 通用 JSONL（未识别但结构可解析的来源族）。
     Jsonl,
+}
+
+impl SourceType {
+    /// 稳定的来源键，与 serde 的 snake_case 取值一致。
+    pub const fn as_key(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Gemini => "gemini",
+            Self::AntigravityCli => "antigravity_cli",
+            Self::Jsonl => "jsonl",
+        }
+    }
 }
 
 /// 物理存放位置：本机本地，或某个 WSL 发行版内。

@@ -2837,8 +2837,9 @@ impl TotalStore {
 
     /// 读出整份注册表，供 [`attribution::attribute`] 使用。
     ///
-    /// 🔴 **读不到就返回空注册表，不是报错。** 空注册表下每个路径都归到
+    /// 兼容入口：忽略读取错误，只返回读到的根。空注册表下每个路径都归到
     /// `Unattributed` —— 一致地说不出来，而不是退回「用 cwd 当根」那个老答案。
+    /// 需要区分空表与读取失败的调用方用 [`Self::project_root_registry_reported`]。
     ///
     /// `mounts` 是 WSL 里 Windows 盘的挂载表（[`crate::wsl::drive_mounts`]）——
     /// 给了就让 `/mnt/c/X` 与 `C:\X` 归到同一个根，空表就不收敛。**每条根的比较键
@@ -2847,25 +2848,42 @@ impl TotalStore {
         &self,
         mounts: &crate::pathnorm::DriveMounts,
     ) -> crate::attribution::RootRegistry {
-        let mut reg = crate::attribution::RootRegistry::with_mounts(mounts.clone());
-        let Ok(conn) = self.conn.lock() else {
-            return reg;
-        };
-        let Ok(mut stmt) = conn.prepare("SELECT root_path, root_source FROM project_root_registry")
-        else {
-            return reg;
-        };
-        let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        else {
-            return reg;
-        };
-        for row in rows.flatten() {
-            // 来源解析不出来时用 `Scan` —— 一个不认识的来源标签不该让这个根整个消失。
-            let src = crate::attribution::RootSource::parse(&row.1)
-                .unwrap_or(crate::attribution::RootSource::Scan);
-            reg.insert(&row.0, src);
-        }
-        reg
+        self.project_root_registry_reported(mounts).0
+    }
+
+    /// 返回已成功读出的项目根，以及是否完整读出注册表。单行读取失败时保留其余有效行，
+    /// 并返回第一个读取错误；据此替换已保存的归属前，调用方必须检查状态。
+    pub fn project_root_registry_reported(
+        &self,
+        mounts: &crate::pathnorm::DriveMounts,
+    ) -> (crate::attribution::RootRegistry, StoreResult<()>) {
+        let mut registry = crate::attribution::RootRegistry::with_mounts(mounts.clone());
+        let status = (|| -> StoreResult<()> {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let mut stmt =
+                conn.prepare("SELECT root_path, root_source FROM project_root_registry")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut first_error = None;
+            for row in rows {
+                match row {
+                    Ok((path, source)) => {
+                        // 不认识的来源标签不该让这个根整个消失。
+                        let source = crate::attribution::RootSource::parse(&source)
+                            .unwrap_or(crate::attribution::RootSource::Scan);
+                        registry.insert(&path, source);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), |error| Err(error.into()))
+        })();
+        (registry, status)
     }
 
     /// 这个来源在总库里**已经有当前投影了吗** —— [`crate::scan_plan::CommitPlan::plan`]
@@ -3258,6 +3276,7 @@ impl TotalStore {
     ///    仍须是 `Reparse`，否则退化成 `Append`，同 seq 被 dedup 丢弃，新解析永久丢失。
     ///
     /// `INSERT OR IGNORE` 仍保幂等：force 全量重扫时同投影内的旧事件全 skip、增量只落新尾。
+    /// 只读来源不接受总库投影，即使目标为空也返回 `InvalidInput`。
     ///
     /// 🔴 **本函数不再记项目身份**（2026-08-14）。那件事现在由
     /// [`sweep_registered_root_identities`] 按注册表驱动 —— 挂在这里的盲区是
@@ -3372,6 +3391,13 @@ impl TotalStore {
         prior_projected_hash: Option<&str>,
         bindings: &crate::session_binding::SessionBindingRegistry,
     ) -> StoreResult<Option<ProjectionStats>> {
+        // 来源由批显式声明，即使空目标也不能为只读来源创建投影或移动头。
+        if batch.source.source_type == SourceType::AntigravityCli {
+            return Err(StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "antigravity_cli is read-only and cannot be projected into the total store",
+            )));
+        }
         let now = now_unix_secs();
         let (type_key, location_key, path_str) = batch.source.parts();
         let source_type = type_key.to_string();
@@ -5737,13 +5763,7 @@ fn now_unix_millis() -> i64 {
 
 /// `SourceType` → 稳定 snake_case 键（与 serde 序列化一致；用于索引列，避免存 Debug 形）。
 fn source_type_key(t: SourceType) -> &'static str {
-    match t {
-        SourceType::ClaudeCode => "claude_code",
-        SourceType::Codex => "codex",
-        SourceType::Cursor => "cursor",
-        SourceType::Gemini => "gemini",
-        SourceType::Jsonl => "jsonl",
-    }
+    t.as_key()
 }
 
 /// `EventType` → 稳定 snake_case 键。
@@ -9670,6 +9690,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn antigravity_projections_are_rejected_without_touching_other_sources() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let existing = mk_event(0, "11111111-2222-3333-4444-555555555555", Some("kept"));
+        store
+            .append_events(std::slice::from_ref(&existing), Projection::Append)
+            .unwrap();
+        store
+            .tombstone(TombstoneScope::ProjectRoot, "/erased")
+            .unwrap();
+        let tombstones = store.tombstones().unwrap();
+        let mut candidate = existing;
+        candidate.source_type = SourceType::AntigravityCli;
+        candidate.project_root = Some("/erased".into());
+        let source = SourceKey::from_event(&candidate);
+        let token = crate::token::ProjectionToken::new(&source, Some("candidate"), 1, 0, (0, 1));
+        let batch = |events| FileProjectionBatch {
+            source: source.clone(),
+            parser_revision: Some(1),
+            mode: Projection::Rollback,
+            events,
+            token: Some(token.clone()),
+        };
+        for events in [vec![candidate.clone()], Vec::new()] {
+            for result in [
+                store.apply_projection(batch(events.clone())),
+                store.apply_full_projection_target(batch(events), None),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+                ));
+            }
+        }
+        assert!(!store.has_projection(&source).unwrap());
+        assert_eq!(store.tombstones().unwrap(), tombstones);
+        let page = store.read_since_page(0, 100).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].1.source_type, SourceType::ClaudeCode);
+        assert_eq!(page.events[0].1.content.as_deref(), Some("kept"));
+
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "raw_events",
+            "projections",
+            "applied_projections",
+            "current_head",
+            "projection_log",
+            "data_keys",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE source_type = ?1"),
+                    [source_type_key(source.source_type)],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "read-only source left rows in {table}");
+        }
+    }
+
     /// 🔴 **ADR-051 描述的那个崩溃序列，逐步复现。**
     ///
     /// ```text
@@ -11905,6 +11986,45 @@ mod project_identity_tests {
             attribute(Some("/w/QuotaBar/third_party/TumeFlow/x.py"), &reg).root(),
             Some("/w/QuotaBar/third_party/TumeFlow")
         );
+    }
+
+    #[test]
+    fn reported_registry_distinguishes_empty_from_partial_and_keeps_valid_rows() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let mounts = Vec::new();
+        let (empty, status) = store.project_root_registry_reported(&mounts);
+        status.unwrap();
+        assert!(empty.is_empty());
+
+        store.register_project_root("/w/first", RootSource::Git);
+        store.register_project_root("/w/broken", RootSource::Git);
+        store.register_project_root("/w/last", RootSource::Marker);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE project_root_registry SET root_source = X'00' WHERE root_path = '/w/broken'",
+                [],
+            )
+            .unwrap();
+
+        let (registry, status) = store.project_root_registry_reported(&mounts);
+        assert!(matches!(
+            status,
+            Err(StoreError::Sqlite(rusqlite::Error::InvalidColumnType(..)))
+        ));
+        for registry in [registry, store.project_root_registry(&mounts)] {
+            assert_eq!(registry.len(), 2);
+            assert_eq!(
+                attribute(Some("/w/first/src"), &registry).root(),
+                Some("/w/first")
+            );
+            assert_eq!(
+                attribute(Some("/w/last/src"), &registry).root(),
+                Some("/w/last")
+            );
+        }
     }
 
     #[test]

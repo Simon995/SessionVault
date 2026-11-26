@@ -41,7 +41,7 @@ pub fn default_distro(distros: &[String]) -> Option<String> {
     }
 }
 
-/// 本进程至今启动过几次 `wsl.exe`。
+/// 本进程至今尝试启动 `wsl.exe` 的次数，包含启动失败。
 ///
 /// 每次约 150 ms 的进程与跨 VM 固定开销（QuotaBar 实测，2026-10-10），一轮扫描的耗时
 /// 主要由这个数决定 —— 给调用方记日志、给测试断言「一轮最多起几次」。
