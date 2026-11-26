@@ -46,6 +46,15 @@ impl Fixture {
         };
         std::fs::create_dir(root.join("source")).unwrap();
         std::fs::create_dir(root.join("source/sessions")).unwrap();
+        std::fs::write(
+            root.join("empty-bindings.json"),
+            r#"{"schemaVersion":1,"bindings":[]}"#,
+        )
+        .unwrap();
+        Self::at(root)
+    }
+
+    fn at(root: PathBuf) -> Self {
         Self {
             source: root.join("source/sessions/fixture.jsonl"),
             state: root.join("state.json"),
@@ -60,7 +69,11 @@ impl Fixture {
             .env_remove("SVAULT_DSH_SESSIONS_DIR")
             .env_remove("SVAULT_DSH_HOME")
             .env("SVAULT_KEY_FILE", self.root.join("fixture.key"))
-            .env("CLAUDE_CONFIG_DIR", self.root.join("empty-claude"))
+            .env(
+                "SVAULT_SESSION_BINDINGS",
+                self.root.join("empty-bindings.json"),
+            )
+            .env("CLAUDE_CONFIG_DIR", self.root.join(".claude"))
             .env("CODEX_HOME", self.root.join("empty-codex"))
             .env_remove("SVAULT_ACCEPTANCE_KEY")
             .args(args)
@@ -81,16 +94,23 @@ impl Fixture {
     }
 
     fn scan(&self) -> Vec<Value> {
-        self.run(&[
+        self.scan_for("jsonl", true)
+    }
+
+    fn scan_for(&self, source_type: &str, write_store: bool) -> Vec<Value> {
+        let mut args = vec![
             "scan-all",
             "--only",
-            "jsonl",
-            "--write-store",
+            source_type,
             "--profile",
             "full",
             "--state",
             self.state.to_str().unwrap(),
-        ])
+        ];
+        if write_store {
+            args.push("--write-store");
+        }
+        self.run(&args)
     }
 
     fn state(&self) -> Value {
@@ -136,11 +156,228 @@ fn messages(texts: &[&str]) -> String {
         .collect()
 }
 
-fn mode(rows: &[Value]) -> &str {
-    let writes: Vec<_> = rows
+// Windows CLI 会枚举真实 WSL 转录；Linux CLI 只需要这组隔离的本机配置根。
+#[cfg(not(windows))]
+#[test]
+fn unchanged_ssh_transcript_reparses_from_the_old_projection() {
+    use session_vault::attribution::RootSource;
+    use session_vault::{
+        FileProjectionBatch, Projection, RawEvent, SourceKey, StoreKey, TotalStore, PARSER_REVISION,
+    };
+
+    // 种旧投影的库调用也会读绑定环境，放在子进程里以免继承真实绑定或修改全局环境。
+    const FIXTURE_ENV: &str = "SVAULT_TEST_SSH_REPARSE_FIXTURE";
+    let Some(root) = std::env::var_os(FIXTURE_ENV) else {
+        let fixture = Fixture::new();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "unchanged_ssh_transcript_reparses_from_the_old_projection",
+                "--nocapture",
+            ])
+            .env(FIXTURE_ENV, &fixture.root)
+            .env(
+                "SVAULT_SESSION_BINDINGS",
+                fixture.root.join("empty-bindings.json"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let fixture = Fixture::at(PathBuf::from(root));
+    let scan = |write_store| fixture.scan_for("claude-code", write_store);
+    // 先让真实 CLI 创建独立钥匙和空库。两种转录稍后用同一份 cwd。
+    scan(true);
+    let key = std::fs::read_to_string(fixture.root.join("fixture.key")).unwrap();
+    let store =
+        TotalStore::open_with_key(&fixture.store, StoreKey::from_encoded(key.trim()).unwrap())
+            .unwrap();
+    let project = fixture.root.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let cwd = project.to_str().unwrap();
+    store.register_project_root(cwd, RootSource::Git);
+
+    const ENDPOINT: &str = "11111111-2222-3333-4444-555555555555";
+    const OLD_REVISION: u32 = 5;
+    let namespace = format!("ssh:{ENDPOINT}");
+    let remote_root = format!("{namespace}:{cwd}");
+    let remote = fixture
+        .root
+        .join(format!(".claude/projects/ssh-{ENDPOINT}/remote.jsonl"));
+    let local = fixture
+        .root
+        .join(".claude/projects/local-project/local.jsonl");
+    let line = |id: &str, content: &str| {
+        json!({"type":"user", "sessionId":id, "cwd":cwd, "message":{"role":"user", "content":content}}).to_string() + "\n"
+    };
+    let remote_bytes = line("remote", "remote first") + &line("remote", "remote second");
+    let local_bytes = line("local", "local control");
+    for (path, bytes) in [(&remote, &remote_bytes), (&local, &local_bytes)] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let remote_path = remote.to_str().unwrap();
+    let local_path = local.to_str().unwrap();
+    let mtime = std::fs::metadata(&remote).unwrap().modified().unwrap();
+    let streamed = scan(false);
+    let mut state = fixture.state();
+    assert_eq!(state.as_object().unwrap().len(), 2);
+    let head = |path| store.current_head("claude_code", "local", path).unwrap();
+    for (path, bytes, revision, event_count) in [
+        (remote_path, &remote_bytes, OLD_REVISION, 2),
+        (local_path, &local_bytes, PARSER_REVISION, 1),
+    ] {
+        let cursor = &mut state[format!("claude_code|local|{path}")];
+        assert_eq!(cursor["safe_offset"], bytes.len());
+        assert_eq!(cursor["fingerprint"]["covered_len"], bytes.len());
+        cursor["parser_revision"] = json!(revision);
+        let events: Vec<RawEvent> = streamed
+            .iter()
+            .filter(|row| row["kind"] == "event" && row["event"]["source_path"] == path)
+            .map(|row| {
+                let mut event: RawEvent = serde_json::from_value(row["event"].clone()).unwrap();
+                if path == remote_path {
+                    event.project_root = Some(cwd.to_owned());
+                    event.project_root_source = Some("git".into());
+                    event.workspace_location = Some("local".into());
+                }
+                event
+            })
+            .collect();
+        assert_eq!(events.len(), event_count);
+        let stats = store
+            .apply_projection(FileProjectionBatch {
+                source: SourceKey {
+                    source_type: events[0].source_type,
+                    source_location: events[0].source_location.clone(),
+                    source_path: path.to_owned(),
+                },
+                parser_revision: Some(revision),
+                mode: Projection::Append,
+                events,
+                token: None,
+            })
+            .unwrap();
+        assert_eq!(stats.appended, event_count as u64);
+    }
+    let [old_ssh_head, local_head] = [remote_path, local_path].map(head);
+    std::fs::write(&fixture.state, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    let current = || -> Vec<Value> {
+        fixture
+            .run(&["pull", "--projection", "current"])
+            .into_iter()
+            .filter(|row| row["kind"] == "pulled")
+            .map(|row| row["event"].clone())
+            .collect()
+    };
+    let old_events = current();
+    assert_eq!(old_events.len(), 3);
+    for event in &old_events {
+        assert_eq!(event["cwd"], cwd);
+        assert_eq!(event["project_root"], cwd);
+        assert_eq!(event["project_root_source"], "git");
+        assert_eq!(event["workspace_location"], "local");
+    }
+    let changes = || store.read_projection_changes(0, 100).unwrap();
+    let prior_changes = changes();
+    let rows = scan(true);
+    let writes = rows_by_kind(&rows, "store_write");
+    assert_eq!(writes.len(), 2, "{rows:?}");
+    let ssh_write = writes
         .iter()
-        .filter(|row| row["kind"] == "store_write")
-        .collect();
+        .find(|row| row["source_path"] == remote_path)
+        .unwrap();
+    assert_eq!(ssh_write["mode"], "reparse");
+    assert_eq!(ssh_write["head_moved"], true);
+    assert_eq!(ssh_write["appended"], 2);
+    let local_write = writes
+        .iter()
+        .find(|row| row["source_path"] == local_path)
+        .unwrap();
+    assert_eq!(local_write["mode"], "append");
+    assert_eq!(local_write["head_moved"], false);
+    assert_eq!(local_write["appended"], 0);
+    let bytes_read = |rows: &[Value], path| {
+        rows.iter()
+            .find(|row| row["kind"] == "source_report" && row["report"]["source_path"] == path)
+            .unwrap()["report"]["bytes_read"]
+            .as_u64()
+            .unwrap()
+    };
+    assert_eq!(bytes_read(&rows, remote_path), remote_bytes.len() as u64);
+    assert_eq!(bytes_read(&rows, local_path), 0);
+    let remote_head = (old_ssh_head.0, old_ssh_head.1 + 1);
+    assert_eq!(head(remote_path), remote_head);
+    assert_eq!(head(local_path), local_head);
+    let updated = fixture.state();
+    let remote_key = format!("claude_code|local|{remote_path}");
+    assert_eq!(updated[&remote_key]["parser_revision"], PARSER_REVISION);
+    assert_eq!(
+        updated[&remote_key]["fingerprint"],
+        state[&remote_key]["fingerprint"]
+    );
+    assert_eq!(std::fs::read_to_string(&remote).unwrap(), remote_bytes);
+    assert_eq!(
+        std::fs::metadata(&remote).unwrap().modified().unwrap(),
+        mtime
+    );
+
+    let mut expected = old_events;
+    for event in expected
+        .iter_mut()
+        .filter(|event| event["source_path"] == remote_path)
+    {
+        event["project_root"] = json!(remote_root);
+        event["project_root_source"] = json!("unattributed");
+        event["workspace_location"] = json!(namespace);
+    }
+    let sort = |events: &mut Vec<Value>| {
+        events.sort_by_key(|event| event["content"].as_str().unwrap().to_owned())
+    };
+    sort(&mut expected);
+    let mut events = current();
+    sort(&mut events);
+    assert_eq!(events, expected);
+    let new_changes = changes();
+    assert_eq!(new_changes.len(), prior_changes.len() + 1);
+    let change = new_changes.last().unwrap();
+    assert_eq!(change.source_path, remote_path);
+    assert_eq!(change.reason, "reparse");
+    assert_eq!(change.old_source_revision, Some(old_ssh_head.0));
+    assert_eq!(change.old_projection_revision, Some(old_ssh_head.1));
+    assert_eq!(
+        (change.new_source_revision, change.new_projection_revision),
+        remote_head
+    );
+
+    let again = scan(true);
+    let writes = rows_by_kind(&again, "store_write");
+    assert_eq!(writes.len(), 2, "{again:?}");
+    for write in writes {
+        assert_eq!(write["mode"], "append");
+        assert_eq!(write["head_moved"], false);
+        assert_eq!(write["appended"], 0);
+    }
+    assert_eq!(bytes_read(&again, remote_path), 0);
+    assert_eq!(head(remote_path), remote_head);
+    assert_eq!(head(local_path), local_head);
+    assert_eq!(changes(), new_changes);
+    assert_eq!(fixture.state(), updated);
+}
+
+fn rows_by_kind<'a>(rows: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    rows.iter().filter(|row| row["kind"] == kind).collect()
+}
+
+fn mode(rows: &[Value]) -> &str {
+    let writes = rows_by_kind(rows, "store_write");
     assert_eq!(writes.len(), 1);
     writes[0]["mode"].as_str().unwrap()
 }
@@ -161,7 +398,6 @@ fn a_streaming_dsh_failure_keeps_the_entire_previous_source_state() {
     state.as_object_mut().unwrap().values_mut().next().unwrap()["parser_revision"] = json!(1);
     std::fs::write(&fixture.state, serde_json::to_vec(&state).unwrap()).unwrap();
     let bindings = fixture.root.join("empty-bindings.json");
-    std::fs::write(&bindings, r#"{"schemaVersion":1,"bindings":[]}"#).unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_svault"))
         .env("SVAULT_JSONL_DIR", "")
         .env("SVAULT_DSH_SESSIONS_DIR", &sessions)

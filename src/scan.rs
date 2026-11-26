@@ -1525,6 +1525,45 @@ mod tests {
     }
 
     #[test]
+    fn scan_local_ssh_transcript_keeps_remote_workspace_isolated() {
+        let body = serde_json::json!({"type":"user", "sessionId":"s", "cwd":"/home/u/project",
+            "message":{"role":"user","content":"hello"}})
+        .to_string()
+            + "\n";
+        let (original, mut source) = temp_source("ssh-context", &body);
+        let root = original.with_extension("ssh-root");
+        let parent =
+            root.join(".claude/projects/ssh-11111111-2222-3333-4444-555555555555/s/subagents");
+        std::fs::create_dir_all(&parent).unwrap();
+        source.path = parent.join("a.jsonl");
+        std::fs::rename(&original, &source.path).unwrap();
+        let (observation, report) = super::scan_append_log_with_bindings(
+            &source,
+            None,
+            None,
+            Profile::Full,
+            no_roots(),
+            crate::deadline::Deadline::unbounded(),
+            &super::StatPrefetch::default(),
+            &crate::session_binding::SessionBindingRegistry::default(),
+        );
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(observation.events.len(), 1);
+        let event = &observation.events[0];
+        assert_eq!(
+            event.project_root.as_deref(),
+            Some("ssh:11111111-2222-3333-4444-555555555555:/home/u/project")
+        );
+        assert_eq!(event.project_root_source.as_deref(), Some("unattributed"));
+        assert_eq!(
+            event.workspace_location.as_deref(),
+            Some("ssh:11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(event.source_location, SourceLocation::Local);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn ingest_binding_mixed_sessions_keep_persistent_events_and_monotonic_seq() {
         for sessions in [
             ["temporary", "persistent", "persistent"],

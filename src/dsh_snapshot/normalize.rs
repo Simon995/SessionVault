@@ -518,6 +518,7 @@ fn normalize_verified(
         cfg.host,
         default_distro.as_deref(),
         &cfg.roots,
+        None,
     );
 
     let mut parsed_records = Vec::with_capacity(positions.len());

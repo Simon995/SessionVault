@@ -47,6 +47,8 @@ pub enum Probe {
     /// 混成一个会让「WSL 关机」看起来像「这些路径都不属于任何项目」，
     /// 而那正是本仓那条「降级要降到说不出来」要防的。
     Failed { reason: String },
+    /// 已知远端，当前没有访问桥；未探测，也不按暂时故障重试。
+    Remote { namespace: String },
 }
 
 /// 一批探测的汇总。
@@ -56,6 +58,8 @@ pub struct DiscoveryReport {
     pub roots: Vec<(String, RootSource)>,
     /// 探测过、确认链上没有根的路径数。
     pub without_root: usize,
+    /// 已知远端、未执行本机探测的路径数。
+    pub remote: usize,
     /// 探测失败的路径数 + 首条原因（诊断用；不逐条留，避免 WSL 关机时刷屏）。
     pub failed: usize,
     pub first_failure: Option<String>,
@@ -70,6 +74,7 @@ impl DiscoveryReport {
                 }
             }
             Probe::None => self.without_root += 1,
+            Probe::Remote { .. } => self.remote += 1,
             Probe::Failed { reason } => {
                 self.failed += 1;
                 if self.first_failure.is_none() {
@@ -328,6 +333,7 @@ pub fn probe_path(
         // `/mnt/<drive>/…` 已由 `reach_of` 换算成宿主形式；本机路径原样。
         // 🔴 **探到的根按宿主形式返回，不转回 `/mnt/…`** —— 见 `probe_mnt_with` 的说明。
         pathnorm::RootReach::Local(host_path) => probe_local(&host_path),
+        pathnorm::RootReach::Remote { namespace } => Probe::Remote { namespace },
         // 🔴 **换算不出来是「没问成」，不是「没有根」**（评审 [P2]）。
         // `None` 会被调用方按「确认无根」走长退避，一次 WSL 超时就让这一族
         // 路径长时间归不到根；而落回 `probe_local` 更糟 —— `/mnt/d/…` 在 Windows 上是
@@ -771,6 +777,42 @@ mod tests {
         assert!(!is_windows_drive_device("/dev/sda1"));
         assert!(!is_windows_drive_device("tmpfs"));
         assert!(!is_windows_drive_device(r"C:\Users"));
+    }
+
+    #[test]
+    fn ssh_remote_is_not_a_missing_root_or_a_temporary_failure() {
+        let namespace = "ssh:11111111-2222-3333-4444-555555555555";
+        let path = format!("{namespace}:/home/u/project");
+        assert_eq!(
+            probe_path(
+                &path,
+                Some("Ubuntu"),
+                &Vec::new(),
+                crate::deadline::Deadline::unbounded()
+            ),
+            Probe::Remote {
+                namespace: namespace.to_string()
+            },
+        );
+        let report = discover(
+            [path],
+            Some("Ubuntu"),
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        );
+        assert_eq!(report.remote, 1);
+        assert!(report.roots.is_empty());
+        assert_eq!((report.without_root, report.failed), (0, 0));
+        assert!(report.first_failure.is_none());
+        // 身份侧同样不查本机或 WSL，且不能伪造「查过了，没有 git」。
+        let err = crate::identity::repo_id_for_root(
+            &format!("{namespace}:/home/u/project"),
+            Some("Ubuntu"),
+            &Vec::new(),
+            crate::deadline::Deadline::unbounded(),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("no identity access bridge"));
     }
 
     #[test]

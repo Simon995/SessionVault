@@ -304,6 +304,7 @@ pub fn claude_project_dirs(root_path: &str, aliases: &[String]) -> Vec<String> {
 /// 🔴 规范形 `wsl:<d>:/…` 与发行版内路径都**打不开** —— 前者是标识符，后者在
 /// Windows 上会被当成当前盘的相对路径。宿主要读这个项目的 `CLAUDE.md`，只能用
 /// UNC 那个写法（它在 `aliases` 里，由 `alias_forms_of` 产出）。
+/// SSH 命名空间没有宿主访问路径。
 ///
 /// `None` = 没有任何一个宿主可用的写法。**这是诚实的「我给不出」**，不是拿规范形
 /// 冒充路径 —— 拿它去 `open()` 必然失败，而失败点会离这里很远。
@@ -316,9 +317,16 @@ pub fn host_openable_form(
     aliases: &[String],
     host: crate::pathnorm::HostPlatform,
 ) -> Option<String> {
+    let is_ssh = |p: &str| {
+        p.trim_start()
+            .starts_with(crate::pathnorm::SSH_NAMESPACE_PREFIX)
+    };
+    if is_ssh(root_path) {
+        return None;
+    }
     let usable = |p: &str| -> bool {
         // 规范形是标识符，永远不是路径。
-        if crate::pathnorm::split_canonical_wsl(p).is_some() {
+        if is_ssh(p) || crate::pathnorm::split_canonical_wsl(p).is_some() {
             return false;
         }
         // 🔴 **POSIX 绝对路径只在 Unix 宿主上是本机路径 —— `/mnt/<drive>/…` 也一样。**
@@ -778,6 +786,22 @@ mod encode_tests {
             host_openable_form("wsl:Ubuntu-22.04:/home/u/p", &[], HostPlatform::Windows),
             None
         );
+    }
+
+    #[test]
+    fn an_ssh_root_has_no_host_openable_form() {
+        let remote = "ssh:11111111-2222-3333-4444-555555555555:/home/u/p";
+        for host in [HostPlatform::Windows, HostPlatform::Unix] {
+            assert_eq!(
+                host_openable_form(remote, &["/home/u/p".into()], host),
+                None
+            );
+            assert_eq!(host_openable_form("ssh::/home/u/p", &[], host), None);
+            assert_eq!(
+                host_openable_form("wsl:d:/home/u/p", &[remote.into()], host),
+                None
+            );
+        }
     }
 
     /// 本机路径两边都直接可用。

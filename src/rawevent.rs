@@ -705,7 +705,7 @@ pub struct RawEvent {
     /// 所以拿 cwd 当答案」，现在那种情况一律是 `unattributed` —— **说不出来要说出来**。
     /// `marker:<file>` 那种带后缀的形式也随之退役（发现层只记「是 marker」，不记哪一个）。
     pub project_root_source: Option<String>,
-    /// 工程物理位置（`local` | `wsl:<distro>`）与 transcript 存储位置的二分。
+    /// 工程物理位置（`local` | `wsl:<distro>` | `ssh:<endpoint>`）与 transcript 存储位置分开。
     /// 由 `pathnorm::workspace_location` 据规范化后的 project_root + 宿主平台判定
     /// （见 `pathnorm` 模块的三层分离说明）；cwd 缺失时为 None。
     pub workspace_location: Option<String>,

@@ -275,6 +275,41 @@ pub fn mnt_to_windows(path: &str, mounts: &DriveMounts) -> Option<String> {
     None
 }
 
+pub(crate) const SSH_NAMESPACE_PREFIX: &str = "ssh:";
+
+/// Claude Desktop Remote SSH 的来源目录携带 endpoint UUID；不从远端 cwd 猜主机。
+/// 只认 `.claude/projects/ssh-<uuid>/...` 的完整目录段，含 subagent 子目录。
+/// 返回 `ssh:<uuid>`，保留 transcript 的物理 `SourceLocation`。
+pub fn claude_ssh_namespace(source_path: &str) -> Option<String> {
+    let path = source_path.replace('\\', "/");
+    let parts: Vec<_> = path.split('/').collect();
+    parts.windows(4).find_map(|parts| {
+        if !parts[0].eq_ignore_ascii_case(".claude")
+            || !parts[1].eq_ignore_ascii_case("projects")
+            || parts[3].is_empty()
+        {
+            return None;
+        }
+        let id = parts[2].strip_prefix("ssh-")?;
+        let valid = id.len() == 36
+            && id.bytes().enumerate().all(|(i, byte)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            });
+        valid.then(|| format!("{SSH_NAMESPACE_PREFIX}{}", id.to_ascii_lowercase()))
+    })
+}
+
+/// SSH 隔离路径拆成 endpoint 与原始远端路径；不对远端路径做本机换算。
+pub fn split_ssh_path(path: &str) -> Option<(&str, &str)> {
+    let (endpoint, remote) = path.strip_prefix(SSH_NAMESPACE_PREFIX)?.split_once(':')?;
+    (!endpoint.is_empty() && !remote.is_empty() && !endpoint.contains(['/', '\\']))
+        .then_some((endpoint, remote))
+}
+
 /// 一条根路径**该问谁** —— 形态分派的唯一实现。
 ///
 /// 🔴 收成一处的理由与 `HostProbe`（「该问谁」）同源：这套判据此前有**两份**，
@@ -296,6 +331,8 @@ pub enum RootReach {
     Local(String),
     /// 归发行版管，要经访问桥。
     Wsl { distro: String, linux: String },
+    /// 已知远端命名空间，没有本机访问桥；不是暂时不可达，不应按 WSL 故障重试。
+    Remote { namespace: String },
     /// 知道它在别处，但**问不出该问谁**（裸 Linux 而 distro 不明、
     /// `/mnt/…` 而挂载表拿不到）。
     ///
@@ -312,6 +349,14 @@ pub fn reach_of(
     host: HostPlatform,
 ) -> RootReach {
     let p = path.trim();
+    if let Some((endpoint, _)) = split_ssh_path(p) {
+        return RootReach::Remote {
+            namespace: format!("{SSH_NAMESPACE_PREFIX}{endpoint}"),
+        };
+    }
+    if p.starts_with(SSH_NAMESPACE_PREFIX) {
+        return RootReach::Unknown(format!("invalid SSH namespace path: {p}"));
+    }
     if let Some((distro, linux)) = split_canonical_wsl(p) {
         return RootReach::Wsl {
             distro: distro.to_string(),
@@ -389,7 +434,7 @@ pub fn normalize_cwd(
     Some(raw.to_string())
 }
 
-/// 工程物理位置标记：`"local"` 或 `"wsl:<distro>"`（distro 不明时为泛 `"wsl"`）。
+/// 工程物理位置标记：`"local"`、`"wsl:<distro>"`（distro 不明时为泛 `"wsl"`）或 `"ssh:<endpoint>"`。
 ///
 /// 写入 `RawEvent.workspace_location`（`Option<String>`），故返回 `String`，与 QuotaBar
 /// 同名函数的取值集对齐。`project_root` 应已规范化（理想是 [`normalize_cwd`] 的产物）。
@@ -407,6 +452,9 @@ pub fn workspace_location(
     transcript_location: &SourceLocation,
     host: HostPlatform,
 ) -> String {
+    if let Some((endpoint, _)) = split_ssh_path(project_root) {
+        return format!("{SSH_NAMESPACE_PREFIX}{endpoint}");
+    }
     if let Some((distro, _)) = split_canonical_wsl(project_root) {
         return format!("wsl:{distro}");
     }
@@ -431,6 +479,50 @@ pub fn workspace_location(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_transcript_namespace_and_reach_are_host_independent() {
+        let id = "11111111-2222-3333-4444-555555555555";
+        let namespace = format!("ssh:{id}");
+        for source in [
+            format!("/home/u/.claude/projects/ssh-{id}/s.jsonl"),
+            format!(r"C:\Users\u\.claude\projects\ssh-{id}\s\subagents\a.jsonl"),
+        ] {
+            assert_eq!(claude_ssh_namespace(&source), Some(namespace.clone()));
+        }
+        for source in [
+            format!("/tmp/ssh-{id}/s.jsonl"),
+            format!("/home/u/.claude/projects/p/ssh-{id}/s.jsonl"),
+            "/home/u/.claude/projects/ssh-repo/s.jsonl".into(),
+        ] {
+            assert_eq!(claude_ssh_namespace(&source), None);
+        }
+        for host in [HostPlatform::Windows, HostPlatform::Unix] {
+            for remote in ["/home/u/p", "/mnt/c/p"] {
+                let path = format!("{namespace}:{remote}");
+                assert_eq!(
+                    reach_of(
+                        &path,
+                        Some("Ubuntu"),
+                        &vec![("/mnt/c".into(), "C:".into())],
+                        host
+                    ),
+                    RootReach::Remote {
+                        namespace: namespace.clone()
+                    },
+                );
+                assert_eq!(
+                    workspace_location(&path, &SourceLocation::Local, host),
+                    namespace
+                );
+                assert_eq!(normalize_cwd(Some(&path), host, Some("Ubuntu")), Some(path));
+            }
+            assert!(matches!(
+                reach_of("ssh::/home/u/p", Some("Ubuntu"), &vec![], host),
+                RootReach::Unknown(_)
+            ));
+        }
+    }
 
     #[test]
     fn unc_to_canonical() {

@@ -51,6 +51,7 @@ use crate::session_binding::{
 /// | 2   | Claude assistant 行的顶层 `effort` 开始被提取（此前整条链路丢弃） |
 /// | 3   | 每条事件带上 [`EventKey`]（记录指纹 + 记录内槽位），ADR-044 决定 4 |
 /// | 5   | 输入来源与父血缘保真；Codex 元信息父关系跨批延续，存量事件需重投影 |
+/// | 6   | Claude Desktop Remote SSH cwd 按 endpoint 隔离，不归到本机或 WSL 项目 |
 ///
 /// 🔴 rev 3 是必须的，不是形式（评审 [P1]）：加 `EventKey` 时若不提版本，从 rev 2
 /// 升上来的安装会认为既有文件**没过期**，只扫增量尾巴 —— 于是绝大多数历史事件永远
@@ -59,7 +60,7 @@ use crate::session_binding::{
 ///
 /// 判据就是本常量文档第一句：**从同一份字节里能提取出什么发生了变化** —— 加一个新
 /// 字段正是这种变化。
-pub const PARSER_REVISION: u32 = 5;
+pub const PARSER_REVISION: u32 = 6;
 
 /// 解析产物：本批事件 + 更新后的 Codex 状态 + 跳过计数 + 告警。
 #[derive(Debug, Clone, Default)]
@@ -297,13 +298,7 @@ fn parse_jsonl(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
         }
         let cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
         let occurred_at = jsonl_timestamp(value.get("timestamp"));
-        let pr = resolve_cached(
-            &mut cache,
-            cwd.as_deref(),
-            ctx.host,
-            ctx.default_distro.as_deref(),
-            &ctx.roots,
-        );
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx);
 
         let mut ev = ctx.event(
             seq,
@@ -398,13 +393,7 @@ fn parse_claude(ctx: &ParseCtx, lines: &[&str], base_seq: u64) -> ParseOut {
             .get("timestamp")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let pr = resolve_cached(
-            &mut cache,
-            cwd.as_deref(),
-            ctx.host,
-            ctx.default_distro.as_deref(),
-            &ctx.roots,
-        );
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx);
 
         // 1) thinking（Claude `message.content[].type=thinking`）。
         if let Some(text) = extract_claude_thinking(&value) {
@@ -698,13 +687,7 @@ fn parse_codex(
             out.session_parents.insert(session_id.clone(), p.clone());
         }
         let cwd = state.current_cwd.clone();
-        let pr = resolve_cached(
-            &mut cache,
-            cwd.as_deref(),
-            ctx.host,
-            ctx.default_distro.as_deref(),
-            &ctx.roots,
-        );
+        let pr = resolve_cached(&mut cache, cwd.as_deref(), ctx);
 
         // response_item：reasoning→thinking / message / tool_use / tool_result。
         if entry_type == Some("response_item") {
@@ -1016,9 +999,7 @@ fn session_id_from_path(path: &str) -> String {
 fn resolve_cached(
     cache: &mut Option<(String, ProjectRoot)>,
     cwd: Option<&str>,
-    host: HostPlatform,
-    default_distro: Option<&str>,
-    roots: &RootRegistry,
+    ctx: &ParseCtx,
 ) -> Option<ProjectRoot> {
     let cwd = cwd?;
     if let Some((c, pr)) = cache.as_ref() {
@@ -1026,9 +1007,22 @@ fn resolve_cached(
             return Some(pr.clone());
         }
     }
-    let pr = resolve(cwd, host, default_distro, roots);
+    let namespace = source_ssh_namespace(ctx.source_type, &ctx.source_path);
+    let pr = resolve(
+        cwd,
+        ctx.host,
+        ctx.default_distro.as_deref(),
+        &ctx.roots,
+        namespace.as_deref(),
+    );
     *cache = Some((cwd.to_string(), pr.clone()));
     Some(pr)
+}
+
+pub(crate) fn source_ssh_namespace(source_type: SourceType, source_path: &str) -> Option<String> {
+    (source_type == SourceType::ClaudeCode)
+        .then(|| pathnorm::claude_ssh_namespace(source_path))
+        .flatten()
 }
 
 fn resolve(
@@ -1036,7 +1030,15 @@ fn resolve(
     host: HostPlatform,
     default_distro: Option<&str>,
     roots: &RootRegistry,
+    ssh_namespace: Option<&str>,
 ) -> ProjectRoot {
+    if let Some(namespace) = ssh_namespace {
+        return ProjectRoot {
+            path: (!cwd.trim().is_empty())
+                .then(|| std::path::PathBuf::from(format!("{namespace}:{}", cwd.trim()))),
+            source: "unattributed".to_string(),
+        };
+    }
     let normalized = pathnorm::normalize_cwd(Some(cwd), host, default_distro);
     project_root_of(attribute(normalized.as_deref(), roots))
 }
@@ -1070,8 +1072,9 @@ pub(crate) fn attribution_from_cwd(
     host: HostPlatform,
     default_distro: Option<&str>,
     roots: &RootRegistry,
+    ssh_namespace: Option<&str>,
 ) -> EventAttribution {
-    let pr = cwd.map(|c| resolve(c, host, default_distro, roots));
+    let pr = cwd.map(|c| resolve(c, host, default_distro, roots, ssh_namespace));
     attribution_of(pr.as_ref(), location, host)
 }
 
@@ -1396,6 +1399,50 @@ mod tests {
         );
         assert_eq!(usage.message_id.as_deref(), Some("msg_1"));
         assert_eq!(usage.request_id.as_deref(), Some("req_1"));
+    }
+
+    #[test]
+    fn ssh_cwd_never_matches_same_named_local_or_wsl_roots() {
+        let namespace = "ssh:11111111-2222-3333-4444-555555555555";
+        let mut registry = RootRegistry::new();
+        for root in ["/home/me/proj", "wsl:Ubuntu:/home/me/proj", "C:/code/proj"] {
+            registry.insert(root, crate::attribution::RootSource::Git);
+        }
+        for host in [HostPlatform::Windows, HostPlatform::Unix] {
+            for source in [
+                "/home/u/.claude/projects/ssh-11111111-2222-3333-4444-555555555555/s.jsonl",
+                r"C:\Users\u\.claude\projects\ssh-11111111-2222-3333-4444-555555555555\s\subagents\a.jsonl",
+            ] {
+                let mut context = ctx_host(SourceType::ClaudeCode, host, Some("Ubuntu"));
+                context.source_path = source.to_string();
+                context.roots = Arc::new(registry.clone());
+                let lines: Vec<_> = ["/home/me/proj/sub", "/mnt/c/code/proj", "/home/me/proj/sub"]
+                    .into_iter()
+                    .map(|cwd| {
+                        serde_json::json!({"type":"user", "sessionId":"s", "cwd":cwd,
+                        "message":{"role":"user","content":"hello"}})
+                        .to_string()
+                    })
+                    .collect();
+                let refs: Vec<_> = lines.iter().map(String::as_str).collect();
+                let out = parse_lines(&context, &refs, 0, None);
+                assert_eq!(out.events.len(), 3);
+                for ev in out.events {
+                    let expected = format!("{namespace}:{}", ev.cwd.as_deref().unwrap());
+                    assert_eq!(ev.project_root.as_deref(), Some(expected.as_str()));
+                    assert_eq!(ev.project_root_source.as_deref(), Some("unattributed"));
+                    assert_eq!(ev.workspace_location.as_deref(), Some(namespace));
+                    assert_eq!(ev.source_location, SourceLocation::Local);
+                }
+            }
+        }
+        assert_eq!(
+            source_ssh_namespace(
+                SourceType::Codex,
+                "/home/u/.claude/projects/ssh-11111111-2222-3333-4444-555555555555/s.jsonl"
+            ),
+            None
+        );
     }
 
     #[test]

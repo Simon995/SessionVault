@@ -99,7 +99,7 @@ CLI 没有「任意路径 → 宿主写法」的出口，缺什么按规则 2 �
 ## 8. 文档索引
 
 - 是什么：`README.md`；设计契约：`docs/INGEST_KERNEL.md`；字段对账：`docs/rawevent-reconciliation.md`；扫描 / 投影状态模型：`docs/scan-state-model.md`。
-- 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
+- 项目归属与身份：`docs/project-attribution.md`、`docs/project-identity.md`；Remote SSH：`docs/remote-ssh-attribution.md`；日志：`docs/LOGGING.md`；与 QuotaBar 的对拍契约：`docs/parity-contract.md`。
 - 控制面绑定、临时会话排除与真实来源契约：`docs/INGEST_KERNEL.md` §2.2、`src/session_binding.rs`；DSH 常规来源已注册、仅显式配置根时发现，物理快照核验仍以 `dsh-experimental` 门控；核查与设计见 `docs/dsh-ingest-survey.md`、`docs/dsh-read-state-design.md`。
 - 总库体积、回收判据与历史测量：`docs/storage-growth.md`；刷新性能与宿主诊断启用边界：`docs/refresh-performance.md`；DSH rc.2 来源侧候选验证：`docs/dsh-rc2-source-qualification.md`。
 - 总库在多台机器之间同步（现状、决定、方案、实测记录）：`docs/linux-replica.md`。

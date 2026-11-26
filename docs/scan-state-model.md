@@ -99,13 +99,17 @@ pub enum ParseQuality {
 ⚠️ **`Skipped` 不在这里**：扫描器根本没被调用，它没有立场报告这件事。
 那属于调度层（QuotaBar 侧）的「未尝试」。
 
+### Remote SSH 归属重投影
+
+Remote SSH 接入将 `PARSER_REVISION` 提升到 6，按 endpoint 隔离 Claude Desktop Remote SSH 转录的 cwd。已记录旧 revision、文件仍可读且调度器传入 `PARSER_STALE` 时，走全文读取、指纹核验和 `Projection::Reparse`，未变字节也更新归属；不能只全读后走 `Append`。旧状态未记录 revision 或源已消失时，不声称 bump 自动修复。源已消失但事件保留原始 cwd 与 source_path 时，可用 `recompute_attribution`，该操作不冒充完整解析器升级。详见 [归属契约](remote-ssh-attribution.md)。
+
 ### 控制面过滤与游标连续性（2026-11-10）
 
 强制全读或欠账重试可以重置解析起点，但不能丢弃旧游标的已消费范围与 mtime 基线；原生前缀验证仍需同时使用旧 `safe_offset` 和可信旧指纹的覆盖长度。增量追加可能已消费到旧全读指纹之外，当前大小短于该已消费范围或 `SourceFingerprint::covered_len()` 均须识别为 `RollbackOrRewrite`，包括文件被清空的早退路径。append-log 新指纹只覆盖原始字节中的完整行，不覆盖尚未消费的半行尾巴；删除半行不应触发回退。指纹和游标共用原始字节边界，在有损 UTF-8 解码前确定，避免坏字节扩展后误算偏移。旧版已存指纹若包含半行，首次遇到该范围被截短时仍可能保守保留旧代，成功全读后更新基线。只靠游标偏移会把重试误报成追加，进而保留已不在源中的旧尾部事件。
 
 过滤前的原生事件序号与过滤后保留条数是两个维度。混合临时与持久会话的文件逐事件判断准入，不能用首条事件代表整份文件；`next_seq` 按过滤前的解析事件数推进，保留被排除事件留下的序号空档。整批临时排除时，保留本批起点、序号与旧解析状态；不能回到文件头却沿用增量序号，否则会重发之前已保存的事件。
 
-Codex 的 `session_meta` 可以单独占一批且不产事件。已知父关系保存于 `CodexState.session_parents`，随游标序列化，下一批按会话 ID 恢复；同一批或跨批切走、切回同一会话时仍保留其已知父关系，不能只存最后一个会话的父 ID。`PARSER_REVISION = 5` 使旧投影重新提取来源与父血缘。旧状态缺少该默认空映射仍可读取；Rust 字面量构造与手写状态映射需要消费方适配。
+Codex 的 `session_meta` 可以单独占一批且不产事件。已知父关系保存于 `CodexState.session_parents`，随游标序列化，下一批按会话 ID 恢复；同一批或跨批切走、切回同一会话时仍保留其已知父关系，不能只存最后一个会话的父 ID。`PARSER_REVISION` 在 revision 5 开始使旧投影重新提取来源与父血缘。旧状态缺少该默认空映射仍可读取；Rust 字面量构造与手写状态映射需要消费方适配。
 
 总库的绑定读取、三态判断与投影保存处于同一个 `BEGIN IMMEDIATE` 事务中。读取 `store_meta` 失败返回带 `RegistryUnreadable` 的注册表，不能压成空规则。消费方若另存本地索引，也须把 `TotalStore::load_session_bindings()` 的有效规则显式传入扫描；总库未就绪时无法确认只存在于元数据中的规则，应明确报告未就绪并冻结整轮持久化，不能把仅有文件规则当成完整快照。总库末端拒绝写入不能撤销消费方提前保存的正文或用量。
 

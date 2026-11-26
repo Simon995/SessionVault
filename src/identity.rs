@@ -371,7 +371,13 @@ pub fn repo_id_for_root(
     mounts: &crate::pathnorm::DriveMounts,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
-    repo_id_for_root_with_prefetch(root, default_distro, mounts, None, deadline)
+    let reach = crate::pathnorm::reach_of(
+        root,
+        default_distro,
+        mounts,
+        crate::pathnorm::HostPlatform::current(),
+    );
+    repo_id_for_reach(root, reach, None, deadline)
 }
 
 /// 一轮注册根扫描中按发行版惰性执行的 WSL 身份预取。
@@ -445,28 +451,13 @@ impl IdentityPrefetch {
     }
 }
 
-pub(crate) fn repo_id_for_root_with_prefetch(
+pub(crate) fn repo_id_for_reach(
     root: &str,
-    default_distro: Option<&str>,
-    mounts: &crate::pathnorm::DriveMounts,
+    reach: crate::pathnorm::RootReach,
     prefetch: Option<&IdentityPrefetch>,
     deadline: Deadline,
 ) -> Result<RepoIdentity, crate::probe::ProbeError> {
-    // 🔴 **形态分派收口到 `pathnorm::reach_of`**（2026-08-15）。
-    //
-    // 这里从前只认两种形态（规范形 / 其余），于是**裸 Linux 路径与 `/mnt/<drive>/…`
-    // 全落进本机分支** —— 在 Windows 上前者是当前盘的相对路径、后者同理，
-    // stat 不到 `.git/config` ⇒ 落 `path:` id ⇒ 被 `store::record_identity_for_root` 丢弃。
-    //
-    // 而 `discovery::probe_path` 认**四种**形态。同一条「这条路径归谁管」的判据
-    // 有两份实现、答不同的问题、于是分别演化 —— 本仓当天已因此栽过四次。
-    // 现在形态只判一次，两个调用点各自决定拿到形态后做什么。
-    match crate::pathnorm::reach_of(
-        root,
-        default_distro,
-        mounts,
-        crate::pathnorm::HostPlatform::current(),
-    ) {
+    match reach {
         crate::pathnorm::RootReach::Wsl { distro, linux } => {
             if let Some(snapshot) = prefetch.and_then(|p| p.get_or_fetch(&distro, deadline)) {
                 let backend = crate::probe::PrefetchedWslBackend::shared(&distro, snapshot);
@@ -480,6 +471,10 @@ pub(crate) fn repo_id_for_root_with_prefetch(
         crate::pathnorm::RootReach::Unknown(why) => {
             Err(crate::probe::ProbeError::new(Path::new(root), why))
         }
+        crate::pathnorm::RootReach::Remote { namespace } => Err(crate::probe::ProbeError::new(
+            Path::new(root),
+            format!("no identity access bridge for remote namespace {namespace}"),
+        )),
         crate::pathnorm::RootReach::Local(host_path) => {
             match find_git_root(Path::new(&host_path)) {
                 GitRoot::Found(p) => Ok(RepoIdentity {

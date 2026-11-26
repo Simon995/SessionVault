@@ -477,7 +477,7 @@ ScanReport {
 - Codex 会话中途 `cwd` 变化 → token 与项目归因正确。
 - `cwd` 缺失 → `project_root_source=missing_cwd`（QuotaBar 实证取值）；WSL UNC `\\wsl.localhost\<distro>\…` → 规范化为 `wsl:<distro>:/path`。
 - WSL 增量三态：`CacheHit`（size==known，零正文）/ `Append`（tail）/ `Full`（首次或截断）→ 由 `(size, known)` 决定，与本地字节游标等价。
-- `workspace_location` ≠ `source_location`：WSL 项目记在 local transcript 下时，前者 `wsl:<distro>`、后者 `local`，不混淆。
+- `workspace_location` ≠ `source_location`：WSL 项目记在 local transcript 下时，前者 `wsl:<distro>`、后者 `local`，不混淆。[Remote SSH 归属](remote-ssh-attribution.md) 将 Claude 远端 cwd 隔离为 `ssh:<endpoint>:/abs`，workspace 标为 `ssh:<endpoint>`，并保留转录的物理来源。项目发现返回 `Remote`，跳过本机和 WSL 探测。重投影及 Rust 消费影响见该契约。
 - 迟到入库：旧 `occurred_at` 事件以大 `offset` 追加 → 时间线按 `occurred_at` 重建，`offset` 不当时间用（latest-wins 不被冒充）。
 - `occurred_at` 缺失 / 不可信 → `time_confidence=low`，不默认当"现在"。
 - 项目归属按当前注册表判据验证已归属、未归属与无法判定；不再使用旧 `cwd` 兜底或数值 confidence 草案。

@@ -858,15 +858,11 @@ CREATE INDEX IF NOT EXISTS idx_identity_cid ON project_identity(canonical_id);
 
 /// 一个根的身份记录结果。
 ///
-/// 🔴 **四态，不是 `bool`/`Option`。** 「问过了没变」「刚记上」「确认没有 remote」
-/// 「没问成」对调用方是四种不同的处置，压成两态就又造一个「没问成长得像没有」。
-///
-/// 🔴 **而它此前只活在这一轮扫描的内存里**（2026-08-21，task #56）——
-/// 只有 `Recorded` 会留下痕迹（`project_identity` 的一行），另外两个算完就没了。
-/// 于是 `svault roots` 的 `canonical_id: null` 同时是三件事，见
-/// [`IdentityVerdict`]。现在每一次探测的结论都落 `project_identity_probe`。
+/// 每次实际探测的结论都落 `project_identity_probe`，供 [`IdentityVerdict`] 报告。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IdentityOutcome {
+    /// 已知远端，当前无访问桥。这轮不探测，也不写探测结论。
+    SkippedRemote,
     /// 本进程已经问过这个根（终态缓存命中）。
     AlreadyProbed,
     /// 身份行已落库。
@@ -1030,6 +1026,8 @@ pub struct IdentitySweep {
     /// **项目搬走了**，是个该被看见的信号。
     pub checkout_missing: usize,
     pub unresolved: usize,
+    /// 已知远端根，本轮没有身份访问桥。
+    pub skipped_remote: usize,
     pub skipped_out_of_budget: usize,
     /// 连注册表都没读成 —— 这一轮**什么都没扫**，与「扫了但零结果」不同。
     pub unreadable: Option<String>,
@@ -2455,6 +2453,7 @@ impl TotalStore {
                 Some(&prefetch),
                 deadline,
             ) {
+                IdentityOutcome::SkippedRemote => sweep.skipped_remote += 1,
                 IdentityOutcome::AlreadyProbed => sweep.already_probed += 1,
                 IdentityOutcome::Recorded => sweep.recorded += 1,
                 IdentityOutcome::NoRemote(_) => sweep.no_remote += 1,
@@ -2488,11 +2487,8 @@ impl TotalStore {
         let outcome =
             self.probe_identity_for_root(root, default_distro, mounts, prefetch, deadline);
         let verdict = match &outcome {
-            // 缓存命中 ⇒ 本进程这一轮之前已经落过判决，不重复写。
-            //
-            // ⚠️ 写成 `if matches!(…) { return }` + 后面一个 `unreachable!()` 也能跑，
-            // 但那是**断言**这一格不会发生；直接在这里 `return`，那一格就不存在。
-            IdentityOutcome::AlreadyProbed => return outcome,
+            // 两种情况都没有在本轮执行探测，因此不写新判决。
+            IdentityOutcome::SkippedRemote | IdentityOutcome::AlreadyProbed => return outcome,
             IdentityOutcome::Recorded => IdentityVerdict::Resolved,
             IdentityOutcome::NoRemote(why) => IdentityVerdict::NoIdentity {
                 why: (*why).to_string(),
@@ -2550,6 +2546,15 @@ impl TotalStore {
         if root.is_empty() {
             return IdentityOutcome::NoRemote("empty root path");
         }
+        let reach = crate::pathnorm::reach_of(
+            root,
+            default_distro,
+            mounts,
+            crate::pathnorm::HostPlatform::current(),
+        );
+        if matches!(reach, crate::pathnorm::RootReach::Remote { .. }) {
+            return IdentityOutcome::SkippedRemote;
+        }
         {
             let Ok(mut seen) = self.identity_seen.lock() else {
                 return IdentityOutcome::Unresolved("identity_seen mutex poisoned".to_string());
@@ -2574,13 +2579,7 @@ impl TotalStore {
         // 三态各有各的处置：`Unknown` 是「本轮没问成」，它**已经**被上面的
         // `identity_seen` 记成「问过了」，所以必须撤回 —— 否则一次瞬时故障让这个
         // 项目在本进程内永远算不出身份。
-        let identity = match crate::identity::repo_id_for_root_with_prefetch(
-            root,
-            default_distro,
-            mounts,
-            prefetch,
-            deadline,
-        ) {
+        let identity = match crate::identity::repo_id_for_reach(root, reach, prefetch, deadline) {
             Ok(identity) => identity,
             Err(e) => {
                 log::debug!(
@@ -4368,6 +4367,7 @@ impl TotalStore {
                     host,
                     crate::parser::scan_default_distro(&ev.source_location).as_deref(),
                     registry,
+                    crate::parser::source_ssh_namespace(ev.source_type, &ev.source_path).as_deref(),
                 );
                 if after == before {
                     continue;
@@ -6432,10 +6432,68 @@ mod tests {
         serde_json::to_value(ev).unwrap()
     }
 
-    /// `recompute_attribution`（QuotaBar 10-21 按规则 2 提的判据）：源文件已不在的来源，入库时归不到根
-    /// （`unattributed`，或 ADR-050 之前的兜底值 `wsl_cwd`）；注册表长出覆盖它的根之后，当前投影逐条
-    /// 等于拿同一份注册表重扫会写下的事件（真解析器）—— 归属三项换了，其余字段、条数、seq 原样；
-    /// 旧代被取代，change-feed 记一笔 reparse。没记 cwd 的旧归属不动；预览不写；再跑一次什么都不写。
+    #[test]
+    fn recompute_ssh_attribution_matches_parse_and_preserves_original_cwd() {
+        let store = TotalStore::open_in_memory().unwrap();
+        let path = r"C:\Users\u\.claude\projects\ssh-11111111-2222-3333-4444-555555555555\s\subagents\a.jsonl";
+        store.register_project_root("/home/u/project", crate::attribution::RootSource::Git);
+        store.register_project_root(
+            "wsl:Ubuntu:/home/u/project",
+            crate::attribution::RootSource::Git,
+        );
+        let registry = store.project_root_registry(&Vec::new());
+        let line = serde_json::json!({"type":"user", "sessionId":"s", "cwd":"/home/u/project/sub",
+            "message":{"role":"user", "content":"remote message"}})
+        .to_string();
+        let context = crate::parser::ParseCtx {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: path.into(),
+            profile: Profile::Full,
+            host: crate::pathnorm::HostPlatform::current(),
+            default_distro: None,
+            roots: std::sync::Arc::new(registry.clone()),
+        };
+        let expected = crate::parser::parse_lines(&context, &[&line], 0, None).events;
+        assert_eq!(expected.len(), 1);
+        assert_eq!(
+            expected[0].project_root_source.as_deref(),
+            Some("unattributed")
+        );
+        let mut old = expected.clone();
+        old[0].project_root = Some("/home/u/project".into());
+        old[0].project_root_source = Some("git".into());
+        old[0].workspace_location = Some("wsl:Ubuntu".into());
+        store.append_events(&old, Projection::Append).unwrap();
+        let key = SourceKey {
+            source_type: SourceType::ClaudeCode,
+            source_location: SourceLocation::Local,
+            source_path: path.into(),
+        };
+        let preview = store
+            .recompute_attribution(&registry, std::slice::from_ref(&key), true)
+            .unwrap();
+        assert_eq!(preview.sources_rewritten, 1);
+        let result = store
+            .recompute_attribution(&registry, std::slice::from_ref(&key), false)
+            .unwrap();
+        assert_eq!((result.sources_rewritten, result.events_written), (1, 1));
+        let got = store
+            .read_session(SourceType::ClaudeCode, &SourceLocation::Local, path, "s")
+            .unwrap();
+        assert_eq!(json_of(&got.events[0]), json_of(&expected[0]));
+        assert_eq!(got.events[0].cwd.as_deref(), Some("/home/u/project/sub"));
+        assert_eq!(
+            store
+                .recompute_attribution(&registry, &[key], false)
+                .unwrap()
+                .sources_rewritten,
+            0
+        );
+    }
+
+    /// 源文件已不在而注册表新增覆盖时，重算结果和用相同注册表重扫的投影逐条一致。
+    /// 旧代被取代，change-feed 记一笔 reparse。没有 cwd 的旧归属保留，预览和重复运行不写库。
     #[test]
     fn recompute_attribution_matches_a_rescan_under_the_current_registry() {
         use crate::attribution::RootSource;
@@ -11403,6 +11461,56 @@ mod project_identity_tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_sweep_skips_known_ssh_roots_but_retries_a_failed_local_probe() {
+        let local_root = scratch("identity-ssh-control");
+        let config = local_root.join(".git/config");
+        seed_repo(&local_root, Some("git@example.com:o/project.git"));
+        // 一个确实读不成的配置。恢复字节后，同一进程的下一轮必须再问。
+        std::fs::write(&config, [0xff]).unwrap();
+        let local = local_root.to_str().unwrap();
+        let remote = "ssh:11111111-2222-3333-4444-555555555555:/home/u/project";
+        let store = TotalStore::open_in_memory().unwrap();
+        store.register_project_root(local, RootSource::Git);
+        store.register_project_root(remote, RootSource::Git);
+
+        let sweep =
+            || store.sweep_registered_root_identities(None, &Vec::new(), Deadline::unbounded());
+        let first = sweep();
+        assert_eq!(first.registered, 2);
+        assert_eq!(first.skipped_remote, 1);
+        assert_eq!(
+            (first.unresolved, first.no_remote, first.recorded),
+            (1, 0, 0)
+        );
+        let (roots, _) = store.project_roots_report(&Vec::new()).unwrap();
+        let local_row = roots.iter().find(|row| row.root_path == local).unwrap();
+        assert!(matches!(
+            local_row.identity_verdict,
+            IdentityVerdict::Unresolved { .. }
+        ));
+        let remote_row = roots.iter().find(|row| row.root_path == remote).unwrap();
+        assert_eq!(remote_row.identity_verdict, IdentityVerdict::NotProbed);
+        assert_eq!(remote_row.canonical_id, None);
+
+        seed_repo(&local_root, Some("git@example.com:o/project.git"));
+        let second = sweep();
+        assert_eq!(second.skipped_remote, 1);
+        assert_eq!(
+            (second.recorded, second.unresolved, second.already_probed),
+            (1, 0, 0)
+        );
+        assert_eq!(
+            store.project_identity(local).as_deref(),
+            Some("git:example.com/o/project")
+        );
+        let (roots, _) = store.project_roots_report(&Vec::new()).unwrap();
+        let remote_row = roots.iter().find(|row| row.root_path == remote).unwrap();
+        assert_eq!(remote_row.identity_verdict, IdentityVerdict::NotProbed);
+        assert_eq!(remote_row.canonical_id, None);
+        std::fs::remove_dir_all(local_root).unwrap();
     }
 
     /// 预算耗尽必须**说出来**：「本轮只看了一半」与「本轮全看过了」在结果上一样。
